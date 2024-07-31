@@ -13,6 +13,8 @@ use tokio::net::TcpListener;
 
 use self::parser::handle_bind_response;
 
+mod data;
+mod index;
 mod parser;
 
 #[tokio::main]
