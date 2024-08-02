@@ -16,6 +16,7 @@ use self::parser::handle_bind_response;
 mod data;
 mod index;
 mod parser;
+mod schema;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
