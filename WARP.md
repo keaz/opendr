@@ -8,14 +8,25 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 
 ## Architecture
 
-The project follows a clean modular architecture:
+The project follows a **finite state machine (FSM) based architecture** designed for high concurrency and clear state management:
 
+- **FSM Layer** (`src/fsm.rs`): Comprehensive FSM traits for all LDAP operations and connection management
 - **Server Layer** (`src/server.rs`): Handles TCP connections, LDAP message parsing, and protocol operations
 - **Backend Layer** (`src/backend.rs`): Provides a trait-based abstraction for directory storage with a MockBackend implementation
 - **Parser Layer** (`src/parser.rs`): Handles LDAP message encoding/decoding using ASN.1 DER encoding
 - **Data Layer** (`src/data.rs`): Serialization structures for persistent storage (currently unused)
 - **Schema Layer** (`src/schema.rs`): LDAP schema parsing and validation (work in progress)
 - **Index Layer** (`src/index.rs`): B-tree indexing implementation for efficient searching
+
+### FSM Architecture
+The server uses 12 FSM traits covering:
+- **Transport**: ConnectionFsm, BerDecoderFsm
+- **Authentication**: AuthFsm, SaslFsm  
+- **Operations**: SearchFsm, WriteFsm, CompareFsm, ExtendedOpFsm
+- **Distribution**: ReferralFsm, ReplicationProviderFsm, ReplicationConsumerFsm
+- **Storage**: BackendTxnFsm
+
+📊 **See [docs/](docs/) for detailed architecture diagrams and design documentation.**
 
 ## Key Components
 
@@ -93,11 +104,13 @@ cargo test modify_success_returns_success_response
 
 ## Code Navigation Tips
 
+- **FSM Traits**: All state machine definitions in `src/fsm.rs`
 - **Server request handlers**: Look in `src/server.rs` for `handle_*_request` functions
 - **Backend implementations**: `MockBackend` in `src/backend.rs`
 - **LDAP message encoding**: `src/parser.rs` - `encode_*` functions
 - **Filter matching logic**: `entry_matches_filter` function in `src/server.rs`
 - **DN manipulation**: Helper functions at bottom of `src/backend.rs`
+- **Architecture docs**: Complete diagrams and design in `docs/` directory
 
 ## Common Development Tasks
 
