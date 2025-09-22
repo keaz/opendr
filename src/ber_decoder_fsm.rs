@@ -13,10 +13,10 @@
 //!
 //! ## State Machine Flow
 //!
-//! ```
-//! WaitingTag → WaitingLength → WaitingValue → MessageComplete
-//!     ↑                                            │
-//!     └────────── Reset/New Message ───────────────┘
+//! ```text
+//! WaitingTag -> WaitingLength -> WaitingValue -> MessageComplete
+//!     ^                                            |
+//!     +------------ Reset/New Message -------------+
 //! ```
 //!
 //! The FSM handles:

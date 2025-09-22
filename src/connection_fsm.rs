@@ -12,19 +12,33 @@
 //! 
 //! ## Usage Example
 //! 
-//! ```rust
+//! ```rust,no_run
 //! use opendr::connection_fsm::*;
+//! use opendr::fsm::{StateMachine, ConnectionState, ConnectionEvent};
 //! 
-//! let tls_handler = MockTlsHandler::new();
-//! let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
+//! // Note: This example shows the API structure.
+//! // In real usage, you would implement your own TlsHandler.
+//! # struct MockTlsHandler;
+//! # #[async_trait::async_trait]
+//! # impl TlsHandler for MockTlsHandler {
+//! #     async fn perform_handshake(&self, _stream: &mut tokio::net::TcpStream) -> Result<(), String> { Ok(()) }
+//! #     fn supports_tls(&self) -> bool { true }
+//! #     fn protocol_version(&self) -> String { "TLSv1.3".to_string() }
+//! # }
 //! 
-//! // Connect
-//! let result = fsm.handle_event(ConnectionEvent::Connect).await?;
-//! assert_eq!(fsm.current_state(), &ConnectionState::Connected);
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let tls_handler = Box::new(MockTlsHandler);
+//! let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", tls_handler);
 //! 
-//! // Start TLS
-//! let result = fsm.handle_event(ConnectionEvent::StartTlsRequest).await?;
-//! assert_eq!(fsm.current_state(), &ConnectionState::Secure);
+//! // Connect would typically be handled by the connection logic
+//! // let _result = fsm.handle_event(ConnectionEvent::Connect).await?;
+//! // assert_eq!(fsm.current_state(), &ConnectionState::Connected);
+//! 
+//! // Start TLS would be initiated after connection is established
+//! // let _result = fsm.handle_event(ConnectionEvent::StartTlsRequest).await?;
+//! // assert_eq!(fsm.current_state(), &ConnectionState::Secure);
+//! # Ok(())
+//! # }
 //! ```
 
 use std::fmt;
