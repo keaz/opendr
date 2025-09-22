@@ -319,7 +319,7 @@ fn apply_modification(
         }
     }
 
-    if attribute.eq("userpassword") {
+    if attribute == "userpassword" {
         if let Some(current) = entry
             .attributes
             .get(&attribute)
