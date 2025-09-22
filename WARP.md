@@ -26,6 +26,16 @@ The server uses 12 FSM traits covering:
 - **Distribution**: ReferralFsm, ReplicationProviderFsm, ReplicationConsumerFsm
 - **Storage**: BackendTxnFsm
 
+#### Extended Operation FSM
+The ExtendedOpFsm handles LDAP extended operations with advanced features:
+- **Operation Support**: StartTLS, Password Modify, WhoAmI, Cancel, and custom operations
+- **Delegation System**: Can delegate operations to external handlers (e.g., TLS negotiation)
+- **Access Control**: Per-operation permission checking
+- **Metrics Collection**: Operation timing and success/failure tracking
+- **Error Handling**: Comprehensive error propagation with custom error types
+- **State Management**: Parsing → Processing/Delegating → Responding → Completed
+- **Implementation**: `src/extended_op_fsm.rs` with trait abstractions for external dependencies
+
 📊 **See [docs/](docs/) for detailed architecture diagrams and design documentation.**
 
 ## Key Components
@@ -44,7 +54,7 @@ All major LDAP v3 operations are implemented:
 - Add, Modify, Delete
 - ModifyDN (rename/move entries)
 - Compare
-- Extended operations (placeholder)
+- Extended operations (StartTLS, Password Modify, WhoAmI, Cancel, custom operations)
 
 ### Protocol Implementation
 - Uses `ldap-parser` crate for parsing incoming LDAP messages
@@ -110,6 +120,7 @@ cargo test modify_success_returns_success_response
 - **LDAP message encoding**: `src/parser.rs` - `encode_*` functions
 - **Filter matching logic**: `entry_matches_filter` function in `src/server.rs`
 - **DN manipulation**: Helper functions at bottom of `src/backend.rs`
+- **Extended Operations**: `src/extended_op_fsm.rs` - comprehensive FSM with trait abstractions
 - **Architecture docs**: Complete diagrams and design in `docs/` directory
 
 ## Common Development Tasks

@@ -4,6 +4,7 @@ pub mod ber_decoder_fsm;
 pub mod compare_fsm;
 pub mod connection_fsm;
 pub mod data;
+pub mod extended_op_fsm;
 pub mod fsm;
 pub mod parser;
 pub mod sasl_fsm;

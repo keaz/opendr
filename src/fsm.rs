@@ -446,7 +446,7 @@ pub enum ExtendedOpState {
     Completed { result_code: ExtendedOpResultCode },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExtendedOpEvent {
     StartExtendedOp { oid: String, value: Option<Vec<u8>> },
     ParseComplete,
