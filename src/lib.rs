@@ -5,5 +5,6 @@ pub mod connection_fsm;
 pub mod data;
 pub mod fsm;
 pub mod parser;
+pub mod sasl_fsm;
 pub mod schema;
 pub mod server;
