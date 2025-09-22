@@ -47,8 +47,20 @@ fn parse_attribute_type(def: &str) -> AttributeType {
         .iter()
         .skip_while(|&&p| p != "DESC")
         .skip(1)
-        .next()
-        .map(|&p| p.trim_matches('\'').to_string());
+        .take_while(|&&p| {
+            p != "EQUALITY" && p != "ORDERING" && p != "SUBSTR" && p != "SYNTAX" &&
+            p != "SINGLE-VALUE" && p != "COLLECTIVE" && p != "NO-USER-MODIFICATION" &&
+            p != "USAGE" && p != "OBSOLETE" && !p.starts_with("X-")
+        })
+        .map(|&p| p.trim_matches('\'').to_string())
+        .collect::<Vec<String>>()
+        .join(" ");
+
+    let description = if description.is_empty() {
+        None
+    } else {
+        Some(description)
+    };
     let equality = parts
         .iter()
         .skip_while(|&&p| p != "EQUALITY")
