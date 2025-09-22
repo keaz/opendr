@@ -683,7 +683,7 @@ fn convert_modifications(changes: Vec<Change<'_>>) -> Vec<Modification> {
                 _ => ModifyOperation::Replace,
             };
 
-            let attribute = change.modification.attr_type.0.into_owned().to_lowercase();
+            let attribute = change.modification.attr_type.0.to_lowercase();
 
             let values = change
                 .modification
