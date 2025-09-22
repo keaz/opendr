@@ -252,7 +252,7 @@ The FSM architecture has been progressively implemented with a focus on complete
    - Performance metrics and monitoring
    - Comprehensive error handling and abandonment
 
-6. **Write FSM** (`write_fsm.rs`) ⭐ **Latest Implementation**
+6. **Write FSM** (`write_fsm.rs`) 
    - Complete LDAP write operations (Add, Modify, ModifyDN, Delete)
    - Schema validation and compliance checking
    - Access Control Information (ACI) evaluation
@@ -261,9 +261,17 @@ The FSM architecture has been progressively implemented with a focus on complete
    - Comprehensive error handling and audit logging
    - Performance metrics and monitoring
 
+7. **Compare FSM** (`compare_fsm.rs`) ⭐ **Latest Implementation**
+   - Complete LDAP compare operations
+   - Lightweight entry retrieval with attribute filtering
+   - Binary-safe and case-insensitive attribute comparisons
+   - Multi-value attribute handling (true if any value matches)
+   - Access control integration for compare permissions
+   - Performance monitoring and comprehensive error handling
+   - Support for operational attribute restrictions
+
 ### 🚧 **Planned FSMs**
 
-- **Compare FSM**: LDAP compare operations
 - **Extended Operation FSM**: Custom LDAP extensions
 - **Referral FSM**: LDAP referral handling
 - **Replication Provider FSM**: RFC 4533 replication

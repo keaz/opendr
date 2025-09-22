@@ -1,6 +1,7 @@
 pub mod auth_fsm;
 pub mod backend;
 pub mod ber_decoder_fsm;
+pub mod compare_fsm;
 pub mod connection_fsm;
 pub mod data;
 pub mod fsm;
