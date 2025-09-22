@@ -9,3 +9,4 @@ pub mod sasl_fsm;
 pub mod schema;
 pub mod search_fsm;
 pub mod server;
+pub mod write_fsm;
