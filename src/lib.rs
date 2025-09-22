@@ -7,4 +7,5 @@ pub mod fsm;
 pub mod parser;
 pub mod sasl_fsm;
 pub mod schema;
+pub mod search_fsm;
 pub mod server;
