@@ -42,7 +42,7 @@
 //!
 //! ```rust,no_run
 //! use opendr::compare_fsm::*;
-//! use opendr::fsm::{StateMachine, CompareState, CompareEvent};
+//! use opendr::fsm::{StateMachine, CompareFsm, CompareState, CompareEvent};
 //! 
 //! # struct MockCompareBackend;
 //! # #[async_trait::async_trait]

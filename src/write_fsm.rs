@@ -46,12 +46,31 @@
 //! #     async fn validate_entry(&self, _dn: &str, _entry: &[u8]) -> Result<(), String> { Ok(()) }
 //! #     async fn begin_transaction(&self) -> Result<String, String> { Ok("txn-1".to_string()) }
 //! #     async fn commit_transaction(&self, _txn_id: &str) -> Result<(), String> { Ok(()) }
+//! #     async fn rollback_transaction(&self, _txn_id: &str, _reason: &str) -> Result<(), String> { Ok(()) }
+//! #     async fn add_entry(&self, _txn_id: &str, _dn: &str, _entry: &[u8]) -> Result<(), String> { Ok(()) }
+//! #     async fn modify_entry(&self, _txn_id: &str, _dn: &str, _modifications: &[Modification]) -> Result<(), String> { Ok(()) }
+//! #     async fn modify_dn(&self, _txn_id: &str, _dn: &str, _new_rdn: &str, _delete_old: bool, _new_superior: Option<&str>) -> Result<(), String> { Ok(()) }
+//! #     async fn delete_entry(&self, _txn_id: &str, _dn: &str) -> Result<(), String> { Ok(()) }
+//! #     async fn entry_exists(&self, _dn: &str) -> Result<bool, String> { Ok(true) }
+//! # }
+//! #
+//! # struct MockSchemaValidator;
+//! # #[async_trait::async_trait]
+//! # impl SchemaValidator for MockSchemaValidator {
+//! #     async fn validate_entry(&self, _entry: &WriteEntry) -> Result<(), String> { Ok(()) }
+//! #     async fn validate_modifications(&self, _dn: &str, _modifications: &[Modification]) -> Result<(), String> { Ok(()) }
+//! # }
+//! #
+//! # struct MockAciChecker;
+//! # #[async_trait::async_trait]
+//! # impl AciChecker for MockAciChecker {
+//! #     async fn check_write_permission(&self, _user_dn: Option<&str>, _operation: &WriteOperation) -> Result<(), String> { Ok(()) }
 //! # }
 //! #
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let backend = Box::new(MockWriteBackend);
-//! let schema_validator = Box::new(MockSchemaValidator::new());
-//! let aci_checker = Box::new(MockAciChecker::new());
+//! let schema_validator = Box::new(MockSchemaValidator);
+//! let aci_checker = Box::new(MockAciChecker);
 //! 
 //! let mut fsm = WriteFsmImpl::new(backend, schema_validator, aci_checker);
 //! 
@@ -59,7 +78,7 @@
 //! let result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
 //!     dn: "cn=newuser,ou=people,dc=example,dc=org".to_string(),
 //!     entry: b"dn: cn=newuser,ou=people,dc=example,dc=org\nobjectClass: person\ncn: newuser\n".to_vec(),
-//! })).await?;
+//! })).await;
 //! # Ok(())
 //! # }
 //! ```
