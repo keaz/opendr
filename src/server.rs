@@ -709,7 +709,7 @@ fn build_entry_from_add_request(
     let mut password = Vec::new();
 
     for attribute in attributes {
-        let name = attribute.attr_type.0.into_owned().to_lowercase();
+        let name = attribute.attr_type.0.to_ascii_lowercase();
         let values: Vec<String> = attribute
             .attr_vals
             .iter()
