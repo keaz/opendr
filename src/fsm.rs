@@ -524,8 +524,11 @@ pub trait ReferralFsm: StateMachine<State = ReferralState, Event = ReferralEvent
     /// Get maximum hop limit
     fn hop_limit(&self) -> u32;
     
-    /// Get target DSA URLs
-    fn target_urls(&self) -> &[String];
+    /// Get current target DSA
+    fn current_target(&self) -> Option<&str>;
+    
+    /// Get referral URLs
+    fn referral_urls(&self) -> Option<&[String]>;
     
     /// Check if more hops are allowed
     fn can_hop(&self) -> bool {
