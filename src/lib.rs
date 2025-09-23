@@ -8,6 +8,7 @@ pub mod extended_op_fsm;
 pub mod fsm;
 pub mod referral_fsm;
 pub mod parser;
+pub mod replication_provider_fsm;
 pub mod sasl_fsm;
 pub mod schema;
 pub mod search_fsm;

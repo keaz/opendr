@@ -542,38 +542,86 @@ pub trait ReferralFsm: StateMachine<State = ReferralState, Event = ReferralEvent
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplicationProviderState {
-    Refresh { entries_sent: usize },
+    /// Initial state waiting for sync request
+    Initializing,
+    /// Refresh phase - sending existing entries
+    Refresh { entries_sent: usize, total_entries: usize },
+    /// Present phase - streaming changelog entries  
     Present { entries_streamed: usize },
+    /// Persist phase - maintaining replication cookie
     Persist { cookie: String },
-    Streaming,
+    /// Streaming mode - continuously sending changes
+    Streaming { active_consumers: usize },
+    /// Replication completed successfully
     Completed,
-    Error,
+    /// Error state
+    Error { message: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ReplicationProviderEvent {
-    StartReplication { consumer_id: String, cookie: Option<String> },
-    RefreshPhaseComplete,
-    PresentPhaseComplete,
-    ChangelogEntry(Vec<u8>),
-    EntryStreamed,
-    ConsumerDisconnected,
+    /// Consumer requests sync replication from cookie
+    StartSyncReplication { consumer_id: String, cookie: Option<String> },
+    /// Refresh phase completed, ready to stream changes
+    RefreshComplete { entries_sent: usize },
+    /// Present phase completed, ready to persist
+    PresentComplete { entries_streamed: usize },
+    /// New changelog entry available for streaming
+    ChangelogEntry { entry: Vec<u8>, sequence_number: u64 },
+    /// Entry successfully streamed to consumer
+    EntryStreamed { consumer_id: String },
+    /// Consumer disconnected
+    ConsumerDisconnected { consumer_id: String },
+    /// Cookie updated/persisted
+    CookiePersisted { new_cookie: String },
+    /// Error occurred
     Error(String),
 }
 
 #[async_trait]
 pub trait ReplicationProviderFsm: StateMachine<State = ReplicationProviderState, Event = ReplicationProviderEvent> {
-    /// Get consumer identifier
+    /// Get primary consumer identifier (for single consumer)
     fn consumer_id(&self) -> Option<&str>;
     
     /// Get current replication cookie
     fn cookie(&self) -> Option<&str>;
     
-    /// Get entries sent count
+    /// Get entries sent count during refresh phase
     fn entries_sent(&self) -> usize;
+    
+    /// Get entries streamed count during present phase
+    fn entries_streamed(&self) -> usize;
     
     /// Check if in streaming mode
     fn is_streaming(&self) -> bool;
+    
+    /// Get active consumer count
+    fn active_consumers(&self) -> usize;
+    
+    /// Get current replication phase
+    fn current_phase(&self) -> ReplicationPhase;
+    
+    /// Get sync replication statistics
+    fn sync_stats(&self) -> (usize, usize, usize); // (refresh_entries, present_entries, total_consumers)
+}
+
+/// RFC 4533 Replication phases
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplicationPhase {
+    /// Initial phase
+    Initialize,
+    /// Refresh phase - sending existing entries
+    Refresh,
+    /// Present phase - streaming changelog entries
+    Present, 
+    /// Persist phase - maintaining cookie state
+    Persist,
+    /// Streaming phase - continuous replication
+    Stream,
+    /// Completed phase
+    Complete,
+    /// Error phase
+    Error,
 }
 
 // ================================================================================================
