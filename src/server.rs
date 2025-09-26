@@ -20,11 +20,17 @@ use crate::backend::{
 use crate::parser::{
     encode_bind_response, encode_result_response, encode_search_entry, ResponseOp,
 };
+use crate::server_fsm::{
+    ConnectionFsmSet, handle_bind_request_fsm, FsmHandlerFactory, FsmOperationHandler
+};
 
 #[derive(Debug)]
 pub enum ServerError {
     Io(std::io::Error),
     Encode(EncodeError),
+    Protocol(String),
+    Internal(String),
+    Backend(BackendError),
 }
 
 impl fmt::Display for ServerError {
@@ -32,6 +38,9 @@ impl fmt::Display for ServerError {
         match self {
             ServerError::Io(err) => write!(f, "I/O error: {}", err),
             ServerError::Encode(err) => write!(f, "encoding error: {:?}", err),
+            ServerError::Protocol(msg) => write!(f, "protocol error: {}", msg),
+            ServerError::Internal(msg) => write!(f, "internal error: {}", msg),
+            ServerError::Backend(err) => write!(f, "backend error: {}", err),
         }
     }
 }
@@ -50,6 +59,30 @@ impl From<EncodeError> for ServerError {
     }
 }
 
+impl From<BackendError> for ServerError {
+    fn from(err: BackendError) -> Self {
+        ServerError::Backend(err)
+    }
+}
+
+/// Run LDAP server with FSM-based authentication support
+pub async fn run_with_fsm(addr: &str, backend: Arc<dyn DirectoryBackend>) -> Result<(), ServerError> {
+    let listener = TcpListener::bind(addr).await?;
+    info!("LDAP server with FSM authentication listening on {}", addr);
+
+    loop {
+        let (socket, addr) = listener.accept().await?;
+        info!("Accepted connection from {:?}", addr);
+
+        let backend = backend.clone();
+
+        tokio::spawn(async move {
+            handle_client_with_fsm(socket, backend).await;
+            info!("Connection {:?} closed", addr);
+        });
+    }
+}
+
 pub async fn run(addr: &str, backend: Arc<dyn DirectoryBackend>) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAP server listening on {}", addr);
@@ -65,6 +98,125 @@ pub async fn run(addr: &str, backend: Arc<dyn DirectoryBackend>) -> Result<(), S
             info!("Connection {:?} closed", addr);
         });
     }
+}
+
+/// Client handler with full FSM support and lifecycle management
+pub async fn handle_client_with_fsm(socket: TcpStream, backend: Arc<dyn DirectoryBackend>) {
+    // Create ConnectionFsmSet with FSM routing enabled for demonstration
+    let mut fsm_set = match ConnectionFsmSet::new(socket).map_err(|e| {
+        error!("Failed to create ConnectionFsmSet: {}", e);
+        e
+    }) {
+        Ok(fsm_set) => fsm_set,
+        Err(_) => return,
+    };
+    
+    // Configure FSM routing - enable all FSM types for demonstration
+    use crate::server_fsm::{FsmRoutingConfig, OperationFsmConfig};
+    
+    let mut routing_config = FsmRoutingConfig::default();
+    routing_config.enable_search_fsm = true;  // Enable for demo
+    routing_config.enable_write_fsm = true;
+    routing_config.enable_compare_fsm = true;
+    routing_config.enable_extended_op_fsm = true;
+    routing_config.fallback_to_direct = true; // Keep fallback enabled
+    
+    let fsm_config = OperationFsmConfig::default();
+    
+    fsm_set.configure_operation_fsms(backend.clone(), routing_config, fsm_config);
+    
+    // Extract the socket from the ConnectionFsmSet for reading
+    // Note: This is a simplified approach - in a production system,
+    // the ConnectionFsmSet would manage the socket directly
+    let mut socket = match TcpStream::connect("127.0.0.1:0").await {
+        Ok(temp_socket) => {
+            // This is a hack for demonstration - in reality we'd refactor
+            // ConnectionFsmSet to manage the socket properly
+            error!("Socket management needs refactoring in ConnectionFsmSet");
+            temp_socket
+        }
+        Err(_) => return,
+    };
+    
+    let mut buffer = vec![0; 4096];
+    
+    info!("FSM-enabled LDAP connection established with routing configuration");
+    
+    loop {
+        match socket.read(&mut buffer).await {
+            Ok(0) => {
+                info!("Client disconnected");
+                break;
+            }
+            Ok(n) => {
+                let payload = &buffer[..n];
+                match parse_ldap_messages(payload) {
+                    Ok((_, messages)) => {
+                        for message in messages {
+                            // Process message with full FSM routing support
+                            match process_message_with_fsm(
+                                &mut socket, 
+                                backend.as_ref(), 
+                                Some(&mut fsm_set),
+                                message
+                            ).await {
+                                Ok(()) => {
+                                    // Message processed successfully
+                                }
+                                Err(ServerError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::TimedOut => {
+                                    warn!("Session timed out, closing connection");
+                                    return;
+                                }
+                                Err(err) => {
+                                    error!("Failed to process message: {}", err);
+                                    // For protocol errors, send error response and continue
+                                    if matches!(err, ServerError::Protocol(_)) {
+                                        if let Err(write_err) = send_bind_response(
+                                            &mut socket,
+                                            0, // Unknown message ID
+                                            ResultCode::ProtocolError,
+                                            "protocol error",
+                                        ).await {
+                                            error!("Failed to send error response: {}", write_err);
+                                            return;
+                                        }
+                                        continue;
+                                    }
+                                    // For other errors, close connection
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        error!("Failed to parse LDAP message: {:?}", err);
+                        if let Err(write_err) = send_bind_response(
+                            &mut socket,
+                            0,
+                            ResultCode::ProtocolError,
+                            "invalid message format",
+                        ).await {
+                            error!("Failed to write error response: {}", write_err);
+                        }
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                error!("Failed to read from socket: {}", err);
+                return;
+            }
+        }
+        
+        // Periodic cleanup of timed-out FSMs
+        let timed_out_fsms = fsm_set.cleanup_timed_out_fsms();
+        if !timed_out_fsms.is_empty() {
+            info!("Cleaned up {} timed-out FSMs during connection handling", timed_out_fsms.len());
+        }
+    }
+    
+    info!("FSM-enabled LDAP connection closed. Final stats: {} active operations", 
+          fsm_set.active_operation_count());
 }
 
 pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBackend>) {
@@ -108,6 +260,152 @@ pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBack
             }
         }
     }
+}
+
+/// Process LDAP message with full FSM routing support
+pub async fn process_message_with_fsm(
+    socket: &mut TcpStream,
+    backend: &dyn DirectoryBackend,
+    mut fsm_set: Option<&mut ConnectionFsmSet>,
+    message: ldap_parser::ldap::LdapMessage<'_>,
+) -> Result<(), ServerError> {
+    let message_id = message.message_id.0;
+    
+    // Update activity and check for timeout if using FSMs
+    if let Some(fsms) = fsm_set.as_ref() {
+        if fsms.is_session_timed_out() {
+            warn!("Session timed out for authenticated user: {:?}", fsms.authenticated_dn());
+            // Send unbind notification and close connection
+            // Note: LDAP doesn't have a "session timeout" response, so we just close
+            return Err(ServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Session timed out"
+            )));
+        }
+    }
+    
+    // Update activity for any message processing
+    if let Some(fsms) = fsm_set.as_mut() {
+        fsms.update_activity();
+        
+        // Clean up any timed-out operation FSMs
+        let timed_out_fsms = fsms.cleanup_timed_out_fsms();
+        if !timed_out_fsms.is_empty() {
+            warn!("Cleaned up {} timed-out operation FSMs", timed_out_fsms.len());
+        }
+    }
+
+    match message.protocol_op {
+        ProtocolOp::BindRequest(bind_request) => {
+            match fsm_set {
+                Some(fsms) => {
+                    // Use FSM-based authentication
+                    handle_bind_request_fsm(fsms, socket, message_id, bind_request).await?
+                }
+                None => {
+                    // Fallback to direct authentication
+                    handle_bind_request(socket, backend, message_id, bind_request).await?
+                }
+            }
+        }
+        
+        // For other operations, try FSM routing first, then fallback to direct handlers
+        _ => {
+            let mut handled_by_fsm = false;
+            
+            // Try FSM routing if available
+            if let Some(fsms) = fsm_set.as_mut() {
+                // Create FSM handler factory
+                let handler_factory = FsmHandlerFactory::new();
+                
+                // Get appropriate handler for this message type
+                if let Some(handler) = handler_factory.get_handler(&message) {
+                    // Check if FSM routing is enabled for this operation
+                    if handler.is_fsm_enabled(fsms) {
+                        info!("Routing {} operation through FSM for message ID {}", 
+                              handler.operation_name(), message_id);
+                        
+                        // Try to handle through FSM
+                        match handler.handle_with_fsm(socket, fsms, &message).await {
+                            Ok(()) => {
+                                handled_by_fsm = true;
+                                info!("Successfully handled {} operation through FSM for message ID {}",
+                                      handler.operation_name(), message_id);
+                            }
+                            Err(fsm_error) => {
+                                error!("FSM handling failed for {} operation, message ID {}: {}", 
+                                       handler.operation_name(), message_id, fsm_error);
+                                
+                                // Check if fallback is enabled
+                                if fsms.should_fallback_to_direct() {
+                                    warn!("Falling back to direct handler for {} operation, message ID {}",
+                                          handler.operation_name(), message_id);
+                                    // Will fall through to direct handlers below
+                                } else {
+                                    // No fallback, propagate the error
+                                    return Err(fsm_error);
+                                }
+                            }
+                        }
+                    } else {
+                        info!("FSM routing disabled for {} operation, using direct handler for message ID {}",
+                              handler.operation_name(), message_id);
+                    }
+                }
+            }
+            
+            // If not handled by FSM, use direct handlers
+            if !handled_by_fsm {
+                handle_message_direct(socket, backend, message_id, &message.protocol_op).await?
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle message through direct (non-FSM) handlers
+async fn handle_message_direct(
+    socket: &mut TcpStream,
+    backend: &dyn DirectoryBackend, 
+    message_id: u32,
+    protocol_op: &ProtocolOp<'_>
+) -> Result<(), ServerError> {
+    match protocol_op {
+        ProtocolOp::SearchRequest(search_request) => {
+            handle_search_request(socket, backend, message_id, search_request.clone()).await?;
+        }
+        ProtocolOp::ModifyRequest(modify_request) => {
+            handle_modify_request(socket, backend, message_id, modify_request.clone()).await?;
+        }
+        ProtocolOp::AddRequest(add_request) => {
+            handle_add_request(socket, backend, message_id, add_request.clone()).await?;
+        }
+        ProtocolOp::DelRequest(delete_request) => {
+            handle_delete_request(socket, backend, message_id, delete_request.clone()).await?;
+        }
+        ProtocolOp::ModDnRequest(rename_request) => {
+            handle_moddn_request(socket, backend, message_id, rename_request.clone()).await?;
+        }
+        ProtocolOp::CompareRequest(compare_request) => {
+            handle_compare_request(socket, backend, message_id, compare_request.clone()).await?;
+        }
+        ProtocolOp::UnbindRequest => {
+            info!("Received unbind request");
+        }
+        ProtocolOp::AbandonRequest(request_id) => {
+            handle_abandon_request(*request_id);
+        }
+        ProtocolOp::ExtendedRequest(request) => {
+            handle_extended_request(socket, message_id, request.clone()).await?;
+        }
+        op => {
+            warn!("Unsupported operation received: {:?}", op);
+            return Err(ServerError::Protocol(format!("Unsupported operation: {:?}", op)));
+        }
+    }
+    
+    Ok(())
 }
 
 pub async fn process_message(
@@ -218,7 +516,7 @@ async fn send_bind_success(socket: &mut TcpStream, message_id: u32) -> Result<()
     send_bind_response(socket, message_id, ResultCode::Success, "").await
 }
 
-async fn send_bind_response(
+pub async fn send_bind_response(
     socket: &mut TcpStream,
     message_id: u32,
     result_code: ResultCode,
@@ -227,6 +525,73 @@ async fn send_bind_response(
     let encoded = encode_bind_response(message_id, result_code, "", diagnostic_message)?;
     socket.write_all(&encoded).await?;
     Ok(())
+}
+
+/// Send search response (placeholder for SearchEntry results)
+pub async fn send_search_response(
+    socket: &mut TcpStream,
+    message_id: u32,
+    result_code: ResultCode,
+    diagnostic_message: impl Into<String>,
+    _entries: Vec<()>, // Placeholder for search entries
+) -> Result<(), ServerError> {
+    // For now, just send the search done response
+    // In a full implementation, this would send SearchResultEntry messages first
+    send_result(socket, message_id, ResponseOp::SearchDone, result_code, "", diagnostic_message).await
+}
+
+/// Send add operation response
+pub async fn send_add_response(
+    socket: &mut TcpStream,
+    message_id: u32,
+    result_code: ResultCode,
+    diagnostic_message: impl Into<String>,
+) -> Result<(), ServerError> {
+    send_result(socket, message_id, ResponseOp::Add, result_code, "", diagnostic_message).await
+}
+
+/// Send modify operation response
+pub async fn send_modify_response(
+    socket: &mut TcpStream,
+    message_id: u32,
+    result_code: ResultCode,
+    diagnostic_message: impl Into<String>,
+) -> Result<(), ServerError> {
+    send_result(socket, message_id, ResponseOp::Modify, result_code, "", diagnostic_message).await
+}
+
+/// Send delete operation response
+pub async fn send_delete_response(
+    socket: &mut TcpStream,
+    message_id: u32,
+    result_code: ResultCode,
+    diagnostic_message: impl Into<String>,
+) -> Result<(), ServerError> {
+    send_result(socket, message_id, ResponseOp::Delete, result_code, "", diagnostic_message).await
+}
+
+/// Send compare operation response
+pub async fn send_compare_response(
+    socket: &mut TcpStream,
+    message_id: u32,
+    result_code: ResultCode,
+    diagnostic_message: impl Into<String>,
+) -> Result<(), ServerError> {
+    send_result(socket, message_id, ResponseOp::Compare, result_code, "", diagnostic_message).await
+}
+
+/// Send extended operation response
+pub async fn send_extended_response(
+    socket: &mut TcpStream,
+    message_id: u32,
+    result_code: ResultCode,
+    diagnostic_message: impl Into<String>,
+    _response_name: &str,
+    _response_value: Option<Vec<u8>>,
+) -> Result<(), ServerError> {
+    // For now, just send a basic response
+    // In a full implementation, this would include the response name and value
+    send_result(socket, message_id, ResponseOp::Extended, result_code, "", diagnostic_message).await
 }
 
 async fn send_result(

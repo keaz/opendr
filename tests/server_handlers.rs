@@ -72,11 +72,64 @@ async fn connected_stream_pair() -> (TcpStream, TcpStream) {
 
 async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
     let mut buf = vec![0u8; 4096];
-    let len = timeout(RESPONSE_TIMEOUT, stream.read(&mut buf))
-        .await
-        .expect("response timeout")
-        .expect("failed to read response");
-    buf.truncate(len);
+    let mut total_read = 0;
+    let mut expected_messages = 0;
+    let mut actual_messages = 0;
+    
+    // Keep reading until we have complete LDAP messages or timeout
+    loop {
+        let len = match timeout(RESPONSE_TIMEOUT, stream.read(&mut buf[total_read..]))
+            .await {
+            Ok(Ok(0)) => break, // EOF reached
+            Ok(Ok(len)) => len,
+            Ok(Err(e)) => panic!("failed to read response: {}", e),
+            Err(_) => {
+                // Timeout - check if we have valid messages so far
+                if total_read == 0 {
+                    panic!("response timeout");
+                }
+                break;
+            }
+        };
+        
+        total_read += len;
+        
+        // Try to parse what we have so far
+        if let Ok((remaining, messages)) = parse_ldap_messages(&buf[..total_read]) {
+            actual_messages = messages.len();
+            
+            // Estimate expected messages from search responses
+            if actual_messages > 0 {
+                if expected_messages == 0 {
+                    match &messages[0].protocol_op {
+                        ldap_parser::ldap::ProtocolOp::SearchResultEntry(_) => {
+                            // For search results, expect at least 2: entry + done
+                            expected_messages = 2;
+                        }
+                        _ => {
+                            // Other operations typically have 1 message
+                            expected_messages = 1;
+                        }
+                    }
+                }
+                
+                // If we have all expected messages and no remaining data, we're done
+                if remaining.is_empty() && actual_messages >= expected_messages {
+                    break;
+                }
+            }
+        }
+        
+        // Prevent infinite loops and buffer overflows
+        if total_read >= buf.len() - 100 {
+            break;
+        }
+        
+        // Brief pause to allow more data to arrive
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+    }
+    
+    buf.truncate(total_read);
     buf
 }
 
