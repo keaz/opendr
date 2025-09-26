@@ -554,7 +554,7 @@ pub trait WriteMetrics: Send + Sync {
 }
 
 /// Configuration for the Write FSM
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WriteFsmConfig {
     /// Default transaction timeout (in seconds)
     pub default_transaction_timeout: u32,
@@ -1467,7 +1467,7 @@ mod tests {
         if let Some(WriteOperation::Add { dn, .. }) = fsm.operation() {
             assert_eq!(dn, "cn=newuser,ou=people,dc=example,dc=org");
         } else {
-            panic!("Expected Add operation");
+            assert!(false, "Expected Add operation, got: {:?}", fsm.operation());
         }
         
         let (total_writes, _, _) = fsm.stats();
@@ -1787,7 +1787,7 @@ mod tests {
         if let Some(WriteOperation::Delete { dn }) = fsm.operation() {
             assert_eq!(dn, "cn=test,dc=example,dc=org");
         } else {
-            panic!("Expected Delete operation");
+            assert!(false, "Expected Delete operation, got: {:?}", fsm.operation());
         }
     }
 }

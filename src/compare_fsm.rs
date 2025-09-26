@@ -400,7 +400,7 @@ pub trait CompareMetrics: Send + Sync {
 }
 
 /// Configuration for the Compare FSM
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompareFsmConfig {
     /// Maximum time to wait for backend operations (in seconds)
     pub max_backend_timeout: u32,

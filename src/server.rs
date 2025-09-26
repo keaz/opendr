@@ -8,7 +8,7 @@ use ldap_parser::ldap::{
     ModDnRequest, ModifyRequest, ProtocolOp, SearchRequest,
 };
 use ldap_parser::parse_ldap_messages;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use rasn::error::EncodeError;
 use rasn_ldap::ResultCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,6 +23,9 @@ use crate::parser::{
 use crate::server_fsm::{
     ConnectionFsmSet, handle_bind_request_fsm, FsmHandlerFactory, FsmOperationHandler
 };
+use crate::validation::{
+    LdapMessageValidator, ValidationConfig, ValidationError, parse_and_validate_ldap_messages
+};
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -31,6 +34,7 @@ pub enum ServerError {
     Protocol(String),
     Internal(String),
     Backend(BackendError),
+    Validation(ValidationError),
 }
 
 impl fmt::Display for ServerError {
@@ -41,6 +45,7 @@ impl fmt::Display for ServerError {
             ServerError::Protocol(msg) => write!(f, "protocol error: {}", msg),
             ServerError::Internal(msg) => write!(f, "internal error: {}", msg),
             ServerError::Backend(err) => write!(f, "backend error: {}", err),
+            ServerError::Validation(err) => write!(f, "validation error: {}", err),
         }
     }
 }
@@ -62,6 +67,12 @@ impl From<EncodeError> for ServerError {
 impl From<BackendError> for ServerError {
     fn from(err: BackendError) -> Self {
         ServerError::Backend(err)
+    }
+}
+
+impl From<ValidationError> for ServerError {
+    fn from(err: ValidationError) -> Self {
+        ServerError::Validation(err)
     }
 }
 
@@ -97,6 +108,34 @@ pub async fn run(addr: &str, backend: Arc<dyn DirectoryBackend>) -> Result<(), S
             handle_client(socket, backend).await;
             info!("Connection {:?} closed", addr);
         });
+    }
+}
+
+/// Enhanced LDAP message parsing with comprehensive validation
+async fn parse_and_validate_messages<'a>(
+    payload: &'a [u8],
+    validator: &mut LdapMessageValidator,
+) -> Result<Vec<ldap_parser::ldap::LdapMessage<'a>>, ServerError> {
+    // Parse and validate messages using the new validation system
+    match parse_and_validate_ldap_messages(payload, validator) {
+        Ok((messages, validation_errors)) => {
+            // Log validation errors but continue processing valid messages
+            if !validation_errors.is_empty() {
+                for validation_error in &validation_errors {
+                    error!("LDAP message validation error: {}", validation_error);
+                }
+                // For now, we'll return the first validation error
+                // In production, we might want to handle partial validation failures differently
+                return Err(ServerError::Validation(validation_errors.into_iter().next().unwrap()));
+            }
+            
+            debug!("Successfully parsed and validated {} LDAP messages", messages.len());
+            Ok(messages)
+        }
+        Err(parse_err) => {
+            error!("LDAP message parsing failed: {}", parse_err);
+            Err(ServerError::Protocol(format!("Message parsing failed: {}", parse_err)))
+        }
     }
 }
 
@@ -140,7 +179,18 @@ pub async fn handle_client_with_fsm(socket: TcpStream, backend: Arc<dyn Director
     
     let mut buffer = vec![0; 4096];
     
-    info!("FSM-enabled LDAP connection established with routing configuration");
+    // Create validator for this connection with production-ready configuration
+    let validation_config = ValidationConfig {
+        max_size_limit: 10000,    // Allow larger searches in production
+        max_time_limit: 600,      // 10 minutes for complex operations
+        max_dn_length: 16384,     // 16KB DN limit
+        enable_security_checks: true,
+        validate_filter_complexity: true,
+        ..ValidationConfig::default()
+    };
+    let mut validator = LdapMessageValidator::with_config(validation_config);
+    
+    info!("FSM-enabled LDAP connection established with routing configuration and message validation");
     
     loop {
         match socket.read(&mut buffer).await {
@@ -150,8 +200,8 @@ pub async fn handle_client_with_fsm(socket: TcpStream, backend: Arc<dyn Director
             }
             Ok(n) => {
                 let payload = &buffer[..n];
-                match parse_ldap_messages(payload) {
-                    Ok((_, messages)) => {
+                match parse_and_validate_messages(payload, &mut validator).await {
+                    Ok(messages) => {
                         for message in messages {
                             // Process message with full FSM routing support
                             match process_message_with_fsm(
@@ -169,32 +219,64 @@ pub async fn handle_client_with_fsm(socket: TcpStream, backend: Arc<dyn Director
                                 }
                                 Err(err) => {
                                     error!("Failed to process message: {}", err);
-                                    // For protocol errors, send error response and continue
-                                    if matches!(err, ServerError::Protocol(_)) {
-                                        if let Err(write_err) = send_bind_response(
-                                            &mut socket,
-                                            0, // Unknown message ID
-                                            ResultCode::ProtocolError,
-                                            "protocol error",
-                                        ).await {
-                                            error!("Failed to send error response: {}", write_err);
-                                            return;
+                                    
+                                    // For validation errors, send appropriate LDAP error response
+                                    let (result_code, diagnostic_message) = match &err {
+                                        ServerError::Validation(validation_err) => {
+                                            match validation_err {
+                                                ValidationError::InvalidProtocolVersion { .. } => {
+                                                    (ResultCode::ProtocolError, "unsupported LDAP version")
+                                                }
+                                                ValidationError::InvalidDn { .. } => {
+                                                    (ResultCode::InvalidDnSyntax, "invalid DN format")
+                                                }
+                                                ValidationError::InvalidSearchFilter { .. } => {
+                                                    (ResultCode::InvalidAttributeSyntax, "invalid search filter")
+                                                }
+                                                ValidationError::InvalidLimits { .. } => {
+                                                    (ResultCode::SizeLimitExceeded, "size or time limit exceeded")
+                                                }
+                                                ValidationError::OperationConstraintViolation { .. } => {
+                                                    (ResultCode::ConstraintViolation, "operation constraint violation")
+                                                }
+                                                _ => (ResultCode::ProtocolError, "validation error")
+                                            }
                                         }
-                                        continue;
+                                        ServerError::Protocol(_) => (ResultCode::ProtocolError, "protocol error"),
+                                        _ => (ResultCode::Other, "server error")
+                                    };
+                                    
+                                    if let Err(write_err) = send_bind_response(
+                                        &mut socket,
+                                        0, // Unknown message ID
+                                        result_code,
+                                        diagnostic_message,
+                                    ).await {
+                                        error!("Failed to send error response: {}", write_err);
+                                        return;
                                     }
-                                    // For other errors, close connection
-                                    return;
+                                    
+                                    // For validation errors, continue processing; for other errors, close connection
+                                    if !matches!(err, ServerError::Validation(_)) {
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
                     Err(err) => {
-                        error!("Failed to parse LDAP message: {:?}", err);
+                        error!("Failed to parse or validate LDAP message: {}", err);
+                        
+                        let (result_code, diagnostic_message) = match &err {
+                            ServerError::Validation(_) => (ResultCode::ProtocolError, "message validation failed"),
+                            _ => (ResultCode::ProtocolError, "invalid message format")
+                        };
+                        
                         if let Err(write_err) = send_bind_response(
                             &mut socket,
                             0,
-                            ResultCode::ProtocolError,
-                            "invalid message format",
+                            result_code,
+                            diagnostic_message,
                         ).await {
                             error!("Failed to write error response: {}", write_err);
                         }
@@ -221,30 +303,80 @@ pub async fn handle_client_with_fsm(socket: TcpStream, backend: Arc<dyn Director
 
 pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBackend>) {
     let mut buffer = vec![0; 4096];
+    
+    // Create validator for this connection with default configuration
+    let mut validator = LdapMessageValidator::new();
 
     loop {
         match socket.read(&mut buffer).await {
             Ok(0) => break,
             Ok(n) => {
                 let payload = &buffer[..n];
-                match parse_ldap_messages(payload) {
-                    Ok((_, messages)) => {
+                match parse_and_validate_messages(payload, &mut validator).await {
+                    Ok(messages) => {
                         for message in messages {
                             if let Err(err) =
                                 process_message(&mut socket, backend.as_ref(), message).await
                             {
                                 error!("Failed to process message: {}", err);
-                                return;
+                                
+                                // Send appropriate error response based on error type
+                                let (result_code, diagnostic_message) = match &err {
+                                    ServerError::Validation(validation_err) => {
+                                        match validation_err {
+                                            ValidationError::InvalidProtocolVersion { .. } => {
+                                                (ResultCode::ProtocolError, "unsupported LDAP version")
+                                            }
+                                            ValidationError::InvalidDn { .. } => {
+                                                (ResultCode::InvalidDnSyntax, "invalid DN format")
+                                            }
+                                            ValidationError::InvalidSearchFilter { .. } => {
+                                                (ResultCode::InvalidAttributeSyntax, "invalid search filter")
+                                            }
+                                            ValidationError::InvalidLimits { .. } => {
+                                                (ResultCode::SizeLimitExceeded, "size or time limit exceeded")
+                                            }
+                                            ValidationError::OperationConstraintViolation { .. } => {
+                                                (ResultCode::ConstraintViolation, "operation constraint violation")
+                                            }
+                                            _ => (ResultCode::ProtocolError, "validation error")
+                                        }
+                                    }
+                                    ServerError::Protocol(_) => (ResultCode::ProtocolError, "protocol error"),
+                                    _ => (ResultCode::Other, "server error")
+                                };
+                                
+                                if let Err(write_err) = send_bind_response(
+                                    &mut socket,
+                                    0,
+                                    result_code,
+                                    diagnostic_message,
+                                )
+                                .await
+                                {
+                                    error!("Failed to write error response: {}", write_err);
+                                }
+                                
+                                // For validation errors, continue; for other errors, close connection
+                                if !matches!(err, ServerError::Validation(_)) {
+                                    return;
+                                }
                             }
                         }
                     }
                     Err(err) => {
-                        error!("Failed to parse LDAP message: {:?}", err);
+                        error!("Failed to parse or validate LDAP message: {}", err);
+                        
+                        let (result_code, diagnostic_message) = match &err {
+                            ServerError::Validation(_) => (ResultCode::ProtocolError, "message validation failed"),
+                            _ => (ResultCode::ProtocolError, "invalid message format")
+                        };
+                        
                         if let Err(write_err) = send_bind_response(
                             &mut socket,
                             0,
-                            ResultCode::ProtocolError,
-                            "invalid message",
+                            result_code,
+                            diagnostic_message,
                         )
                         .await
                         {
@@ -527,17 +659,70 @@ pub async fn send_bind_response(
     Ok(())
 }
 
-/// Send search response (placeholder for SearchEntry results)
+/// Send search response with proper entry handling
 pub async fn send_search_response(
     socket: &mut TcpStream,
     message_id: u32,
     result_code: ResultCode,
     diagnostic_message: impl Into<String>,
-    _entries: Vec<()>, // Placeholder for search entries
+    entries: Vec<Vec<u8>>, // LDIF-formatted entry data
 ) -> Result<(), ServerError> {
-    // For now, just send the search done response
-    // In a full implementation, this would send SearchResultEntry messages first
+    // Send each search result entry
+    for entry_data in entries {
+        let parsed_entry = parse_ldif_entry(&entry_data)?;
+        send_search_entry(socket, message_id, &parsed_entry).await?;
+    }
+    
+    // Send the search done response
     send_result(socket, message_id, ResponseOp::SearchDone, result_code, "", diagnostic_message).await
+}
+
+/// Parse LDIF-formatted entry data into a DirectoryEntry
+fn parse_ldif_entry(ldif_data: &[u8]) -> Result<DirectoryEntry, ServerError> {
+    let ldif_str = String::from_utf8_lossy(ldif_data);
+    let lines: Vec<&str> = ldif_str.lines().filter(|line| !line.trim().is_empty()).collect();
+    
+    if lines.is_empty() {
+        return Err(ServerError::Protocol("Empty LDIF entry".to_string()));
+    }
+    
+    // First line should be the DN
+    let first_line = lines[0];
+    if !first_line.starts_with("dn:") {
+        return Err(ServerError::Protocol("LDIF entry must start with DN".to_string()));
+    }
+    
+    let dn = first_line[3..].trim().to_string();
+    let mut attributes = HashMap::new();
+    
+    // Parse remaining lines as attributes
+    for line in &lines[1..] {
+        if let Some(colon_pos) = line.find(':') {
+            let attr_name = line[..colon_pos].trim();
+            let attr_value = line[colon_pos + 1..].trim();
+            
+            attributes.entry(attr_name.to_string())
+                .or_insert_with(Vec::new)
+                .push(attr_value.to_string());
+        }
+    }
+    
+    Ok(DirectoryEntry::new(&dn, attributes))
+}
+
+/// Send a single search result entry
+async fn send_search_entry(
+    socket: &mut TcpStream,
+    message_id: u32,
+    entry: &DirectoryEntry,
+) -> Result<(), ServerError> {
+    // Convert attributes to the format expected by encode_search_entry
+    let attributes_formatted: Vec<(String, Vec<String>)> = entry.attributes.iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let encoded = encode_search_entry(message_id, entry, &attributes_formatted, false)?;
+    socket.write_all(&encoded).await?;
+    Ok(())
 }
 
 /// Send add operation response

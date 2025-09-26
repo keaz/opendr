@@ -6,70 +6,21 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::backend::{DirectoryBackend, DirectoryEntry};
 use crate::fsm::{
     WriteResultCode, WriteOperation,
-    CompareParams,
+    CompareParams, SearchParams, SearchResultCode,
 };
-// Note: SearchFsm types would be imported from the actual search FSM implementation
-// For now, we'll define basic placeholders and fix this when the SearchFsm is implemented
 
-// Placeholder types for SearchFsm (to be replaced when SearchFsm is implemented)
-struct SearchFsmImpl;
+// Import the actual SearchFsm implementation and related types
+use crate::search_fsm::{
+    SearchFsmImpl, SearchBackend, SearchEntry, FilterMatcher, EntryFormatter,
+    SearchFsmConfig, SearchMetrics
+};
 
-#[async_trait]
-trait SearchBackend: Send + Sync {
-    async fn find_candidates(&self, base_dn: &str, scope: i32, filter: &str) -> Result<Vec<String>, String>;
-    async fn get_entry(&self, dn: &str, attributes: &[String]) -> Result<Option<SearchEntry>, String>;
-}
-
-struct SearchEntry { 
-    pub dn: String, 
-    pub attributes: HashMap<String, Vec<Vec<u8>>> 
-}
-
-impl SearchEntry {
-    pub fn new(dn: String) -> Self {
-        Self {
-            dn,
-            attributes: HashMap::new(),
-        }
-    }
-    
-    pub fn set_object_classes(&mut self, _classes: Vec<String>) {
-        // Placeholder implementation
-    }
-    
-    pub fn add_attribute(&mut self, name: String, values: Vec<Vec<u8>>) {
-        self.attributes.insert(name, values);
-    }
-    
-    pub fn get_attribute(&self, name: &str) -> Option<&Vec<Vec<u8>>> {
-        self.attributes.get(name)
-    }
-}
-
-#[async_trait]
-trait FilterMatcher: Send + Sync {
-    async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String>;
-}
-
-#[async_trait]
-trait EntryFormatter: Send + Sync {
-    async fn format_entry(&self, entry: &SearchEntry, requested_attributes: &[String]) -> Result<Vec<u8>, String>;
-}
-
-#[derive(Debug, Clone)]
-pub struct SearchFsmConfig;
-
-impl Default for SearchFsmConfig {
-    fn default() -> Self {
-        Self
-    }
-}
 
 use crate::write_fsm::{
     WriteFsmImpl, WriteBackend, WriteEntry, SchemaValidator,
@@ -113,7 +64,7 @@ impl Default for FsmRoutingConfig {
 }
 
 /// Configuration for Extended Operation FSM
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExtendedOpFsmConfig {
     /// Enable access control checking
     pub enable_access_control: bool,
@@ -170,21 +121,100 @@ impl Default for OperationFsmConfig {
 }
 
 /// Enum for storing different operation FSM instances
-/// Note: Using concrete types for now, will be updated when the actual FSM traits are implemented
 pub enum OperationFsmInstance {
-    // Search FSM placeholder - will be updated when SearchFsm is implemented
-    Search(Box<dyn std::fmt::Debug + Send + Sync>), // Placeholder
+    Search(Box<SearchFsmImpl>),
     Write(Box<WriteFsmImpl>),
     Compare(Box<CompareFsmImpl>),
     ExtendedOp(Box<ExtendedOpFsmImpl>),
 }
 
 impl OperationFsmInstance {
-    /// Check if the FSM operation has timed out
-    pub fn is_timed_out(&self, _timeout: Duration, _now: Instant) -> bool {
-        // For now, return false since FSM timeout methods need to be implemented
-        // TODO: Implement proper timeout checking when FSM traits support it
-        false
+    /// Check if the FSM operation has timed out given elapsed time
+    pub fn is_timed_out(&self, config: &OperationFsmConfig, elapsed: Duration) -> bool {
+        match self {
+            OperationFsmInstance::Search(fsm) => {
+                // SearchFsm implements TimeoutFsm trait
+                use crate::fsm::TimeoutFsm;
+                if let Some(fsm_timeout) = fsm.timeout() {
+                    // Use the FSM's specific timeout if it's shorter than the global timeout
+                    let effective_timeout = std::cmp::min(config.operation_timeout, fsm_timeout);
+                    elapsed > effective_timeout
+                } else {
+                    // Fall back to global timeout
+                    elapsed > config.operation_timeout
+                }
+            },
+            OperationFsmInstance::Write(_fsm) => {
+                // WriteFsm timeout checking - use simple elapsed time approach
+                // In a real implementation, this would check session transaction timeout
+                let write_timeout = Duration::from_secs(30); // Default write timeout
+                elapsed > write_timeout
+            },
+            OperationFsmInstance::Compare(_fsm) => {
+                // CompareFsm timeout checking - use simple elapsed time
+                let compare_timeout = Duration::from_secs(30); // Default compare timeout
+                elapsed > compare_timeout
+            },
+            OperationFsmInstance::ExtendedOp(_fsm) => {
+                // ExtendedOpFsm timeout checking
+                // For now, we'll use the global timeout mechanism
+                elapsed > config.operation_timeout
+            },
+        }
+    }
+    
+    /// Get the operation type name for logging and debugging
+    pub fn operation_type(&self) -> &'static str {
+        match self {
+            OperationFsmInstance::Search(_) => "search",
+            OperationFsmInstance::Write(_) => "write",
+            OperationFsmInstance::Compare(_) => "compare",
+            OperationFsmInstance::ExtendedOp(_) => "extended",
+        }
+    }
+    
+    /// Check if the FSM is in a terminal state (completed, failed, etc.)
+    pub fn is_terminal(&self) -> bool {
+        use crate::fsm::StateMachine;
+        match self {
+            OperationFsmInstance::Search(fsm) => fsm.is_terminal(),
+            OperationFsmInstance::Write(fsm) => fsm.is_terminal(),
+            OperationFsmInstance::Compare(fsm) => fsm.is_terminal(),
+            OperationFsmInstance::ExtendedOp(fsm) => fsm.is_terminal(),
+        }
+    }
+    
+    /// Get timeout duration specific to this FSM type, if any
+    pub fn fsm_specific_timeout(&self) -> Option<Duration> {
+        match self {
+            OperationFsmInstance::Search(fsm) => {
+                use crate::fsm::TimeoutFsm;
+                fsm.timeout()
+            },
+            OperationFsmInstance::Write(fsm) => {
+                // WriteFsm uses transaction timeout - use a reasonable default
+                // In a real implementation, this would be configurable
+                Some(Duration::from_secs(30)) // Default 30 seconds for write operations
+            },
+            OperationFsmInstance::Compare(fsm) => {
+                // CompareFsm could have its own timeout from config
+                Some(Duration::from_secs(30)) // Default 30 seconds for compare operations
+            },
+            OperationFsmInstance::ExtendedOp(fsm) => {
+                // ExtendedOpFsm timeout from parsed operation or config
+                if let Some(parsed_op) = fsm.parsed_operation() {
+                    // Some extended operations might have specific timeouts
+                    match parsed_op.operation_type {
+                        crate::extended_op_fsm::ExtendedOperationType::WhoAmI => Some(Duration::from_secs(10)),
+                        crate::extended_op_fsm::ExtendedOperationType::PasswordModify => Some(Duration::from_secs(60)),
+                        crate::extended_op_fsm::ExtendedOperationType::StartTLS => Some(Duration::from_secs(30)),
+                        _ => Some(Duration::from_secs(30)), // Default for custom/other operations
+                    }
+                } else {
+                    None
+                }
+            },
+        }
     }
 }
 
@@ -213,11 +243,36 @@ impl FsmFactory {
         }
     }
     
+    /// Get reference to the backend
+    pub fn backend(&self) -> &Arc<dyn DirectoryBackend> {
+        &self.backend
+    }
+    
+    /// Get reference to the configuration
+    pub fn config(&self) -> &OperationFsmConfig {
+        &self.config
+    }
+    
     /// Create a new SearchFsm instance
-    /// TODO: Implement when SearchFsm trait and implementation are available
-    pub fn create_search_fsm(&self) -> Box<dyn std::fmt::Debug + Send + Sync> {
-        // Placeholder - will be implemented when SearchFsm is available
-        Box::new(String::from("SearchFsm placeholder"))
+    pub fn create_search_fsm(&self) -> Box<SearchFsmImpl> {
+        let backend = Box::new(SearchBackendAdapter::new(self.backend.clone()));
+        let filter_matcher = Box::new(DefaultFilterMatcher::new());
+        let entry_formatter = Box::new(DefaultEntryFormatter::new());
+        
+        let fsm = SearchFsmImpl::with_config(
+            backend,
+            filter_matcher,
+            entry_formatter,
+            self.config.search.clone(),
+        );
+        
+        // Optional metrics
+        if self.config.search.enable_metrics {
+            let metrics = Box::new(DefaultSearchMetrics::new());
+            Box::new(fsm.with_metrics(metrics))
+        } else {
+            Box::new(fsm)
+        }
     }
     
     /// Create a new WriteFsm instance
@@ -299,24 +354,24 @@ impl SearchBackendAdapter {
     
     /// Convert DirectoryEntry to SearchEntry
     fn convert_to_search_entry(&self, entry: DirectoryEntry, attributes: &[String]) -> SearchEntry {
-        let mut search_entry = SearchEntry::new(entry.dn);
+        let mut search_entry = SearchEntry::new(entry.dn.clone());
         
-        // Copy object classes
-        if let Some(object_classes) = entry.attributes.get("objectClass") {
+        // Copy object classes from attributes (case insensitive)
+        let object_classes = entry.attributes.get("objectClass")
+            .or_else(|| entry.attributes.get("objectclass"))
+            .or_else(|| entry.attributes.get("OBJECTCLASS"));
+            
+        if let Some(object_classes) = object_classes {
             search_entry.set_object_classes(object_classes.clone());
         }
         
         // Copy attributes (only requested ones if specified)
         let include_all = attributes.is_empty();
         
-        for (name, values) in entry.attributes {
-            if include_all || attributes.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
-                // Convert string values to bytes
-                let binary_values: Vec<Vec<u8>> = values.iter()
-                    .map(|v| v.as_bytes().to_vec())
-                    .collect();
-                
-                search_entry.add_attribute(name, binary_values);
+        for (name, values) in &entry.attributes {
+            if include_all || attributes.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+                // SearchEntry expects Vec<String> for attributes
+                search_entry.add_attribute(name.clone(), values.clone());
             }
         }
         
@@ -685,20 +740,22 @@ impl FilterMatcher for DefaultFilterMatcher {
                 let attr = &inner[0..equals_pos];
                 let value = &inner[equals_pos + 1..];
                 
+                // SearchEntry from search_fsm has attributes as HashMap<String, Vec<String>>
                 if let Some(attr_values) = entry.get_attribute(attr) {
-                    for attr_value in attr_values {
-                        // Compare value (potentially case-insensitive for string attributes)
-                        if attr_value == value.as_bytes() {
-                            return Ok(true);
-                        }
-                    }
-                    return Ok(false);
+                    return Ok(attr_values.iter().any(|v| v == value));
                 }
             }
         }
         
-        // Default to true for testing
-        Ok(true)
+        // Default to false for non-matching filters
+        Ok(false)
+    }
+    
+    async fn validate_filter(&self, filter: &str) -> Result<(), String> {
+        if filter.is_empty() {
+            return Err("Filter cannot be empty".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -717,27 +774,29 @@ impl EntryFormatter for DefaultEntryFormatter {
         // Simple LDIF formatting
         let mut result = format!("dn: {}\n", entry.dn);
         
-        // Handle attribute selection
+        // Include object classes
+        for oc in &entry.object_classes {
+            result.push_str(&format!("objectClass: {}\n", oc));
+        }
+        
+        // Handle attribute selection - SearchEntry from search_fsm has Vec<String> values
         let include_all = requested_attributes.is_empty();
         
         for (name, values) in &entry.attributes {
             if include_all || requested_attributes.iter().any(|a| a.eq_ignore_ascii_case(name)) {
                 for value in values {
-                    // Attempt to format as string if possible
-                    match std::str::from_utf8(value) {
-                        Ok(str_val) => {
-                            result.push_str(&format!("{}: {}\n", name, str_val));
-                        },
-                        Err(_) => {
-                            // Base64 encode binary values (simplified here)
-                            result.push_str(&format!("{}: [binary data]\n", name));
-                        }
-                    }
+                    result.push_str(&format!("{}: {}\n", name, value));
                 }
             }
         }
         
+        result.push('\n'); // Empty line to separate entries
         Ok(result.into_bytes())
+    }
+    
+    async fn calculate_entry_size(&self, entry: &SearchEntry, requested_attributes: &[String]) -> Result<usize, String> {
+        let formatted = self.format_entry(entry, requested_attributes).await?;
+        Ok(formatted.len())
     }
 }
 
@@ -1075,3 +1134,37 @@ pub fn format_filter(filter: &ldap_parser::filter::Filter) -> String {
 pub fn ldap_filter_to_string(filter: &ldap_parser::filter::Filter) -> String {
     format_filter(filter)
 }
+
+/// Default search metrics for search operations
+pub struct DefaultSearchMetrics;
+
+impl DefaultSearchMetrics {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl SearchMetrics for DefaultSearchMetrics {
+    fn record_search_start(&self, params: &SearchParams) {
+        log::debug!("Search operation started: base_dn={}, scope={}, filter={}", 
+                   params.base_dn, params.scope, params.filter);
+    }
+    
+    fn record_candidates_found(&self, count: usize) {
+        log::debug!("Search candidates found: {}", count);
+    }
+    
+    fn record_entry_processed(&self, dn: &str, matched: bool) {
+        log::debug!("Search entry processed: {}, matched: {}", dn, matched);
+    }
+    
+    fn record_search_complete(&self, result_code: &SearchResultCode, entries_sent: usize, duration: Duration) {
+        log::debug!("Search operation complete: result={:?}, entries_sent={}, duration={:?}", 
+                   result_code, entries_sent, duration);
+    }
+    
+    fn record_search_abandoned(&self) {
+        log::debug!("Search operation abandoned");
+    }
+}
+

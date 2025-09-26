@@ -13,6 +13,8 @@ mod backend_txn_fsm;
 pub mod replication_provider_fsm;
 pub mod sasl_fsm;
 pub mod schema;
+pub mod search_fsm;
 pub mod server;
 pub mod server_fsm;
+pub mod validation;
 pub mod write_fsm;

@@ -722,7 +722,7 @@ mod tests {
             assert_eq!(from, ConnectionState::Connected);
             assert_eq!(to, ConnectionState::Connected);
         } else {
-            panic!("Expected InvalidTransition error");
+            assert!(false, "Expected InvalidTransition error, got: {:?}", result);
         }
     }
 
@@ -787,7 +787,7 @@ mod tests {
         if let Err(ConnectionFsmError::TlsHandshakeFailed { reason }) = result {
             assert_eq!(reason, "Certificate error");
         } else {
-            panic!("Expected TlsHandshakeFailed error");
+            assert!(false, "Expected TlsHandshakeFailed error, got: {:?}", result);
         }
     }
 
@@ -839,7 +839,7 @@ mod tests {
         if let Err(ConnectionFsmError::ConnectionClosed) = result {
             // Expected
         } else {
-            panic!("Expected ConnectionClosed error");
+            assert!(false, "Expected ConnectionClosed error, got: {:?}", result);
         }
     }
 
@@ -945,7 +945,7 @@ mod tests {
         if let Err(ConnectionFsmError::Timeout { duration }) = result {
             assert_eq!(duration, Duration::from_millis(1));
         } else {
-            panic!("Expected Timeout error");
+            assert!(false, "Expected Timeout error, got: {:?}", result);
         }
     }
 }

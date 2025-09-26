@@ -203,11 +203,30 @@ impl AuthFsmImpl {
         self.auth_start_time = Some(Instant::now());
         self.stats.current_auth_attempts += 1;
         
-        // Validate DN format
+        // Validate DN format and perform authentication if backend is available
         if let Some(backend) = &self.backend {
             backend.validate_dn(&dn).map_err(|e| AuthError::DirectoryError { message: e })?;
+            
+            // Perform actual authentication
+            match backend.authenticate(&dn, &password).await {
+                Ok(true) => {
+                    // Authentication succeeded - trigger success event immediately
+                    return self.handle_auth_success().await;
+                }
+                Ok(false) => {
+                    // Authentication failed - trigger failure event immediately
+                    let _ = self.handle_auth_failure().await;
+                    return Err(AuthError::InvalidCredentials);
+                }
+                Err(e) => {
+                    // Backend error
+                    let _ = self.handle_auth_failure().await;
+                    return Err(AuthError::DirectoryError { message: e });
+                }
+            }
         }
         
+        // No backend - just transition to authenticating state for manual success/failure events
         Ok(None)
     }
     
@@ -729,14 +748,18 @@ mod tests {
         let backend = Box::new(MockAuthBackend::new());
         let mut fsm = AuthFsmImpl::new().with_backend(backend);
         
-        // Valid credentials
-        let _ = fsm.handle_event(AuthEvent::BindRequest {
+        // Valid credentials - should complete authentication immediately
+        let result = fsm.handle_event(AuthEvent::BindRequest {
             dn: "cn=admin,dc=example,dc=org".to_string(),
             password: b"secret".to_vec()
         }).await;
         
-        // Should be in authenticating state
-        assert!(matches!(fsm.current_state(), AuthState::Authenticating { .. }));
+        // Should succeed and be authenticated immediately
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some()); // Returns user info
+        assert!(matches!(fsm.current_state(), AuthState::SimpleBound { .. }));
+        assert!(fsm.is_authenticated());
+        assert_eq!(fsm.authenticated_dn(), Some("cn=admin,dc=example,dc=org"));
     }
     
     #[tokio::test] 

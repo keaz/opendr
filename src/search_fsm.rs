@@ -389,7 +389,7 @@ pub trait SearchMetrics: Send + Sync {
 }
 
 /// Configuration for the Search FSM
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchFsmConfig {
     /// Default size limit for searches
     pub default_size_limit: u32,
@@ -405,6 +405,8 @@ pub struct SearchFsmConfig {
     pub candidate_batch_size: usize,
     /// Enable search result caching
     pub enable_caching: bool,
+    /// Enable metrics collection
+    pub enable_metrics: bool,
 }
 
 impl Default for SearchFsmConfig {
@@ -417,6 +419,7 @@ impl Default for SearchFsmConfig {
             max_candidates: 50000,
             candidate_batch_size: 100,
             enable_caching: false,
+            enable_metrics: false,
         }
     }
 }
@@ -621,10 +624,34 @@ impl SearchFsmImpl {
     /// * `metrics` - Metrics implementation
     /// 
     /// # Returns
-    /// * Updated Search FSM instance
+    /// * Self for method chaining
     pub fn with_metrics(mut self, metrics: Box<dyn SearchMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+    
+    /// Get the current FSM configuration
+    /// 
+    /// # Returns
+    /// * Reference to the FSM configuration
+    pub fn config(&self) -> &SearchFsmConfig {
+        &self.config
+    }
+    
+    /// Get the current FSM configuration mutably
+    /// 
+    /// # Returns
+    /// * Mutable reference to the FSM configuration
+    pub fn config_mut(&mut self) -> &mut SearchFsmConfig {
+        &mut self.config
+    }
+    
+    /// Set the FSM configuration
+    /// 
+    /// # Arguments
+    /// * `config` - New configuration
+    pub fn set_config(&mut self, config: SearchFsmConfig) {
+        self.config = config;
     }
     
     /// Get search statistics
@@ -1365,6 +1392,7 @@ mod tests {
             max_candidates: 10000,
             candidate_batch_size: 50,
             enable_caching: true,
+            enable_metrics: false,
         };
         
         let fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);
