@@ -405,7 +405,7 @@ impl LdapMessageValidator {
         self.validate_attribute_name(&request.ava.attribute_desc.0)?;
         
         // Validate attribute value
-        self.validate_attribute_value(&request.ava.attribute_desc.0, request.ava.assertion_value)?;
+        self.validate_attribute_value(&request.ava.attribute_desc.0, &request.ava.assertion_value)?;
         
         Ok(())
     }
@@ -570,14 +570,14 @@ impl LdapMessageValidator {
             }
             Filter::EqualityMatch(ava) | Filter::GreaterOrEqual(ava) | Filter::LessOrEqual(ava) => {
                 self.validate_attribute_name(&ava.attribute_desc.0)?;
-                self.validate_attribute_value(&ava.attribute_desc.0, ava.assertion_value)?;
+                self.validate_attribute_value(&ava.attribute_desc.0, &ava.assertion_value)?;
             }
             Filter::Present(attr) => {
                 self.validate_attribute_name(&attr.0)?;
             }
             Filter::ApproxMatch(ava) => {
                 self.validate_attribute_name(&ava.attribute_desc.0)?;
-                self.validate_attribute_value(&ava.attribute_desc.0, ava.assertion_value)?;
+                self.validate_attribute_value(&ava.attribute_desc.0, &ava.assertion_value)?;
             }
             Filter::Substrings(substring_filter) => {
                 self.validate_attribute_name(&substring_filter.filter_type.0)?;

@@ -913,7 +913,7 @@ fn format_filter(filter: &Filter) -> Result<String, String> {
         },
         Filter::EqualityMatch(ava) => {
             let attr = &ava.attribute_desc.0;
-            let value = String::from_utf8_lossy(ava.assertion_value);
+            let value = String::from_utf8_lossy(&ava.assertion_value);
             Ok(format!("({}={})", attr, value))
         },
         Filter::Present(attr) => {
@@ -927,17 +927,17 @@ fn format_filter(filter: &Filter) -> Result<String, String> {
         },
         Filter::GreaterOrEqual(ava) => {
             let attr = &ava.attribute_desc.0;
-            let value = String::from_utf8_lossy(ava.assertion_value);
+            let value = String::from_utf8_lossy(&ava.assertion_value);
             Ok(format!("({}>={})", attr, value))
         },
         Filter::LessOrEqual(ava) => {
             let attr = &ava.attribute_desc.0;
-            let value = String::from_utf8_lossy(ava.assertion_value);
+            let value = String::from_utf8_lossy(&ava.assertion_value);
             Ok(format!("({}<={})", attr, value))
         },
         Filter::ApproxMatch(ava) => {
             let attr = &ava.attribute_desc.0;
-            let value = String::from_utf8_lossy(ava.assertion_value);
+            let value = String::from_utf8_lossy(&ava.assertion_value);
             Ok(format!("({}~={})", attr, value))
         },
         Filter::ExtensibleMatch(_) => {

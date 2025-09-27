@@ -1120,7 +1120,7 @@ pub fn format_filter(filter: &ldap_parser::filter::Filter) -> String {
             format!("(!{})", format_filter(filter))
         },
         ldap_parser::filter::Filter::EqualityMatch(ava) => {
-            let value = String::from_utf8_lossy(ava.assertion_value);
+            let value = String::from_utf8_lossy(&ava.assertion_value);
             format!("({}={})", ava.attribute_desc.0, value)
         },
         ldap_parser::filter::Filter::Present(attr) => {

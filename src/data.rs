@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct LdapEntry {
     dn: String,
     attributes: Vec<Attribute>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct Attribute {
     key: String,
     value: Vec<String>,
@@ -22,7 +22,7 @@ impl LdapEntry {
     }
 
     pub async fn to_file(&self, file_path: &Path) -> std::io::Result<()> {
-        let serialized = bincode::serialize(self).unwrap();
+        let serialized = bincode::encode_to_vec(self, bincode::config::standard()).unwrap();
         let mut file = File::create(file_path).await?;
         file.write_all(&serialized).await?;
         Ok(())
@@ -32,7 +32,7 @@ impl LdapEntry {
         let mut file = File::open(file_path).await?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).await?;
-        let entry: LdapEntry = bincode::deserialize(&bytes).unwrap();
+        let (entry, _): (LdapEntry, usize) = bincode::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         Ok(entry)
     }
 }

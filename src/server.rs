@@ -1044,7 +1044,7 @@ pub async fn handle_compare_request(
 ) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let attribute = request.ava.attribute_desc.0.as_ref().trim().to_owned();
-    let assertion = bytes_to_string(request.ava.assertion_value);
+    let assertion = bytes_to_string(&request.ava.assertion_value);
 
     match backend.compare_attribute(&dn, &attribute, &assertion).await {
         Ok(true) => {
@@ -1143,7 +1143,7 @@ fn entry_matches_filter(entry: &DirectoryEntry, filter: &Filter<'_>) -> bool {
         Filter::Not(filter) => !entry_matches_filter(entry, filter),
         Filter::EqualityMatch(ava) => attribute_values(entry, ava.attribute_desc.0.as_ref())
             .map(|values| {
-                let assertion = bytes_to_string(ava.assertion_value);
+                let assertion = bytes_to_string(&ava.assertion_value);
                 values.iter().any(|candidate| candidate == &assertion)
             })
             .unwrap_or(false),
@@ -1152,20 +1152,20 @@ fn entry_matches_filter(entry: &DirectoryEntry, filter: &Filter<'_>) -> bool {
             .unwrap_or(false),
         Filter::GreaterOrEqual(ava) => attribute_values(entry, ava.attribute_desc.0.as_ref())
             .map(|values| {
-                let assertion = bytes_to_string(ava.assertion_value);
+                let assertion = bytes_to_string(&ava.assertion_value);
                 values.iter().any(|candidate| candidate >= &assertion)
             })
             .unwrap_or(false),
         Filter::LessOrEqual(ava) => attribute_values(entry, ava.attribute_desc.0.as_ref())
             .map(|values| {
-                let assertion = bytes_to_string(ava.assertion_value);
+                let assertion = bytes_to_string(&ava.assertion_value);
                 values.iter().any(|candidate| candidate <= &assertion)
             })
             .unwrap_or(false),
         Filter::Present(attribute) => attribute_values(entry, attribute.0.as_ref()).is_some(),
         Filter::ApproxMatch(ava) => attribute_values(entry, ava.attribute_desc.0.as_ref())
             .map(|values| {
-                let assertion = bytes_to_string(ava.assertion_value);
+                let assertion = bytes_to_string(&ava.assertion_value);
                 values
                     .iter()
                     .any(|candidate| candidate.eq_ignore_ascii_case(&assertion))
