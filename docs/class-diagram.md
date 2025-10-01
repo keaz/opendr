@@ -276,6 +276,12 @@ classDiagram
         +from_credentials(credentials) Self
     }
 
+    class FileBackend {
+        -storage_path: PathBuf
+        -entries: RwLock~HashMap~String, StoredEntry~~
+        +new(data_dir) Result~Self~
+    }
+
     class DirectoryEntry {
         +dn: String
         +attributes: HashMap~String, Vec~String~~
@@ -338,6 +344,7 @@ classDiagram
 
     %% Backend Integration
     DirectoryBackend <|.. MockBackend : implements
+    DirectoryBackend <|.. FileBackend : implements
     DirectoryBackend --> DirectoryEntry : manages
     WriteFsm --> DirectoryBackend : uses
     SearchFsm --> DirectoryBackend : uses

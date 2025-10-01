@@ -4,7 +4,7 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 
 ## Project Overview
 
-`opendr` is a Rust-based LDAP (Lightweight Directory Access Protocol) server implementation. It's designed as an experimental/learning project that implements the full LDAP v3 protocol with asynchronous I/O using Tokio. The server features a pluggable backend architecture and currently includes a mock in-memory backend for development and testing.
+`opendr` is a Rust-based LDAP (Lightweight Directory Access Protocol) server implementation. It's designed as an experimental/learning project that implements the full LDAP v3 protocol with asynchronous I/O using Tokio. The server features a pluggable backend architecture with a disk-backed `FileBackend` for production use and a lightweight mock backend for testing.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ The project follows a **finite state machine (FSM) based architecture** designed
 
 - **FSM Layer** (`src/fsm.rs`): Comprehensive FSM traits for all LDAP operations and connection management
 - **Server Layer** (`src/server.rs`): Handles TCP connections, LDAP message parsing, and protocol operations
-- **Backend Layer** (`src/backend.rs`): Provides a trait-based abstraction for directory storage with a MockBackend implementation
+- **Backend Layer** (`src/backend.rs`): Provides a trait-based abstraction for directory storage with both persistent (`FileBackend`) and in-memory (`MockBackend`) implementations
 - **Parser Layer** (`src/parser.rs`): Handles LDAP message encoding/decoding using ASN.1 DER encoding
 - **Data Layer** (`src/data.rs`): Serialization structures for persistent storage (currently unused)
 - **Schema Layer** (`src/schema.rs`): LDAP schema parsing and validation (work in progress)
@@ -88,7 +88,7 @@ cargo build --release
 
 - **Logging**: Configured via `config/log4rs.yml` (log4rs configuration)
 - **Server**: Hardcoded to bind on `127.0.0.1:1389` in `main.rs`
-- **Backend**: Currently uses MockBackend with default admin credentials (`cn=admin,dc=example,dc=org` / `secret`)
+- **Backend**: Uses the persistent FileBackend that stores data under the `data/` directory by default
 
 ## Testing Strategy
 
@@ -116,7 +116,7 @@ cargo test modify_success_returns_success_response
 
 - **FSM Traits**: All state machine definitions in `src/fsm.rs`
 - **Server request handlers**: Look in `src/server.rs` for `handle_*_request` functions
-- **Backend implementations**: `MockBackend` in `src/backend.rs`
+- **Backend implementations**: `FileBackend` and `MockBackend` in `src/backend.rs`
 - **LDAP message encoding**: `src/parser.rs` - `encode_*` functions
 - **Filter matching logic**: `entry_matches_filter` function in `src/server.rs`
 - **DN manipulation**: Helper functions at bottom of `src/backend.rs`

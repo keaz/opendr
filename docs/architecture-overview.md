@@ -36,7 +36,7 @@ graph TB
     subgraph "Storage Layer"
         BTF[BackendTxnFsm<br/>Transaction Management]
         DB[DirectoryBackend<br/>Data Storage]
-        MB[MockBackend<br/>In-Memory Implementation]
+        FB[FileBackend<br/>Disk-backed Implementation]
     end
 
     C --> CF
@@ -52,7 +52,7 @@ graph TB
     WF --> BTF
     CoF --> BTF
     BTF --> DB
-    DB --> MB
+    DB --> FB
     SeF --> RPF
     SeF --> RCF
 
@@ -66,7 +66,7 @@ graph TB
     class AF,SF auth
     class SeF,WF,CoF,EF,RF operation
     class RPF,RCF replication
-    class BTF,DB,MB storage
+    class BTF,DB,FB storage
 ```
 
 ## Connection Lifecycle and FSM Management
@@ -192,6 +192,8 @@ sequenceDiagram
 - **Authentication**: Manage session identity and authorization
 - **Operations**: Execute LDAP protocol operations independently
 - **Storage**: Provide transactional data access
+
+The `FileBackend` implementation persists directory entries to disk while keeping an in-memory snapshot for fast read paths. The storage snapshot is flushed after every mutating operation, which keeps the design ready for a future read-through cache layer without changing the `DirectoryBackend` trait contract.
 
 ### 2. **Concurrency Model**
 - Each operation is an independent FSM instance

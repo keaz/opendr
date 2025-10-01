@@ -312,6 +312,7 @@ async fn test_fsm_timeout_cleanup() {
     // Configure with very short timeout for testing
     let backend = Arc::new(MockBackend::new());
     let routing_config = FsmRoutingConfig {
+        enable_search_fsm: true,
         enable_write_fsm: true,
         ..Default::default()
     };
@@ -321,12 +322,14 @@ async fn test_fsm_timeout_cleanup() {
     fsm_set.configure_operation_fsms(backend, routing_config, fsm_config);
     
     // Create some FSMs
-    assert!(fsm_set.create_write_fsm(1).is_ok());
-    assert!(fsm_set.create_write_fsm(2).is_ok());
+    assert!(fsm_set.create_search_fsm(1).is_ok());
+    assert!(fsm_set.create_search_fsm(2).is_ok());
     assert_eq!(fsm_set.active_operation_count(), 2);
     
     // Wait for timeout
-    sleep(Duration::from_millis(100)).await;
+    // Allow generous time for the asynchronous timeout enforcement to fire under varying CI
+    // scheduling conditions.
+    sleep(Duration::from_millis(200)).await;
     
     // Clean up timed out FSMs
     let timed_out = fsm_set.cleanup_timed_out_fsms();

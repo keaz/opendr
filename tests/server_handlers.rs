@@ -75,11 +75,10 @@ async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
     let mut total_read = 0;
     let mut expected_messages = 0;
     let mut actual_messages = 0;
-    
+
     // Keep reading until we have complete LDAP messages or timeout
     loop {
-        let len = match timeout(RESPONSE_TIMEOUT, stream.read(&mut buf[total_read..]))
-            .await {
+        let len = match timeout(RESPONSE_TIMEOUT, stream.read(&mut buf[total_read..])).await {
             Ok(Ok(0)) => break, // EOF reached
             Ok(Ok(len)) => len,
             Ok(Err(e)) => panic!("failed to read response: {}", e),
@@ -91,13 +90,13 @@ async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
                 break;
             }
         };
-        
+
         total_read += len;
-        
+
         // Try to parse what we have so far
         if let Ok((remaining, messages)) = parse_ldap_messages(&buf[..total_read]) {
             actual_messages = messages.len();
-            
+
             // Estimate expected messages from search responses
             if actual_messages > 0 {
                 if expected_messages == 0 {
@@ -112,23 +111,23 @@ async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
                         }
                     }
                 }
-                
+
                 // If we have all expected messages and no remaining data, we're done
                 if remaining.is_empty() && actual_messages >= expected_messages {
                     break;
                 }
             }
         }
-        
+
         // Prevent infinite loops and buffer overflows
         if total_read >= buf.len() - 100 {
             break;
         }
-        
+
         // Brief pause to allow more data to arrive
         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
     }
-    
+
     buf.truncate(total_read);
     buf
 }
@@ -262,7 +261,7 @@ async fn search_returns_entries_and_success() {
         types_only: false,
         filter: Filter::EqualityMatch(AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         }),
         attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
     };
@@ -646,7 +645,7 @@ async fn compare_matching_attribute_returns_true() {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
         ava: AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         },
     };
 
@@ -681,7 +680,7 @@ async fn compare_non_matching_attribute_returns_false() {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
         ava: AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Bob",
+            assertion_value: Cow::Borrowed(b"Bob"),
         },
     };
 
@@ -716,7 +715,7 @@ async fn compare_backend_error_maps_to_no_such_object() {
         entry: LdapDN(Cow::Owned("cn=Missing,dc=example,dc=org".to_string())),
         ava: AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         },
     };
 

@@ -1377,7 +1377,7 @@ mod tests {
 
         let equality_filter = Filter::EqualityMatch(AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         });
         assert!(entry_matches_filter(&entry, &equality_filter));
 
