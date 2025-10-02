@@ -133,13 +133,33 @@ impl NetworkHandler for DefaultNetworkHandler {
     async fn connect(&self, addr: &str) -> Result<TcpStream, std::io::Error> {
         TcpStream::connect(addr).await
     }
-    
+
     fn local_addr(&self, stream: &TcpStream) -> Result<String, std::io::Error> {
         Ok(stream.local_addr()?.to_string())
     }
-    
+
     fn remote_addr(&self, stream: &TcpStream) -> Result<String, std::io::Error> {
         Ok(stream.peer_addr()?.to_string())
+    }
+}
+
+/// No-op TLS handler that doesn't support TLS
+///
+/// This is used when TLS is not configured or not available.
+pub struct NoOpTlsHandler;
+
+#[async_trait]
+impl TlsHandler for NoOpTlsHandler {
+    async fn perform_handshake(&self, _stream: &mut TcpStream) -> Result<(), String> {
+        Err("TLS not supported".to_string())
+    }
+
+    fn supports_tls(&self) -> bool {
+        false
+    }
+
+    fn protocol_version(&self) -> String {
+        "None".to_string()
     }
 }
 
@@ -223,6 +243,37 @@ impl ConnectionFsmImpl {
         }
     }
     
+    /// Create a new ConnectionFsm with an already established stream
+    ///
+    /// This is used when accepting incoming connections from a server socket.
+    ///
+    /// # Arguments
+    /// * `stream` - Already established TCP stream
+    /// * `remote_addr` - Remote address as a string
+    /// * `tls_handler` - Optional TLS handler for StartTLS operations
+    ///
+    /// # Returns
+    /// * New ConnectionFsmImpl instance in Connected state
+    pub fn new_with_stream(
+        stream: TcpStream,
+        remote_addr: String,
+        tls_handler: Option<Box<dyn TlsHandler>>,
+    ) -> Self {
+        // Use a no-op TLS handler if none provided
+        let tls = tls_handler.unwrap_or_else(|| Box::new(NoOpTlsHandler));
+
+        Self {
+            state: ConnectionState::Connected,
+            stream: Some(stream),
+            target_addr: remote_addr,
+            tls_handler: tls,
+            network_handler: Box::new(DefaultNetworkHandler),
+            is_secure: false,
+            connect_start: Some(Instant::now()),
+            connect_timeout: Duration::from_secs(30),
+        }
+    }
+
     /// Set connection timeout
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;

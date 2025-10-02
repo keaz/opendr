@@ -6,6 +6,8 @@ pub mod connection_fsm;
 pub mod data;
 pub mod extended_op_fsm;
 pub mod fsm;
+pub mod fsm_runtime;
+pub mod fsm_server;
 pub mod referral_fsm;
 pub mod parser;
 mod replication_consumer_fsm;
