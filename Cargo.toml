@@ -11,6 +11,7 @@ hex = "0.4.3"
 lazy_static = "1.5.0"
 ldap-parser = "0.4.0"
 ldap3 = { version = "0.11.5" }
+lmdb = "0.8.0"
 log = "0.4.22"
 log4rs = "1.3.0"
 nom = "7.1.3"
@@ -25,3 +26,9 @@ async-trait = "0.1.80"
 
 [dev-dependencies]
 mockall = "0.12.1"
+criterion = "0.5"
+tempfile = "3.10"
+
+[[bench]]
+name = "backend_benchmarks"
+harness = false

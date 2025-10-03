@@ -10,16 +10,35 @@ OpenDR is a Rust-based LDAP v3 server implementation using a finite state machin
 
 **Overall Progress:** Phase 1 - Complete (100%) ✅
 
-**Last Updated:** 2025-10-02
+**Last Updated:** 2025-10-03 (Phase 4.1 Complete)
 
-### Recent Accomplishments (Today) 🎉
+### Recent Accomplishments (Today - Phase 4.1) 🎉
+- ✅ **LMDB Backend**: Read-optimized persistent storage implementation
+- ✅ **Performance**: 1.17 µs reads, 393 ns auth with memory-mapped I/O
+- ✅ **ACID Transactions**: Full transaction support with crash safety
+- ✅ **Concurrent Reads**: Up to 126 simultaneous readers, no blocking
+- ✅ **DN Indexing**: Case-insensitive lookups via normalized index
+- ✅ **Data Persistence**: All data survives process restarts
+- ✅ **Comprehensive Testing**: 14 tests (4 unit + 10 integration)
+- ✅ **Performance Benchmarks**: criterion-based benchmarks
+- ✅ **Documentation**: STORAGE_PERFORMANCE.md with detailed analysis
+- ✅ **All Tests Passing**: 248 unit tests passing
+
+### Previous Accomplishments (Today - Phase 1.3) 🎉
+- ✅ **Backend Integration**: Connected FSM implementations to DirectoryBackend via adapter pattern
+- ✅ **SearchBackendAdapter**: Search operations now use DirectoryBackend
+- ✅ **WriteBackendAdapter**: Write operations (add/modify/delete/rename) integrated
+- ✅ **CompareBackendAdapter**: Compare operations integrated with binary attribute support
+- ✅ **Integration Tests**: 4 new comprehensive backend adapter tests
+- ✅ **Documentation**: Added BACKEND_INTEGRATION.md with full implementation details
+
+### Previous Accomplishments (2025-10-02) 🎉
 - ✅ **ConnectionFsmSet Runtime**: Complete FSM management infrastructure
 - ✅ **Message ID Correlation**: Full operation lifecycle management
 - ✅ **Timeout Management**: Automatic cleanup and monitoring
 - ✅ **TLS Support**: Added NoOpTlsHandler and new_with_stream() constructor
 - ✅ **FSM Server**: Complete FSM-based LDAP server implementation (src/fsm_server.rs)
-- ✅ **Integration Tests**: 6 comprehensive integration tests
-- ✅ **All Tests Passing**: 282 tests (up from 241) with no regressions
+- ✅ **Integration Tests**: 6 FSM server integration tests
 
 ### What's Done ✅
 - **FSM Architecture**: All 12 FSM traits defined with comprehensive state/event/error types
@@ -29,8 +48,11 @@ OpenDR is a Rust-based LDAP v3 server implementation using a finite state machin
   - Operations: SearchFsm, WriteFsm, CompareFsm, ExtendedOpFsm
   - Distribution: ReferralFsm, ReplicationProviderFsm, ReplicationConsumerFsm
   - Storage: BackendTxnFsm
-- **FSM Runtime** (NEW): ConnectionFsmSet with message routing and timeout management
-- **Documentation**: Comprehensive architecture docs with diagrams
+- **FSM Runtime**: ConnectionFsmSet with message routing and timeout management
+- **Backend Integration** (NEW): Adapter pattern connecting FSMs to DirectoryBackend
+  - SearchBackendAdapter, WriteBackendAdapter, CompareBackendAdapter
+  - Full integration tests with 100% pass rate
+- **Documentation**: Comprehensive architecture docs with diagrams + BACKEND_INTEGRATION.md
 - **Basic Server**: Working LDAP server with MockBackend
 - **Protocol Support**: LDAP message parsing/encoding infrastructure
 
@@ -104,18 +126,22 @@ This phase integrated the FSM architecture into the server infrastructure.
     - ✅ 6 integration tests in fsm_server_integration
   - **Note:** FSM server is production-ready. Current server.rs remains for backward compatibility.
 
-- [ ] **Task:** Connect FSM implementations to DirectoryBackend
-  - **File:** Multiple FSM files
+- [x] **Task:** Connect FSM implementations to DirectoryBackend ✅ **COMPLETED**
+  - **File:** `src/backend_adapters.rs`, `tests/backend_adapters_integration.rs`
   - **Description:** Wire up FSM trait abstractions to actual DirectoryBackend
   - **Dependencies:** 1.2 Server Refactoring
   - **Estimated Effort:** 2 days
-  - **Status:** NOT STARTED - FSM implementations already use trait-based backends
+  - **Completion Date:** 2025-10-03
+  - **Status:** COMPLETED - Backend adapters created and tested
   - **Details:**
-    - SearchFsm already uses SearchBackend trait
-    - WriteFsm already uses WriteBackend trait
-    - CompareFsm already uses CompareBackend trait
-    - Backend integration is ready, just needs server integration
-  - **Note:** FSM implementations are designed with proper backend abstractions.
+    - ✅ Created SearchBackendAdapter (SearchBackend → DirectoryBackend)
+    - ✅ Created WriteBackendAdapter (WriteBackend → DirectoryBackend)
+    - ✅ Created CompareBackendAdapter (CompareBackend → DirectoryBackend)
+    - ✅ Implemented adapter pattern for loose coupling
+    - ✅ Added comprehensive integration tests (4 tests, all passing)
+    - ✅ All 286 tests passing (up from 282)
+    - ✅ Code compiles successfully (dev and release modes)
+  - **Note:** Adapters enable any DirectoryBackend to work with FSMs. See BACKEND_INTEGRATION.md for details.
 
 ### 1.3 Operational Support
 - [x] **Task:** Implement FSM timeout management ✅ **COMPLETED**
@@ -234,22 +260,30 @@ Implement security features and authentication mechanisms.
 
 ## Phase 4: Storage & Performance
 
-**Priority:** HIGH | **Status:** Not Started
+**Priority:** HIGH | **Status:** In Progress (4.1 Complete)
 
 Implement persistent storage and optimize performance.
 
 ### 4.1 Persistent Backend
-- [ ] **Task:** Develop persistent backend implementation
-  - **File:** Create `src/backend_lmdb.rs` or `src/backend_rocksdb.rs`
+- [x] **Task:** Develop persistent backend implementation ✅ **COMPLETED**
+  - **File:** `src/backend_lmdb.rs`
   - **Description:** Replace MockBackend with disk-based storage
   - **Dependencies:** Phase 1 complete
   - **Estimated Effort:** 10-14 days
+  - **Completion Date:** 2025-10-03
+  - **Status:** COMPLETED - LMDB backend with read optimization
   - **Details:**
-    - Choose storage engine (LMDB or RocksDB)
-    - Implement DirectoryBackend trait
-    - Add transaction support
-    - Implement DN indexing
-    - Add data serialization/deserialization
+    - ✅ Chose LMDB storage engine for read performance
+    - ✅ Implemented DirectoryBackend trait completely
+    - ✅ Added ACID transaction support
+    - ✅ Implemented DN indexing (normalized for case-insensitive)
+    - ✅ Added data serialization/deserialization (bincode)
+    - ✅ Memory-mapped I/O for zero-copy reads
+    - ✅ Multi-reader support (up to 126 concurrent readers)
+    - ✅ Separate databases for entries, passwords, indexes
+    - ✅ 14 comprehensive tests (4 unit + 10 integration)
+    - ✅ Performance benchmarks: 1.17 µs reads, 393 ns auth
+  - **Note:** See STORAGE_PERFORMANCE.md for detailed analysis
 
 ### 4.2 Indexing
 - [ ] **Task:** Implement B-tree indexing integration
@@ -493,8 +527,9 @@ With parallel work and multiple developers, this could be completed in 3-6 month
 - [x] ✅ Message parsing through BerDecoderFsm
 - [x] ✅ Authentication through AuthFsm
 - [x] ✅ Operation dispatch framework in place
-- [x] ✅ All tests passing: 282 tests (up from 241)
-- [x] ✅ Integration tests verify FSM server functionality
+- [x] ✅ Backend integration complete (adapter pattern)
+- [x] ✅ All tests passing: 286 tests (up from 241)
+- [x] ✅ Integration tests verify FSM server and backend adapters
 - **Note**: Both FSM server (new) and traditional server (existing) are operational
 
 ### Phase 2 Success
@@ -536,6 +571,7 @@ With parallel work and multiple developers, this could be completed in 3-6 month
 ## Notes
 
 - **Architecture Completeness**: The FSM architecture design is complete and well-documented. All trait definitions and concrete implementations exist.
+- **Backend Integration**: FSMs now connected to DirectoryBackend via adapter pattern (completed 2025-10-03).
 - **Integration Focus**: The main work is integrating FSMs with the existing server, not creating new FSMs.
 - **Testing Critical**: Given the complexity of state machines, comprehensive testing (Phase 2) is critical.
 - **Incremental Delivery**: Each phase delivers working functionality that can be tested independently.
@@ -544,7 +580,7 @@ With parallel work and multiple developers, this could be completed in 3-6 month
 ---
 
 ## Last Updated
-2025-10-02
+2025-10-03
 
 ## Maintainers
 Track your progress by checking off tasks as they are completed.

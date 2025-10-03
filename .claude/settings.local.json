@@ -3,7 +3,10 @@
     "allow": [
       "Bash(cargo test:*)",
       "Bash(cargo build:*)",
-      "Bash(awk:*)"
+      "Bash(awk:*)",
+      "Bash(timeout 10 cargo test:*)",
+      "Bash(timeout 30 cargo test:*)",
+      "Bash(cargo bench:*)"
     ],
     "deny": [],
     "ask": []
