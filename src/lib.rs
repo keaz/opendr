@@ -22,5 +22,6 @@ pub mod sasl_mechanisms;
 pub mod schema;
 pub mod search_fsm;
 pub mod server;
+pub mod setup;
 pub mod tls;
 pub mod write_fsm;
