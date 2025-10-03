@@ -46,6 +46,12 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+
+    /// Generate password hash
+    HashPassword {
+        /// Password to hash
+        password: String,
+    },
 }
 
 #[tokio::main]
@@ -154,6 +160,28 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("✓ Server configuration has been reset");
             println!("\nRun setup again with:");
             println!("  opendr-setup interactive");
+        }
+
+        Commands::HashPassword { password } => {
+            use sha2::{Digest, Sha512};
+            use base64::Engine;
+            use rand::Rng;
+
+            // Generate 16-byte salt
+            let salt: [u8; 16] = rand::thread_rng().gen();
+
+            // Hash password + salt
+            let mut hasher = Sha512::new();
+            hasher.update(password.as_bytes());
+            hasher.update(&salt);
+            let hash = hasher.finalize();
+
+            // Combine hash + salt and encode in base64
+            let mut combined = hash.to_vec();
+            combined.extend_from_slice(&salt);
+
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&combined);
+            println!("{{SSHA512}}{}", encoded);
         }
     }
 

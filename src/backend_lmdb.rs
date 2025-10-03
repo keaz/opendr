@@ -458,22 +458,33 @@ impl DirectoryBackend for LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
         let normalized_dn = Self::normalize_dn(dn);
+        log::debug!("Authentication attempt - DN: {}, Normalized: {}", dn, normalized_dn);
 
         // Get actual DN from index
         let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
             Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Ok(false),
+            Err(lmdb::Error::NotFound) => {
+                log::warn!("DN not found in index: {}", normalized_dn);
+                return Ok(false);
+            },
             Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
         };
+        log::debug!("Found actual DN: {}", actual_dn);
 
         // Get password hash
         match txn.get(self.passwords_db, &actual_dn.as_bytes()) {
             Ok(stored_password_bytes) => {
                 let stored_password_str = String::from_utf8_lossy(stored_password_bytes);
+                log::debug!("Found password hash for DN: {}", actual_dn);
                 // Verify SSHA512 hash
-                Ok(Self::verify_ssha512(password, &stored_password_str))
+                let result = Self::verify_ssha512(password, &stored_password_str);
+                log::debug!("Password verification result: {}", result);
+                Ok(result)
             },
-            Err(lmdb::Error::NotFound) => Ok(false),
+            Err(lmdb::Error::NotFound) => {
+                log::warn!("Password not found for DN: {}", actual_dn);
+                Ok(false)
+            },
             Err(e) => Err(BackendError::Storage(format!("Password lookup failed: {}", e))),
         }
     }

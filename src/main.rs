@@ -24,9 +24,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut backend = LmdbBackend::new(&config.data_directory, 1024)?;
 
             // Initialize with base structure if needed
-            if let Err(_) = backend.get_entry(&config.base_dn).await {
-                println!("Initializing base directory structure...");
-                initialize_base_structure(&mut backend, &config).await?;
+            match backend.get_entry(&config.base_dn).await {
+                Ok(Some(_)) => {
+                    println!("Base DN exists, skipping initialization");
+                },
+                Ok(None) | Err(_) => {
+                    println!("Initializing base directory structure...");
+                    initialize_base_structure(&mut backend, &config).await?;
+                }
             }
 
             Arc::new(backend)

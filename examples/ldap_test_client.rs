@@ -1,6 +1,6 @@
 use ldap3::{LdapConnAsync, Scope, SearchEntry};
-use std::error::Error;
 use std::collections::HashSet;
+use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -33,12 +33,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Test 1: Search for base DN
     println!("3. Searching for base DN ({})...", base_dn);
     let (rs, _res) = ldap
-        .search(
-            base_dn,
-            Scope::Base,
-            "(objectClass=*)",
-            vec!["*"],
-        )
+        .search(base_dn, Scope::Base, "(objectClass=*)", vec!["*"])
         .await?
         .success()?;
 
@@ -80,7 +75,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("5. Adding a test user...");
     let user_dn = "cn=John Doe,ou=People,dc=example,dc=com";
     let user_attrs = vec![
-        ("objectClass", HashSet::from(["person", "organizationalPerson", "inetOrgPerson"])),
+        (
+            "objectClass",
+            HashSet::from(["person", "organizationalPerson", "inetOrgPerson"]),
+        ),
         ("cn", HashSet::from(["John Doe"])),
         ("sn", HashSet::from(["Doe"])),
         ("givenName", HashSet::from(["John"])),
@@ -129,9 +127,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Test 5: Modify the user
     println!("7. Modifying user's mail attribute...");
     use ldap3::Mod;
-    let mods = vec![
-        Mod::Replace("mail", HashSet::from(["john.doe.updated@example.com"])),
-    ];
+    let mods = vec![Mod::Replace(
+        "mail",
+        HashSet::from(["john.doe.updated@example.com"]),
+    )];
 
     ldap.modify(user_dn, mods).await?.success()?;
     println!("   ✓ User modified successfully\n");
@@ -139,12 +138,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Test 6: Verify the modification
     println!("8. Verifying the modification...");
     let (rs, _res) = ldap
-        .search(
-            user_dn,
-            Scope::Base,
-            "(objectClass=*)",
-            vec!["mail"],
-        )
+        .search(user_dn, Scope::Base, "(objectClass=*)", vec!["mail"])
         .await?
         .success()?;
 
@@ -168,7 +162,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ldap
     };
 
-    match user_ldap.simple_bind(user_dn, "TestPassword123").await?.success() {
+    match user_ldap
+        .simple_bind(user_dn, "TestPassword123")
+        .await?
+        .success()
+    {
         Ok(_) => println!("   ✓ User bind successful"),
         Err(e) => println!("   ✗ User bind failed: {}", e),
     }
@@ -181,7 +179,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if compare_result.0.rc == 0 {
         println!("   ✓ Compare operation successful (sn=Doe matches)");
     } else {
-        println!("   ✗ Compare operation returned: rc={}", compare_result.0.rc);
+        println!(
+            "   ✗ Compare operation returned: rc={}",
+            compare_result.0.rc
+        );
     }
     println!();
 
@@ -200,7 +201,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("   ✓ Found {} entries matching filter:", rs.len());
     for entry in rs {
         let entry = SearchEntry::construct(entry);
-        println!("     - {} ({})", entry.dn, entry.attrs.get("mail").map(|v| v[0].as_str()).unwrap_or(""));
+        println!(
+            "     - {} ({})",
+            entry.dn,
+            entry.attrs.get("mail").map(|v| v[0].as_str()).unwrap_or("")
+        );
     }
     println!();
 

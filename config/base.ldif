@@ -11,8 +11,8 @@ dc: com
 dn: dc=example,dc=com
 objectClass: top
 objectClass: organization
-o: password
-description: password
+o: Example Organization
+description: Example Organization
 
 dn: ou=People,dc=example,dc=com
 objectClass: top
