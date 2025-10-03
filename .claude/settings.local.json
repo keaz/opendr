@@ -6,7 +6,8 @@
       "Bash(awk:*)",
       "Bash(timeout 10 cargo test:*)",
       "Bash(timeout 30 cargo test:*)",
-      "Bash(cargo bench:*)"
+      "Bash(cargo bench:*)",
+      "Bash(RUST_BACKTRACE=1 cargo test --lib extended_ops::tests::test_password_modify_operation)"
     ],
     "deny": [],
     "ask": []
