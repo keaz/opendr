@@ -1,8 +1,8 @@
-dn: cn=Directory Manager
+dn: cn=manager
 objectClass: person
 objectClass: organizationalPerson
 objectClass: inetOrgPerson
-cn: Directory Manager
+cn: manager
 sn: Administrator
-userPassword: {SSHA512}mKQsMRKlQk159JDSfWxaNeItFC36LipuHnbUQdc9CF84RxUclb0I8Bn2hMzpv4fkjfs8P/fTa4//vfxqUjoJMqSnvqQr/27vy/wMQFmSKwc=
+userPassword: {SSHA512}RIg3NqrQ5Ma3jnu+T2dDODy1rG0URxdeMXPNQ3ziyWdXyRHv9rAd+/B68kST30/TX+UpbmMe6lco2Tg8+JacBbBR5cH+MZtYzx3wbxiGlCA=
 description: Root Administrator Account

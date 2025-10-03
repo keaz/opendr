@@ -1,4 +1,4 @@
 is_configured = true
-setup_timestamp = "2025-10-03T09:10:46.041355682+00:00"
+setup_timestamp = "2025-10-03T15:30:45.697340+00:00"
 config_version = "1.0.0"
 base_dn = "dc=example,dc=com"

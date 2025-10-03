@@ -32,6 +32,8 @@ use lmdb::{Database, Environment, Transaction, WriteFlags, Cursor};
 use ldap_parser::ldap::SearchScope;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use sha2::{Sha512, Digest};
+use base64::Engine;
 
 use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation};
 
@@ -211,6 +213,39 @@ impl LmdbBackend {
             .filter(|c| !c.is_empty())
             .collect()
     }
+
+    /// Verify SSHA512 password hash
+    /// Format: {SSHA512}base64(SHA512(password + salt) + salt)
+    fn verify_ssha512(password: &[u8], stored_hash: &str) -> bool {
+        // Remove {SSHA512} prefix if present
+        let hash_b64 = if stored_hash.starts_with("{SSHA512}") {
+            &stored_hash[9..]
+        } else {
+            stored_hash
+        };
+
+        // Decode base64
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(hash_b64) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+
+        // SSHA512: first 64 bytes are SHA512 hash, remaining bytes are salt
+        if decoded.len() < 64 {
+            return false;
+        }
+
+        let (stored_hash, salt) = decoded.split_at(64);
+
+        // Hash the provided password with the stored salt
+        let mut hasher = Sha512::new();
+        hasher.update(password);
+        hasher.update(salt);
+        let computed_hash = hasher.finalize();
+
+        // Constant-time comparison
+        computed_hash.as_slice() == stored_hash
+    }
 }
 
 #[async_trait]
@@ -230,7 +265,11 @@ impl DirectoryBackend for LmdbBackend {
 
         // Get password hash
         match txn.get(self.passwords_db, &actual_dn.as_bytes()) {
-            Ok(stored_password) => Ok(stored_password == password),
+            Ok(stored_password_bytes) => {
+                let stored_password_str = String::from_utf8_lossy(stored_password_bytes);
+                // Verify SSHA512 hash
+                Ok(Self::verify_ssha512(password, &stored_password_str))
+            },
             Err(lmdb::Error::NotFound) => Ok(false),
             Err(e) => Err(BackendError::Storage(format!("Password lookup failed: {}", e))),
         }

@@ -1,10 +1,10 @@
 base_dn = "dc=example,dc=com"
-root_user_dn = "cn=Directory Manager"
+root_user_dn = "cn=manager"
 root_password = "Admin@123"
 ldap_port = 1389
 ldaps_port = 1636
 hostname = "localhost"
-organization_name = "Example Organization"
+organization_name = "password"
 backend_type = "Lmdb"
 data_directory = "./data"
 import_sample_data = false
