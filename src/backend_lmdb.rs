@@ -35,6 +35,10 @@ use tokio::sync::RwLock;
 use sha2::{Sha512, Digest};
 use base64::Engine;
 
+// LMDB cursor operation constants
+const MDB_SET: u32 = 15;
+const MDB_NEXT_DUP: u32 = 18;
+
 use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation};
 
 /// Serialized entry structure for LMDB storage
@@ -56,6 +60,28 @@ impl StoredEntry {
     }
 }
 
+/// Configuration for indexed attributes
+#[derive(Debug, Clone)]
+pub struct IndexConfig {
+    /// Attributes that should be indexed
+    pub indexed_attributes: Vec<String>,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            // Default indexed attributes for common LDAP operations
+            indexed_attributes: vec![
+                "cn".to_string(),
+                "uid".to_string(),
+                "mail".to_string(),
+                "objectclass".to_string(),
+                "ou".to_string(),
+            ],
+        }
+    }
+}
+
 /// LMDB-based persistent backend optimized for read performance
 pub struct LmdbBackend {
     /// LMDB environment
@@ -66,6 +92,11 @@ pub struct LmdbBackend {
     passwords_db: Database,
     /// DN index for case-insensitive lookups
     dn_index_db: Database,
+    /// Attribute indexes: map from "attr:value" -> DN
+    /// One database per indexed attribute
+    attr_indexes: Arc<RwLock<HashMap<String, Database>>>,
+    /// Index configuration
+    index_config: IndexConfig,
     /// Lock for write operations (reads are lock-free in LMDB)
     write_lock: Arc<RwLock<()>>,
     /// Database directory path
@@ -73,7 +104,7 @@ pub struct LmdbBackend {
 }
 
 impl LmdbBackend {
-    /// Create a new LMDB backend
+    /// Create a new LMDB backend with default index configuration
     ///
     /// # Arguments
     /// * `path` - Directory path for LMDB database files
@@ -82,6 +113,23 @@ impl LmdbBackend {
     /// # Returns
     /// * `Result<Self, BackendError>` - New backend instance or error
     pub fn new<P: AsRef<Path>>(path: P, max_size_mb: usize) -> Result<Self, BackendError> {
+        Self::new_with_config(path, max_size_mb, IndexConfig::default())
+    }
+
+    /// Create a new LMDB backend with custom index configuration
+    ///
+    /// # Arguments
+    /// * `path` - Directory path for LMDB database files
+    /// * `max_size_mb` - Maximum database size in megabytes
+    /// * `index_config` - Configuration for attribute indexing
+    ///
+    /// # Returns
+    /// * `Result<Self, BackendError>` - New backend instance or error
+    pub fn new_with_config<P: AsRef<Path>>(
+        path: P,
+        max_size_mb: usize,
+        index_config: IndexConfig,
+    ) -> Result<Self, BackendError> {
         let db_path = path.as_ref().to_path_buf();
 
         // Create directory if it doesn't exist
@@ -89,8 +137,9 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to create db directory: {}", e)))?;
 
         // Create LMDB environment with read-optimized settings
+        // Increased max_dbs to accommodate attribute indexes
         let env = Environment::new()
-            .set_max_dbs(10) // Allow multiple named databases
+            .set_max_dbs(50) // Increased for attribute indexes
             .set_map_size(max_size_mb * 1024 * 1024) // Set max size
             .set_max_readers(126) // High reader concurrency
             .open(&db_path)
@@ -108,11 +157,24 @@ impl LmdbBackend {
         let dn_index_db = env.create_db(Some("dn_index"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create dn_index db: {}", e)))?;
 
+        // Create attribute index databases
+        // Note: Using DUPSORT for indices to allow multiple DNs per attribute value
+        let mut attr_indexes = HashMap::new();
+        for attr in &index_config.indexed_attributes {
+            let db_name = format!("idx_{}", attr.to_lowercase());
+            // Create without DUP_SORT to avoid complexity - store value:DN as key
+            let db = env.create_db(Some(&db_name), lmdb::DatabaseFlags::empty())
+                .map_err(|e| BackendError::Storage(format!("Failed to create index for {}: {}", attr, e)))?;
+            attr_indexes.insert(attr.to_lowercase(), db);
+        }
+
         Ok(Self {
             env,
             entries_db,
             passwords_db,
             dn_index_db,
+            attr_indexes: Arc::new(RwLock::new(attr_indexes)),
+            index_config,
             write_lock: Arc::new(RwLock::new(())),
             db_path,
         })
@@ -214,6 +276,29 @@ impl LmdbBackend {
             .collect()
     }
 
+    /// Create SSHA512 password hash
+    /// Format: {SSHA512}base64(SHA512(password + salt) + salt)
+    fn create_ssha512(password: &[u8]) -> String {
+        use rand::Rng;
+
+        // Generate random 16-byte salt
+        let salt: [u8; 16] = rand::thread_rng().gen();
+
+        // Hash password with salt
+        let mut hasher = Sha512::new();
+        hasher.update(password);
+        hasher.update(&salt);
+        let hash = hasher.finalize();
+
+        // Combine hash and salt
+        let mut combined = Vec::with_capacity(64 + 16);
+        combined.extend_from_slice(&hash);
+        combined.extend_from_slice(&salt);
+
+        // Encode to base64 with prefix
+        format!("{{SSHA512}}{}", base64::engine::general_purpose::STANDARD.encode(&combined))
+    }
+
     /// Verify SSHA512 password hash
     /// Format: {SSHA512}base64(SHA512(password + salt) + salt)
     fn verify_ssha512(password: &[u8], stored_hash: &str) -> bool {
@@ -245,6 +330,124 @@ impl LmdbBackend {
 
         // Constant-time comparison
         computed_hash.as_slice() == stored_hash
+    }
+
+    /// Update attribute indexes for an entry
+    ///
+    /// This method updates the attribute indexes when an entry is added or modified.
+    /// For each indexed attribute in the entry, it creates an index entry mapping
+    /// "value:dn" -> "" (using composite key to allow multiple DNs per value).
+    fn update_attribute_indexes(
+        &self,
+        txn: &mut lmdb::RwTransaction,
+        dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> Result<(), BackendError> {
+        let indexes = self.attr_indexes.try_read()
+            .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
+
+        for (attr_name, values) in attributes {
+            let attr_lower = attr_name.to_lowercase();
+
+            // Check if this attribute is indexed
+            if let Some(index_db) = indexes.get(&attr_lower) {
+                // Index each value with a composite key "value:dn"
+                for value in values {
+                    let value_lower = value.to_lowercase();
+                    let index_key = format!("{}:{}", value_lower, dn);
+                    txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
+                        .map_err(|e| BackendError::Storage(format!("Failed to update index for {}:{}: {}", attr_name, value, e)))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove attribute indexes for an entry
+    ///
+    /// This method removes index entries when an entry is deleted.
+    fn remove_attribute_indexes(
+        &self,
+        txn: &mut lmdb::RwTransaction,
+        dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> Result<(), BackendError> {
+        let indexes = self.attr_indexes.try_read()
+            .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
+
+        for (attr_name, values) in attributes {
+            let attr_lower = attr_name.to_lowercase();
+
+            // Check if this attribute is indexed
+            if let Some(index_db) = indexes.get(&attr_lower) {
+                // Remove each value from index using composite key
+                for value in values {
+                    let value_lower = value.to_lowercase();
+                    let index_key = format!("{}:{}", value_lower, dn);
+                    txn.del(*index_db, &index_key.as_bytes(), None)
+                        .or_else(|e| match e {
+                            lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
+                            _ => Err(BackendError::Storage(format!("Failed to remove index for {}:{}: {}", attr_name, value, e)))
+                        })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Search using attribute indexes
+    ///
+    /// This method performs an indexed lookup for a specific attribute value.
+    /// Returns a list of DNs that have the specified attribute value.
+    pub fn search_by_index(&self, attribute: &str, value: &str) -> Result<Vec<String>, BackendError> {
+        let attr_lower = attribute.to_lowercase();
+        let value_lower = value.to_lowercase();
+
+        let indexes = self.attr_indexes.try_read()
+            .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
+
+        // Check if this attribute has an index
+        let index_db = match indexes.get(&attr_lower) {
+            Some(db) => *db,
+            None => {
+                // Attribute not indexed, return empty result
+                return Ok(Vec::new());
+            }
+        };
+
+        let txn = self.env.begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+
+        let mut results = Vec::new();
+
+        // Use cursor to iterate over all DNs for this attribute value
+        // Keys are "value:dn", so we need to find all keys starting with "value:"
+        let mut cursor = txn.open_ro_cursor(index_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+
+        let search_prefix = format!("{}:", value_lower);
+
+        // Iterate through all entries and filter by prefix
+        for (key, _value) in cursor.iter() {
+            let key_str = String::from_utf8_lossy(key);
+            if key_str.starts_with(&search_prefix) {
+                // Extract DN from "value:dn" format
+                if let Some(dn) = key_str.strip_prefix(&search_prefix) {
+                    results.push(dn.to_string());
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Check if an attribute is indexed
+    pub fn is_indexed(&self, attribute: &str) -> bool {
+        let attr_lower = attribute.to_lowercase();
+        self.index_config.indexed_attributes.iter()
+            .any(|a| a.to_lowercase() == attr_lower)
     }
 }
 
@@ -312,13 +515,19 @@ impl DirectoryBackend for LmdbBackend {
         txn.put(self.entries_db, &entry.dn.as_bytes(), &entry_bytes, WriteFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
 
-        // Write password
-        txn.put(self.passwords_db, &entry.dn.as_bytes(), &password, WriteFlags::empty())
-            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+        // Hash and write password (if provided)
+        if !password.is_empty() {
+            let password_hash = Self::create_ssha512(&password);
+            txn.put(self.passwords_db, &entry.dn.as_bytes(), &password_hash.as_bytes(), WriteFlags::empty())
+                .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+        }
 
         // Update DN index
         txn.put(self.dn_index_db, &normalized_dn.as_bytes(), &entry.dn.as_bytes(), WriteFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
+
+        // Update attribute indexes
+        self.update_attribute_indexes(&mut txn, &entry.dn, &stored_entry.attributes)?;
 
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -341,13 +550,25 @@ impl DirectoryBackend for LmdbBackend {
             Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
         };
 
+        // Get entry to remove from attribute indexes
+        let entry_bytes = txn.get(self.entries_db, &actual_dn.as_bytes())
+            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
+        let stored_entry: StoredEntry = bincode::deserialize(entry_bytes)
+            .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
+
+        // Remove from attribute indexes
+        self.remove_attribute_indexes(&mut txn, &actual_dn, &stored_entry.attributes)?;
+
         // Delete entry
         txn.del(self.entries_db, &actual_dn.as_bytes(), None)
             .map_err(|e| BackendError::Storage(format!("Failed to delete entry: {}", e)))?;
 
-        // Delete password
+        // Delete password (if it exists)
         txn.del(self.passwords_db, &actual_dn.as_bytes(), None)
-            .map_err(|_| BackendError::Storage("Failed to delete password".to_string()))?;
+            .or_else(|e| match e {
+                lmdb::Error::NotFound => Ok(()), // No password, that's fine
+                _ => Err(BackendError::Storage("Failed to delete password".to_string()))
+            })?;
 
         // Delete DN index
         txn.del(self.dn_index_db, &normalized_dn.as_bytes(), None)
@@ -364,6 +585,9 @@ impl DirectoryBackend for LmdbBackend {
 
         let mut entry = self.get_entry_internal(dn)?
             .ok_or(BackendError::NotFound)?;
+
+        // Save old attributes for index updates
+        let old_attributes = entry.attributes.clone();
 
         // Apply modifications
         for modification in modifications {
@@ -412,6 +636,11 @@ impl DirectoryBackend for LmdbBackend {
 
         txn.put(self.entries_db, &entry.dn.as_bytes(), &entry_bytes, WriteFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+
+        // Update attribute indexes
+        // Remove old indexed values and add new ones
+        self.remove_attribute_indexes(&mut txn, &entry.dn, &old_attributes)?;
+        self.update_attribute_indexes(&mut txn, &entry.dn, &entry.attributes)?;
 
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -562,5 +791,204 @@ mod tests {
 
         assert!(backend.authenticate("cn=test,dc=example,dc=org", b"secret").await.unwrap());
         assert!(!backend.authenticate("cn=test,dc=example,dc=org", b"wrong").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_index_config_defaults() {
+        let config = IndexConfig::default();
+        assert!(config.indexed_attributes.contains(&"cn".to_string()));
+        assert!(config.indexed_attributes.contains(&"uid".to_string()));
+        assert!(config.indexed_attributes.contains(&"mail".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_is_indexed() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+
+        // Default indexed attributes
+        assert!(backend.is_indexed("cn"));
+        assert!(backend.is_indexed("CN")); // Case insensitive
+        assert!(backend.is_indexed("uid"));
+        assert!(backend.is_indexed("mail"));
+
+        // Not indexed by default
+        assert!(!backend.is_indexed("description"));
+    }
+
+    #[tokio::test]
+    async fn test_attribute_index_on_add() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+
+        // Add entry with indexed attributes
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["John Doe".to_string()]);
+        attributes.insert("uid".to_string(), vec!["jdoe".to_string()]);
+        let entry = DirectoryEntry::new("uid=jdoe,dc=example,dc=org", attributes);
+
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        // Search by indexed attribute
+        let results = backend.search_by_index("cn", "John Doe").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "uid=jdoe,dc=example,dc=org");
+
+        // Search by uid
+        let results = backend.search_by_index("uid", "jdoe").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], "uid=jdoe,dc=example,dc=org");
+    }
+
+    #[tokio::test]
+    async fn test_attribute_index_multiple_values() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+
+        // Add entry with multiple values for indexed attribute
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["John Doe".to_string(), "J. Doe".to_string()]);
+        let entry = DirectoryEntry::new("uid=jdoe,dc=example,dc=org", attributes);
+
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        // Search by first value
+        let results = backend.search_by_index("cn", "John Doe").unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Search by second value
+        let results = backend.search_by_index("cn", "J. Doe").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_attribute_index_case_insensitive() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["John Doe".to_string()]);
+        let entry = DirectoryEntry::new("uid=jdoe,dc=example,dc=org", attributes);
+
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        // Search with different case
+        let results = backend.search_by_index("cn", "john doe").unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results = backend.search_by_index("CN", "JOHN DOE").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_attribute_index_multiple_entries() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+
+        // Add multiple entries with same attribute value
+        for i in 1..=3 {
+            let mut attributes = HashMap::new();
+            attributes.insert("cn".to_string(), vec![format!("User {}", i)]);
+            attributes.insert("ou".to_string(), vec!["Engineering".to_string()]);
+            let entry = DirectoryEntry::new(&format!("uid=user{},dc=example,dc=org", i), attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+        }
+
+        // Search should return all entries with ou=Engineering
+        let results = backend.search_by_index("ou", "Engineering").unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_attribute_index_update_on_modify() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+
+        // Add entry
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Old Name".to_string()]);
+        let entry = DirectoryEntry::new("uid=test,dc=example,dc=org", attributes);
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        // Verify old index
+        let results = backend.search_by_index("cn", "Old Name").unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Modify entry
+        let modifications = vec![Modification {
+            operation: ModifyOperation::Replace,
+            attribute: "cn".to_string(),
+            values: vec!["New Name".to_string()],
+        }];
+        backend.modify_entry("uid=test,dc=example,dc=org", modifications).await.unwrap();
+
+        // Old value should not be in index
+        let results = backend.search_by_index("cn", "Old Name").unwrap();
+        assert_eq!(results.len(), 0);
+
+        // New value should be in index
+        let results = backend.search_by_index("cn", "New Name").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_attribute_index_removed_on_delete() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+
+        // Add entry
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Test User".to_string()]);
+        let entry = DirectoryEntry::new("uid=test,dc=example,dc=org", attributes);
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        // Verify index exists
+        let results = backend.search_by_index("cn", "Test User").unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Delete entry
+        backend.delete_entry("uid=test,dc=example,dc=org").await.unwrap();
+
+        // Index should be removed
+        let results = backend.search_by_index("cn", "Test User").unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_nonindexed_attribute() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+
+        // Add entry with non-indexed attribute
+        let mut attributes = HashMap::new();
+        attributes.insert("description".to_string(), vec!["Test".to_string()]);
+        let entry = DirectoryEntry::new("uid=test,dc=example,dc=org", attributes);
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        // Searching non-indexed attribute returns empty
+        let results = backend.search_by_index("description", "Test").unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_custom_index_config() {
+        let dir = tempdir().unwrap();
+        let config = IndexConfig {
+            indexed_attributes: vec!["custom".to_string(), "special".to_string()],
+        };
+        let backend = LmdbBackend::new_with_config(dir.path(), 100, config).unwrap();
+
+        assert!(backend.is_indexed("custom"));
+        assert!(backend.is_indexed("special"));
+        assert!(!backend.is_indexed("cn")); // Not in custom config
+
+        // Add entry and verify custom index works
+        let mut attributes = HashMap::new();
+        attributes.insert("custom".to_string(), vec!["value".to_string()]);
+        let entry = DirectoryEntry::new("uid=test,dc=example,dc=org", attributes);
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        let results = backend.search_by_index("custom", "value").unwrap();
+        assert_eq!(results.len(), 1);
     }
 }
