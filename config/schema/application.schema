@@ -1,0 +1,228 @@
+# Application Integration Schema
+# Version: 1.0
+# Author: OpenDR Project
+# Date: 2025-01-04
+# OID Namespace: 1.2.3.4.6 (EXAMPLE - Replace with your registered PEN)
+#
+# This schema provides object classes and attributes for managing
+# application registrations, API keys, OAuth clients, and service accounts
+# in the LDAP directory.
+
+################################################################################
+# Attribute Type Definitions
+################################################################################
+
+# Application ID
+# Unique identifier for the application
+# Format: Alphanumeric, kebab-case
+# Example: web-app-1, mobile-app-ios
+attributetype ( 1.2.3.4.6.1.1 NAME 'appId'
+    DESC 'Unique application identifier'
+    EQUALITY caseIgnoreMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15
+    SINGLE-VALUE )
+
+# Application Secret
+# Secret key for application authentication (store hashed!)
+# This should contain the HASHED secret, never plain text
+# Example: {SSHA512}base64encodedhashedvalue
+attributetype ( 1.2.3.4.6.1.2 NAME 'appSecret'
+    DESC 'Application secret key (hashed)'
+    EQUALITY octetStringMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40
+    SINGLE-VALUE )
+
+# Callback URL
+# OAuth 2.0 redirect/callback URL
+# Must be HTTPS in production
+# Example: https://app.example.com/oauth/callback
+attributetype ( 1.2.3.4.6.1.3 NAME 'callbackUrl'
+    DESC 'OAuth 2.0 callback/redirect URL'
+    EQUALITY caseExactMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+
+# API Key
+# API access key for application (store hashed!)
+# Format: Hashed value with algorithm prefix
+# Example: {SSHA512}base64encodedhashedvalue
+attributetype ( 1.2.3.4.6.1.4 NAME 'apiKey'
+    DESC 'API access key (hashed)'
+    EQUALITY octetStringMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40
+    SINGLE-VALUE )
+
+# Allowed Scopes
+# OAuth scopes the application can request
+# Multi-valued for multiple scopes
+# Example: read:users, write:data, admin:*
+attributetype ( 1.2.3.4.6.1.5 NAME 'allowedScopes'
+    DESC 'OAuth scopes this application can request'
+    EQUALITY caseIgnoreMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+
+# Application Type
+# Type of application: web, mobile, native, service
+# Example: web, mobile-ios, mobile-android, service
+attributetype ( 1.2.3.4.6.1.6 NAME 'appType'
+    DESC 'Application type (web, mobile, native, service)'
+    EQUALITY caseIgnoreMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15
+    SINGLE-VALUE )
+
+# Application Owner
+# DN of the user or group that owns this application
+# Example: uid=admin,ou=People,dc=example,dc=com
+attributetype ( 1.2.3.4.6.1.7 NAME 'appOwner'
+    DESC 'Distinguished name of application owner'
+    EQUALITY distinguishedNameMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 )
+
+# Rate Limit
+# API rate limit in requests per minute
+# Format: Integer value
+# Example: 1000
+attributetype ( 1.2.3.4.6.1.8 NAME 'rateLimit'
+    DESC 'API rate limit (requests per minute)'
+    EQUALITY integerMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27
+    SINGLE-VALUE )
+
+# Application Status
+# Current status of the application
+# Values: active, disabled, pending, revoked
+attributetype ( 1.2.3.4.6.1.9 NAME 'appStatus'
+    DESC 'Application status (active, disabled, pending, revoked)'
+    EQUALITY caseIgnoreMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15
+    SINGLE-VALUE )
+
+################################################################################
+# Object Class Definitions
+################################################################################
+
+# Application Object Class
+# Structural class for application registrations
+#
+# Required:
+#   - appId: Unique application identifier
+#   - cn: Application name
+#
+# Optional:
+#   - appSecret: Application secret (hashed)
+#   - callbackUrl: OAuth callback URL(s)
+#   - apiKey: API key (hashed)
+#   - allowedScopes: Permitted OAuth scopes
+#   - appType: Application type
+#   - appOwner: Owner DN
+#   - rateLimit: Rate limit
+#   - appStatus: Current status
+#   - description: Application description
+objectclass ( 1.2.3.4.6.2.1 NAME 'application'
+    DESC 'Application registration entry'
+    SUP top
+    STRUCTURAL
+    MUST ( appId $ cn )
+    MAY ( appSecret $ callbackUrl $ apiKey $ allowedScopes $
+          appType $ appOwner $ rateLimit $ appStatus $ description ) )
+
+# OAuth Client Object Class
+# Auxiliary class for OAuth 2.0 client applications
+# Add to existing application entries
+objectclass ( 1.2.3.4.6.2.2 NAME 'oauthClient'
+    DESC 'OAuth 2.0 client application'
+    SUP top
+    AUXILIARY
+    MUST ( callbackUrl )
+    MAY ( allowedScopes ) )
+
+# Service Account Object Class
+# For machine-to-machine authentication
+# Use for background services, cron jobs, etc.
+objectclass ( 1.2.3.4.6.2.3 NAME 'serviceAccount'
+    DESC 'Service account for machine-to-machine auth'
+    SUP top
+    STRUCTURAL
+    MUST ( appId $ cn )
+    MAY ( apiKey $ allowedScopes $ appOwner $ rateLimit $ appStatus ) )
+
+################################################################################
+# Usage Examples
+################################################################################
+
+# Example 1: Web Application with OAuth
+# dn: appId=web-app-1,ou=Applications,dc=example,dc=com
+# objectClass: top
+# objectClass: application
+# objectClass: oauthClient
+# appId: web-app-1
+# cn: Company Website
+# description: Main company website and portal
+# appType: web
+# appOwner: uid=webteam,ou=Groups,dc=example,dc=com
+# appSecret: {SSHA512}abc123...
+# callbackUrl: https://example.com/oauth/callback
+# callbackUrl: https://example.com/oauth/callback2
+# allowedScopes: read:profile
+# allowedScopes: read:email
+# allowedScopes: write:data
+# rateLimit: 1000
+# appStatus: active
+
+# Example 2: Mobile Application
+# dn: appId=mobile-ios-1,ou=Applications,dc=example,dc=com
+# objectClass: top
+# objectClass: application
+# appId: mobile-ios-1
+# cn: iOS Mobile App
+# description: Company iOS mobile application
+# appType: mobile-ios
+# appOwner: uid=mobileteam,ou=Groups,dc=example,dc=com
+# apiKey: {SSHA512}def456...
+# allowedScopes: read:profile
+# allowedScopes: read:data
+# rateLimit: 500
+# appStatus: active
+
+# Example 3: Service Account
+# dn: appId=backup-service,ou=Applications,dc=example,dc=com
+# objectClass: top
+# objectClass: serviceAccount
+# appId: backup-service
+# cn: Backup Service Account
+# description: Automated backup service
+# appOwner: uid=sysadmin,ou=People,dc=example,dc=com
+# apiKey: {SSHA512}ghi789...
+# allowedScopes: read:*
+# rateLimit: 10000
+# appStatus: active
+
+################################################################################
+# Security Notes
+################################################################################
+#
+# 1. NEVER store plain text secrets or API keys
+#    - Always hash using SSHA512 or similar
+#    - Example: {SSHA512}base64(SHA512(secret + salt) + salt)
+#
+# 2. Use HTTPS for all callback URLs in production
+#    - http:// URLs should only be used for local development
+#
+# 3. Restrict access to application entries
+#    - Use ACLs to limit who can read appSecret and apiKey
+#    - Consider separate ACLs for different app types
+#
+# 4. Implement rate limiting
+#    - Set appropriate rateLimit values
+#    - Monitor and adjust based on usage
+#
+# 5. Regular key rotation
+#    - Rotate appSecret and apiKey periodically
+#    - Maintain audit log of rotations
+
+################################################################################
+# Changelog
+################################################################################
+# Version 1.0 - 2025-01-04
+#   - Initial release
+#   - Added application, oauthClient, and serviceAccount classes
+#   - Added core application management attributes

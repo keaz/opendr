@@ -7,8 +7,17 @@ Welcome to the opendr LDAP server documentation. This directory contains compreh
 ### 📊 [Architecture Overview](./architecture-overview.md)
 High-level system architecture showing the layered FSM design, component relationships, and key design principles. Start here for understanding the overall system structure.
 
-### 🔧 [Complete Class Diagram](./class-diagram.md) 
+### 🔧 [Complete Class Diagram](./class-diagram.md)
 Detailed class diagrams showing all FSM traits, their relationships, state definitions, and runtime management structures. Essential for developers implementing the FSM traits.
+
+### 🔐 [Schema Integration Guide](./schema_integration.md)
+Comprehensive guide for LDAP schema validation integration. Covers schema validation rules, custom schema extensions, and integration with the Write FSM.
+
+### 📋 [Schema Definition Guide](./SCHEMA_DEFINITION_GUIDE.md)
+Complete guide for defining custom LDAP schemas. Covers OID management, schema file formats, attribute and object class definitions, and best practices.
+
+### ⚡ [Schema Quick Start](./SCHEMA_QUICK_START.md)
+Quick start guide for schema definition. Get started with custom schemas in 5 minutes.
 
 ### 📘 [WARP.md](../WARP.md)
 Development guide for working with the codebase, including build commands, testing strategies, and code navigation tips.

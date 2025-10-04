@@ -29,7 +29,7 @@ use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_fsm::{ConnectionFsmImpl, TlsHandler};
 use crate::sasl_fsm::SaslFsmImpl;
 use crate::search_fsm::SearchFsmImpl;
-use crate::write_fsm::WriteFsmImpl;
+use crate::write_fsm::{WriteFsmImpl, SchemaValidator};
 use crate::compare_fsm::CompareFsmImpl;
 use crate::extended_op_fsm::ExtendedOpFsmImpl;
 use crate::fsm::{StateMachine, AuthState, SaslFsm, TimeoutFsm};
@@ -134,6 +134,9 @@ pub struct ConnectionFsmSet {
     /// Backend for directory operations
     backend: Arc<dyn DirectoryBackend>,
 
+    /// Schema validator for write operations
+    schema_validator: Arc<dyn SchemaValidator>,
+
     /// Metadata about operations
     operation_info: HashMap<i32, OperationInfo>,
 }
@@ -152,6 +155,25 @@ impl ConnectionFsmSet {
         stream: TcpStream,
         backend: Arc<dyn DirectoryBackend>,
         tls_handler: Option<Box<dyn TlsHandler>>,
+    ) -> Self {
+        Self::new_with_schema_validator(stream, backend, tls_handler, None)
+    }
+
+    /// Create a new ConnectionFsmSet with a custom schema validator
+    ///
+    /// # Arguments
+    /// * `stream` - The TCP stream for this connection
+    /// * `backend` - The directory backend to use for operations
+    /// * `tls_handler` - Handler for TLS operations (if TLS is supported)
+    /// * `schema_validator` - Custom schema validator (uses default if None)
+    ///
+    /// # Returns
+    /// A new ConnectionFsmSet ready to handle LDAP operations
+    pub fn new_with_schema_validator(
+        stream: TcpStream,
+        backend: Arc<dyn DirectoryBackend>,
+        tls_handler: Option<Box<dyn TlsHandler>>,
+        schema_validator: Option<Arc<dyn SchemaValidator>>,
     ) -> Self {
         // Get address info before moving stream
         let remote_addr = stream
@@ -172,14 +194,26 @@ impl ConnectionFsmSet {
         // Start with simple authentication (anonymous)
         let auth = AuthenticationFsm::Simple(AuthFsmImpl::new());
 
+        // Use provided schema validator or create default one
+        let schema_validator = schema_validator.unwrap_or_else(|| {
+            use crate::schema_adapter::LdapSchemaValidator;
+            Arc::new(LdapSchemaValidator::new())
+        });
+
         Self {
             connection,
             decoder,
             auth,
             operations: HashMap::new(),
             backend,
+            schema_validator,
             operation_info: HashMap::new(),
         }
+    }
+
+    /// Get a reference to the schema validator
+    pub fn schema_validator(&self) -> &Arc<dyn SchemaValidator> {
+        &self.schema_validator
     }
 
     /// Get a reference to the connection FSM

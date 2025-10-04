@@ -20,6 +20,7 @@ use crate::backend::{
 use crate::parser::{
     encode_bind_response, encode_result_response, encode_search_entry, ResponseOp,
 };
+use crate::schema::LdapSchema;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -54,20 +55,24 @@ pub async fn run(addr: &str, backend: Arc<dyn DirectoryBackend>) -> Result<(), S
     let listener = TcpListener::bind(addr).await?;
     info!("LDAP server listening on {}", addr);
 
+    // Create schema validator with core schema
+    let schema = Arc::new(LdapSchema::with_core_schema());
+
     loop {
         let (socket, addr) = listener.accept().await?;
         info!("Accepted connection from {:?}", addr);
 
         let backend = backend.clone();
+        let schema = schema.clone();
 
         tokio::spawn(async move {
-            handle_client(socket, backend).await;
+            handle_client(socket, backend, schema).await;
             info!("Connection {:?} closed", addr);
         });
     }
 }
 
-pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBackend>) {
+pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBackend>, schema: Arc<LdapSchema>) {
     let mut buffer = vec![0; 4096];
 
     loop {
@@ -79,7 +84,7 @@ pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBack
                     Ok((_, messages)) => {
                         for message in messages {
                             if let Err(err) =
-                                process_message(&mut socket, backend.as_ref(), message).await
+                                process_message(&mut socket, backend.as_ref(), schema.as_ref(), message).await
                             {
                                 error!("Failed to process message: {}", err);
                                 return;
@@ -113,6 +118,7 @@ pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBack
 pub async fn process_message(
     socket: &mut TcpStream,
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     message: ldap_parser::ldap::LdapMessage<'_>,
 ) -> Result<(), ServerError> {
     let message_id = message.message_id.0;
@@ -128,7 +134,7 @@ pub async fn process_message(
             handle_modify_request(socket, backend, message_id, modify_request).await?;
         }
         ProtocolOp::AddRequest(add_request) => {
-            handle_add_request(socket, backend, message_id, add_request).await?;
+            handle_add_request(socket, backend, schema, message_id, add_request).await?;
         }
         ProtocolOp::DelRequest(delete_request) => {
             handle_delete_request(socket, backend, message_id, delete_request).await?;
@@ -368,11 +374,27 @@ pub async fn handle_modify_request(
 pub async fn handle_add_request(
     socket: &mut TcpStream,
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     message_id: u32,
     request: AddRequest<'_>,
 ) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let (entry, password) = build_entry_from_add_request(&dn, request.attributes);
+
+    // Perform schema validation before adding
+    if let Err(schema_error) = schema.validate_entry(&entry.attributes) {
+        error!("Schema validation failed for {}: {}", dn, schema_error);
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::Add,
+            ResultCode::ObjectClassViolation,
+            &dn,
+            &format!("Schema validation failed: {}", schema_error),
+        )
+        .await?;
+        return Ok(());
+    }
 
     match backend.add_entry(entry, password).await {
         Ok(()) => {

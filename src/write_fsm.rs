@@ -885,7 +885,7 @@ impl WriteFsmImpl {
     }
     
     /// Handle validation complete event
-    /// 
+    ///
     /// # Returns
     /// * Result indicating success or error
     async fn handle_validation_complete(&mut self) -> Result<Option<Vec<u8>>, WriteFsmError> {
@@ -895,19 +895,177 @@ impl WriteFsmImpl {
                 let duration = session.validation_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
                 metrics.record_validation_complete(session.operation_type(), duration);
             }
-            
+
             if self.config.strict_schema_validation {
                 self.state = WriteState::CheckingSchema;
+                session.schema_check_start = Some(Instant::now());
+
+                // Perform schema validation
+                if let Err(e) = self.perform_schema_validation().await {
+                    self.state = WriteState::Failed { error: e.clone() };
+                    return Err(WriteFsmError::SchemaError { message: e });
+                }
+
+                // Schema validation passed, move to next state
+                if self.config.enable_aci_checks {
+                    self.state = WriteState::CheckingAci;
+                } else {
+                    self.state = WriteState::InTransaction;
+                }
             } else if self.config.enable_aci_checks {
                 self.state = WriteState::CheckingAci;
             } else {
                 self.state = WriteState::InTransaction;
             }
-            
+
             Ok(None)
         } else {
             Err(WriteFsmError::NoActiveOperation)
         }
+    }
+
+    /// Perform schema validation on the current operation
+    ///
+    /// # Returns
+    /// * Ok(()) if validation passes
+    /// * Err(String) with error message if validation fails
+    async fn perform_schema_validation(&self) -> Result<(), String> {
+        if let Some(session) = &self.session {
+            match &session.operation {
+                WriteOperation::Add { dn, entry } => {
+                    // Convert entry bytes to WriteEntry for validation
+                    let write_entry = self.parse_add_entry(dn, entry)?;
+                    self.schema_validator.validate_entry(&write_entry).await?;
+                }
+                WriteOperation::Modify { dn, changes } => {
+                    // Parse LDIF changes into Modification objects
+                    let modifications = self.parse_modifications(changes)?;
+                    self.schema_validator.validate_modifications(dn, &modifications).await?;
+                }
+                WriteOperation::ModifyDn { dn, new_rdn, new_superior, .. } => {
+                    self.schema_validator.validate_dn_modification(dn, new_rdn, new_superior.as_deref()).await?;
+                }
+                WriteOperation::Delete { .. } => {
+                    // Delete operations don't require schema validation
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse modification bytes into Modification objects
+    ///
+    /// # Arguments
+    /// * `changes_bytes` - LDIF formatted modifications
+    ///
+    /// # Returns
+    /// * Vec of Modification objects
+    fn parse_modifications(&self, changes_bytes: &[u8]) -> Result<Vec<Modification>, String> {
+        let changes_str = std::str::from_utf8(changes_bytes)
+            .map_err(|e| format!("Invalid UTF-8 in modifications: {}", e))?;
+
+        let mut modifications = Vec::new();
+        let mut current_mod: Option<(String, String, Vec<String>)> = None; // (op, name, values)
+
+        for line in changes_str.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            if let Some(colon_pos) = line.find(':') {
+                let key = line[..colon_pos].trim();
+                let value = line[colon_pos + 1..].trim().to_string();
+
+                match key.to_lowercase().as_str() {
+                    "add" | "delete" | "replace" => {
+                        // Save previous modification if any
+                        if let Some((op, name, values)) = current_mod.take() {
+                            modifications.push(Self::create_modification(&op, name, values)?);
+                        }
+                        // Start new modification
+                        current_mod = Some((key.to_lowercase(), value, Vec::new()));
+                    }
+                    _ => {
+                        // Add value to current modification
+                        if let Some((_, _, ref mut values)) = current_mod {
+                            values.push(value);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Save last modification
+        if let Some((op, name, values)) = current_mod {
+            modifications.push(Self::create_modification(&op, name, values)?);
+        }
+
+        Ok(modifications)
+    }
+
+    /// Create a Modification from operation, name, and values
+    fn create_modification(operation: &str, name: String, values: Vec<String>) -> Result<Modification, String> {
+        match operation {
+            "add" => Ok(Modification::Add { name, values }),
+            "delete" => Ok(Modification::Delete { name, values }),
+            "replace" => Ok(Modification::Replace { name, values }),
+            _ => Err(format!("Unknown modification operation: {}", operation)),
+        }
+    }
+
+    /// Parse ADD entry bytes into WriteEntry structure
+    ///
+    /// # Arguments
+    /// * `dn` - Distinguished name
+    /// * `entry_bytes` - LDIF formatted entry
+    ///
+    /// # Returns
+    /// * WriteEntry structure for validation
+    fn parse_add_entry(&self, dn: &str, entry_bytes: &[u8]) -> Result<WriteEntry, String> {
+        let entry_str = std::str::from_utf8(entry_bytes)
+            .map_err(|e| format!("Invalid UTF-8 in entry: {}", e))?;
+
+        let mut attributes: HashMap<String, Vec<String>> = HashMap::new();
+        let mut object_classes: Vec<String> = Vec::new();
+
+        for line in entry_str.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Skip DN line
+            if line.starts_with("dn:") || line.starts_with("DN:") {
+                continue;
+            }
+
+            // Parse attribute: value
+            if let Some(colon_pos) = line.find(':') {
+                let attr_name = line[..colon_pos].trim();
+                let attr_value = line[colon_pos + 1..].trim().to_string();
+
+                if attr_name.eq_ignore_ascii_case("objectClass") {
+                    object_classes.push(attr_value.clone());
+                }
+
+                attributes
+                    .entry(attr_name.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(attr_value);
+            }
+        }
+
+        // Remove objectClass from attributes since it's stored separately
+        attributes.remove("objectClass");
+        attributes.remove("objectclass");
+
+        Ok(WriteEntry {
+            dn: dn.to_string(),
+            attributes,
+            object_classes,
+            binary_attributes: HashMap::new(),
+        })
     }
     
     /// Handle schema check complete event

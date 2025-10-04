@@ -1,0 +1,127 @@
+# Sample Application Entries
+# This file demonstrates how to use the application schema
+# Prerequisites: Application schema must be loaded
+
+# Web Application with OAuth
+dn: appId=web-portal,ou=Applications,dc=example,dc=com
+objectClass: top
+objectClass: application
+objectClass: oauthClient
+appId: web-portal
+cn: Employee Portal
+description: Internal employee portal and dashboard
+appType: web
+appOwner: uid=msmith,ou=People,dc=example,dc=com
+appSecret: {SSHA512}base64encodedhashedsecret123
+callbackUrl: https://portal.example.com/oauth/callback
+callbackUrl: https://portal.example.com/auth/redirect
+allowedScopes: read:profile
+allowedScopes: read:email
+allowedScopes: write:profile
+allowedScopes: read:employees
+rateLimit: 1000
+appStatus: active
+
+# Mobile iOS Application
+dn: appId=mobile-ios,ou=Applications,dc=example,dc=com
+objectClass: top
+objectClass: application
+appId: mobile-ios
+cn: Company Mobile App (iOS)
+description: Official iOS mobile application
+appType: mobile-ios
+appOwner: uid=bwilson,ou=People,dc=example,dc=com
+apiKey: {SSHA512}base64encodedhashedkey456
+allowedScopes: read:profile
+allowedScopes: read:notifications
+allowedScopes: write:feedback
+rateLimit: 500
+appStatus: active
+
+# Mobile Android Application
+dn: appId=mobile-android,ou=Applications,dc=example,dc=com
+objectClass: top
+objectClass: application
+appId: mobile-android
+cn: Company Mobile App (Android)
+description: Official Android mobile application
+appType: mobile-android
+appOwner: uid=bwilson,ou=People,dc=example,dc=com
+apiKey: {SSHA512}base64encodedhashedkey789
+allowedScopes: read:profile
+allowedScopes: read:notifications
+allowedScopes: write:feedback
+rateLimit: 500
+appStatus: active
+
+# Service Account: Backup Service
+dn: appId=backup-service,ou=Applications,dc=example,dc=com
+objectClass: top
+objectClass: serviceAccount
+appId: backup-service
+cn: Automated Backup Service
+description: Daily backup and archival service
+appOwner: uid=cgarcia,ou=People,dc=example,dc=com
+apiKey: {SSHA512}base64encodedhashedkeyabc
+allowedScopes: read:all
+allowedScopes: backup:create
+rateLimit: 10000
+appStatus: active
+
+# Service Account: Monitoring System
+dn: appId=monitoring-system,ou=Applications,dc=example,dc=com
+objectClass: top
+objectClass: serviceAccount
+appId: monitoring-system
+cn: System Monitoring Service
+description: Real-time system health monitoring
+appOwner: uid=cgarcia,ou=People,dc=example,dc=com
+apiKey: {SSHA512}base64encodedhashedkeydef
+allowedScopes: read:metrics
+allowedScopes: read:logs
+allowedScopes: alert:create
+rateLimit: 5000
+appStatus: active
+
+# Third-party Integration
+dn: appId=slack-integration,ou=Applications,dc=example,dc=com
+objectClass: top
+objectClass: application
+objectClass: oauthClient
+appId: slack-integration
+cn: Slack Integration
+description: Slack workspace integration for notifications
+appType: integration
+appOwner: uid=ajohnson,ou=People,dc=example,dc=com
+appSecret: {SSHA512}base64encodedhashedsecretghi
+callbackUrl: https://slack.com/oauth/callback
+allowedScopes: read:notifications
+allowedScopes: write:messages
+rateLimit: 200
+appStatus: active
+
+# Development Application (Disabled)
+dn: appId=dev-test-app,ou=Applications,dc=example,dc=com
+objectClass: top
+objectClass: application
+appId: dev-test-app
+cn: Development Test Application
+description: Application for development and testing
+appType: development
+appOwner: uid=jdoe,ou=People,dc=example,dc=com
+apiKey: {SSHA512}base64encodedhashedkeyjkl
+allowedScopes: test:all
+rateLimit: 100
+appStatus: disabled
+
+# Pending Application Approval
+dn: appId=new-feature-app,ou=Applications,dc=example,dc=com
+objectClass: top
+objectClass: application
+appId: new-feature-app
+cn: New Feature Application
+description: New experimental feature application
+appType: web
+appOwner: uid=slee,ou=People,dc=example,dc=com
+rateLimit: 50
+appStatus: pending

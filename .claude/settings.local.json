@@ -7,7 +7,14 @@
       "Bash(timeout 10 cargo test:*)",
       "Bash(timeout 30 cargo test:*)",
       "Bash(cargo bench:*)",
-      "Bash(RUST_BACKTRACE=1 cargo test --lib extended_ops::tests::test_password_modify_operation)"
+      "Bash(RUST_BACKTRACE=1 cargo test --lib extended_ops::tests::test_password_modify_operation)",
+      "Bash(cargo run:*)",
+      "Bash(pkill:*)",
+      "Bash(chmod:*)",
+      "Bash(ldapsearch:*)",
+      "Bash(./scripts/test_schema_validation.sh:*)",
+      "Read(//private/tmp/**)",
+      "Bash(tee:*)"
     ],
     "deny": [],
     "ask": []
