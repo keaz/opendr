@@ -6,6 +6,7 @@ use std::path::Path;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
 use opendr::setup::{SetupConfig, BackendType};
+use opendr::shutdown::{ShutdownCoordinator, ShutdownConfig};
 use opendr::server;
 
 #[tokio::main]
@@ -14,6 +15,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Load configuration from server.toml
     let config = load_config("config/server.toml").await?;
+
+    // Create shutdown coordinator
+    let shutdown_config = ShutdownConfig::default();
+    let shutdown = Arc::new(ShutdownCoordinator::new(shutdown_config));
+
+    // Install signal handlers
+    let shutdown_signal = shutdown.install_signal_handlers();
+    let shutdown_clone = shutdown.clone();
+
+    // Spawn signal handler task
+    tokio::spawn(async move {
+        shutdown_signal.wait().await;
+        println!("\nShutdown signal received, initiating graceful shutdown...");
+    });
 
     // Create backend based on configuration
     let backend: Arc<dyn DirectoryBackend> = match config.backend_type {
@@ -58,9 +73,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bind_addr = format!("127.0.0.1:{}", config.ldap_port);
     println!("Starting LDAP server on {}", bind_addr);
 
-    server::run(&bind_addr, backend)
-        .await
-        .map_err(|err| Box::new(err) as Box<dyn Error>)
+    // Run server with shutdown support
+    let server_task = tokio::spawn(async move {
+        if let Err(e) = server::run(&bind_addr, backend).await {
+            eprintln!("Server error: {}", e);
+        }
+    });
+
+    // Wait for shutdown signal
+    let mut shutdown_rx = shutdown_clone.subscribe();
+    let _ = shutdown_rx.recv().await;
+
+    println!("Shutting down server...");
+
+    // Execute shutdown sequence
+    shutdown_clone.drain().await;
+    shutdown_clone.complete_shutdown().await;
+
+    // Wait for server task to finish
+    match server_task.await {
+        Ok(()) => println!("Server shutdown complete"),
+        Err(e) => eprintln!("Server task error: {}", e),
+    }
+
+    Ok(())
 }
 
 /// Load configuration from TOML file

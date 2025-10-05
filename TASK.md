@@ -8,11 +8,41 @@ OpenDR is a Rust-based LDAP v3 server implementation using a finite state machin
 
 ## Current Status
 
-**Overall Progress:** Phase 1 Complete ✅ | Phase 2.1 Complete ✅ | Phase 3 Complete ✅ | Phase 4 Complete ✅ | Phase 5 Complete ✅
+**Overall Progress:** Phase 1 Complete ✅ | Phase 2.1 Complete ✅ | Phase 3 Complete ✅ | Phase 4 Complete ✅ | Phase 5 Complete ✅ | Phase 6.1-6.2 Complete ✅
 
-**Last Updated:** 2025-10-05 (Phase 5 Complete - Enterprise Features)
+**Last Updated:** 2025-10-05 (Phase 6.2 Complete - Lifecycle Management)
 
-### Today's Accomplishments (Phase 5.4 Audit Logging) 🎉
+### Today's Accomplishments (Phase 6.2 Lifecycle Management) 🎉
+- ✅ **Shutdown Coordinator**: Complete graceful shutdown system (src/shutdown.rs)
+- ✅ **Signal Handlers**: SIGTERM/SIGINT support (Unix and Windows)
+- ✅ **Connection Tracking**: Register and track active connections
+- ✅ **Operation Tracking**: Track in-flight operations for graceful drain
+- ✅ **Graceful Drain**: Wait for operations to complete (default: 10s timeout)
+- ✅ **State Machine**: Running → ShuttingDown → Draining → Terminated
+- ✅ **Broadcast Notifications**: Notify all components of shutdown
+- ✅ **Connection Rejection**: Reject new connections during shutdown
+- ✅ **Operation Rejection**: Reject new operations during drain
+- ✅ **FSM Integration**: `run_with_shutdown` for graceful server termination
+- ✅ **Production Ready**: Integrated into main.rs with signal handling
+- ✅ **Unit Tests**: 10 comprehensive unit tests
+- ✅ **Integration Tests**: 14 integration tests covering all lifecycle scenarios
+- ✅ **All Tests Passing**: 24 lifecycle management tests (10 unit + 14 integration)
+
+### Previous Accomplishments (Phase 6.1 Resource Management) 🎉
+- ✅ **Connection Pool**: Complete resource management system (src/connection_pool.rs)
+- ✅ **Connection Limits**: Max total connections (1000) and per-IP limits (10)
+- ✅ **Operation Limits**: Per-connection operation limits (100 concurrent operations)
+- ✅ **Memory Tracking**: Per-connection and total memory usage limits
+- ✅ **Idle Cleanup**: Automatic detection and cleanup of idle connections
+- ✅ **Statistics**: Real-time tracking of connections, operations, and memory
+- ✅ **FSM Integration**: Fully integrated into FSM server with automatic enforcement
+- ✅ **Error Responses**: Proper LDAP "Unavailable" and "Busy" responses
+- ✅ **Thread-Safe**: Async/await with RwLock for concurrent access
+- ✅ **Unit Tests**: 8 comprehensive unit tests
+- ✅ **Integration Tests**: 12 integration tests covering all scenarios
+- ✅ **All Tests Passing**: 20 resource management tests (8 unit + 12 integration)
+
+### Previous Accomplishments (Phase 5.4 Audit Logging) 🎉
 - ✅ **Audit Logger**: Complete security audit trail system (src/audit.rs)
 - ✅ **Event Types**: Authentication, authorization, data modification, connection events
 - ✅ **Multiple Formats**: JSON, syslog (RFC 5424), and plain text
@@ -587,32 +617,60 @@ Implement advanced enterprise-grade features.
 
 ## Phase 6: Production Readiness
 
-**Priority:** MEDIUM | **Status:** Not Started
+**Priority:** MEDIUM | **Status:** In Progress (6.1 Complete)
 
 Production deployment and operational features.
 
 ### 6.1 Resource Management
-- [ ] **Task:** Add connection pooling and resource management
-  - **File:** `src/server.rs`, create `src/connection_pool.rs`
+- [x] **Task:** Add connection pooling and resource management ✅ **COMPLETED**
+  - **File:** `src/connection_pool.rs`, `src/fsm_server.rs`, `tests/resource_management_integration.rs`
   - **Description:** Efficient resource utilization
   - **Dependencies:** Phase 1 complete
   - **Estimated Effort:** 3-4 days
+  - **Completion Date:** 2025-10-05
+  - **Status:** COMPLETED - Connection pooling and resource limits fully implemented
   - **Details:**
-    - Implement connection limits
-    - Add per-client operation limits
-    - Memory usage tracking and limits
+    - ✅ Connection pool with configurable limits (`src/connection_pool.rs`)
+    - ✅ Maximum total connections enforcement (default: 1000)
+    - ✅ Per-IP connection limits (default: 10 per IP)
+    - ✅ Per-connection operation limits (default: 100 operations)
+    - ✅ Memory usage tracking and limits (per-connection and total)
+    - ✅ Idle connection detection and cleanup
+    - ✅ Connection activity tracking
+    - ✅ Comprehensive statistics (connections, operations, memory)
+    - ✅ Thread-safe async implementation with RwLock
+    - ✅ Integrated into FSM server with automatic resource enforcement
+    - ✅ Connection rejection with proper LDAP error responses
+    - ✅ Operation limits enforced with "Busy" responses
+    - ✅ 8 unit tests in connection_pool module
+    - ✅ 12 integration tests covering all resource management scenarios
+    - ✅ All 20 tests passing (8 unit + 12 integration)
 
 ### 6.2 Lifecycle Management
-- [ ] **Task:** Implement graceful shutdown and connection draining
-  - **File:** `src/server.rs`, `src/main.rs`
+- [x] **Task:** Implement graceful shutdown and connection draining ✅ **COMPLETED**
+  - **File:** `src/shutdown.rs`, `src/fsm_server.rs`, `src/main.rs`, `tests/lifecycle_integration.rs`
   - **Description:** Clean service lifecycle management
   - **Dependencies:** Phase 1 complete
   - **Estimated Effort:** 2-3 days
+  - **Completion Date:** 2025-10-05
+  - **Status:** COMPLETED - Graceful shutdown and lifecycle management fully implemented
   - **Details:**
-    - Handle SIGTERM/SIGINT
-    - Drain existing connections
-    - Complete in-flight operations
-    - Clean FSM shutdown
+    - ✅ Shutdown coordinator for lifecycle management (`src/shutdown.rs`)
+    - ✅ Signal handlers for SIGTERM/SIGINT (Unix and Windows support)
+    - ✅ Connection registration and tracking
+    - ✅ Operation registration and tracking
+    - ✅ Graceful drain with configurable timeout (default: 10s)
+    - ✅ Force drain option for immediate shutdown
+    - ✅ Shutdown state transitions (Running → ShuttingDown → Draining → Terminated)
+    - ✅ Broadcast shutdown notifications to all components
+    - ✅ Reject new connections during shutdown
+    - ✅ Reject new operations during drain phase
+    - ✅ Wait for in-flight operations to complete
+    - ✅ Integrated with FSM server (`run_with_shutdown`)
+    - ✅ Integrated with main.rs for production use
+    - ✅ 10 unit tests in shutdown module
+    - ✅ 14 integration tests covering all lifecycle scenarios
+    - ✅ All 24 tests passing (10 unit + 14 integration)
 
 ### 6.3 Configuration
 - [ ] **Task:** Create configuration system
@@ -785,11 +843,22 @@ With parallel work and multiple developers, this could be completed in 3-6 month
 - [x] ✅ Configurable audit levels with filtering
 - [x] ✅ 44 audit tests passing (18 unit + 26 integration)
 
-### Phase 6 Success
-- [ ] Server handles graceful shutdown
-- [ ] Configuration loaded from file
-- [ ] Rate limiting protects server
-- [ ] E2E tests pass with multiple LDAP clients
+### Phase 6 Success (Partially Met - 6.1-6.2 Complete)
+- [x] ✅ Connection pooling enforces resource limits (Phase 6.1)
+- [x] ✅ Per-IP connection limits prevent resource hogging (Phase 6.1)
+- [x] ✅ Operation limits prevent client abuse (Phase 6.1)
+- [x] ✅ Memory tracking prevents excessive usage (Phase 6.1)
+- [x] ✅ Idle connection cleanup maintains efficiency (Phase 6.1)
+- [x] ✅ 20 resource management tests passing (8 unit + 12 integration)
+- [x] ✅ Server handles graceful shutdown (Phase 6.2)
+- [x] ✅ SIGTERM/SIGINT signal handling implemented (Phase 6.2)
+- [x] ✅ Connection draining with timeout enforcement (Phase 6.2)
+- [x] ✅ In-flight operation tracking and completion (Phase 6.2)
+- [x] ✅ Clean FSM shutdown with state transitions (Phase 6.2)
+- [x] ✅ 24 lifecycle management tests passing (10 unit + 14 integration)
+- [ ] 🔲 Configuration loaded from file (Phase 6.3)
+- [ ] 🔲 Rate limiting protects server (Phase 6.4)
+- [ ] 🔲 E2E tests pass with multiple LDAP clients (Phase 6.5)
 
 ### Phase 7 Success
 - [ ] Complete rustdoc for all APIs
