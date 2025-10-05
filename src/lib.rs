@@ -14,6 +14,7 @@ pub mod fsm_runtime;
 pub mod fsm_server;
 pub mod referral_fsm;
 pub mod referral;
+pub mod metrics;
 pub mod parser;
 pub mod replication_consumer_fsm;
 mod backend_txn_fsm;
