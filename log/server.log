@@ -2441,3 +2441,105 @@
 2025-10-04 19:45:46 | DEBUG | src/backend_lmdb.rs:481 — Password verification result: true
 2025-10-04 19:45:46 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:149 — Received unbind request
 2025-10-04 19:45:46 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:70 — Connection 127.0.0.1:63498 closed
+2025-10-06 00:06:04 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:56 — LDAP server listening on localhost:1389
+2025-10-06 00:06:24 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:315 — Received SIGINT signal
+2025-10-06 00:06:24 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:218 — Beginning connection drain
+2025-10-06 00:06:24 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:230 — All operations and connections completed
+2025-10-06 00:06:24 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:252 — Graceful drain completed successfully
+2025-10-06 00:06:24 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:271 — Shutdown complete
+2025-10-06 00:15:18 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:60 — LDAP server listening on localhost:1389
+2025-10-06 00:15:35 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:315 — Received SIGINT signal
+2025-10-06 00:15:35 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:218 — Beginning connection drain
+2025-10-06 00:15:35 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:230 — All operations and connections completed
+2025-10-06 00:15:35 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:252 — Graceful drain completed successfully
+2025-10-06 00:15:35 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:271 — Shutdown complete
+2025-10-06 00:15:35 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:80 — Server received shutdown signal, stopping accept loop
+2025-10-06 00:15:35 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:86 — Server stopped accepting new connections
+2025-10-06 00:17:17 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:60 — LDAP server listening on localhost:1389
+2025-10-06 00:18:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:315 — Received SIGINT signal
+2025-10-06 00:18:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:218 — Beginning connection drain
+2025-10-06 00:18:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:80 — Server received shutdown signal, stopping accept loop
+2025-10-06 00:18:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:230 — All operations and connections completed
+2025-10-06 00:18:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:252 — Graceful drain completed successfully
+2025-10-06 00:18:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:86 — Server stopped accepting new connections
+2025-10-06 00:18:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:271 — Shutdown complete
+2025-10-06 00:18:28 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:60 — LDAP server listening on localhost:1389
+2025-10-06 00:18:42 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:69 — Accepted connection from [::1]:54385
+2025-10-06 00:18:42 | DEBUG | src/backend_lmdb.rs:461 — Authentication attempt - DN: cn=manager,dc=example,dc=com, Normalized: cn=manager,dc=example,dc=com
+2025-10-06 00:18:42 | DEBUG | src/backend_lmdb.rs:472 — Found actual DN: cn=manager,dc=example,dc=com
+2025-10-06 00:18:42 | DEBUG | src/backend_lmdb.rs:478 — Found password hash for DN: cn=manager,dc=example,dc=com
+2025-10-06 00:18:42 | DEBUG | src/backend_lmdb.rs:481 — Password verification result: false
+2025-10-06 00:18:42 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:76 — Connection [::1]:54385 closed
+2025-10-06 00:26:36 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:60 — LDAP server listening on localhost:1389
+2025-10-06 00:26:46 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:69 — Accepted connection from [::1]:54548
+2025-10-06 00:26:46 | DEBUG | src/backend_lmdb.rs:461 — Authentication attempt - DN: cn=manager,dc=example,dc=com, Normalized: cn=manager,dc=example,dc=com
+2025-10-06 00:26:46 | DEBUG | src/backend_lmdb.rs:472 — Found actual DN: cn=manager,dc=example,dc=com
+2025-10-06 00:26:46 | DEBUG | src/backend_lmdb.rs:478 — Found password hash for DN: cn=manager,dc=example,dc=com
+2025-10-06 00:26:46 | DEBUG | src/backend_lmdb.rs:481 — Password verification result: false
+2025-10-06 00:26:46 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:76 — Connection [::1]:54548 closed
+2025-10-06 00:26:48 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:69 — Accepted connection from [::1]:54549
+2025-10-06 00:26:48 | DEBUG | src/backend_lmdb.rs:461 — Authentication attempt - DN: cn=manager,dc=example,dc=com, Normalized: cn=manager,dc=example,dc=com
+2025-10-06 00:26:48 | DEBUG | src/backend_lmdb.rs:472 — Found actual DN: cn=manager,dc=example,dc=com
+2025-10-06 00:26:48 | DEBUG | src/backend_lmdb.rs:478 — Found password hash for DN: cn=manager,dc=example,dc=com
+2025-10-06 00:26:48 | DEBUG | src/backend_lmdb.rs:481 — Password verification result: false
+2025-10-06 00:26:48 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:76 — Connection [::1]:54549 closed
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:315 — Received SIGINT signal
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:218 — Beginning connection drain
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:230 — All operations and connections completed
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:252 — Graceful drain completed successfully
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:271 — Shutdown complete
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:80 — Server received shutdown signal, stopping accept loop
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:86 — Server stopped accepting new connections
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:315 — Received SIGINT signal
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:80 — Server received shutdown signal, stopping accept loop
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:86 — Server stopped accepting new connections
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:218 — Beginning connection drain
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:230 — All operations and connections completed
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:252 — Graceful drain completed successfully
+2025-10-06 00:27:11 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:271 — Shutdown complete
+2025-10-06 00:27:20 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:60 — LDAP server listening on localhost:1389
+2025-10-06 00:27:24 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:69 — Accepted connection from [::1]:54565
+2025-10-06 00:27:24 | DEBUG | src/backend_lmdb.rs:494 — Authentication attempt - DN: cn=manager,dc=example,dc=com, Normalized: cn=manager,dc=example,dc=com
+2025-10-06 00:27:24 | DEBUG | src/backend_lmdb.rs:505 — Found actual DN: cn=manager,dc=example,dc=com
+2025-10-06 00:27:24 | DEBUG | src/backend_lmdb.rs:511 — Found password hash for DN: cn=manager,dc=example,dc=com
+2025-10-06 00:27:24 | DEBUG | src/backend_lmdb.rs:514 — Password verification result: true
+2025-10-06 00:27:24 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:76 — Connection [::1]:54565 closed
+2025-10-06 00:28:07 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:315 — Received SIGINT signal
+2025-10-06 00:28:07 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:218 — Beginning connection drain
+2025-10-06 00:28:07 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:80 — Server received shutdown signal, stopping accept loop
+2025-10-06 00:28:07 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:230 — All operations and connections completed
+2025-10-06 00:28:07 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:86 — Server stopped accepting new connections
+2025-10-06 00:28:07 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:252 — Graceful drain completed successfully
+2025-10-06 00:28:07 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:271 — Shutdown complete
+2025-10-06 00:29:07 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:60 — LDAP server listening on localhost:1389
+2025-10-06 00:29:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:69 — Accepted connection from [::1]:54601
+2025-10-06 00:29:14 | DEBUG | src/backend_lmdb.rs:494 — Authentication attempt - DN: cn=manager,dc=example,dc=com, Normalized: cn=manager,dc=example,dc=com
+2025-10-06 00:29:14 | DEBUG | src/backend_lmdb.rs:505 — Found actual DN: cn=manager,dc=example,dc=com
+2025-10-06 00:29:14 | DEBUG | src/backend_lmdb.rs:511 — Found password hash for DN: cn=manager,dc=example,dc=com
+2025-10-06 00:29:14 | DEBUG | src/backend_lmdb.rs:514 — Password verification result: true
+2025-10-06 00:29:14 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:76 — Connection [::1]:54601 closed
+2025-10-06 00:30:06 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:69 — Accepted connection from [::1]:54610
+2025-10-06 00:30:06 | DEBUG | src/backend_lmdb.rs:494 — Authentication attempt - DN: cn=manager,dc=example,dc=com, Normalized: cn=manager,dc=example,dc=com
+2025-10-06 00:30:06 | DEBUG | src/backend_lmdb.rs:505 — Found actual DN: cn=manager,dc=example,dc=com
+2025-10-06 00:30:06 | DEBUG | src/backend_lmdb.rs:511 — Found password hash for DN: cn=manager,dc=example,dc=com
+2025-10-06 00:30:06 | DEBUG | src/backend_lmdb.rs:514 — Password verification result: true
+2025-10-06 00:30:06 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:76 — Connection [::1]:54610 closed
+2025-10-06 00:30:25 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:69 — Accepted connection from [::1]:54627
+2025-10-06 00:30:25 | DEBUG | src/backend_lmdb.rs:494 — Authentication attempt - DN: cn=manager,dc=example,dc=com, Normalized: cn=manager,dc=example,dc=com
+2025-10-06 00:30:25 | DEBUG | src/backend_lmdb.rs:505 — Found actual DN: cn=manager,dc=example,dc=com
+2025-10-06 00:30:25 | DEBUG | src/backend_lmdb.rs:511 — Found password hash for DN: cn=manager,dc=example,dc=com
+2025-10-06 00:30:25 | DEBUG | src/backend_lmdb.rs:514 — Password verification result: true
+2025-10-06 00:30:25 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:76 — Connection [::1]:54627 closed
+2025-10-06 00:30:37 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:69 — Accepted connection from [::1]:54628
+2025-10-06 00:30:37 | DEBUG | src/backend_lmdb.rs:494 — Authentication attempt - DN: cn=manager,dc=example,dc=com, Normalized: cn=manager,dc=example,dc=com
+2025-10-06 00:30:37 | DEBUG | src/backend_lmdb.rs:505 — Found actual DN: cn=manager,dc=example,dc=com
+2025-10-06 00:30:37 | DEBUG | src/backend_lmdb.rs:511 — Found password hash for DN: cn=manager,dc=example,dc=com
+2025-10-06 00:30:37 | DEBUG | src/backend_lmdb.rs:514 — Password verification result: true
+2025-10-06 00:30:37 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:76 — Connection [::1]:54628 closed
+2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:315 — Received SIGINT signal
+2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:80 — Server received shutdown signal, stopping accept loop
+2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:86 — Server stopped accepting new connections
+2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:218 — Beginning connection drain
+2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:230 — All operations and connections completed
+2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:252 — Graceful drain completed successfully
+2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:271 — Shutdown complete

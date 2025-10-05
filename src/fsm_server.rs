@@ -34,6 +34,7 @@ use crate::backend::DirectoryBackend;
 use crate::connection_pool::{ConnectionPool, ResourceLimits};
 use crate::fsm_runtime::{ConnectionFsmSet, OperationFsm, OperationType};
 use crate::fsm::{StateMachine, BerDecoderEvent, ConnectionEvent, ConnectionFsm, BerDecoderFsm};
+use crate::rate_limit::{RateLimiter, RateLimitConfig};
 use crate::server::ServerError;
 use crate::shutdown::ShutdownCoordinator;
 
@@ -54,6 +55,12 @@ pub struct FsmServerConfig {
 
     /// Resource limits for connection pooling
     pub resource_limits: ResourceLimits,
+
+    /// Rate limiting configuration
+    pub rate_limit_config: RateLimitConfig,
+
+    /// Enable rate limiting
+    pub rate_limiting_enabled: bool,
 }
 
 impl Default for FsmServerConfig {
@@ -64,6 +71,8 @@ impl Default for FsmServerConfig {
             read_buffer_size: 4096,
             max_concurrent_operations: 100,
             resource_limits: ResourceLimits::default(),
+            rate_limit_config: RateLimitConfig::default(),
+            rate_limiting_enabled: true,
         }
     }
 }
@@ -107,6 +116,13 @@ pub async fn run_with_shutdown(
     // Create connection pool
     let pool = Arc::new(ConnectionPool::new(config.resource_limits.clone()));
 
+    // Create rate limiter
+    let rate_limiter = if config.rate_limiting_enabled {
+        Some(Arc::new(RateLimiter::new(config.rate_limit_config.clone())))
+    } else {
+        None
+    };
+
     // Create shutdown receiver if coordinator provided
     let mut shutdown_rx = shutdown.as_ref().map(|s| s.subscribe());
 
@@ -137,6 +153,32 @@ pub async fn run_with_shutdown(
             }
         }
     });
+
+    // Spawn rate limiter cleanup task
+    if let Some(ref limiter) = rate_limiter {
+        let limiter_clone = limiter.clone();
+        let cleanup_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(60)) => {
+                        limiter_clone.cleanup_expired_bans().await;
+                    }
+                    _ = async {
+                        if let Some(ref sd) = cleanup_shutdown {
+                            let mut rx = sd.subscribe();
+                            let _ = rx.recv().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        info!("Rate limiter cleanup task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -182,9 +224,10 @@ pub async fn run_with_shutdown(
                 let config = config.clone();
                 let pool_clone = pool.clone();
                 let shutdown_clone = shutdown.clone();
+                let rate_limiter_clone = rate_limiter.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(socket, backend, config, pool_clone.clone(), conn_id, shutdown_clone.clone()).await {
+                    if let Err(e) = handle_connection(socket, backend, config, pool_clone.clone(), conn_id, shutdown_clone.clone(), rate_limiter_clone).await {
                         error!("Connection error for {:?}: {}", client_addr, e);
                     }
                     // Release connection when done
@@ -261,7 +304,10 @@ async fn handle_connection(
     pool: Arc<ConnectionPool>,
     conn_id: u64,
     shutdown: Option<Arc<ShutdownCoordinator>>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 ) -> Result<(), ServerError> {
+    // Get client IP for rate limiting
+    let client_ip = socket.peer_addr().ok().map(|addr| addr.ip());
     // Create FSM set for this connection
     let mut fsm_set = ConnectionFsmSet::new(socket, backend.clone(), None);
 
@@ -343,6 +389,8 @@ async fn handle_connection(
                                     &config,
                                     &pool,
                                     conn_id,
+                                    &rate_limiter,
+                                    client_ip,
                                 ).await {
                                     error!("Failed to process LDAP message: {}", e);
                                     // Don't break, try to continue with next message
@@ -378,10 +426,36 @@ async fn process_ldap_message(
     config: &FsmServerConfig,
     pool: &Arc<ConnectionPool>,
     conn_id: u64,
+    rate_limiter: &Option<Arc<RateLimiter>>,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Result<(), String> {
     let message_id = message.message_id.0 as i32;
 
     debug!("Processing LDAP message ID {} type {:?}", message_id, message.protocol_op);
+
+    // Determine operation type for rate limiting
+    let operation_type = match &message.protocol_op {
+        ProtocolOp::BindRequest(_) => "bind",
+        ProtocolOp::SearchRequest(_) => "search",
+        ProtocolOp::ModifyRequest(_) => "modify",
+        ProtocolOp::AddRequest(_) => "add",
+        ProtocolOp::DelRequest(_) => "delete",
+        ProtocolOp::ModDnRequest(_) => "modifydn",
+        ProtocolOp::CompareRequest(_) => "compare",
+        ProtocolOp::ExtendedRequest(_) => "extended",
+        ProtocolOp::UnbindRequest => "unbind",
+        ProtocolOp::AbandonRequest(_) => "abandon",
+        _ => "unknown",
+    };
+
+    // Check rate limit if enabled
+    if let (Some(limiter), Some(ip)) = (rate_limiter, client_ip) {
+        if !limiter.check_rate_limit(ip, operation_type).await {
+            warn!("Rate limit exceeded for {} from {}", operation_type, ip);
+            // Send busy response
+            return send_rate_limit_exceeded(fsm_set, message_id).await;
+        }
+    }
 
     match message.protocol_op {
         ProtocolOp::BindRequest(bind_req) => {
@@ -658,6 +732,33 @@ async fn send_busy_response(
     Ok(())
 }
 
+/// Send rate limit exceeded response
+async fn send_rate_limit_exceeded(
+    fsm_set: &mut ConnectionFsmSet,
+    message_id: i32,
+) -> Result<(), String> {
+    use crate::parser::encode_result_response;
+    use crate::parser::ResponseOp;
+    use rasn_ldap::ResultCode;
+
+    // Send busy response (rate limit uses same code)
+    let response = encode_result_response(
+        message_id as u32,
+        ResponseOp::SearchDone, // Generic response type
+        ResultCode::Busy,
+        "",
+        "Rate limit exceeded - please slow down"
+    ).map_err(|e| format!("Encode error: {:?}", e))?;
+
+    let stream = fsm_set.connection_mut().stream_mut()
+        .ok_or("No active stream")?;
+
+    stream.write_all(&response).await
+        .map_err(|e| format!("Write error: {}", e))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,7 +790,7 @@ mod tests {
             let conn_id = pool.acquire_connection(client_addr).await.unwrap();
 
             // Should handle connection without panicking
-            let _ = handle_connection(socket, backend, config, pool.clone(), conn_id, None).await;
+            let _ = handle_connection(socket, backend, config, pool.clone(), conn_id, None, None).await;
             pool.release_connection(conn_id).await;
         });
 

@@ -1664,21 +1664,23 @@ mod tests {
         let backend = Box::new(MockWriteBackend::new());
         let schema_validator = Box::new(MockSchemaValidator::new());
         let aci_checker = Box::new(MockAciChecker::new());
-        
+
         let mut fsm = WriteFsmImpl::new(backend, schema_validator, aci_checker);
-        
+
         // Start write operation first
         let _result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
             dn: "cn=test,dc=example,dc=org".to_string(),
             entry: b"test entry".to_vec(),
         })).await.unwrap();
-        
+
         // Handle validation complete
         let result = fsm.handle_event(WriteEvent::ValidationComplete).await;
-        
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
-        assert_eq!(fsm.current_state(), &WriteState::CheckingSchema); // Default config has strict validation
+        // ValidationComplete performs schema validation synchronously and moves to CheckingAci
+        // (because default config has both strict_schema_validation and enable_aci_checks enabled)
+        assert_eq!(fsm.current_state(), &WriteState::CheckingAci);
     }
 
     #[tokio::test]

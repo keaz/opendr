@@ -4,8 +4,16 @@
 //! entries that both pass and fail schema validation.
 
 use ldap3::{LdapConnAsync, Mod, Scope, SearchEntry};
+use std::collections::HashSet;
 use std::error::Error;
 use tokio;
+
+/// Helper function to convert attribute list from Vec to HashSet format
+fn attrs<'a>(data: Vec<(&'a str, Vec<&'a str>)>) -> Vec<(&'a str, HashSet<&'a str>)> {
+    data.into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -34,7 +42,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     match ldap
-        .add("cn=John Doe,ou=People,dc=example,dc=com", valid_person)
+        .add("cn=John Doe,ou=People,dc=example,dc=com", attrs(valid_person))
         .await
     {
         Ok(result) => {
@@ -59,7 +67,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     match ldap
-        .add("cn=Jane Smith,ou=People,dc=example,dc=com", missing_sn)
+        .add("cn=Jane Smith,ou=People,dc=example,dc=com", attrs(missing_sn))
         .await
     {
         Ok(result) => {
@@ -87,7 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     match ldap
-        .add("cn=Missing CN,ou=People,dc=example,dc=com", missing_cn)
+        .add("cn=Missing CN,ou=People,dc=example,dc=com", attrs(missing_cn))
         .await
     {
         Ok(result) => {
@@ -115,7 +123,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     match ldap
-        .add("cn=Test User,ou=People,dc=example,dc=com", unknown_class)
+        .add("cn=Test User,ou=People,dc=example,dc=com", attrs(unknown_class))
         .await
     {
         Ok(result) => {
@@ -142,7 +150,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     match ldap
-        .add("cn=Abstract Only,ou=People,dc=example,dc=com", only_abstract)
+        .add("cn=Abstract Only,ou=People,dc=example,dc=com", attrs(only_abstract))
         .await
     {
         Ok(result) => {
@@ -173,7 +181,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     match ldap
-        .add("uid=ajohnson,ou=People,dc=example,dc=com", valid_inetorg)
+        .add("uid=ajohnson,ou=People,dc=example,dc=com", attrs(valid_inetorg))
         .await
     {
         Ok(result) => {
@@ -197,7 +205,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     match ldap
-        .add("ou=Engineering,dc=example,dc=com", valid_ou)
+        .add("ou=Engineering,dc=example,dc=com", attrs(valid_ou))
         .await
     {
         Ok(result) => {
@@ -222,7 +230,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     match ldap
-        .add("cn=Bob Brown,ou=People,dc=example,dc=com", unknown_attr)
+        .add("cn=Bob Brown,ou=People,dc=example,dc=com", attrs(unknown_attr))
         .await
     {
         Ok(result) => {

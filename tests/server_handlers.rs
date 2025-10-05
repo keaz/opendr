@@ -16,6 +16,7 @@ use mockall::mock;
 use opendr::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
 };
+use opendr::schema::LdapSchema;
 use opendr::server;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -399,8 +400,9 @@ async fn add_success_persists_entry() {
     };
 
     let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+    let schema = LdapSchema::default();
 
-    server::handle_add_request(&mut server_stream, &backend, 15, request)
+    server::handle_add_request(&mut server_stream, &backend, &schema, 15, request)
         .await
         .unwrap();
 
@@ -428,8 +430,9 @@ async fn add_existing_entry_returns_error() {
     };
 
     let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+    let schema = LdapSchema::default();
 
-    server::handle_add_request(&mut server_stream, &backend, 16, request)
+    server::handle_add_request(&mut server_stream, &backend, &schema, 16, request)
         .await
         .unwrap();
 

@@ -28,18 +28,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lmdb::{Database, Environment, Transaction, WriteFlags, Cursor};
-use ldap_parser::ldap::SearchScope;
-use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-use sha2::{Sha512, Digest};
 use base64::Engine;
+use ldap_parser::ldap::SearchScope;
+use lmdb::{Cursor, Database, Environment, Transaction, WriteFlags};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
+use tokio::sync::RwLock;
 
 // LMDB cursor operation constants
 const MDB_SET: u32 = 15;
 const MDB_NEXT_DUP: u32 = 18;
 
-use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation};
+use crate::backend::{
+    BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
+};
 
 /// Serialized entry structure for LMDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,13 +150,16 @@ impl LmdbBackend {
         let env = Arc::new(env);
 
         // Create databases
-        let entries_db = env.create_db(Some("entries"), lmdb::DatabaseFlags::empty())
+        let entries_db = env
+            .create_db(Some("entries"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create entries db: {}", e)))?;
 
-        let passwords_db = env.create_db(Some("passwords"), lmdb::DatabaseFlags::empty())
+        let passwords_db = env
+            .create_db(Some("passwords"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create passwords db: {}", e)))?;
 
-        let dn_index_db = env.create_db(Some("dn_index"), lmdb::DatabaseFlags::empty())
+        let dn_index_db = env
+            .create_db(Some("dn_index"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create dn_index db: {}", e)))?;
 
         // Create attribute index databases
@@ -163,8 +168,11 @@ impl LmdbBackend {
         for attr in &index_config.indexed_attributes {
             let db_name = format!("idx_{}", attr.to_lowercase());
             // Create without DUP_SORT to avoid complexity - store value:DN as key
-            let db = env.create_db(Some(&db_name), lmdb::DatabaseFlags::empty())
-                .map_err(|e| BackendError::Storage(format!("Failed to create index for {}: {}", attr, e)))?;
+            let db = env
+                .create_db(Some(&db_name), lmdb::DatabaseFlags::empty())
+                .map_err(|e| {
+                    BackendError::Storage(format!("Failed to create index for {}: {}", attr, e))
+                })?;
             attr_indexes.insert(attr.to_lowercase(), db);
         }
 
@@ -180,6 +188,50 @@ impl LmdbBackend {
         })
     }
 
+    /// Set a pre-hashed password for an entry (used during initialization)
+    ///
+    /// # Arguments
+    /// * `dn` - Distinguished name of the entry
+    /// * `hashed_password` - Pre-hashed password (e.g., {SSHA512}...)
+    ///
+    /// # Returns
+    /// * `Result<(), BackendError>` - Success or error
+    pub async fn set_prehashed_password(
+        &self,
+        dn: &str,
+        hashed_password: &str,
+    ) -> Result<(), BackendError> {
+        let _lock = self.write_lock.write().await;
+
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+
+        let normalized_dn = Self::normalize_dn(dn);
+
+        // Get actual DN from index
+        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
+            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        };
+
+        // Write the pre-hashed password directly
+        txn.put(
+            self.passwords_db,
+            &actual_dn.as_bytes(),
+            &hashed_password.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Normalize DN for case-insensitive comparison
     fn normalize_dn(dn: &str) -> String {
         dn.to_lowercase().trim().to_string()
@@ -187,7 +239,9 @@ impl LmdbBackend {
 
     /// Get entry by DN with read transaction (optimized for concurrency)
     fn get_entry_internal(&self, dn: &str) -> Result<Option<StoredEntry>, BackendError> {
-        let txn = self.env.begin_ro_txn()
+        let txn = self
+            .env
+            .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
         // Try normalized DN first for fast case-insensitive lookup
@@ -197,14 +251,20 @@ impl LmdbBackend {
         let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
             Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
             Err(lmdb::Error::NotFound) => return Ok(None),
-            Err(e) => return Err(BackendError::Storage(format!("DN index lookup failed: {}", e))),
+            Err(e) => {
+                return Err(BackendError::Storage(format!(
+                    "DN index lookup failed: {}",
+                    e
+                )))
+            }
         };
 
         // Get entry data
         match txn.get(self.entries_db, &actual_dn.as_bytes()) {
             Ok(bytes) => {
-                let entry: StoredEntry = bincode::deserialize(bytes)
-                    .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
+                let entry: StoredEntry = bincode::deserialize(bytes).map_err(|e| {
+                    BackendError::Storage(format!("Failed to deserialize entry: {}", e))
+                })?;
                 Ok(Some(entry))
             }
             Err(lmdb::Error::NotFound) => Ok(None),
@@ -213,23 +273,31 @@ impl LmdbBackend {
     }
 
     /// Search entries with scope filtering (optimized with cursor iteration)
-    fn search_entries_internal(&self, base_dn: &str, scope: SearchScope) -> Result<Vec<StoredEntry>, BackendError> {
-        let txn = self.env.begin_ro_txn()
+    fn search_entries_internal(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+    ) -> Result<Vec<StoredEntry>, BackendError> {
+        let txn = self
+            .env
+            .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
         let mut results = Vec::new();
         let base_components = Self::dn_components(base_dn);
 
         // Use cursor for efficient iteration
-        let mut cursor = txn.open_ro_cursor(self.entries_db)
+        let mut cursor = txn
+            .open_ro_cursor(self.entries_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
 
         for (key, value) in cursor.iter() {
             let dn = String::from_utf8_lossy(key).to_string();
 
             if Self::entry_in_scope(&dn, &base_components, scope) {
-                let entry: StoredEntry = bincode::deserialize(value)
-                    .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
+                let entry: StoredEntry = bincode::deserialize(value).map_err(|e| {
+                    BackendError::Storage(format!("Failed to deserialize entry: {}", e))
+                })?;
                 results.push(entry);
             }
         }
@@ -244,7 +312,9 @@ impl LmdbBackend {
         match scope {
             SearchScope(0) => {
                 // Base: exact match
-                components.iter().map(|c| c.to_lowercase())
+                components
+                    .iter()
+                    .map(|c| c.to_lowercase())
                     .eq(base_components.iter().map(|c| c.to_lowercase()))
             }
             SearchScope(1) => {
@@ -252,7 +322,9 @@ impl LmdbBackend {
                 if components.len() != base_components.len() + 1 {
                     return false;
                 }
-                components[1..].iter().map(|c| c.to_lowercase())
+                components[1..]
+                    .iter()
+                    .map(|c| c.to_lowercase())
                     .eq(base_components.iter().map(|c| c.to_lowercase()))
             }
             SearchScope(2) => {
@@ -261,7 +333,8 @@ impl LmdbBackend {
                     return false;
                 }
                 components[components.len() - base_components.len()..]
-                    .iter().map(|c| c.to_lowercase())
+                    .iter()
+                    .map(|c| c.to_lowercase())
                     .eq(base_components.iter().map(|c| c.to_lowercase()))
             }
             _ => false,
@@ -296,7 +369,10 @@ impl LmdbBackend {
         combined.extend_from_slice(&salt);
 
         // Encode to base64 with prefix
-        format!("{{SSHA512}}{}", base64::engine::general_purpose::STANDARD.encode(&combined))
+        format!(
+            "{{SSHA512}}{}",
+            base64::engine::general_purpose::STANDARD.encode(&combined)
+        )
     }
 
     /// Verify SSHA512 password hash
@@ -343,7 +419,9 @@ impl LmdbBackend {
         dn: &str,
         attributes: &HashMap<String, Vec<String>>,
     ) -> Result<(), BackendError> {
-        let indexes = self.attr_indexes.try_read()
+        let indexes = self
+            .attr_indexes
+            .try_read()
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
 
         for (attr_name, values) in attributes {
@@ -356,7 +434,12 @@ impl LmdbBackend {
                     let value_lower = value.to_lowercase();
                     let index_key = format!("{}:{}", value_lower, dn);
                     txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
-                        .map_err(|e| BackendError::Storage(format!("Failed to update index for {}:{}: {}", attr_name, value, e)))?;
+                        .map_err(|e| {
+                            BackendError::Storage(format!(
+                                "Failed to update index for {}:{}: {}",
+                                attr_name, value, e
+                            ))
+                        })?;
                 }
             }
         }
@@ -373,7 +456,9 @@ impl LmdbBackend {
         dn: &str,
         attributes: &HashMap<String, Vec<String>>,
     ) -> Result<(), BackendError> {
-        let indexes = self.attr_indexes.try_read()
+        let indexes = self
+            .attr_indexes
+            .try_read()
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
 
         for (attr_name, values) in attributes {
@@ -388,7 +473,10 @@ impl LmdbBackend {
                     txn.del(*index_db, &index_key.as_bytes(), None)
                         .or_else(|e| match e {
                             lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
-                            _ => Err(BackendError::Storage(format!("Failed to remove index for {}:{}: {}", attr_name, value, e)))
+                            _ => Err(BackendError::Storage(format!(
+                                "Failed to remove index for {}:{}: {}",
+                                attr_name, value, e
+                            ))),
                         })?;
                 }
             }
@@ -401,11 +489,17 @@ impl LmdbBackend {
     ///
     /// This method performs an indexed lookup for a specific attribute value.
     /// Returns a list of DNs that have the specified attribute value.
-    pub fn search_by_index(&self, attribute: &str, value: &str) -> Result<Vec<String>, BackendError> {
+    pub fn search_by_index(
+        &self,
+        attribute: &str,
+        value: &str,
+    ) -> Result<Vec<String>, BackendError> {
         let attr_lower = attribute.to_lowercase();
         let value_lower = value.to_lowercase();
 
-        let indexes = self.attr_indexes.try_read()
+        let indexes = self
+            .attr_indexes
+            .try_read()
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
 
         // Check if this attribute has an index
@@ -417,14 +511,17 @@ impl LmdbBackend {
             }
         };
 
-        let txn = self.env.begin_ro_txn()
+        let txn = self
+            .env
+            .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
         let mut results = Vec::new();
 
         // Use cursor to iterate over all DNs for this attribute value
         // Keys are "value:dn", so we need to find all keys starting with "value:"
-        let mut cursor = txn.open_ro_cursor(index_db)
+        let mut cursor = txn
+            .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
 
         let search_prefix = format!("{}:", value_lower);
@@ -446,7 +543,9 @@ impl LmdbBackend {
     /// Check if an attribute is indexed
     pub fn is_indexed(&self, attribute: &str) -> bool {
         let attr_lower = attribute.to_lowercase();
-        self.index_config.indexed_attributes.iter()
+        self.index_config
+            .indexed_attributes
+            .iter()
             .any(|a| a.to_lowercase() == attr_lower)
     }
 }
@@ -454,11 +553,17 @@ impl LmdbBackend {
 #[async_trait]
 impl DirectoryBackend for LmdbBackend {
     async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError> {
-        let txn = self.env.begin_ro_txn()
+        let txn = self
+            .env
+            .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
         let normalized_dn = Self::normalize_dn(dn);
-        log::debug!("Authentication attempt - DN: {}, Normalized: {}", dn, normalized_dn);
+        log::debug!(
+            "Authentication attempt - DN: {}, Normalized: {}",
+            dn,
+            normalized_dn
+        );
 
         // Get actual DN from index
         let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
@@ -466,7 +571,7 @@ impl DirectoryBackend for LmdbBackend {
             Err(lmdb::Error::NotFound) => {
                 log::warn!("DN not found in index: {}", normalized_dn);
                 return Ok(false);
-            },
+            }
             Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
         };
         log::debug!("Found actual DN: {}", actual_dn);
@@ -480,12 +585,15 @@ impl DirectoryBackend for LmdbBackend {
                 let result = Self::verify_ssha512(password, &stored_password_str);
                 log::debug!("Password verification result: {}", result);
                 Ok(result)
-            },
+            }
             Err(lmdb::Error::NotFound) => {
                 log::warn!("Password not found for DN: {}", actual_dn);
                 Ok(false)
-            },
-            Err(e) => Err(BackendError::Storage(format!("Password lookup failed: {}", e))),
+            }
+            Err(e) => Err(BackendError::Storage(format!(
+                "Password lookup failed: {}",
+                e
+            ))),
         }
     }
 
@@ -493,10 +601,16 @@ impl DirectoryBackend for LmdbBackend {
         Ok(self.get_entry_internal(dn)?.map(|e| e.to_directory_entry()))
     }
 
-    async fn add_entry(&self, entry: DirectoryEntry, password: Vec<u8>) -> Result<(), BackendError> {
+    async fn add_entry(
+        &self,
+        entry: DirectoryEntry,
+        password: Vec<u8>,
+    ) -> Result<(), BackendError> {
         let _lock = self.write_lock.write().await;
 
-        let mut txn = self.env.begin_rw_txn()
+        let mut txn = self
+            .env
+            .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
         let normalized_dn = Self::normalize_dn(&entry.dn);
@@ -523,19 +637,34 @@ impl DirectoryBackend for LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
 
         // Write entry
-        txn.put(self.entries_db, &entry.dn.as_bytes(), &entry_bytes, WriteFlags::empty())
-            .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+        txn.put(
+            self.entries_db,
+            &entry.dn.as_bytes(),
+            &entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
 
         // Hash and write password (if provided)
         if !password.is_empty() {
             let password_hash = Self::create_ssha512(&password);
-            txn.put(self.passwords_db, &entry.dn.as_bytes(), &password_hash.as_bytes(), WriteFlags::empty())
-                .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+            txn.put(
+                self.passwords_db,
+                &entry.dn.as_bytes(),
+                &password_hash.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
         }
 
         // Update DN index
-        txn.put(self.dn_index_db, &normalized_dn.as_bytes(), &entry.dn.as_bytes(), WriteFlags::empty())
-            .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
+        txn.put(
+            self.dn_index_db,
+            &normalized_dn.as_bytes(),
+            &entry.dn.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
 
         // Update attribute indexes
         self.update_attribute_indexes(&mut txn, &entry.dn, &stored_entry.attributes)?;
@@ -549,7 +678,9 @@ impl DirectoryBackend for LmdbBackend {
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
         let _lock = self.write_lock.write().await;
 
-        let mut txn = self.env.begin_rw_txn()
+        let mut txn = self
+            .env
+            .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
         let normalized_dn = Self::normalize_dn(dn);
@@ -562,7 +693,8 @@ impl DirectoryBackend for LmdbBackend {
         };
 
         // Get entry to remove from attribute indexes
-        let entry_bytes = txn.get(self.entries_db, &actual_dn.as_bytes())
+        let entry_bytes = txn
+            .get(self.entries_db, &actual_dn.as_bytes())
             .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
         let stored_entry: StoredEntry = bincode::deserialize(entry_bytes)
             .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
@@ -578,7 +710,9 @@ impl DirectoryBackend for LmdbBackend {
         txn.del(self.passwords_db, &actual_dn.as_bytes(), None)
             .or_else(|e| match e {
                 lmdb::Error::NotFound => Ok(()), // No password, that's fine
-                _ => Err(BackendError::Storage("Failed to delete password".to_string()))
+                _ => Err(BackendError::Storage(
+                    "Failed to delete password".to_string(),
+                )),
             })?;
 
         // Delete DN index
@@ -591,11 +725,14 @@ impl DirectoryBackend for LmdbBackend {
         Ok(())
     }
 
-    async fn modify_entry(&self, dn: &str, modifications: Vec<Modification>) -> Result<(), BackendError> {
+    async fn modify_entry(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+    ) -> Result<(), BackendError> {
         let _lock = self.write_lock.write().await;
 
-        let mut entry = self.get_entry_internal(dn)?
-            .ok_or(BackendError::NotFound)?;
+        let mut entry = self.get_entry_internal(dn)?.ok_or(BackendError::NotFound)?;
 
         // Save old attributes for index updates
         let old_attributes = entry.attributes.clone();
@@ -639,14 +776,21 @@ impl DirectoryBackend for LmdbBackend {
             .as_secs();
 
         // Write updated entry
-        let mut txn = self.env.begin_rw_txn()
+        let mut txn = self
+            .env
+            .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
         let entry_bytes = bincode::serialize(&entry)
             .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
 
-        txn.put(self.entries_db, &entry.dn.as_bytes(), &entry_bytes, WriteFlags::empty())
-            .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+        txn.put(
+            self.entries_db,
+            &entry.dn.as_bytes(),
+            &entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
 
         // Update attribute indexes
         // Remove old indexed values and add new ones
@@ -659,12 +803,18 @@ impl DirectoryBackend for LmdbBackend {
         Ok(())
     }
 
-    async fn compare_attribute(&self, dn: &str, attribute: &str, value: &str) -> Result<bool, BackendError> {
-        let entry = self.get_entry_internal(dn)?
-            .ok_or(BackendError::NotFound)?;
+    async fn compare_attribute(
+        &self,
+        dn: &str,
+        attribute: &str,
+        value: &str,
+    ) -> Result<bool, BackendError> {
+        let entry = self.get_entry_internal(dn)?.ok_or(BackendError::NotFound)?;
 
         let attribute = attribute.to_lowercase();
-        Ok(entry.attributes.get(&attribute)
+        Ok(entry
+            .attributes
+            .get(&attribute)
             .map(|values| values.iter().any(|v| v == value))
             .unwrap_or(false))
     }
@@ -680,8 +830,7 @@ impl DirectoryBackend for LmdbBackend {
 
         // This is a simplified implementation
         // Full implementation would handle subtree renames
-        let entry = self.get_entry_internal(dn)?
-            .ok_or(BackendError::NotFound)?;
+        let entry = self.get_entry_internal(dn)?.ok_or(BackendError::NotFound)?;
 
         // Compute new DN
         let new_dn = if let Some(superior) = new_superior {
@@ -699,10 +848,13 @@ impl DirectoryBackend for LmdbBackend {
 
         // Get password (in separate scope to drop txn)
         let password = {
-            let txn = self.env.begin_ro_txn()
+            let txn = self
+                .env
+                .begin_ro_txn()
                 .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
-            let pw = txn.get(self.passwords_db, &entry.dn.as_bytes())
+            let pw = txn
+                .get(self.passwords_db, &entry.dn.as_bytes())
                 .map(|p| p.to_vec())
                 .unwrap_or_default();
 
@@ -725,7 +877,9 @@ impl DirectoryBackend for LmdbBackend {
         if let Some((attr, val)) = new_rdn.split_once('=') {
             let attr_lower = attr.trim().to_lowercase();
             let val_str = val.trim().to_string();
-            new_entry.attributes.entry(attr_lower)
+            new_entry
+                .attributes
+                .entry(attr_lower)
                 .or_default()
                 .push(val_str);
         }
@@ -739,9 +893,16 @@ impl DirectoryBackend for LmdbBackend {
         Ok(())
     }
 
-    async fn search_entries(&self, base_dn: &str, scope: SearchScope) -> Result<Vec<DirectoryEntry>, BackendError> {
+    async fn search_entries(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
         let entries = self.search_entries_internal(base_dn, scope)?;
-        Ok(entries.into_iter().map(|e| e.to_directory_entry()).collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| e.to_directory_entry())
+            .collect())
     }
 }
 
@@ -766,9 +927,15 @@ mod tests {
         attributes.insert("cn".to_string(), vec!["test".to_string()]);
         let entry = DirectoryEntry::new("cn=test,dc=example,dc=org", attributes);
 
-        backend.add_entry(entry.clone(), b"password".to_vec()).await.unwrap();
+        backend
+            .add_entry(entry.clone(), b"password".to_vec())
+            .await
+            .unwrap();
 
-        let retrieved = backend.get_entry("cn=test,dc=example,dc=org").await.unwrap();
+        let retrieved = backend
+            .get_entry("cn=test,dc=example,dc=org")
+            .await
+            .unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().dn, "cn=test,dc=example,dc=org");
     }
@@ -782,10 +949,16 @@ mod tests {
         attributes.insert("cn".to_string(), vec!["test".to_string()]);
         let entry = DirectoryEntry::new("cn=test,dc=example,dc=org", attributes);
 
-        backend.add_entry(entry, b"password".to_vec()).await.unwrap();
+        backend
+            .add_entry(entry, b"password".to_vec())
+            .await
+            .unwrap();
 
         // Test case-insensitive lookup
-        let retrieved = backend.get_entry("CN=TEST,DC=EXAMPLE,DC=ORG").await.unwrap();
+        let retrieved = backend
+            .get_entry("CN=TEST,DC=EXAMPLE,DC=ORG")
+            .await
+            .unwrap();
         assert!(retrieved.is_some());
     }
 
@@ -800,8 +973,14 @@ mod tests {
 
         backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
 
-        assert!(backend.authenticate("cn=test,dc=example,dc=org", b"secret").await.unwrap());
-        assert!(!backend.authenticate("cn=test,dc=example,dc=org", b"wrong").await.unwrap());
+        assert!(backend
+            .authenticate("cn=test,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+        assert!(!backend
+            .authenticate("cn=test,dc=example,dc=org", b"wrong")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -858,7 +1037,10 @@ mod tests {
 
         // Add entry with multiple values for indexed attribute
         let mut attributes = HashMap::new();
-        attributes.insert("cn".to_string(), vec!["John Doe".to_string(), "J. Doe".to_string()]);
+        attributes.insert(
+            "cn".to_string(),
+            vec!["John Doe".to_string(), "J. Doe".to_string()],
+        );
         let entry = DirectoryEntry::new("uid=jdoe,dc=example,dc=org", attributes);
 
         backend.add_entry(entry, vec![]).await.unwrap();
@@ -901,7 +1083,8 @@ mod tests {
             let mut attributes = HashMap::new();
             attributes.insert("cn".to_string(), vec![format!("User {}", i)]);
             attributes.insert("ou".to_string(), vec!["Engineering".to_string()]);
-            let entry = DirectoryEntry::new(&format!("uid=user{},dc=example,dc=org", i), attributes);
+            let entry =
+                DirectoryEntry::new(&format!("uid=user{},dc=example,dc=org", i), attributes);
             backend.add_entry(entry, vec![]).await.unwrap();
         }
 
@@ -931,7 +1114,10 @@ mod tests {
             attribute: "cn".to_string(),
             values: vec!["New Name".to_string()],
         }];
-        backend.modify_entry("uid=test,dc=example,dc=org", modifications).await.unwrap();
+        backend
+            .modify_entry("uid=test,dc=example,dc=org", modifications)
+            .await
+            .unwrap();
 
         // Old value should not be in index
         let results = backend.search_by_index("cn", "Old Name").unwrap();
@@ -958,7 +1144,10 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         // Delete entry
-        backend.delete_entry("uid=test,dc=example,dc=org").await.unwrap();
+        backend
+            .delete_entry("uid=test,dc=example,dc=org")
+            .await
+            .unwrap();
 
         // Index should be removed
         let results = backend.search_by_index("cn", "Test User").unwrap();

@@ -202,12 +202,25 @@ impl AuthFsmImpl {
         self.state = AuthState::Authenticating { dn: dn.clone() };
         self.auth_start_time = Some(Instant::now());
         self.stats.current_auth_attempts += 1;
-        
-        // Validate DN format
+
+        // Validate DN format and perform authentication if backend is available
         if let Some(backend) = &self.backend {
             backend.validate_dn(&dn).map_err(|e| AuthError::DirectoryError { message: e })?;
+
+            // Perform authentication immediately
+            let authenticated = backend.authenticate(&dn, &password).await
+                .map_err(|e| AuthError::DirectoryError { message: e })?;
+
+            if authenticated {
+                // Authentication succeeded
+                return self.handle_auth_success().await;
+            } else {
+                // Authentication failed
+                return self.handle_auth_failure().await;
+            }
         }
-        
+
+        // No backend available - stay in Authenticating state
         Ok(None)
     }
     

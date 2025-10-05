@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use opendr::backend::{DirectoryBackend, DirectoryEntry};
 use opendr::backend_lmdb::LmdbBackend;
-use opendr::setup::{BackendType, SetupConfig};
+use opendr::setup::{BackendType, SetupConfig, ReplicationConfig};
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -285,6 +285,7 @@ async fn test_setup_config_with_lmdb_backend() {
         backend_type: BackendType::Lmdb,
         data_directory: temp_dir.path().to_path_buf(),
         import_sample_data: false,
+        replication: ReplicationConfig::default(),
     };
 
     // Create backend

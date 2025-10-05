@@ -1,0 +1,8 @@
+dn: cn=manager
+objectClass: person
+objectClass: organizationalPerson
+objectClass: inetOrgPerson
+cn: manager
+sn: Administrator
+userPassword: {SSHA512}J5WK692gKXYQUC0474/w1ihxHTWaIwTKMpKcEk9LNZ8Mu2GZ5Nt3uSB+JvjKastDkpKU2Jmz/uN4bqgfsSAZKRIo9AxuBVFpz/dy9YR4jC0=
+description: Root Administrator Account

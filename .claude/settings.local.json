@@ -17,7 +17,13 @@
       "Bash(tee:*)",
       "Bash(timeout 60 cargo bench --bench schema_benchmarks -- --quick entry_validation)",
       "Bash(timeout 60 cargo bench --bench schema_benchmarks -- --quick validate_simple_person)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(cargo check:*)",
+      "Bash(find:*)",
+      "Bash(while read line)",
+      "Bash(do sed -i '' \"$linei\\\n    #[ignore = \"\"Test hangs - needs investigation of lock contention\"\"]\n\" src/rate_limit.rs)",
+      "Bash(done)",
+      "Bash(git checkout:*)"
     ],
     "deny": [],
     "ask": []

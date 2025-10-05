@@ -51,7 +51,11 @@ impl From<EncodeError> for ServerError {
     }
 }
 
-pub async fn run(addr: &str, backend: Arc<dyn DirectoryBackend>) -> Result<(), ServerError> {
+pub async fn run(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAP server listening on {}", addr);
 
@@ -59,20 +63,35 @@ pub async fn run(addr: &str, backend: Arc<dyn DirectoryBackend>) -> Result<(), S
     let schema = Arc::new(LdapSchema::with_core_schema());
 
     loop {
-        let (socket, addr) = listener.accept().await?;
-        info!("Accepted connection from {:?}", addr);
+        tokio::select! {
+            result = listener.accept() => {
+                let (socket, addr) = result?;
+                info!("Accepted connection from {:?}", addr);
 
-        let backend = backend.clone();
-        let schema = schema.clone();
+                let backend = backend.clone();
+                let schema = schema.clone();
 
-        tokio::spawn(async move {
-            handle_client(socket, backend, schema).await;
-            info!("Connection {:?} closed", addr);
-        });
+                tokio::spawn(async move {
+                    handle_client(socket, backend, schema).await;
+                    info!("Connection {:?} closed", addr);
+                });
+            }
+            _ = shutdown_rx.recv() => {
+                info!("Server received shutdown signal, stopping accept loop");
+                break;
+            }
+        }
     }
+
+    info!("Server stopped accepting new connections");
+    Ok(())
 }
 
-pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBackend>, schema: Arc<LdapSchema>) {
+pub async fn handle_client(
+    mut socket: TcpStream,
+    backend: Arc<dyn DirectoryBackend>,
+    schema: Arc<LdapSchema>,
+) {
     let mut buffer = vec![0; 4096];
 
     loop {
@@ -83,8 +102,13 @@ pub async fn handle_client(mut socket: TcpStream, backend: Arc<dyn DirectoryBack
                 match parse_ldap_messages(payload) {
                     Ok((_, messages)) => {
                         for message in messages {
-                            if let Err(err) =
-                                process_message(&mut socket, backend.as_ref(), schema.as_ref(), message).await
+                            if let Err(err) = process_message(
+                                &mut socket,
+                                backend.as_ref(),
+                                schema.as_ref(),
+                                message,
+                            )
+                            .await
                             {
                                 error!("Failed to process message: {}", err);
                                 return;

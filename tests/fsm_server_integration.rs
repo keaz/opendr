@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opendr::backend::MockBackend;
+use opendr::connection_pool::ResourceLimits;
 use opendr::fsm_server::FsmServerConfig;
 use opendr::fsm_runtime::ConnectionFsmSet;
+use opendr::rate_limit::RateLimitConfig;
 use tokio::net::TcpStream;
 
 #[tokio::test]
@@ -29,6 +31,9 @@ async fn test_fsm_server_config_custom() {
         cleanup_interval: Duration::from_secs(30),
         read_buffer_size: 8192,
         max_concurrent_operations: 50,
+        resource_limits: ResourceLimits::default(),
+        rate_limit_config: RateLimitConfig::default(),
+        rate_limiting_enabled: true,
     };
 
     assert_eq!(custom_config.operation_timeout, Duration::from_secs(60));

@@ -1,20 +1,22 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
-use std::collections::HashMap;
-use std::path::Path;
 
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
-use opendr::setup::{SetupConfig, BackendType};
-use opendr::shutdown::{ShutdownCoordinator, ShutdownConfig};
+use opendr::config::ServerConfig;
 use opendr::server;
+use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     log4rs::init_file("config/log4rs.yml", Default::default()).unwrap();
 
     // Load configuration from server.toml
-    let config = load_config("config/server.toml").await?;
+    let config = ServerConfig::from_file("config/server.toml")?;
+
+    // Validate configuration
+    config.validate()?;
 
     // Create shutdown coordinator
     let shutdown_config = ShutdownConfig::default();
@@ -31,58 +33,66 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // Create backend based on configuration
-    let backend: Arc<dyn DirectoryBackend> = match config.backend_type {
-        BackendType::Lmdb => {
-            println!("Initializing LMDB backend at {:?}", config.data_directory);
+    let backend: Arc<dyn DirectoryBackend> =
+        match config.backend.backend_type.to_lowercase().as_str() {
+            "lmdb" => {
+                println!(
+                    "Initializing LMDB backend at {:?}",
+                    config.backend.data_directory
+                );
 
-            // Create LMDB backend with 1GB max size
-            let mut backend = LmdbBackend::new(&config.data_directory, 1024)?;
+                // Create LMDB backend with configured max size (convert to MB)
+                let max_size_mb = (config.backend.lmdb_max_size / (1024 * 1024)) as usize;
+                let mut backend = LmdbBackend::new(&config.backend.data_directory, max_size_mb)?;
 
-            // Initialize with base structure if needed
-            match backend.get_entry(&config.base_dn).await {
-                Ok(Some(_)) => {
-                    println!("Base DN exists, skipping initialization");
-                },
-                Ok(None) | Err(_) => {
-                    println!("Initializing base directory structure...");
-                    initialize_base_structure(&mut backend, &config).await?;
+                // Initialize with base structure if needed
+                match backend.get_entry(&config.server.base_dn).await {
+                    Ok(Some(_)) => {
+                        println!("Base DN exists, skipping initialization");
+                    }
+                    Ok(None) | Err(_) => {
+                        println!("Initializing base directory structure...");
+                        initialize_lmdb_base_structure(&mut backend, &config).await?;
+                    }
                 }
+
+                Arc::new(backend)
             }
+            "memory" => {
+                println!("Initializing in-memory backend (MockBackend)");
 
-            Arc::new(backend)
-        }
-        BackendType::InMemory => {
-            println!("Initializing in-memory backend (MockBackend)");
+                // Create mock backend with credentials from config
+                let mut backend = MockBackend::from_credentials([(
+                    &format!("{},{}", config.server.root_user_dn, config.server.base_dn),
+                    config.server.root_password.as_bytes().to_vec(),
+                )]);
 
-            // Create mock backend with credentials from config
-            let mut backend = MockBackend::from_credentials([(
-                &format!("{},{}", config.root_user_dn, config.base_dn),
-                config.root_password.as_bytes().to_vec(),
-            )]);
+                // Add base structure entries
+                initialize_base_structure(&mut backend, &config).await?;
 
-            // Add base structure entries
-            initialize_base_structure(&mut backend, &config).await?;
+                Arc::new(backend)
+            }
+            backend_type => {
+                return Err(format!("Unsupported backend type: {}", backend_type).into());
+            }
+        };
 
-            Arc::new(backend)
-        }
-        BackendType::Custom(ref name) => {
-            return Err(format!("Unsupported backend type: {}", name).into());
-        }
-    };
-
-    let bind_addr = format!("127.0.0.1:{}", config.ldap_port);
+    let bind_addr = config.ldap_bind_address();
     println!("Starting LDAP server on {}", bind_addr);
+
+    // Create a channel for server shutdown
+    let shutdown_rx = shutdown_clone.subscribe();
 
     // Run server with shutdown support
     let server_task = tokio::spawn(async move {
-        if let Err(e) = server::run(&bind_addr, backend).await {
+        if let Err(e) = server::run(&bind_addr, backend, shutdown_rx).await {
             eprintln!("Server error: {}", e);
         }
     });
 
     // Wait for shutdown signal
-    let mut shutdown_rx = shutdown_clone.subscribe();
-    let _ = shutdown_rx.recv().await;
+    let mut shutdown_signal_rx = shutdown_clone.subscribe();
+    let _ = shutdown_signal_rx.recv().await;
 
     println!("Shutting down server...");
 
@@ -99,68 +109,212 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Load configuration from TOML file
-async fn load_config(path: impl AsRef<Path>) -> Result<SetupConfig, Box<dyn Error>> {
-    let content = tokio::fs::read_to_string(path).await?;
-    let config: SetupConfig = toml::from_str(&content)?;
-    Ok(config)
-}
-
 /// Initialize base directory structure
 async fn initialize_base_structure(
     backend: &mut dyn DirectoryBackend,
-    config: &SetupConfig,
+    config: &ServerConfig,
 ) -> Result<(), Box<dyn Error>> {
     // Add root DN entry
     let base_dn_entry = DirectoryEntry::new(
-        &config.base_dn,
+        &config.server.base_dn,
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]),
-            ("o".to_string(), vec![config.organization_name.clone()]),
-            ("description".to_string(), vec![config.organization_name.clone()]),
-        ])
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organization".to_string()],
+            ),
+            (
+                "o".to_string(),
+                vec![config.server.organization_name.clone()],
+            ),
+            (
+                "description".to_string(),
+                vec![config.server.organization_name.clone()],
+            ),
+        ]),
     );
     backend.add_entry(base_dn_entry, vec![]).await?;
 
     // Add root user entry with password
     let root_user_entry = DirectoryEntry::new(
-        &format!("{},{}", config.root_user_dn, config.base_dn),
+        &format!("{},{}", config.server.root_user_dn, config.server.base_dn),
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
-            ("cn".to_string(), vec![config.root_user_dn.split('=').nth(1).unwrap_or("manager").to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            (
+                "cn".to_string(),
+                vec![config
+                    .server
+                    .root_user_dn
+                    .split('=')
+                    .nth(1)
+                    .unwrap_or("manager")
+                    .to_string()],
+            ),
             ("sn".to_string(), vec!["Manager".to_string()]),
-        ])
+        ]),
     );
-    backend.add_entry(root_user_entry, config.root_password.as_bytes().to_vec()).await?;
+    backend
+        .add_entry(
+            root_user_entry,
+            config.server.root_password.as_bytes().to_vec(),
+        )
+        .await?;
 
     // Add organizational units
     let people_ou_entry = DirectoryEntry::new(
-        &format!("ou=People,{}", config.base_dn),
+        &format!("ou=People,{}", config.server.base_dn),
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organizationalUnit".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
             ("ou".to_string(), vec!["People".to_string()]),
-            ("description".to_string(), vec!["People container".to_string()]),
-        ])
+            (
+                "description".to_string(),
+                vec!["People container".to_string()],
+            ),
+        ]),
     );
     backend.add_entry(people_ou_entry, vec![]).await?;
 
     let groups_ou_entry = DirectoryEntry::new(
-        &format!("ou=Groups,{}", config.base_dn),
+        &format!("ou=Groups,{}", config.server.base_dn),
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organizationalUnit".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
             ("ou".to_string(), vec!["Groups".to_string()]),
-            ("description".to_string(), vec!["Groups container".to_string()]),
-        ])
+            (
+                "description".to_string(),
+                vec!["Groups container".to_string()],
+            ),
+        ]),
     );
     backend.add_entry(groups_ou_entry, vec![]).await?;
 
     let apps_ou_entry = DirectoryEntry::new(
-        &format!("ou=Applications,{}", config.base_dn),
+        &format!("ou=Applications,{}", config.server.base_dn),
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organizationalUnit".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
             ("ou".to_string(), vec!["Applications".to_string()]),
-            ("description".to_string(), vec!["Applications container".to_string()]),
-        ])
+            (
+                "description".to_string(),
+                vec!["Applications container".to_string()],
+            ),
+        ]),
+    );
+    backend.add_entry(apps_ou_entry, vec![]).await?;
+
+    println!("Base directory structure initialized");
+    Ok(())
+}
+
+/// Initialize base directory structure for LMDB backend
+async fn initialize_lmdb_base_structure(
+    backend: &mut LmdbBackend,
+    config: &ServerConfig,
+) -> Result<(), Box<dyn Error>> {
+    // Add root DN entry
+    let base_dn_entry = DirectoryEntry::new(
+        &config.server.base_dn,
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organization".to_string()],
+            ),
+            (
+                "o".to_string(),
+                vec![config.server.organization_name.clone()],
+            ),
+            (
+                "description".to_string(),
+                vec![config.server.organization_name.clone()],
+            ),
+        ]),
+    );
+    backend.add_entry(base_dn_entry, vec![]).await?;
+
+    // Add root user entry (without password initially)
+    let root_dn = format!("{},{}", config.server.root_user_dn, config.server.base_dn);
+    let root_user_entry = DirectoryEntry::new(
+        &root_dn,
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            (
+                "cn".to_string(),
+                vec![config
+                    .server
+                    .root_user_dn
+                    .split('=')
+                    .nth(1)
+                    .unwrap_or("manager")
+                    .to_string()],
+            ),
+            ("sn".to_string(), vec!["Manager".to_string()]),
+        ]),
+    );
+    backend.add_entry(root_user_entry, vec![]).await?;
+
+    // Set the pre-hashed password from config
+    backend
+        .set_prehashed_password(&root_dn, &config.server.root_password)
+        .await?;
+
+    // Add organizational units
+    let people_ou_entry = DirectoryEntry::new(
+        &format!("ou=People,{}", config.server.base_dn),
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
+            ("ou".to_string(), vec!["People".to_string()]),
+            (
+                "description".to_string(),
+                vec!["People container".to_string()],
+            ),
+        ]),
+    );
+    backend.add_entry(people_ou_entry, vec![]).await?;
+
+    let groups_ou_entry = DirectoryEntry::new(
+        &format!("ou=Groups,{}", config.server.base_dn),
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
+            ("ou".to_string(), vec!["Groups".to_string()]),
+            (
+                "description".to_string(),
+                vec!["Groups container".to_string()],
+            ),
+        ]),
+    );
+    backend.add_entry(groups_ou_entry, vec![]).await?;
+
+    let apps_ou_entry = DirectoryEntry::new(
+        &format!("ou=Applications,{}", config.server.base_dn),
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
+            ("ou".to_string(), vec!["Applications".to_string()]),
+            (
+                "description".to_string(),
+                vec!["Applications container".to_string()],
+            ),
+        ]),
     );
     backend.add_entry(apps_ou_entry, vec![]).await?;
 
@@ -174,115 +328,118 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_load_config_from_file() {
-        // Create a temporary config file
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("test_server.toml");
-
-        let config_content = r#"
-            base_dn = "dc=test,dc=com"
-            root_user_dn = "cn=admin"
-            root_password = "TestPassword123"
-            ldap_port = 3389
-            ldaps_port = 3636
-            hostname = "testhost"
-            organization_name = "Test Org"
-            backend_type = "Lmdb"
-            data_directory = "./test_data"
-            import_sample_data = true
-        "#;
-
-        tokio::fs::write(&config_path, config_content).await.unwrap();
-
-        // Load the configuration
-        let config = load_config(&config_path).await.unwrap();
-
-        // Verify configuration values
-        assert_eq!(config.base_dn, "dc=test,dc=com");
-        assert_eq!(config.root_user_dn, "cn=admin");
-        assert_eq!(config.root_password, "TestPassword123");
-        assert_eq!(config.ldap_port, 3389);
-        assert_eq!(config.ldaps_port, 3636);
-        assert_eq!(config.hostname, "testhost");
-        assert_eq!(config.organization_name, "Test Org");
-        assert_eq!(config.backend_type, BackendType::Lmdb);
-        assert_eq!(config.import_sample_data, true);
-    }
-
-    #[tokio::test]
     async fn test_initialize_base_structure_inmemory() {
-        let config = SetupConfig {
-            base_dn: "dc=example,dc=org".to_string(),
-            root_user_dn: "cn=manager".to_string(),
-            root_password: "secret".to_string(),
-            ldap_port: 1389,
-            ldaps_port: 1636,
-            hostname: "localhost".to_string(),
-            organization_name: "Example Org".to_string(),
-            backend_type: BackendType::InMemory,
-            data_directory: "./data".into(),
-            import_sample_data: false,
-        };
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.server.root_user_dn = "cn=manager".to_string();
+        config.server.root_password = "secret".to_string();
+        config.server.organization_name = "Example Org".to_string();
+        config.backend.backend_type = "memory".to_string();
 
         let mut backend = MockBackend::new();
-        initialize_base_structure(&mut backend, &config).await.unwrap();
+        initialize_base_structure(&mut backend, &config)
+            .await
+            .unwrap();
 
         // Verify base DN entry was created
-        let base_entry = backend.get_entry("dc=example,dc=org").await.unwrap().unwrap();
+        let base_entry = backend
+            .get_entry("dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
         // Attributes are normalized to lowercase
         assert!(base_entry.attributes.contains_key("objectclass"));
         assert_eq!(base_entry.attributes["o"][0], "Example Org");
 
         // Verify root user entry was created
-        let root_entry = backend.get_entry("cn=manager,dc=example,dc=org").await.unwrap().unwrap();
+        let root_entry = backend
+            .get_entry("cn=manager,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(root_entry.attributes.contains_key("cn"));
 
         // Verify organizational units were created
-        assert!(backend.get_entry("ou=People,dc=example,dc=org").await.is_ok());
-        assert!(backend.get_entry("ou=Groups,dc=example,dc=org").await.is_ok());
-        assert!(backend.get_entry("ou=Applications,dc=example,dc=org").await.is_ok());
+        assert!(backend
+            .get_entry("ou=People,dc=example,dc=org")
+            .await
+            .is_ok());
+        assert!(backend
+            .get_entry("ou=Groups,dc=example,dc=org")
+            .await
+            .is_ok());
+        assert!(backend
+            .get_entry("ou=Applications,dc=example,dc=org")
+            .await
+            .is_ok());
 
         // Verify authentication works with root user
-        assert!(backend.authenticate("cn=manager,dc=example,dc=org", b"secret").await.unwrap());
-        assert!(!backend.authenticate("cn=manager,dc=example,dc=org", b"wrong").await.unwrap());
+        assert!(backend
+            .authenticate("cn=manager,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+        assert!(!backend
+            .authenticate("cn=manager,dc=example,dc=org", b"wrong")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
     async fn test_initialize_base_structure_lmdb() {
         let temp_dir = TempDir::new().unwrap();
-        let config = SetupConfig {
-            base_dn: "dc=test,dc=local".to_string(),
-            root_user_dn: "cn=admin".to_string(),
-            root_password: "AdminPass123".to_string(),
-            ldap_port: 1389,
-            ldaps_port: 1636,
-            hostname: "localhost".to_string(),
-            organization_name: "Test Org".to_string(),
-            backend_type: BackendType::Lmdb,
-            data_directory: temp_dir.path().to_path_buf(),
-            import_sample_data: false,
-        };
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=test,dc=local".to_string();
+        config.server.root_user_dn = "cn=admin".to_string();
+        config.server.root_password = "AdminPass123".to_string();
+        config.server.organization_name = "Test Org".to_string();
+        config.backend.backend_type = "lmdb".to_string();
+        config.backend.data_directory = temp_dir.path().to_path_buf();
 
         let mut backend = LmdbBackend::new(temp_dir.path(), 100).unwrap();
-        initialize_base_structure(&mut backend, &config).await.unwrap();
+        initialize_base_structure(&mut backend, &config)
+            .await
+            .unwrap();
 
         // Verify base DN entry was created
-        let base_entry = backend.get_entry("dc=test,dc=local").await.unwrap().unwrap();
+        let base_entry = backend
+            .get_entry("dc=test,dc=local")
+            .await
+            .unwrap()
+            .unwrap();
         // Attributes are normalized to lowercase
         assert!(base_entry.attributes.contains_key("objectclass"));
         assert_eq!(base_entry.attributes["o"][0], "Test Org");
 
         // Verify root user entry was created
-        let root_entry = backend.get_entry("cn=admin,dc=test,dc=local").await.unwrap().unwrap();
+        let root_entry = backend
+            .get_entry("cn=admin,dc=test,dc=local")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(root_entry.attributes.contains_key("cn"));
 
         // Verify organizational units were created
-        assert!(backend.get_entry("ou=People,dc=test,dc=local").await.is_ok());
-        assert!(backend.get_entry("ou=Groups,dc=test,dc=local").await.is_ok());
-        assert!(backend.get_entry("ou=Applications,dc=test,dc=local").await.is_ok());
+        assert!(backend
+            .get_entry("ou=People,dc=test,dc=local")
+            .await
+            .is_ok());
+        assert!(backend
+            .get_entry("ou=Groups,dc=test,dc=local")
+            .await
+            .is_ok());
+        assert!(backend
+            .get_entry("ou=Applications,dc=test,dc=local")
+            .await
+            .is_ok());
 
         // Verify authentication works with root user
-        assert!(backend.authenticate("cn=admin,dc=test,dc=local", b"AdminPass123").await.unwrap());
-        assert!(!backend.authenticate("cn=admin,dc=test,dc=local", b"wrong").await.unwrap());
+        assert!(backend
+            .authenticate("cn=admin,dc=test,dc=local", b"AdminPass123")
+            .await
+            .unwrap());
+        assert!(!backend
+            .authenticate("cn=admin,dc=test,dc=local", b"wrong")
+            .await
+            .unwrap());
     }
 }

@@ -100,8 +100,8 @@ pub struct BerDecoderConfig {
 impl Default for BerDecoderConfig {
     fn default() -> Self {
         Self {
-            max_message_size: 64 * 1024, // 64KB default
-            max_buffer_size: 128 * 1024, // 128KB buffer
+            max_message_size: 10 * 1024 * 1024, // 10MB default
+            max_buffer_size: 1024 * 1024, // 1MB buffer
             message_timeout: Some(Duration::from_secs(30)),
             strict_validation: true,
         }
