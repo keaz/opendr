@@ -34,6 +34,14 @@ The monitoring system is designed for:
 
 ## Quick Start
 
+> **🚀 Live Demo Available!**
+>
+> Run the comprehensive monitoring demo to see all features in action:
+> ```bash
+> cargo run --example monitoring_demo
+> ```
+> See [MONITORING_DEMO_RESULTS.md](../examples/MONITORING_DEMO_RESULTS.md) for detailed verification results.
+
 ### Basic Usage
 
 ```rust
