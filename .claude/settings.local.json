@@ -14,7 +14,10 @@
       "Bash(ldapsearch:*)",
       "Bash(./scripts/test_schema_validation.sh:*)",
       "Read(//private/tmp/**)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "Bash(timeout 60 cargo bench --bench schema_benchmarks -- --quick entry_validation)",
+      "Bash(timeout 60 cargo bench --bench schema_benchmarks -- --quick validate_simple_person)",
+      "Bash(grep:*)"
     ],
     "deny": [],
     "ask": []

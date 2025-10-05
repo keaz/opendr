@@ -33,6 +33,8 @@ base64 = "0.22"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
+url = "2.5"
+socket2 = "0.5"
 
 [dev-dependencies]
 mockall = "0.12.1"
@@ -46,3 +48,15 @@ harness = false
 [[bin]]
 name = "opendr-setup"
 path = "src/bin/setup.rs"
+
+[[bench]]
+name = "fsm_benchmarks"
+harness = false
+
+[[bench]]
+name = "schema_benchmarks"
+harness = false
+
+[[bench]]
+name = "server_benchmarks"
+harness = false
