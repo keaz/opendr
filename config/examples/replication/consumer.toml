@@ -11,7 +11,7 @@ bind_address_ldaps = "0.0.0.0:636"
 # Directory structure (must match provider)
 base_dn = "dc=example,dc=com"
 admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "CHANGE_THIS_PASSWORD"  # Local admin password
+admin_password = "CHANGE_THIS_PASSWORD" # Local admin password
 
 # Server identification
 server_id = "consumer-01"
@@ -21,11 +21,19 @@ server_name = "Consumer LDAP Server"
 # Storage backend configuration
 backend_type = "Lmdb"
 lmdb_path = "/var/lib/opendr/consumer/data"
-lmdb_map_size = 10737418240  # 10GB
+lmdb_map_size = 10737418240                 # 10GB
 max_readers = 126
 
 # Indexed attributes (should match provider)
-indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou", "sn", "givenName"]
+indexed_attributes = [
+    "cn",
+    "uid",
+    "mail",
+    "objectClass",
+    "ou",
+    "sn",
+    "givenName",
+]
 
 [replication]
 # Enable replication
@@ -35,17 +43,17 @@ enabled = true
 mode = "consumer"
 
 # Provider connection settings
-provider_url = "ldap://provider.example.com:389"  # Provider server URL
+provider_url = "ldap://provider.example.com:389" # Provider server URL
 # provider_url = "ldaps://provider.example.com:636"  # For TLS
 
 # Authentication credentials for provider connection
 replication_bind_dn = "cn=replication,dc=example,dc=com"
-replication_bind_password = "CHANGE_THIS_PASSWORD"  # Replication user password
+replication_bind_password = "CHANGE_THIS_PASSWORD"       # Replication user password
 
 # Synchronization settings
-sync_interval_secs = 30      # How often to check for updates
-max_batch_size = 100         # Maximum entries per batch
-provider_timeout = 30        # Timeout for provider requests (seconds)
+sync_interval_secs = 30 # How often to check for updates
+max_batch_size = 100    # Maximum entries per batch
+provider_timeout = 30   # Timeout for provider requests (seconds)
 
 # State persistence
 state_storage_path = "/var/lib/opendr/consumer/replication_state"
@@ -53,7 +61,7 @@ state_persistence_timeout_secs = 10
 
 # Change listening (real-time updates)
 listen_for_changes = true
-listen_timeout_secs = 300    # 5 minutes before reconnect
+listen_timeout_secs = 300 # 5 minutes before reconnect
 
 # Retry settings
 max_retry_attempts = 5
@@ -92,7 +100,7 @@ adaptive_enabled = true
 [monitoring]
 # Metrics and monitoring
 enabled = true
-prometheus_port = 9091  # Different port from provider
+prometheus_port = 9091   # Different port from provider
 health_check_port = 8081
 
 # Consumer-specific metrics

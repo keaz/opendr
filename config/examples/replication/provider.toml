@@ -11,7 +11,7 @@ bind_address_ldaps = "0.0.0.0:636"
 # Directory structure
 base_dn = "dc=example,dc=com"
 admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "CHANGE_THIS_PASSWORD"  # Use strong password in production
+admin_password = "CHANGE_THIS_PASSWORD" # Use strong password in production
 
 # Server identification
 server_id = "provider-01"
@@ -21,11 +21,19 @@ server_name = "Provider LDAP Server"
 # Storage backend configuration
 backend_type = "Lmdb"
 lmdb_path = "/var/lib/opendr/provider/data"
-lmdb_map_size = 10737418240  # 10GB
+lmdb_map_size = 10737418240                 # 10GB
 max_readers = 126
 
 # Indexed attributes for fast searches
-indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou", "sn", "givenName"]
+indexed_attributes = [
+    "cn",
+    "uid",
+    "mail",
+    "objectClass",
+    "ou",
+    "sn",
+    "givenName",
+]
 
 [replication]
 # Enable replication
@@ -35,7 +43,7 @@ enabled = true
 mode = "provider"
 
 # Changelog settings
-changelog_capacity = 100000  # Maximum changelog entries in memory
+changelog_capacity = 100000 # Maximum changelog entries in memory
 max_batch_size = 100        # Maximum entries per sync batch
 provider_timeout = 30       # Timeout for consumer operations (seconds)
 
@@ -62,7 +70,7 @@ max_version = "TLS13"
 [resources]
 # Resource limits
 max_connections = 1000
-max_connections_per_ip = 50  # Higher for consumers
+max_connections_per_ip = 50         # Higher for consumers
 max_operations_per_connection = 200
 max_memory_per_connection_mb = 10
 max_total_memory_mb = 2048
@@ -76,7 +84,7 @@ per_client_requests_per_second = 1000
 adaptive_enabled = true
 
 # Whitelist replication consumers
-whitelist = ["10.0.1.0/24"]  # Consumer subnet
+whitelist = ["10.0.1.0/24"] # Consumer subnet
 
 [monitoring]
 # Metrics and monitoring

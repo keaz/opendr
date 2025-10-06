@@ -19,18 +19,26 @@ admin_dn = "cn=admin,dc=example,dc=com"
 admin_password = "CHANGE_THIS_PASSWORD"
 
 # Server identification (unique for each master)
-server_id = "master-a"  # Change to "master-b" on other server
+server_id = "master-a"                     # Change to "master-b" on other server
 server_name = "Multi-Master LDAP Server A"
 
 [backend]
 # Storage backend configuration
 backend_type = "Lmdb"
 lmdb_path = "/var/lib/opendr/master-a/data"
-lmdb_map_size = 10737418240  # 10GB
+lmdb_map_size = 10737418240                 # 10GB
 max_readers = 126
 
 # Indexed attributes
-indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou", "sn", "givenName"]
+indexed_attributes = [
+    "cn",
+    "uid",
+    "mail",
+    "objectClass",
+    "ou",
+    "sn",
+    "givenName",
+]
 
 [replication]
 # Enable replication
@@ -44,7 +52,7 @@ changelog_capacity = 100000
 max_batch_size = 100
 
 # Consumer settings (for receiving changes from other master)
-provider_url = "ldap://master-b.example.com:389"  # URL of other master
+provider_url = "ldap://master-b.example.com:389" # URL of other master
 # provider_url = "ldaps://master-b.example.com:636"  # For TLS
 
 # Authentication for connecting to other master
@@ -52,8 +60,8 @@ replication_bind_dn = "cn=replication,dc=example,dc=com"
 replication_bind_password = "CHANGE_THIS_PASSWORD"
 
 # Synchronization settings
-sync_interval_secs = 10      # Faster sync for multi-master (10s)
-provider_timeout = 30        # Timeout for provider requests (seconds)
+sync_interval_secs = 10 # Faster sync for multi-master (10s)
+provider_timeout = 30   # Timeout for provider requests (seconds)
 max_retry_attempts = 5
 retry_backoff_secs = 5
 
@@ -101,7 +109,7 @@ per_client_requests_per_second = 1000
 adaptive_enabled = true
 
 # Whitelist other master
-whitelist = ["10.0.1.0/24"]  # Other master's IP range
+whitelist = ["10.0.1.0/24"] # Other master's IP range
 
 [monitoring]
 # Metrics and monitoring
