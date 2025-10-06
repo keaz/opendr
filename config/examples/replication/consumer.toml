@@ -1,0 +1,123 @@
+# OpenDR Consumer Server Configuration Example
+#
+# This configuration sets up OpenDR as a replication consumer (replica).
+# The consumer synchronizes data from a provider server.
+
+[server]
+# Network binding
+bind_address = "0.0.0.0:389"
+bind_address_ldaps = "0.0.0.0:636"
+
+# Directory structure (must match provider)
+base_dn = "dc=example,dc=com"
+admin_dn = "cn=admin,dc=example,dc=com"
+admin_password = "CHANGE_THIS_PASSWORD"  # Local admin password
+
+# Server identification
+server_id = "consumer-01"
+server_name = "Consumer LDAP Server"
+
+[backend]
+# Storage backend configuration
+backend_type = "Lmdb"
+lmdb_path = "/var/lib/opendr/consumer/data"
+lmdb_map_size = 10737418240  # 10GB
+max_readers = 126
+
+# Indexed attributes (should match provider)
+indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou", "sn", "givenName"]
+
+[replication]
+# Enable replication
+enabled = true
+
+# Server role: "consumer" (replica) receives changes from provider
+mode = "consumer"
+
+# Provider connection settings
+provider_url = "ldap://provider.example.com:389"  # Provider server URL
+# provider_url = "ldaps://provider.example.com:636"  # For TLS
+
+# Authentication credentials for provider connection
+replication_bind_dn = "cn=replication,dc=example,dc=com"
+replication_bind_password = "CHANGE_THIS_PASSWORD"  # Replication user password
+
+# Synchronization settings
+sync_interval_secs = 30      # How often to check for updates
+max_batch_size = 100         # Maximum entries per batch
+provider_timeout = 30        # Timeout for provider requests (seconds)
+
+# State persistence
+state_storage_path = "/var/lib/opendr/consumer/replication_state"
+state_persistence_timeout_secs = 10
+
+# Change listening (real-time updates)
+listen_for_changes = true
+listen_timeout_secs = 300    # 5 minutes before reconnect
+
+# Retry settings
+max_retry_attempts = 5
+retry_backoff_secs = 10
+
+[tls]
+# TLS/SSL configuration for provider connection
+enabled = true
+cert_file = "/etc/opendr/certs/consumer.crt"
+key_file = "/etc/opendr/certs/consumer.key"
+ca_file = "/etc/opendr/certs/ca.crt"
+
+# Verify provider certificate
+verify_provider_cert = true
+
+# TLS version
+min_version = "TLS12"
+max_version = "TLS13"
+
+[resources]
+# Resource limits (can be lower for read-only replica)
+max_connections = 500
+max_connections_per_ip = 10
+max_operations_per_connection = 100
+max_memory_per_connection_mb = 5
+max_total_memory_mb = 1024
+idle_timeout_secs = 300
+
+[rate_limit]
+# Rate limiting (can be stricter for consumer)
+enabled = true
+global_requests_per_second = 1000
+per_client_requests_per_second = 100
+adaptive_enabled = true
+
+[monitoring]
+# Metrics and monitoring
+enabled = true
+prometheus_port = 9091  # Different port from provider
+health_check_port = 8081
+
+# Consumer-specific metrics
+track_sync_success_rate = true
+track_replication_lag = true
+track_entries_received = true
+
+[audit]
+# Audit logging
+enabled = true
+log_file = "/var/log/opendr/consumer-audit.log"
+log_format = "json"
+log_level = "info"
+
+# Log authentication and replication events
+log_authentication = true
+log_replication_events = true
+
+[performance]
+# Performance tuning
+worker_threads = 4
+io_threads = 2
+connection_backlog = 64
+
+# Cache settings (can be smaller for replica)
+schema_cache_size_mb = 50
+entry_cache_size_mb = 256
+entry_cache_ttl_secs = 600

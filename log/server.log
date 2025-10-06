@@ -2543,3 +2543,6 @@
 2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:230 — All operations and connections completed
 2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:252 — Graceful drain completed successfully
 2025-10-06 00:30:45 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:271 — Shutdown complete
+2025-10-06 11:33:23 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:60 — LDAP server listening on localhost:1389
+2025-10-06 11:33:51 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/server.rs:60 — LDAP server listening on localhost:1389
+2025-10-06 11:49:25 | INFO  | /Users/kasunranasinghe/Projects/Rust/opendr/src/shutdown.rs:315 — Received SIGINT signal

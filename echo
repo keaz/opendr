@@ -1,0 +1,248 @@
+
+========================================
+Test: single_provider_single_consumer
+Basic replication: ADD, MODIFY, DELETE operations
+========================================
+
+[INFO] Test started at Mon Oct  6 14:45:26 +0530 2025
+[INFO] Run directory: /tmp/opendr_e2e.TlWnwi
+▶ Locating or building server binary...
+[SUCCESS] Found server binary at /Users/kasunranasinghe/Projects/Rust/opendr/target/release/opendr
+▶ Checking required tools...
+[SUCCESS] All required tools available
+▶ Creating provider and consumer configurations
+▶ Starting provider server on port 3890
+[INFO] Starting provider:3890 with config /tmp/opendr_e2e.TlWnwi/provider/server.toml
+▶ Initializing base directory structure
+adding new entry "dc=example,dc=org"
+
+▶ Starting consumer server on port 3891
+[INFO] Starting consumer:3891 with config /tmp/opendr_e2e.TlWnwi/consumer/server.toml
+▶ Test 1: Adding 5 entries to provider
+[INFO] Waiting for replication to complete...
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+/Users/kasunranasinghe/Projects/Rust/opendr/e2e_tests/helpers.sh: line 512: [[: 0
+0: syntax error in expression (error token is "0")
+[ERROR] Replication timeout: provider=5, consumer=0
+0, expected=5
+
+▶ Cleaning up test environment...
+[WARN] Test failed or encountered errors. Dumping server logs:
+
+──── provider:3890 log (last 50 lines) ────
+2025-10-06T14:45:50.424035+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:50.424064+05:30 INFO opendr::server - Connection 127.0.0.1:59647 closed
+2025-10-06T14:45:50.966283+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59649
+2025-10-06T14:45:50.966665+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:50.966687+05:30 INFO opendr::server - Connection 127.0.0.1:59649 closed
+2025-10-06T14:45:51.510682+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59652
+2025-10-06T14:45:51.510959+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:51.510972+05:30 INFO opendr::server - Connection 127.0.0.1:59652 closed
+2025-10-06T14:45:52.050029+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59654
+2025-10-06T14:45:52.050307+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:52.050325+05:30 INFO opendr::server - Connection 127.0.0.1:59654 closed
+2025-10-06T14:45:52.599514+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59656
+2025-10-06T14:45:52.599842+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:52.599869+05:30 INFO opendr::server - Connection 127.0.0.1:59656 closed
+2025-10-06T14:45:53.143490+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59658
+2025-10-06T14:45:53.143803+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:53.143839+05:30 INFO opendr::server - Connection 127.0.0.1:59658 closed
+2025-10-06T14:45:53.691853+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59660
+2025-10-06T14:45:53.692188+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:53.692210+05:30 INFO opendr::server - Connection 127.0.0.1:59660 closed
+2025-10-06T14:45:54.233119+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59662
+2025-10-06T14:45:54.233355+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:54.233373+05:30 INFO opendr::server - Connection 127.0.0.1:59662 closed
+2025-10-06T14:45:54.785345+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59664
+2025-10-06T14:45:54.785749+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:54.785769+05:30 INFO opendr::server - Connection 127.0.0.1:59664 closed
+2025-10-06T14:45:55.341227+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59666
+2025-10-06T14:45:55.341515+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:55.341529+05:30 INFO opendr::server - Connection 127.0.0.1:59666 closed
+2025-10-06T14:45:55.895996+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59668
+2025-10-06T14:45:55.896317+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:55.896345+05:30 INFO opendr::server - Connection 127.0.0.1:59668 closed
+2025-10-06T14:45:56.435790+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59670
+2025-10-06T14:45:56.436075+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:56.436112+05:30 INFO opendr::server - Connection 127.0.0.1:59670 closed
+2025-10-06T14:45:56.983842+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59672
+2025-10-06T14:45:56.984110+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:56.984128+05:30 INFO opendr::server - Connection 127.0.0.1:59672 closed
+2025-10-06T14:45:57.539224+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59674
+2025-10-06T14:45:57.539482+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:57.539495+05:30 INFO opendr::server - Connection 127.0.0.1:59674 closed
+2025-10-06T14:45:58.077794+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59676
+2025-10-06T14:45:58.078063+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:58.078084+05:30 INFO opendr::server - Connection 127.0.0.1:59676 closed
+2025-10-06T14:45:58.624730+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59678
+2025-10-06T14:45:58.624985+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:58.625001+05:30 INFO opendr::server - Connection 127.0.0.1:59678 closed
+2025-10-06T14:45:59.165052+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59680
+2025-10-06T14:45:59.165405+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:59.165430+05:30 INFO opendr::server - Connection 127.0.0.1:59680 closed
+
+──── consumer:3891 log (last 50 lines) ────
+2025-10-06T14:45:50.442483+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:50.442498+05:30 INFO opendr::server - Connection 127.0.0.1:59648 closed
+2025-10-06T14:45:50.985271+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59650
+2025-10-06T14:45:50.985535+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:50.985557+05:30 INFO opendr::server - Connection 127.0.0.1:59650 closed
+2025-10-06T14:45:51.526062+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59653
+2025-10-06T14:45:51.526273+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:51.526287+05:30 INFO opendr::server - Connection 127.0.0.1:59653 closed
+2025-10-06T14:45:52.068623+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59655
+2025-10-06T14:45:52.068915+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:52.068936+05:30 INFO opendr::server - Connection 127.0.0.1:59655 closed
+2025-10-06T14:45:52.617818+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59657
+2025-10-06T14:45:52.618089+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:52.618107+05:30 INFO opendr::server - Connection 127.0.0.1:59657 closed
+2025-10-06T14:45:53.161679+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59659
+2025-10-06T14:45:53.161961+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:53.161980+05:30 INFO opendr::server - Connection 127.0.0.1:59659 closed
+2025-10-06T14:45:53.711252+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59661
+2025-10-06T14:45:53.711497+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:53.711512+05:30 INFO opendr::server - Connection 127.0.0.1:59661 closed
+2025-10-06T14:45:54.250908+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59663
+2025-10-06T14:45:54.251194+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:54.251213+05:30 INFO opendr::server - Connection 127.0.0.1:59663 closed
+2025-10-06T14:45:54.807432+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59665
+2025-10-06T14:45:54.807688+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:54.807715+05:30 INFO opendr::server - Connection 127.0.0.1:59665 closed
+2025-10-06T14:45:55.357808+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59667
+2025-10-06T14:45:55.358104+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:55.358124+05:30 INFO opendr::server - Connection 127.0.0.1:59667 closed
+2025-10-06T14:45:55.914891+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59669
+2025-10-06T14:45:55.915144+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:55.915159+05:30 INFO opendr::server - Connection 127.0.0.1:59669 closed
+2025-10-06T14:45:56.457616+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59671
+2025-10-06T14:45:56.457892+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:56.457915+05:30 INFO opendr::server - Connection 127.0.0.1:59671 closed
+2025-10-06T14:45:57.002458+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59673
+2025-10-06T14:45:57.002756+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:57.002784+05:30 INFO opendr::server - Connection 127.0.0.1:59673 closed
+2025-10-06T14:45:57.556888+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59675
+2025-10-06T14:45:57.557212+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:57.557232+05:30 INFO opendr::server - Connection 127.0.0.1:59675 closed
+2025-10-06T14:45:58.096098+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59677
+2025-10-06T14:45:58.096327+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:58.096346+05:30 INFO opendr::server - Connection 127.0.0.1:59677 closed
+2025-10-06T14:45:58.639958+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59679
+2025-10-06T14:45:58.640205+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:58.640224+05:30 INFO opendr::server - Connection 127.0.0.1:59679 closed
+2025-10-06T14:45:59.184214+05:30 INFO opendr::server - Accepted connection from 127.0.0.1:59681
+2025-10-06T14:45:59.184456+05:30 INFO opendr::server - Received unbind request
+2025-10-06T14:45:59.184474+05:30 INFO opendr::server - Connection 127.0.0.1:59681 closed
+
+[INFO] Stopping provider:3890 (PID 47827)
+[INFO] Stopping consumer:3891 (PID 47844)
+[INFO] Removing temporary directory: /tmp/opendr_e2e.TlWnwi
+[INFO] Total execution time: 33s

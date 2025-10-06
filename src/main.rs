@@ -5,6 +5,7 @@ use std::sync::Arc;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
 use opendr::config::ServerConfig;
+use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 
@@ -33,7 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // Create backend based on configuration
-    let backend: Arc<dyn DirectoryBackend> =
+    let raw_backend: Arc<dyn DirectoryBackend> =
         match config.backend.backend_type.to_lowercase().as_str() {
             "lmdb" => {
                 println!(
@@ -77,6 +78,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
+    // Wrap backend with replication service if configured
+    let replication_service = ReplicationService::from_config(&config, raw_backend)?;
+
+    // Get the backend to use (wrapped with changelog if provider enabled)
+    let backend = replication_service.backend();
+
+    // Start replication provider if enabled
+    let provider_handle = match replication_service.start_provider(shutdown.clone()).await {
+        Ok(Some(handle)) => {
+            println!("Replication provider started");
+            Some(handle)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("Failed to start replication provider: {}", e);
+            None
+        }
+    };
+
+    // Start replication consumer if enabled
+    let consumer_handle = match replication_service.start_consumer(shutdown.clone()).await {
+        Ok(Some(handle)) => {
+            println!("Replication consumer started");
+            Some(handle)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("Failed to start replication consumer: {}", e);
+            None
+        }
+    };
+
     let bind_addr = config.ldap_bind_address();
     println!("Starting LDAP server on {}", bind_addr);
 
@@ -104,6 +137,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match server_task.await {
         Ok(()) => println!("Server shutdown complete"),
         Err(e) => eprintln!("Server task error: {}", e),
+    }
+
+    // Wait for replication provider to finish if it was started
+    if let Some(handle) = provider_handle {
+        match handle.await {
+            Ok(()) => println!("Replication provider shutdown complete"),
+            Err(e) => eprintln!("Replication provider task error: {}", e),
+        }
+    }
+
+    // Wait for replication consumer to finish if it was started
+    if let Some(handle) = consumer_handle {
+        match handle.await {
+            Ok(()) => println!("Replication consumer shutdown complete"),
+            Err(e) => eprintln!("Replication consumer task error: {}", e),
+        }
     }
 
     Ok(())

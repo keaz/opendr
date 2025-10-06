@@ -155,6 +155,270 @@ state_persistence_timeout_secs = 10
 state_storage_path = "/var/lib/opendr/consumer/replication_state"
 ```
 
+## Server Startup
+
+### Starting the Provider Server
+
+The provider server initializes replication services automatically when configured:
+
+```bash
+# Start with configuration file
+opendr --config /etc/opendr/provider.toml
+
+# Or with environment variables
+OPENDR_REPLICATION_ENABLED=true \
+OPENDR_REPLICATION_MODE=provider \
+OPENDR_REPLICATION_CHANGELOG_CAPACITY=100000 \
+opendr
+```
+
+**Startup Sequence:**
+
+1. **Configuration Loading**: Reads replication settings from config file or environment
+2. **Backend Initialization**: Wraps DirectoryBackend with ChangelogBackendWrapper
+3. **Changelog Tracker**: Creates in-memory changelog with configured capacity
+4. **Provider FSM**: Initializes ReplicationProviderFsm with dependencies
+5. **Background Task**: Spawns provider service task for handling consumer requests
+6. **Ready State**: Provider begins accepting consumer connections
+
+**Startup Logs:**
+
+```
+[INFO] Replication service initialized in provider mode
+[INFO] Changelog capacity: 100000 entries
+[INFO] Provider FSM started, waiting for consumer connections
+[INFO] Replication provider ready on ldap://0.0.0.0:389
+```
+
+### Starting the Consumer Server
+
+The consumer server connects to the provider and begins synchronization:
+
+```bash
+# Start with configuration file
+opendr --config /etc/opendr/consumer.toml
+
+# Or with environment variables
+OPENDR_REPLICATION_ENABLED=true \
+OPENDR_REPLICATION_MODE=consumer \
+OPENDR_REPLICATION_PROVIDER_URL=ldap://provider:389 \
+OPENDR_REPLICATION_SYNC_INTERVAL_SECS=30 \
+opendr
+```
+
+**Startup Sequence:**
+
+1. **Configuration Loading**: Reads consumer settings and provider URL
+2. **State Manager**: Loads replication cookie from state storage (if exists)
+3. **Provider Connection**: Establishes connection to provider server
+4. **Consumer FSM**: Initializes ReplicationConsumerFsm with dependencies
+5. **Initial Sync**: Performs full refresh phase if no state exists
+6. **Periodic Sync**: Spawns background task for interval-based synchronization
+7. **Ready State**: Consumer enters persist phase, listening for updates
+
+**Startup Logs:**
+
+```
+[INFO] Replication service initialized in consumer mode
+[INFO] Provider URL: ldap://provider.example.com:389
+[INFO] Sync interval: 30 seconds
+[INFO] Loading replication state from /var/lib/opendr/consumer/replication_state
+[INFO] Previous cookie found: seq-12345
+[INFO] Consumer FSM started, connecting to provider
+[INFO] Refresh phase complete: 1234 entries synchronized
+[INFO] Entering persist phase: listening for updates
+[INFO] Replication consumer ready
+```
+
+### Starting Both Modes (Multi-Master)
+
+For multi-master replication, set mode to "both":
+
+```bash
+# Start server acting as both provider and consumer
+opendr --config /etc/opendr/both.toml
+```
+
+**Configuration:**
+
+```toml
+[replication]
+enabled = true
+mode = "both"  # Acts as both provider and consumer
+
+# Provider settings
+changelog_capacity = 100000
+
+# Consumer settings
+provider_url = "ldap://other-master:389"
+sync_interval_secs = 30
+```
+
+**Startup Sequence:**
+
+1. Provider service initializes first
+2. Consumer service initializes and connects to remote provider
+3. Both services run independently in background tasks
+4. Graceful shutdown coordinates both services
+
+**Startup Logs:**
+
+```
+[INFO] Replication service initialized in both mode
+[INFO] Starting provider service...
+[INFO] Provider FSM started, ready for consumers
+[INFO] Starting consumer service...
+[INFO] Consumer FSM started, connecting to ldap://other-master:389
+[INFO] Both provider and consumer services ready
+```
+
+### Graceful Shutdown
+
+OpenDR handles replication shutdown cleanly:
+
+```bash
+# Send SIGTERM or SIGINT
+kill -TERM <pid>
+# or
+Ctrl+C
+```
+
+**Shutdown Sequence:**
+
+1. **Shutdown Initiated**: ShutdownCoordinator receives signal
+2. **Reject New Connections**: Stop accepting new consumer connections (provider)
+3. **Complete In-Flight**: Allow current sync operations to complete (2s timeout)
+4. **Save State**: Consumer saves current cookie to state storage
+5. **Cleanup Resources**: Close connections, flush buffers
+6. **Exit**: Clean process termination
+
+**Shutdown Logs:**
+
+```
+[INFO] Shutdown signal received, initiating graceful shutdown
+[INFO] Stopping replication consumer...
+[INFO] Saving replication state: seq-12500
+[INFO] Replication consumer stopped
+[INFO] Stopping replication provider...
+[INFO] Active consumers: 2, waiting for completion...
+[INFO] Replication provider stopped
+[INFO] Shutdown complete
+```
+
+### Service Management
+
+#### systemd Service Files
+
+**Provider Service** (`/etc/systemd/system/opendr-provider.service`):
+
+```ini
+[Unit]
+Description=OpenDR LDAP Provider Server
+After=network.target
+
+[Service]
+Type=simple
+User=opendr
+Group=opendr
+ExecStart=/usr/local/bin/opendr --config /etc/opendr/provider.toml
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Graceful shutdown with 30s timeout
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Consumer Service** (`/etc/systemd/system/opendr-consumer.service`):
+
+```ini
+[Unit]
+Description=OpenDR LDAP Consumer Server
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opendr
+Group=opendr
+ExecStart=/usr/local/bin/opendr --config /etc/opendr/consumer.toml
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Graceful shutdown with 30s timeout
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Managing Services:**
+
+```bash
+# Enable services to start on boot
+sudo systemctl enable opendr-provider
+sudo systemctl enable opendr-consumer
+
+# Start services
+sudo systemctl start opendr-provider
+sudo systemctl start opendr-consumer
+
+# Check status
+sudo systemctl status opendr-provider
+sudo systemctl status opendr-consumer
+
+# View logs
+sudo journalctl -u opendr-provider -f
+sudo journalctl -u opendr-consumer -f
+
+# Restart services
+sudo systemctl restart opendr-provider
+sudo systemctl restart opendr-consumer
+
+# Stop services
+sudo systemctl stop opendr-provider
+sudo systemctl stop opendr-consumer
+```
+
+### Health Checks
+
+#### Provider Health Check
+
+```bash
+# Check if provider is running and accepting connections
+ldapsearch -x -H ldap://provider:389 \
+    -b "" -s base \
+    "(objectClass=*)" namingContexts
+
+# Expected output:
+# namingContexts: dc=example,dc=com
+```
+
+#### Consumer Health Check
+
+```bash
+# Check consumer state file
+cat /var/lib/opendr/consumer/replication_state/cookie
+
+# Check last sync time (via logs)
+sudo journalctl -u opendr-consumer | grep "Sync complete"
+
+# Verify data synchronization
+ldapsearch -x -H ldap://consumer:389 \
+    -b "dc=example,dc=com" \
+    "(objectClass=*)" dn | wc -l
+```
+
 ## Setup Examples
 
 ### Single Provider, Single Consumer

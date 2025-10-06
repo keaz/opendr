@@ -1,0 +1,370 @@
+//! Backend Changelog Wrapper
+//!
+//! This module provides a wrapper around DirectoryBackend that automatically
+//! records all write operations to a changelog for replication purposes.
+//!
+//! ## Overview
+//!
+//! The `ChangelogBackendWrapper` intercepts all backend operations and:
+//! - Forwards read operations directly to the underlying backend
+//! - Records write operations to the changelog after successful completion
+//! - Maintains sequence numbers for changelog entries
+//! - Supports optional changelog (can be disabled)
+//!
+//! ## Usage
+//!
+//! ```rust,ignore
+//! use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
+//! use opendr::replication::ChangelogTracker;
+//!
+//! // Create backend with changelog tracking
+//! let changelog = Arc::new(ChangelogTracker::new());
+//! let backend = Arc::new(LmdbBackend::new("./data", 100)?);
+//! let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog));
+//!
+//! // All write operations now recorded to changelog
+//! wrapper.add_entry(entry, password).await?;
+//! ```
+
+use async_trait::async_trait;
+use ldap_parser::ldap::SearchScope as Scope;
+use std::sync::Arc;
+
+use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, Modification};
+use crate::replication::ChangelogTracker;
+use crate::replication_provider_fsm::ChangeType;
+
+/// Wrapper around DirectoryBackend that records changes to a changelog
+///
+/// This wrapper forwards all operations to the underlying backend and records
+/// write operations to the changelog after successful completion.
+pub struct ChangelogBackendWrapper {
+    /// Underlying directory backend
+    backend: Arc<dyn DirectoryBackend>,
+
+    /// Optional changelog tracker for replication
+    changelog: Option<Arc<ChangelogTracker>>,
+}
+
+impl ChangelogBackendWrapper {
+    /// Create a new changelog wrapper
+    ///
+    /// # Arguments
+    /// * `backend` - The underlying directory backend
+    /// * `changelog` - Optional changelog tracker (None disables changelog)
+    ///
+    /// # Returns
+    /// New `ChangelogBackendWrapper` instance
+    pub fn new(
+        backend: Arc<dyn DirectoryBackend>,
+        changelog: Option<Arc<ChangelogTracker>>,
+    ) -> Self {
+        Self { backend, changelog }
+    }
+
+    /// Record a change to the changelog
+    ///
+    /// # Arguments
+    /// * `change_type` - Type of change (Add, Modify, Delete, ModifyDN)
+    /// * `dn` - Distinguished name of the entry
+    /// * `change_data` - Serialized entry data
+    ///
+    /// # Returns
+    /// Sequence number assigned to the change, or None if changelog disabled
+    fn record_change(
+        &self,
+        change_type: ChangeType,
+        dn: String,
+        change_data: Vec<u8>,
+    ) -> Option<u64> {
+        if let Some(ref changelog) = self.changelog {
+            let seq = changelog.record_change(change_type, dn, change_data);
+            Some(seq)
+        } else {
+            None
+        }
+    }
+
+    /// Serialize an entry to bytes for changelog storage
+    fn serialize_entry(entry: &DirectoryEntry) -> Vec<u8> {
+        // Simple serialization: DN + attributes as JSON
+        // In production, consider using a more efficient binary format
+        let mut data = entry.dn.as_bytes().to_vec();
+        data.push(b'\n');
+        if let Ok(attrs) = serde_json::to_vec(&entry.attributes) {
+            data.extend_from_slice(&attrs);
+        }
+        data
+    }
+}
+
+#[async_trait]
+impl DirectoryBackend for ChangelogBackendWrapper {
+    async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError> {
+        // Authentication is read-only, no changelog recording needed
+        self.backend.authenticate(dn, password).await
+    }
+
+    async fn add_entry(
+        &self,
+        entry: DirectoryEntry,
+        password: Vec<u8>,
+    ) -> Result<(), BackendError> {
+        // Record DN and serialized entry before adding
+        let dn = entry.dn.clone();
+        let entry_data = Self::serialize_entry(&entry);
+
+        // Perform the add operation
+        self.backend.add_entry(entry, password).await?;
+
+        // Record to changelog after successful add
+        self.record_change(ChangeType::Add, dn, entry_data);
+
+        Ok(())
+    }
+
+    async fn get_entry(&self, dn: &str) -> Result<Option<DirectoryEntry>, BackendError> {
+        // Read operation, no changelog recording needed
+        self.backend.get_entry(dn).await
+    }
+
+    async fn modify_entry(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+    ) -> Result<(), BackendError> {
+        // Perform the modify operation
+        self.backend.modify_entry(dn, modifications.clone()).await?;
+
+        // Get the updated entry for changelog
+        if let Ok(Some(entry)) = self.backend.get_entry(dn).await {
+            let entry_data = Self::serialize_entry(&entry);
+            self.record_change(ChangeType::Modify, dn.to_string(), entry_data);
+        }
+
+        Ok(())
+    }
+
+    async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
+        // Get entry before deletion for changelog
+        let entry_data = if let Ok(Some(entry)) = self.backend.get_entry(dn).await {
+            Self::serialize_entry(&entry)
+        } else {
+            Vec::new()
+        };
+
+        // Perform the delete operation
+        self.backend.delete_entry(dn).await?;
+
+        // Record to changelog after successful delete
+        self.record_change(ChangeType::Delete, dn.to_string(), entry_data);
+
+        Ok(())
+    }
+
+    async fn search_entries(
+        &self,
+        base_dn: &str,
+        scope: Scope,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        // Read operation, no changelog recording needed
+        self.backend.search_entries(base_dn, scope).await
+    }
+
+    async fn rename_entry(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old: bool,
+        new_superior: Option<String>,
+    ) -> Result<(), BackendError> {
+        // Get entry before rename for changelog
+        let entry_data = if let Ok(Some(entry)) = self.backend.get_entry(dn).await {
+            Self::serialize_entry(&entry)
+        } else {
+            Vec::new()
+        };
+
+        // Perform the rename operation
+        self.backend
+            .rename_entry(dn, new_rdn, delete_old, new_superior)
+            .await?;
+
+        // Record to changelog after successful rename
+        self.record_change(ChangeType::Rename, dn.to_string(), entry_data);
+
+        Ok(())
+    }
+
+    async fn compare_attribute(
+        &self,
+        dn: &str,
+        attribute: &str,
+        value: &str,
+    ) -> Result<bool, BackendError> {
+        // Read operation, no changelog recording needed
+        self.backend.compare_attribute(dn, attribute, value).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::MockBackend;
+    use std::collections::HashMap;
+
+    fn create_test_entry(dn: &str) -> DirectoryEntry {
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Test User".to_string()]);
+        attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+        DirectoryEntry::new(dn, attributes)
+    }
+
+    #[tokio::test]
+    async fn test_add_entry_records_to_changelog() {
+        let backend = Arc::new(MockBackend::new());
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        wrapper.add_entry(entry, vec![]).await.unwrap();
+
+        // Verify changelog recorded the add
+        let entries = changelog.get_since(0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
+        assert!(matches!(entries[0].change_type, ChangeType::Add));
+    }
+
+    #[tokio::test]
+    async fn test_modify_entry_records_to_changelog() {
+        let mut backend = MockBackend::new();
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        backend.add_entry(entry.clone(), vec![]).await.unwrap();
+
+        let backend = Arc::new(backend);
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+
+        let modifications = vec![Modification {
+            operation: crate::backend::ModifyOperation::Replace,
+            attribute: "cn".to_string(),
+            values: vec!["Modified User".to_string()],
+        }];
+        wrapper
+            .modify_entry("cn=test,dc=example,dc=com", modifications)
+            .await
+            .unwrap();
+
+        // Verify changelog recorded the modify
+        let entries = changelog.get_since(0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
+        assert!(matches!(entries[0].change_type, ChangeType::Modify));
+    }
+
+    #[tokio::test]
+    async fn test_delete_entry_records_to_changelog() {
+        let mut backend = MockBackend::new();
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        let backend = Arc::new(backend);
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+
+        wrapper
+            .delete_entry("cn=test,dc=example,dc=com")
+            .await
+            .unwrap();
+
+        // Verify changelog recorded the delete
+        let entries = changelog.get_since(0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
+        assert!(matches!(entries[0].change_type, ChangeType::Delete));
+    }
+
+    #[tokio::test]
+    async fn test_rename_entry_records_to_changelog() {
+        let mut backend = MockBackend::new();
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        let backend = Arc::new(backend);
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+
+        wrapper
+            .rename_entry("cn=test,dc=example,dc=com", "cn=renamed", true, None)
+            .await
+            .unwrap();
+
+        // Verify changelog recorded the rename
+        let entries = changelog.get_since(0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
+        assert!(matches!(entries[0].change_type, ChangeType::Rename));
+    }
+
+    #[tokio::test]
+    async fn test_operations_without_changelog() {
+        let backend = Arc::new(MockBackend::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, None);
+
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        wrapper.add_entry(entry, vec![]).await.unwrap();
+
+        // Should not panic, operations work without changelog
+    }
+
+    #[tokio::test]
+    async fn test_sequence_number_generation() {
+        let backend = Arc::new(MockBackend::new());
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+
+        // Add multiple entries
+        for i in 0..5 {
+            let entry = create_test_entry(&format!("cn=test{},dc=example,dc=com", i));
+            wrapper.add_entry(entry, vec![]).await.unwrap();
+        }
+
+        // Verify sequence numbers are sequential
+        let entries = changelog.get_since(0);
+        assert_eq!(entries.len(), 5);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.sequence_number, (i + 1) as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_changelog_recording() {
+        let backend = Arc::new(MockBackend::new());
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = Arc::new(ChangelogBackendWrapper::new(
+            backend,
+            Some(changelog.clone()),
+        ));
+
+        // Spawn multiple concurrent add operations
+        let mut handles = vec![];
+        for i in 0..10 {
+            let wrapper = wrapper.clone();
+            let handle = tokio::spawn(async move {
+                let entry = create_test_entry(&format!("cn=test{},dc=example,dc=com", i));
+                wrapper.add_entry(entry, vec![]).await.unwrap();
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all operations to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Verify all entries recorded
+        let entries = changelog.get_since(0);
+        assert_eq!(entries.len(), 10);
+    }
+}
