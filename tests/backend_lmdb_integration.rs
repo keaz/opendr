@@ -17,7 +17,7 @@ use ldap_parser::ldap::SearchScope;
 #[tokio::test]
 async fn test_lmdb_basic_crud() {
     let dir = tempdir().unwrap();
-    let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
     // Create
     let mut attributes = HashMap::new();
@@ -57,7 +57,7 @@ async fn test_lmdb_basic_crud() {
 #[tokio::test]
 async fn test_lmdb_case_insensitive_operations() {
     let dir = tempdir().unwrap();
-    let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
     let mut attributes = HashMap::new();
     attributes.insert("cn".to_string(), vec!["Test User".to_string()]);
@@ -113,7 +113,7 @@ async fn test_lmdb_persistence() {
 #[tokio::test]
 async fn test_lmdb_concurrent_reads() {
     let dir = tempdir().unwrap();
-    let backend = Arc::new(LmdbBackend::new(dir.path(), 100).unwrap());
+    let backend = Arc::new(LmdbBackend::new(dir.path(), 100, 1).unwrap());
 
     // Add test entries
     for i in 0..100 {
@@ -145,7 +145,7 @@ async fn test_lmdb_concurrent_reads() {
 #[tokio::test]
 async fn test_lmdb_search_operations() {
     let dir = tempdir().unwrap();
-    let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
     // Add hierarchical entries
     for i in 0..10 {
@@ -171,7 +171,7 @@ async fn test_lmdb_search_operations() {
 #[tokio::test]
 async fn test_lmdb_modify_operations() {
     let dir = tempdir().unwrap();
-    let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
     let mut attributes = HashMap::new();
     attributes.insert("cn".to_string(), vec!["Test".to_string()]);
@@ -221,7 +221,7 @@ async fn test_lmdb_modify_operations() {
 #[ignore = "Test hangs due to deadlock in rename_entry - calls add_entry/delete_entry which re-acquire write lock"]
 async fn test_lmdb_rename_operations() {
     let dir = tempdir().unwrap();
-    let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
     let mut attributes = HashMap::new();
     attributes.insert("cn".to_string(), vec!["oldname".to_string()]);
@@ -249,7 +249,7 @@ async fn test_lmdb_rename_operations() {
 #[tokio::test]
 async fn test_lmdb_compare_operations() {
     let dir = tempdir().unwrap();
-    let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
     let mut attributes = HashMap::new();
     attributes.insert("cn".to_string(), vec!["Test".to_string()]);
@@ -274,7 +274,7 @@ async fn test_lmdb_compare_operations() {
 #[tokio::test]
 async fn test_lmdb_duplicate_prevention() {
     let dir = tempdir().unwrap();
-    let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
     let mut attributes = HashMap::new();
     attributes.insert("cn".to_string(), vec!["duplicate".to_string()]);
@@ -292,7 +292,7 @@ async fn test_lmdb_duplicate_prevention() {
 #[tokio::test]
 async fn test_lmdb_error_handling() {
     let dir = tempdir().unwrap();
-    let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
     // Test delete non-existent entry
     let result = backend.delete_entry("cn=nonexistent,dc=example,dc=org").await;

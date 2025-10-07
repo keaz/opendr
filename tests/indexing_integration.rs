@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 /// Helper to create a test backend with default configuration
 fn create_test_backend(temp_dir: &TempDir) -> LmdbBackend {
-    LmdbBackend::new(temp_dir.path(), 100).unwrap()
+    LmdbBackend::new(temp_dir.path(), 100, 1).unwrap()
 }
 
 /// Helper to create a test backend with custom index configuration

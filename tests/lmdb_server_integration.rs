@@ -21,7 +21,7 @@ use tokio::time::timeout;
 
 /// Helper function to initialize LMDB backend with test data
 async fn create_test_backend(temp_dir: &TempDir) -> LmdbBackend {
-    let mut backend = LmdbBackend::new(temp_dir.path(), 100).unwrap();
+    let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
 
     // Add base DN
     let base_entry = DirectoryEntry::new(
@@ -73,7 +73,7 @@ async fn test_lmdb_backend_persistence() {
 
     // Create backend and add data
     {
-        let mut backend = LmdbBackend::new(temp_dir.path(), 100).unwrap();
+        let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
 
         let entry = DirectoryEntry::new(
             "dc=persist,dc=test",
@@ -89,7 +89,7 @@ async fn test_lmdb_backend_persistence() {
 
     // Create new backend instance with same directory
     {
-        let backend = LmdbBackend::new(temp_dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
 
         // Verify data persisted
         let entry = backend.get_entry("dc=persist,dc=test").await.unwrap().unwrap();
@@ -236,7 +236,7 @@ async fn test_lmdb_backend_password_authentication() {
 #[tokio::test]
 async fn test_lmdb_backend_large_dataset() {
     let temp_dir = TempDir::new().unwrap();
-    let mut backend = LmdbBackend::new(temp_dir.path(), 100).unwrap();
+    let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
 
     // Add base DN
     let base_entry = DirectoryEntry::new(

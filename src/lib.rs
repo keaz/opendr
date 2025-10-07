@@ -11,6 +11,7 @@ pub mod compare_fsm;
 pub mod config;
 pub mod connection_fsm;
 pub mod connection_pool;
+pub mod csn;
 pub mod data;
 pub mod extended_op_fsm;
 pub mod extended_ops;

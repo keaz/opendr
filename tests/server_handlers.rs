@@ -55,6 +55,8 @@ mock! {
             base_dn: &str,
             scope: SearchScope,
         ) -> Result<Vec<DirectoryEntry>, BackendError>;
+        async fn get_context_csn(&self) -> Result<Option<opendr::csn::Csn>, BackendError>;
+        async fn set_context_csn(&self, csn: opendr::csn::Csn) -> Result<(), BackendError>;
     }
 }
 

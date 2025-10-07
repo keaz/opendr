@@ -37,7 +37,7 @@ fn setup_mock_backend() -> Arc<MockBackend> {
 
 fn setup_lmdb_backend() -> Arc<LmdbBackend> {
     let dir = tempdir().unwrap();
-    let backend = Arc::new(LmdbBackend::new(dir.path(), 100).unwrap());
+    let backend = Arc::new(LmdbBackend::new(dir.path(), 100, 1).unwrap());
 
     // Add test entries
     tokio::runtime::Runtime::new().unwrap().block_on(async {

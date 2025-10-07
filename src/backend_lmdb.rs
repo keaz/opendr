@@ -42,6 +42,7 @@ const MDB_NEXT_DUP: u32 = 18;
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
 };
+use crate::csn::{Csn, CsnGenerator};
 
 /// Serialized entry structure for LMDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,11 +55,16 @@ struct StoredEntry {
     pub created_at: u64,
     /// Last modification timestamp
     pub modified_at: u64,
+    /// Operational attributes (entryCSN, timestamps, etc.)
+    #[serde(default)]
+    pub operational_attributes: crate::backend::OperationalAttributes,
 }
 
 impl StoredEntry {
     fn to_directory_entry(&self) -> DirectoryEntry {
-        DirectoryEntry::new(self.dn.clone(), self.attributes.clone())
+        let mut entry = DirectoryEntry::new(self.dn.clone(), self.attributes.clone());
+        entry.operational_attributes = self.operational_attributes.clone();
+        entry
     }
 }
 
@@ -94,6 +100,8 @@ pub struct LmdbBackend {
     passwords_db: Database,
     /// DN index for case-insensitive lookups
     dn_index_db: Database,
+    /// Metadata database (for contextCSN, etc.)
+    metadata_db: Database,
     /// Attribute indexes: map from "attr:value" -> DN
     /// One database per indexed attribute
     attr_indexes: Arc<RwLock<HashMap<String, Database>>>,
@@ -103,6 +111,8 @@ pub struct LmdbBackend {
     write_lock: Arc<RwLock<()>>,
     /// Database directory path
     db_path: PathBuf,
+    /// CSN generator for operational attributes
+    csn_generator: Arc<CsnGenerator>,
 }
 
 impl LmdbBackend {
@@ -111,11 +121,12 @@ impl LmdbBackend {
     /// # Arguments
     /// * `path` - Directory path for LMDB database files
     /// * `max_size_mb` - Maximum database size in megabytes
+    /// * `replica_id` - Replica ID for CSN generation (1-4095)
     ///
     /// # Returns
     /// * `Result<Self, BackendError>` - New backend instance or error
-    pub fn new<P: AsRef<Path>>(path: P, max_size_mb: usize) -> Result<Self, BackendError> {
-        Self::new_with_config(path, max_size_mb, IndexConfig::default())
+    pub fn new<P: AsRef<Path>>(path: P, max_size_mb: usize, replica_id: u16) -> Result<Self, BackendError> {
+        Self::new_with_config(path, max_size_mb, replica_id, IndexConfig::default())
     }
 
     /// Create a new LMDB backend with custom index configuration
@@ -123,6 +134,7 @@ impl LmdbBackend {
     /// # Arguments
     /// * `path` - Directory path for LMDB database files
     /// * `max_size_mb` - Maximum database size in megabytes
+    /// * `replica_id` - Replica ID for CSN generation (1-4095)
     /// * `index_config` - Configuration for attribute indexing
     ///
     /// # Returns
@@ -130,6 +142,7 @@ impl LmdbBackend {
     pub fn new_with_config<P: AsRef<Path>>(
         path: P,
         max_size_mb: usize,
+        replica_id: u16,
         index_config: IndexConfig,
     ) -> Result<Self, BackendError> {
         let db_path = path.as_ref().to_path_buf();
@@ -162,6 +175,10 @@ impl LmdbBackend {
             .create_db(Some("dn_index"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create dn_index db: {}", e)))?;
 
+        let metadata_db = env
+            .create_db(Some("metadata"), lmdb::DatabaseFlags::empty())
+            .map_err(|e| BackendError::Storage(format!("Failed to create metadata db: {}", e)))?;
+
         // Create attribute index databases
         // Note: Using DUPSORT for indices to allow multiple DNs per attribute value
         let mut attr_indexes = HashMap::new();
@@ -176,15 +193,20 @@ impl LmdbBackend {
             attr_indexes.insert(attr.to_lowercase(), db);
         }
 
+        // Initialize CSN generator with replica ID
+        let csn_generator = Arc::new(CsnGenerator::new(replica_id));
+
         Ok(Self {
             env,
             entries_db,
             passwords_db,
             dn_index_db,
+            metadata_db,
             attr_indexes: Arc::new(RwLock::new(attr_indexes)),
             index_config,
             write_lock: Arc::new(RwLock::new(())),
             db_path,
+            csn_generator,
         })
     }
 
@@ -603,7 +625,7 @@ impl DirectoryBackend for LmdbBackend {
 
     async fn add_entry(
         &self,
-        entry: DirectoryEntry,
+        mut entry: DirectoryEntry,
         password: Vec<u8>,
     ) -> Result<(), BackendError> {
         let _lock = self.write_lock.write().await;
@@ -620,6 +642,16 @@ impl DirectoryBackend for LmdbBackend {
             return Err(BackendError::AlreadyExists);
         }
 
+        // Generate CSN for this entry
+        let csn = self.csn_generator.generate();
+        
+        // Set operational attributes (entryCSN, createTimestamp, modifyTimestamp, creatorsName)
+        // TODO: Get creator DN from authentication context (for now, use None)
+        entry.operational_attributes = crate::backend::OperationalAttributes::for_new_entry(
+            csn.clone(),
+            None, // creator_dn - should come from auth context
+        );
+
         // Create stored entry
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -631,6 +663,7 @@ impl DirectoryBackend for LmdbBackend {
             attributes: entry.attributes,
             created_at: now,
             modified_at: now,
+            operational_attributes: entry.operational_attributes.clone(),
         };
 
         let entry_bytes = bincode::serialize(&stored_entry)
@@ -668,6 +701,16 @@ impl DirectoryBackend for LmdbBackend {
 
         // Update attribute indexes
         self.update_attribute_indexes(&mut txn, &entry.dn, &stored_entry.attributes)?;
+
+        // Update contextCSN with the new CSN
+        let csn_string = csn.to_ldap_string();
+        txn.put(
+            self.metadata_db,
+            &b"context_csn",
+            &csn_string.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
 
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -904,6 +947,54 @@ impl DirectoryBackend for LmdbBackend {
             .map(|e| e.to_directory_entry())
             .collect())
     }
+
+    async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read transaction: {}", e)))?;
+
+        match txn.get(self.metadata_db, &b"context_csn") {
+            Ok(bytes) => {
+                // Deserialize CSN from stored bytes
+                let csn_string = std::str::from_utf8(bytes)
+                    .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in contextCSN: {}", e)))?;
+                let csn = crate::csn::Csn::parse(csn_string)
+                    .map_err(|e| BackendError::Storage(format!("Failed to parse contextCSN: {}", e)))?;
+                Ok(Some(csn))
+            }
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(BackendError::Storage(format!(
+                "Failed to read contextCSN: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn set_context_csn(&self, csn: crate::csn::Csn) -> Result<(), BackendError> {
+        let _lock = self.write_lock.write().await;
+        
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write transaction: {}", e)))?;
+
+        // Serialize CSN to LDAP string format
+        let csn_string = csn.to_ldap_string();
+        
+        txn.put(
+            self.metadata_db,
+            &b"context_csn",
+            &csn_string.as_bytes(),
+            lmdb::WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write contextCSN: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit contextCSN: {}", e)))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -914,14 +1005,14 @@ mod tests {
     #[tokio::test]
     async fn test_lmdb_backend_create() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
         assert!(backend.db_path.exists());
     }
 
     #[tokio::test]
     async fn test_lmdb_backend_add_and_get() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         let mut attributes = HashMap::new();
         attributes.insert("cn".to_string(), vec!["test".to_string()]);
@@ -943,7 +1034,7 @@ mod tests {
     #[tokio::test]
     async fn test_lmdb_backend_case_insensitive_lookup() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         let mut attributes = HashMap::new();
         attributes.insert("cn".to_string(), vec!["test".to_string()]);
@@ -965,7 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn test_lmdb_backend_authenticate() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         let mut attributes = HashMap::new();
         attributes.insert("cn".to_string(), vec!["test".to_string()]);
@@ -994,7 +1085,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_indexed() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         // Default indexed attributes
         assert!(backend.is_indexed("cn"));
@@ -1009,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn test_attribute_index_on_add() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         // Add entry with indexed attributes
         let mut attributes = HashMap::new();
@@ -1033,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn test_attribute_index_multiple_values() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         // Add entry with multiple values for indexed attribute
         let mut attributes = HashMap::new();
@@ -1057,7 +1148,7 @@ mod tests {
     #[tokio::test]
     async fn test_attribute_index_case_insensitive() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         let mut attributes = HashMap::new();
         attributes.insert("cn".to_string(), vec!["John Doe".to_string()]);
@@ -1076,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn test_attribute_index_multiple_entries() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         // Add multiple entries with same attribute value
         for i in 1..=3 {
@@ -1096,7 +1187,7 @@ mod tests {
     #[tokio::test]
     async fn test_attribute_index_update_on_modify() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         // Add entry
         let mut attributes = HashMap::new();
@@ -1131,7 +1222,7 @@ mod tests {
     #[tokio::test]
     async fn test_attribute_index_removed_on_delete() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         // Add entry
         let mut attributes = HashMap::new();
@@ -1157,7 +1248,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_nonindexed_attribute() {
         let dir = tempdir().unwrap();
-        let backend = LmdbBackend::new(dir.path(), 100).unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
         // Add entry with non-indexed attribute
         let mut attributes = HashMap::new();
@@ -1176,7 +1267,7 @@ mod tests {
         let config = IndexConfig {
             indexed_attributes: vec!["custom".to_string(), "special".to_string()],
         };
-        let backend = LmdbBackend::new_with_config(dir.path(), 100, config).unwrap();
+        let backend = LmdbBackend::new_with_config(dir.path(), 100, 1, config).unwrap();
 
         assert!(backend.is_indexed("custom"));
         assert!(backend.is_indexed("special"));
@@ -1190,5 +1281,73 @@ mod tests {
 
         let results = backend.search_by_index("custom", "value").unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_context_csn_initially_none() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        // Initially, contextCSN should be None
+        let csn = backend.get_context_csn().await.unwrap();
+        assert!(csn.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_context_csn_set_and_get() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        // Create a CSN
+        let csn = crate::csn::Csn::with_values(1696680896789012, 1, 0, 0);
+
+        // Set contextCSN
+        backend.set_context_csn(csn.clone()).await.unwrap();
+
+        // Retrieve contextCSN
+        let retrieved = backend.get_context_csn().await.unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap(), csn);
+    }
+
+    #[tokio::test]
+    async fn test_context_csn_update() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        // Set initial CSN
+        let csn1 = crate::csn::Csn::with_values(1696680896789012, 1, 0, 0);
+        backend.set_context_csn(csn1).await.unwrap();
+
+        // Update to newer CSN
+        let csn2 = crate::csn::Csn::with_values(1696680896789013, 1, 1, 0);
+        backend.set_context_csn(csn2.clone()).await.unwrap();
+
+        // Should retrieve the newer CSN
+        let retrieved = backend.get_context_csn().await.unwrap();
+        assert_eq!(retrieved.unwrap(), csn2);
+    }
+
+    #[tokio::test]
+    async fn test_context_csn_persistence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Create backend and set CSN
+        {
+            let backend = LmdbBackend::new(&path, 100, 1).unwrap();
+            let csn = crate::csn::Csn::with_values(1696680896789012, 1, 0, 0);
+            backend.set_context_csn(csn).await.unwrap();
+        }
+
+        // Reopen backend and verify CSN persisted
+        {
+            let backend = LmdbBackend::new(&path, 100, 1).unwrap();
+            let retrieved = backend.get_context_csn().await.unwrap();
+            assert!(retrieved.is_some());
+            let csn = retrieved.unwrap();
+            assert_eq!(csn.timestamp_us(), 1696680896789012);
+            assert_eq!(csn.replica_id(), 1);
+        }
     }
 }

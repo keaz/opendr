@@ -173,6 +173,16 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         self.backend.search_entries(base_dn, scope).await
     }
 
+    async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
+        // Delegate to underlying backend
+        self.backend.get_context_csn().await
+    }
+
+    async fn set_context_csn(&self, csn: crate::csn::Csn) -> Result<(), BackendError> {
+        // Delegate to underlying backend
+        self.backend.set_context_csn(csn).await
+    }
+
     async fn rename_entry(
         &self,
         dn: &str,

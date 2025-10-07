@@ -511,6 +511,7 @@ impl ProviderConnection for ProviderConnectionImpl {
                 let dir_entry = crate::backend::DirectoryEntry {
                     dn: dn.clone(),
                     attributes: search_entry.attrs.clone(),
+                    operational_attributes: crate::backend::OperationalAttributes::new(),
                 };
                 
                 // Serialize to JSON

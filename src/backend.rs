@@ -1,16 +1,136 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ldap_parser::ldap::SearchScope;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::csn::Csn;
+
+/// Operational attributes for LDAP entries per RFC 4512
+///
+/// These attributes are maintained by the directory server and describe
+/// operational information about the entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalAttributes {
+    /// entryCSN - Change Sequence Number for this entry (RFC 4533)
+    pub entry_csn: Option<Csn>,
+    /// createTimestamp - When the entry was created (RFC 4512)
+    pub create_timestamp: Option<String>,
+    /// modifyTimestamp - When the entry was last modified (RFC 4512)
+    pub modify_timestamp: Option<String>,
+    /// creatorsName - DN of the user who created the entry (RFC 4512)
+    pub creators_name: Option<String>,
+    /// modifiersName - DN of the user who last modified the entry (RFC 4512)
+    pub modifiers_name: Option<String>,
+}
+
+impl OperationalAttributes {
+    /// Create empty operational attributes
+    pub fn new() -> Self {
+        Self {
+            entry_csn: None,
+            create_timestamp: None,
+            modify_timestamp: None,
+            creators_name: None,
+            modifiers_name: None,
+        }
+    }
+
+    /// Create operational attributes for a new entry
+    pub fn for_new_entry(csn: Csn, creator_dn: Option<String>) -> Self {
+        let timestamp = Self::current_timestamp();
+        Self {
+            entry_csn: Some(csn),
+            create_timestamp: Some(timestamp.clone()),
+            modify_timestamp: Some(timestamp),
+            creators_name: creator_dn.clone(),
+            modifiers_name: creator_dn,
+        }
+    }
+
+    /// Update operational attributes for a modified entry
+    pub fn for_modified_entry(&mut self, csn: Csn, modifier_dn: Option<String>) {
+        self.entry_csn = Some(csn);
+        self.modify_timestamp = Some(Self::current_timestamp());
+        self.modifiers_name = modifier_dn;
+    }
+
+    /// Get current timestamp in LDAP GeneralizedTime format (RFC 4517)
+    /// Format: YYYYMMDDHHMMSSz
+    fn current_timestamp() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time before UNIX epoch");
+        
+        let secs = duration.as_secs();
+        let tm = chrono::DateTime::from_timestamp(secs as i64, 0)
+            .expect("Invalid timestamp");
+        tm.format("%Y%m%d%H%M%SZ").to_string()
+    }
+
+    /// Convert operational attributes to HashMap for LDAP responses
+    pub fn to_attributes(&self) -> HashMap<String, Vec<String>> {
+        let mut attrs = HashMap::new();
+
+        if let Some(ref csn) = self.entry_csn {
+            attrs.insert("entrycsn".to_string(), vec![csn.to_ldap_string()]);
+        }
+        if let Some(ref ts) = self.create_timestamp {
+            attrs.insert("createtimestamp".to_string(), vec![ts.clone()]);
+        }
+        if let Some(ref ts) = self.modify_timestamp {
+            attrs.insert("modifytimestamp".to_string(), vec![ts.clone()]);
+        }
+        if let Some(ref dn) = self.creators_name {
+            attrs.insert("creatorsname".to_string(), vec![dn.clone()]);
+        }
+        if let Some(ref dn) = self.modifiers_name {
+            attrs.insert("modifiersname".to_string(), vec![dn.clone()]);
+        }
+
+        attrs
+    }
+
+    /// Check if a given attribute name is an operational attribute
+    pub fn is_operational(attr_name: &str) -> bool {
+        matches!(
+            attr_name.to_lowercase().as_str(),
+            "entrycsn"
+                | "createtimestamp"
+                | "modifytimestamp"
+                | "creatorsname"
+                | "modifiersname"
+                | "subschemasubentry"
+                | "hassubordinates"
+                | "numsubordinates"
+                | "structuralobjectclass"
+                | "pwdchangedtime"
+                | "pwdaccountlockedtime"
+                | "pwdfailuretime"
+                | "pwdhistory"
+                | "contextcsn"
+        )
+    }
+}
+
+impl Default for OperationalAttributes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Representation of an LDAP directory entry used by storage backends.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub dn: String,
     pub attributes: HashMap<String, Vec<String>>,
+    /// Operational attributes (not returned by default in searches)
+    #[serde(default)]
+    pub operational_attributes: OperationalAttributes,
 }
 
 impl DirectoryEntry {
@@ -23,6 +143,25 @@ impl DirectoryEntry {
         Self {
             dn: dn.into(),
             attributes: normalized_attributes,
+            operational_attributes: OperationalAttributes::new(),
+        }
+    }
+
+    /// Create a new entry with operational attributes
+    pub fn with_operational_attrs(
+        dn: impl Into<String>,
+        attributes: HashMap<String, Vec<String>>,
+        operational_attributes: OperationalAttributes,
+    ) -> Self {
+        let normalized_attributes = attributes
+            .into_iter()
+            .map(|(key, values)| (key.to_lowercase(), values))
+            .collect();
+
+        Self {
+            dn: dn.into(),
+            attributes: normalized_attributes,
+            operational_attributes,
         }
     }
 }
@@ -86,6 +225,24 @@ pub trait DirectoryBackend: Send + Sync {
         base_dn: &str,
         scope: SearchScope,
     ) -> Result<Vec<DirectoryEntry>, BackendError>;
+
+    /// Get the current contextCSN for the database
+    /// 
+    /// # Returns
+    /// * `Ok(Some(Csn))` - The current contextCSN
+    /// * `Ok(None)` - No contextCSN set yet (empty database)
+    /// * `Err(BackendError)` - Error retrieving contextCSN
+    async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError>;
+
+    /// Set the contextCSN for the database
+    /// 
+    /// # Arguments
+    /// * `csn` - The new contextCSN value
+    /// 
+    /// # Returns
+    /// * `Ok(())` - contextCSN updated successfully
+    /// * `Err(BackendError)` - Error updating contextCSN
+    async fn set_context_csn(&self, csn: crate::csn::Csn) -> Result<(), BackendError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,12 +267,20 @@ struct StoredEntry {
 /// In-memory mock backend useful during early development.
 pub struct MockBackend {
     entries: RwLock<HashMap<String, StoredEntry>>,
+    context_csn: RwLock<Option<crate::csn::Csn>>,
+    csn_generator: Arc<crate::csn::CsnGenerator>,
 }
 
 impl MockBackend {
     pub fn new() -> Self {
+        Self::with_replica_id(1)
+    }
+
+    pub fn with_replica_id(replica_id: u16) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            context_csn: RwLock::new(None),
+            csn_generator: Arc::new(crate::csn::CsnGenerator::new(replica_id)),
         }
     }
 
@@ -136,6 +301,7 @@ impl MockBackend {
                     entry: DirectoryEntry {
                         dn: dn_string,
                         attributes: HashMap::new(),
+                        operational_attributes: OperationalAttributes::new(),
                     },
                 },
             );
@@ -143,6 +309,8 @@ impl MockBackend {
 
         Self {
             entries: RwLock::new(entries),
+            context_csn: RwLock::new(None),
+            csn_generator: Arc::new(crate::csn::CsnGenerator::new(1)),
         }
     }
 }
@@ -173,13 +341,22 @@ impl DirectoryBackend for MockBackend {
 
     async fn add_entry(
         &self,
-        entry: DirectoryEntry,
+        mut entry: DirectoryEntry,
         password: Vec<u8>,
     ) -> Result<(), BackendError> {
         let mut entries = self.entries.write().await;
         if entries.contains_key(&entry.dn) {
             return Err(BackendError::AlreadyExists);
         }
+
+        // Generate CSN for this entry and update contextCSN
+        let csn = self.csn_generator.generate();
+        entry.operational_attributes = OperationalAttributes::for_new_entry(csn.clone(), None);
+
+        // Update contextCSN
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
+        drop(context_csn);
 
         entries.insert(entry.dn.clone(), StoredEntry { password, entry });
 
@@ -188,7 +365,14 @@ impl DirectoryBackend for MockBackend {
 
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
         let mut entries = self.entries.write().await;
-        entries.remove(dn).map(|_| ()).ok_or(BackendError::NotFound)
+        entries.remove(dn).ok_or(BackendError::NotFound)?;
+
+        // Update contextCSN after delete
+        let csn = self.csn_generator.generate();
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
+
+        Ok(())
     }
 
     async fn modify_entry(
@@ -199,9 +383,17 @@ impl DirectoryBackend for MockBackend {
         let mut entries = self.entries.write().await;
         let stored = entries.get_mut(dn).ok_or(BackendError::NotFound)?;
 
+        // Generate new CSN for this modification
+        let csn = self.csn_generator.generate();
+        stored.entry.operational_attributes.for_modified_entry(csn.clone(), None);
+
         for modification in modifications {
             apply_modification(&mut stored.entry, &mut stored.password, &modification);
         }
+
+        // Update contextCSN
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
 
         Ok(())
     }
@@ -246,6 +438,9 @@ impl DirectoryBackend for MockBackend {
 
         let renames = plan_dn_renames(&*entries, dn, &target_dn)?;
 
+        // Generate CSN for rename operation
+        let csn = self.csn_generator.generate();
+
         for (old_dn, new_dn) in renames {
             if let Some(mut stored) = entries.remove(&old_dn) {
                 update_entry_for_rename(
@@ -258,9 +453,17 @@ impl DirectoryBackend for MockBackend {
                     delete_old,
                 );
                 stored.entry.dn = new_dn.clone();
+                
+                // Update operational attributes for renamed entry
+                stored.entry.operational_attributes.for_modified_entry(csn.clone(), None);
+                
                 entries.insert(new_dn, stored);
             }
         }
+
+        // Update contextCSN
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
 
         Ok(())
     }
@@ -281,6 +484,17 @@ impl DirectoryBackend for MockBackend {
         }
 
         Ok(results)
+    }
+
+    async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
+        let context_csn = self.context_csn.read().await;
+        Ok(context_csn.clone())
+    }
+
+    async fn set_context_csn(&self, csn: crate::csn::Csn) -> Result<(), BackendError> {
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
+        Ok(())
     }
 }
 

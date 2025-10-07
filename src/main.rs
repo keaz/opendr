@@ -44,7 +44,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Create LMDB backend with configured max size (convert to MB)
                 let max_size_mb = (config.backend.lmdb_max_size / (1024 * 1024)) as usize;
-                let mut backend = LmdbBackend::new(&config.backend.data_directory, max_size_mb)?;
+                // TODO: Get replica_id from configuration (for now, use default 1)
+                let replica_id = 1;
+                let mut backend = LmdbBackend::new(&config.backend.data_directory, max_size_mb, replica_id)?;
 
                 // Initialize with base structure if needed
                 match backend.get_entry(&config.server.base_dn).await {
@@ -444,7 +446,7 @@ mod tests {
         config.backend.backend_type = "lmdb".to_string();
         config.backend.data_directory = temp_dir.path().to_path_buf();
 
-        let mut backend = LmdbBackend::new(temp_dir.path(), 100).unwrap();
+        let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
         initialize_base_structure(&mut backend, &config)
             .await
             .unwrap();
