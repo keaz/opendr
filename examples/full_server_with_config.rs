@@ -191,10 +191,14 @@ async fn create_backend(config: &ServerConfig) -> Result<Arc<dyn DirectoryBacken
         "lmdb" => {
             println!("  Initializing LMDB backend...");
             let max_size_mb = (config.backend.lmdb_max_size / (1024 * 1024)) as usize;
+            let replica_id = config.replication.as_ref()
+                .and_then(|r| r.replica_id)
+                .unwrap_or(1);
 
             let mut backend = LmdbBackend::new(
                 &config.backend.data_directory,
-                max_size_mb
+                max_size_mb,
+                replica_id
             )?;
 
             // Initialize directory structure if needed

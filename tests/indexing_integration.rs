@@ -24,7 +24,7 @@ fn create_custom_backend(temp_dir: &TempDir, indexed_attrs: Vec<String>) -> Lmdb
     let config = IndexConfig {
         indexed_attributes: indexed_attrs,
     };
-    LmdbBackend::new_with_config(temp_dir.path(), 100, config).unwrap()
+    LmdbBackend::new_with_config(temp_dir.path(), 100, 1, config).unwrap()
 }
 
 #[tokio::test]

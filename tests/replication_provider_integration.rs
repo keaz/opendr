@@ -99,7 +99,7 @@ async fn test_backend_wrapper_with_changelog() {
     wrapper.add_entry(entry, vec![]).await.unwrap();
 
     // Verify changelog recorded it
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
 }
@@ -122,7 +122,7 @@ async fn test_replication_service_backend_wrapper() {
 
     // Verify changelog recorded it
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
     assert_eq!(entries.len(), 1);
 }
 
@@ -148,7 +148,7 @@ async fn test_replication_service_multiple_operations() {
 
     // Verify all recorded
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
     assert_eq!(entries.len(), 5);
 }
 
@@ -175,7 +175,7 @@ async fn test_replication_service_changelog_capacity() {
 
     // Verify capacity limit enforced
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
     // Should have pruned old entries
     assert!(entries.len() <= 10);
 }

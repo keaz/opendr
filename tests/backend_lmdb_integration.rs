@@ -89,7 +89,7 @@ async fn test_lmdb_persistence() {
 
     // Create backend and add entry
     {
-        let backend = LmdbBackend::new(&db_path, 100).unwrap();
+        let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
 
         let mut attributes = HashMap::new();
         attributes.insert("cn".to_string(), vec!["persistent".to_string()]);
@@ -100,7 +100,7 @@ async fn test_lmdb_persistence() {
 
     // Reopen backend and verify data persists
     {
-        let backend = LmdbBackend::new(&db_path, 100).unwrap();
+        let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
 
         let retrieved = backend.get_entry("cn=persistent,dc=example,dc=org").await.unwrap();
         assert!(retrieved.is_some(), "Data should persist after backend restart");

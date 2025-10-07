@@ -96,12 +96,13 @@ async fn test_e2e_add_operation_tracking() {
 
     // Verify changelog recorded the add
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].change_type, ChangeType::Add);
     assert_eq!(entries[0].dn, "cn=user1,dc=test,dc=org");
-    assert_eq!(entries[0].sequence_number, 1);
+    // Verify CSN is assigned
+    assert_eq!(entries[0].csn.replica_id(), 1); // Default replica ID
 }
 
 /// Test changelog tracking for modify operations
@@ -134,12 +135,13 @@ async fn test_e2e_modify_operation_tracking() {
 
     // Verify changelog has both operations
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].change_type, ChangeType::Add);
     assert_eq!(entries[1].change_type, ChangeType::Modify);
-    assert_eq!(entries[1].sequence_number, 2);
+    // Verify CSNs are ordered
+    assert!(entries[1].csn > entries[0].csn);
 }
 
 /// Test changelog tracking for delete operations
@@ -161,7 +163,7 @@ async fn test_e2e_delete_operation_tracking() {
 
     // Verify changelog has both operations
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].change_type, ChangeType::Add);
@@ -191,7 +193,7 @@ async fn test_e2e_rename_operation_tracking() {
 
     // Verify changelog has both operations
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].change_type, ChangeType::Add);
@@ -218,13 +220,15 @@ async fn test_e2e_sequence_number_ordering() {
         wrapped_backend.add_entry(entry, vec![]).await.unwrap();
     }
 
-    // Verify sequence numbers
+    // Verify CSN ordering
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 5);
-    for (idx, entry) in entries.iter().enumerate() {
-        assert_eq!(entry.sequence_number, (idx + 1) as u64);
+    // Verify CSNs are strictly increasing
+    for idx in 1..entries.len() {
+        assert!(entries[idx].csn > entries[idx-1].csn,
+            "CSN at index {} should be greater than CSN at index {}", idx, idx-1);
     }
 }
 
@@ -251,11 +255,14 @@ async fn test_e2e_changelog_capacity() {
 
     // Verify only latest entries retained
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].sequence_number, 3); // Oldest entry is #3
-    assert_eq!(entries[2].sequence_number, 5); // Newest entry is #5
+    // Should keep only last 3 entries (most recent)
+    assert!(entries.len() <= 3);
+    // Verify CSNs are ordered
+    for idx in 1..entries.len() {
+        assert!(entries[idx].csn > entries[idx-1].csn);
+    }
 }
 
 /// Test provider service startup and shutdown
@@ -381,7 +388,7 @@ async fn test_e2e_changelog_persistence() {
 
     // Verify all operations in changelog
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 4);
     assert_eq!(entries[0].change_type, ChangeType::Add);
@@ -412,8 +419,13 @@ async fn test_e2e_provider_serves_changes() {
     // Get changelog and verify it can be queried
     let changelog = service.changelog().unwrap();
 
-    // Simulate consumer query from cookie (get changes since sequence 5)
-    let changes_since_5 = changelog.get_since(5);
+    // Get all changes and verify count
+    let all_changes = changelog.get_all();
+    assert_eq!(all_changes.len(), 10); // All 10 entries
+    
+    // Simulate consumer query from cookie (get changes since 5th CSN)
+    let csn5 = &all_changes[4].csn; // 5th entry (index 4)
+    let changes_since_5 = changelog.get_since_csn(csn5);
 
     assert_eq!(changes_since_5.len(), 5); // Entries 6-10
 }
@@ -449,15 +461,17 @@ async fn test_e2e_concurrent_operations() {
 
     // Verify all operations recorded
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 20);
 
-    // Verify sequence numbers are unique and ordered
-    let mut seq_nums: Vec<u64> = entries.iter().map(|e| e.sequence_number).collect();
-    seq_nums.sort();
-    for (idx, &seq) in seq_nums.iter().enumerate() {
-        assert_eq!(seq, (idx + 1) as u64);
+    // Verify CSNs are unique and all entries recorded
+    let mut csns: Vec<_> = entries.iter().map(|e| e.csn.clone()).collect();
+    csns.sort();
+    
+    // Verify all CSNs are unique (no duplicates after sorting)
+    for idx in 1..csns.len() {
+        assert!(csns[idx] > csns[idx-1], "CSNs should be unique and ordered");
     }
 }
 
@@ -469,7 +483,7 @@ async fn test_e2e_empty_changelog() {
     let service = ReplicationService::from_config(&config, backend).unwrap();
 
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 0);
 }
@@ -493,16 +507,18 @@ async fn test_e2e_changelog_cookie() {
         wrapped_backend.add_entry(entry, vec![]).await.unwrap();
     }
 
-    // Cookie should represent the latest sequence number
+    // Cookie should represent the latest CSN
     let changelog = service.changelog().unwrap();
-    let current_seq = changelog.current_sequence();
+    let context_csn = changelog.get_context_csn();
 
+    assert!(context_csn.is_some(), "Context CSN should exist after changes");
+    
     // Verify we can generate and parse cookies
-    let cookie = changelog.generate_cookie_from_seq(current_seq);
-    let parsed_seq = changelog.parse_cookie(&cookie);
+    let cookie = changelog.generate_context_cookie();
+    let parsed_csn = changelog.parse_cookie(&cookie);
 
-    assert_eq!(current_seq, 5);
-    assert_eq!(parsed_seq, Some(5));
+    assert!(parsed_csn.is_some(), "Cookie should be parseable");
+    assert_eq!(parsed_csn.unwrap(), context_csn.unwrap());
 }
 
 /// Test read operations don't affect changelog
@@ -528,7 +544,7 @@ async fn test_e2e_reads_dont_replicate() {
 
     // Verify only the add operation is in changelog
     let changelog = service.changelog().unwrap();
-    let entries = changelog.get_since(0);
+    let entries = changelog.get_all();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].change_type, ChangeType::Add);

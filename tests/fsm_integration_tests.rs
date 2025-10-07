@@ -51,7 +51,7 @@ async fn test_connection_fsm_set_with_mock_backend() {
 async fn test_connection_fsm_set_with_lmdb_backend() {
     // Test ConnectionFsmSet with real LMDB backend
     let temp_dir = TempDir::new().unwrap();
-    let backend = Arc::new(LmdbBackend::new(temp_dir.path(), 10).unwrap());
+    let backend = Arc::new(LmdbBackend::new(temp_dir.path(), 10, 1).unwrap());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -209,7 +209,7 @@ async fn test_backend_operations_with_mock() {
 async fn test_backend_operations_with_lmdb() {
     // Test basic backend operations with LMDB
     let temp_dir = TempDir::new().unwrap();
-    let backend = Arc::new(LmdbBackend::new(temp_dir.path(), 10).unwrap());
+    let backend = Arc::new(LmdbBackend::new(temp_dir.path(), 10, 1).unwrap());
 
     // Add entries
     let entry1 = DirectoryEntry::new(

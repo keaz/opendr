@@ -581,8 +581,12 @@ impl ChangelogProvider for MockChangelogProvider {
         Ok(vec![])
     }
 
-    async fn generate_cookie(&self, _last_sequence: u64) -> Result<String, String> {
+    async fn generate_cookie(&self, _last_csn: &opendr::csn::Csn) -> Result<String, String> {
         Ok("new_cookie".to_string())
+    }
+
+    async fn get_context_csn(&self) -> Result<Option<opendr::csn::Csn>, String> {
+        Ok(None)
     }
 
     async fn validate_cookie(&self, _cookie: &str) -> Result<bool, String> {

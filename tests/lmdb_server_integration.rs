@@ -289,7 +289,7 @@ async fn test_setup_config_with_lmdb_backend() {
     };
 
     // Create backend
-    let mut backend = LmdbBackend::new(&config.data_directory, 100).unwrap();
+    let mut backend = LmdbBackend::new(&config.data_directory, 100, 1).unwrap();
 
     // Add base structure (similar to what main.rs does)
     let base_entry = DirectoryEntry::new(

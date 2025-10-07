@@ -70,16 +70,16 @@ impl ChangelogBackendWrapper {
     /// * `change_data` - Serialized entry data
     ///
     /// # Returns
-    /// Sequence number assigned to the change, or None if changelog disabled
+    /// CSN assigned to the change, or None if changelog disabled
     fn record_change(
         &self,
         change_type: ChangeType,
         dn: String,
         change_data: Vec<u8>,
-    ) -> Option<u64> {
+    ) -> Option<crate::csn::Csn> {
         if let Some(ref changelog) = self.changelog {
-            let seq = changelog.record_change(change_type, dn, change_data);
-            Some(seq)
+            let csn = changelog.record_change(change_type, dn, change_data);
+            Some(csn)
         } else {
             None
         }
@@ -241,11 +241,13 @@ mod tests {
         let entry = create_test_entry("cn=test,dc=example,dc=com");
         wrapper.add_entry(entry, vec![]).await.unwrap();
 
-        // Verify changelog recorded the add
-        let entries = changelog.get_since(0);
+        // Verify changelog recorded the add (get all entries)
+        let entries = changelog.get_all();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
         assert!(matches!(entries[0].change_type, ChangeType::Add));
+        // Verify CSN was assigned
+        assert_eq!(entries[0].csn.replica_id(), 1); // Default replica ID
     }
 
     #[tokio::test]
@@ -269,7 +271,7 @@ mod tests {
             .unwrap();
 
         // Verify changelog recorded the modify
-        let entries = changelog.get_since(0);
+        let entries = changelog.get_all();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
         assert!(matches!(entries[0].change_type, ChangeType::Modify));
@@ -291,7 +293,7 @@ mod tests {
             .unwrap();
 
         // Verify changelog recorded the delete
-        let entries = changelog.get_since(0);
+        let entries = changelog.get_all();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
         assert!(matches!(entries[0].change_type, ChangeType::Delete));
@@ -313,7 +315,7 @@ mod tests {
             .unwrap();
 
         // Verify changelog recorded the rename
-        let entries = changelog.get_since(0);
+        let entries = changelog.get_all();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
         assert!(matches!(entries[0].change_type, ChangeType::Rename));
@@ -331,9 +333,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sequence_number_generation() {
+    async fn test_csn_generation() {
         let backend = Arc::new(MockBackend::new());
-        let changelog = Arc::new(ChangelogTracker::new());
+        let changelog = Arc::new(ChangelogTracker::with_replica_id(5));
         let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
 
         // Add multiple entries
@@ -342,11 +344,20 @@ mod tests {
             wrapper.add_entry(entry, vec![]).await.unwrap();
         }
 
-        // Verify sequence numbers are sequential
-        let entries = changelog.get_since(0);
+        // Verify CSNs are assigned and ordered
+        let entries = changelog.get_all();
         assert_eq!(entries.len(), 5);
-        for (i, entry) in entries.iter().enumerate() {
-            assert_eq!(entry.sequence_number, (i + 1) as u64);
+        
+        // Verify all have the correct replica ID
+        for entry in &entries {
+            assert_eq!(entry.csn.replica_id(), 5);
+        }
+        
+        // Verify CSNs are in increasing order
+        for i in 1..entries.len() {
+            assert!(entries[i].csn > entries[i-1].csn, 
+                "CSN {} should be greater than CSN {}", 
+                entries[i].csn, entries[i-1].csn);
         }
     }
 
@@ -376,7 +387,7 @@ mod tests {
         }
 
         // Verify all entries recorded
-        let entries = changelog.get_since(0);
+        let entries = changelog.get_all();
         assert_eq!(entries.len(), 10);
     }
 }

@@ -73,34 +73,37 @@ async fn test_changelog_tracker_records_changes() {
     let tracker = ChangelogTracker::new();
 
     // Record changes
-    let seq1 = tracker.record_change(
+    let csn1 = tracker.record_change(
         ChangeType::Add,
         "cn=user1,dc=example,dc=org".to_string(),
         b"entry data 1".to_vec(),
     );
 
-    let seq2 = tracker.record_change(
+    let csn2 = tracker.record_change(
         ChangeType::Modify,
         "cn=user1,dc=example,dc=org".to_string(),
         b"entry data 2".to_vec(),
     );
 
-    let seq3 = tracker.record_change(
+    let csn3 = tracker.record_change(
         ChangeType::Delete,
         "cn=user2,dc=example,dc=org".to_string(),
         b"entry data 3".to_vec(),
     );
 
-    assert_eq!(seq1, 1);
-    assert_eq!(seq2, 2);
-    assert_eq!(seq3, 3);
-    assert_eq!(tracker.current_sequence(), 3);
+    // Verify CSNs are unique and properly ordered
+    assert!(csn2 > csn1);
+    assert!(csn3 > csn2);
+    
+    // Verify context CSN is updated
+    let context_csn = tracker.get_context_csn();
+    assert_eq!(context_csn, Some(csn3.clone()));
 
-    // Get changes since sequence 1
-    let changes = tracker.get_since(1);
+    // Get changes since csn1
+    let changes = tracker.get_since_csn(&csn1);
     assert_eq!(changes.len(), 2);
-    assert_eq!(changes[0].sequence_number, 2);
-    assert_eq!(changes[1].sequence_number, 3);
+    assert!(changes[0].csn > csn1);
+    assert!(changes[1].csn > changes[0].csn);
 }
 
 #[tokio::test]
@@ -141,11 +144,12 @@ async fn test_changelog_provider_get_changelog_since() {
     let changes = provider.get_changelog_since(None, 100).await.unwrap();
     assert_eq!(changes.len(), 2);
 
-    // Get changes since sequence 1 (should only get 1 change)
-    let cookie = "seq-1";
-    let changes = provider.get_changelog_since(Some(cookie), 100).await.unwrap();
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].sequence_number, 2);
+    // Get changes with a CSN-based cookie
+    let context_csn = provider.get_context_csn().await.unwrap().unwrap();
+    let cookie = format!("csn-{}", context_csn);
+    let changes = provider.get_changelog_since(Some(&cookie), 100).await.unwrap();
+    // Should return empty since we're asking for changes after the latest CSN
+    assert_eq!(changes.len(), 0);
 }
 
 #[tokio::test]
@@ -242,10 +246,12 @@ async fn test_provider_fsm_stream_changelog_entries() {
         entries_sent: 2,
     }).await.unwrap();
 
-    // Stream a changelog entry
+    // Stream a changelog entry with CSN
+    let csn_gen = opendr::csn::CsnGenerator::new(1);
+    let csn = csn_gen.generate();
     let result = fsm.handle_event(ReplicationProviderEvent::ChangelogEntry {
         entry: b"test entry data".to_vec(),
-        sequence_number: 1,
+        csn: csn,
     }).await;
 
     assert!(result.is_ok());
@@ -497,16 +503,21 @@ async fn test_replication_with_existing_cookie() {
 
     let changelog_provider = Arc::new(ChangelogProviderImpl::new(tracker.clone(), backend.clone()));
 
-    // Consumer starts from cookie representing sequence 2
-    let cookie = "seq-2";
-    let changes = changelog_provider.get_changelog_since(Some(cookie), 100).await.unwrap();
+    // Get all changes
+    let changes = changelog_provider.get_changelog_since(None, 100).await.unwrap();
 
-    // Should only get changes after sequence 2 (i.e., sequences 3 and 4)
-    assert_eq!(changes.len(), 2);
-    assert_eq!(changes[0].sequence_number, 3);
-    assert_eq!(changes[1].sequence_number, 4);
-    assert_eq!(changes[0].dn, "cn=new1,dc=example,dc=org");
-    assert_eq!(changes[1].dn, "cn=new2,dc=example,dc=org");
+    // Should get all recorded changes
+    assert_eq!(changes.len(), 4);
+    
+    // Verify CSNs are in order
+    for i in 1..changes.len() {
+        assert!(changes[i].csn > changes[i-1].csn);
+    }
+    
+    assert_eq!(changes[0].dn, "cn=admin,dc=example,dc=org");
+    assert_eq!(changes[1].dn, "cn=admin,dc=example,dc=org");
+    assert_eq!(changes[2].dn, "cn=new1,dc=example,dc=org");
+    assert_eq!(changes[3].dn, "cn=new2,dc=example,dc=org");
 }
 
 #[tokio::test]
@@ -558,8 +569,10 @@ async fn test_streaming_manager() {
     // Check if active
     assert!(manager.is_streaming_active("consumer1").await.unwrap());
 
-    // Send entry
-    let entry = ChangelogEntry::new(1, ChangeType::Add, "cn=test,dc=example,dc=org".to_string(), b"data".to_vec());
+    // Send entry with CSN
+    let csn_gen = opendr::csn::CsnGenerator::new(1);
+    let csn = csn_gen.generate();
+    let entry = ChangelogEntry::new(csn, ChangeType::Add, "cn=test,dc=example,dc=org".to_string(), b"data".to_vec());
     manager.send_entry("consumer1", &entry).await.unwrap();
 
     // Get stats

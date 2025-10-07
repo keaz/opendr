@@ -70,7 +70,7 @@ pub trait ChangelogProvider: Send + Sync {
     /// Get changelog entries since a specific cookie
     /// 
     /// # Arguments
-    /// * `cookie` - Replication cookie representing last sync point
+    /// * `cookie` - Replication cookie representing last sync point (CSN-based)
     /// * `limit` - Maximum number of entries to return
     /// 
     /// # Returns  
@@ -78,20 +78,28 @@ pub trait ChangelogProvider: Send + Sync {
     /// * `Err(String)` - Error message if operation fails
     async fn get_changelog_since(&self, cookie: Option<&str>, limit: usize) -> Result<Vec<ChangelogEntry>, String>;
     
-    /// Generate new replication cookie after streaming entries
+    /// Generate new replication cookie from CSN
     /// 
     /// # Arguments
-    /// * `last_sequence` - Last sequence number processed
+    /// * `last_csn` - Last CSN processed (for cookie generation)
     /// 
     /// # Returns
     /// * `Ok(String)` - New replication cookie
     /// * `Err(String)` - Error message if generation fails
-    async fn generate_cookie(&self, last_sequence: u64) -> Result<String, String>;
+    async fn generate_cookie(&self, last_csn: &crate::csn::Csn) -> Result<String, String>;
+    
+    /// Get current contextCSN (highest CSN in changelog)
+    /// 
+    /// # Returns
+    /// * `Ok(Some(Csn))` - Current contextCSN if any changes exist
+    /// * `Ok(None)` - No changes recorded yet
+    /// * `Err(String)` - Error message if retrieval fails
+    async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, String>;
     
     /// Validate if a replication cookie is still valid
     /// 
     /// # Arguments  
-    /// * `cookie` - Cookie to validate
+    /// * `cookie` - Cookie to validate (CSN-based format)
     /// 
     /// # Returns
     /// * `Ok(bool)` - True if cookie is valid, false otherwise
@@ -371,8 +379,8 @@ impl DirectoryEntry {
 /// Represents a changelog entry for replication  
 #[derive(Debug, Clone)]
 pub struct ChangelogEntry {
-    /// Unique sequence number for this change
-    pub sequence_number: u64,
+    /// Change Sequence Number (CSN) - unique identifier for this change
+    pub csn: crate::csn::Csn,
     /// Type of change (add, modify, delete, rename)
     pub change_type: ChangeType,
     /// Distinguished name of affected entry
@@ -389,16 +397,16 @@ impl ChangelogEntry {
     /// Create a new changelog entry
     /// 
     /// # Arguments
-    /// * `sequence_number` - Unique sequence number
+    /// * `csn` - Change Sequence Number for this change
     /// * `change_type` - Type of directory change
     /// * `dn` - Distinguished name of affected entry
     /// * `change_data` - Serialized change data
     /// 
     /// # Returns
     /// * New ChangelogEntry instance
-    pub fn new(sequence_number: u64, change_type: ChangeType, dn: String, change_data: Vec<u8>) -> Self {
+    pub fn new(csn: crate::csn::Csn, change_type: ChangeType, dn: String, change_data: Vec<u8>) -> Self {
         Self {
-            sequence_number,
+            csn,
             change_type,
             dn,
             change_data,
@@ -1274,10 +1282,17 @@ impl ReplicationProviderFsmImpl {
         let consumer_id = self.sessions.keys().next()
             .ok_or(ReplicationProviderError::NoActiveConsumer)?.clone();
         
-        // Generate new replication cookie
-        let last_sequence = entries_streamed as u64;
-        let new_cookie = self.changelog_provider.generate_cookie(last_sequence).await
+        // Get contextCSN and generate new replication cookie
+        let context_csn = self.changelog_provider.get_context_csn().await
             .map_err(|e| ReplicationProviderError::ChangelogError { message: e })?;
+        
+        let new_cookie = if let Some(csn) = context_csn {
+            self.changelog_provider.generate_cookie(&csn).await
+                .map_err(|e| ReplicationProviderError::ChangelogError { message: e })?
+        } else {
+            // No CSN yet - use empty cookie
+            "csn-empty".to_string()
+        };
         
         // Update session
         if let Some(session) = self.sessions.get_mut(&consumer_id) {
@@ -1300,18 +1315,18 @@ impl ReplicationProviderFsmImpl {
         Ok(Some(entries_streamed))
     }
     
-    /// Handle changelog entry streaming
+    /// Handle changelog entry streaming (CSN-based)
     /// 
     /// # Arguments
     /// * `entry` - Changelog entry data
-    /// * `sequence_number` - Entry sequence number
+    /// * `csn` - Change Sequence Number for this entry
     /// 
     /// # Returns
     /// * Result indicating success or error
     async fn handle_changelog_entry(
         &mut self, 
         entry: Vec<u8>, 
-        sequence_number: u64
+        csn: crate::csn::Csn
     ) -> Result<Option<usize>, ReplicationProviderError> {
         // Validate we're in streaming-capable state
         if !matches!(self.state, 
@@ -1331,9 +1346,9 @@ impl ReplicationProviderFsmImpl {
             return Err(ReplicationProviderError::NoActiveConsumer);
         }
         
-        // Create changelog entry
+        // Create changelog entry with CSN
         let changelog_entry = ChangelogEntry::new(
-            sequence_number,
+            csn,
             ChangeType::Modify, // Default to modify
             "cn=example,dc=example,dc=org".to_string(),
             entry,
@@ -1544,8 +1559,8 @@ impl StateMachine for ReplicationProviderFsmImpl {
             ReplicationProviderEvent::PresentComplete { entries_streamed } => {
                 self.handle_present_complete(entries_streamed).await
             },
-            ReplicationProviderEvent::ChangelogEntry { entry, sequence_number } => {
-                self.handle_changelog_entry(entry, sequence_number).await
+            ReplicationProviderEvent::ChangelogEntry { entry, csn } => {
+                self.handle_changelog_entry(entry, csn).await
             },
             ReplicationProviderEvent::EntryStreamed { consumer_id } => {
                 self.handle_entry_streamed(consumer_id).await
@@ -1681,7 +1696,7 @@ pub mod tests {
                     DirectoryEntry::new("cn=user2,dc=example,dc=org".to_string(), HashMap::new()),
                 ],
                 changelog: vec![
-                    ChangelogEntry::new(1, ChangeType::Add, "cn=user3,dc=example,dc=org".to_string(), b"entry data".to_vec()),
+                    ChangelogEntry::new(crate::csn::Csn::new(1), ChangeType::Add, "cn=user3,dc=example,dc=org".to_string(), b"entry data".to_vec()),
                 ],
             }
         }
@@ -1715,11 +1730,21 @@ pub mod tests {
             }
         }
         
-        async fn generate_cookie(&self, last_sequence: u64) -> Result<String, String> {
+        async fn generate_cookie(&self, last_csn: &crate::csn::Csn) -> Result<String, String> {
             if self.should_fail {
                 Err("Mock cookie generation failure".to_string())
             } else {
-                Ok(format!("cookie-{}", last_sequence))
+                Ok(format!("csn-{}", last_csn))
+            }
+        }
+        
+        async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, String> {
+            if self.should_fail {
+                Err("Mock context CSN retrieval failure".to_string())
+            } else if let Some(entry) = self.changelog.last() {
+                Ok(Some(entry.csn.clone()))
+            } else {
+                Ok(None)
             }
         }
         
@@ -2140,10 +2165,11 @@ pub mod tests {
             entries_sent: 2,
         }).await.unwrap();
         
-        // Stream changelog entry
+        // Stream changelog entry with CSN
+        let csn = crate::csn::Csn::new(1);
         let result = fsm.handle_event(ReplicationProviderEvent::ChangelogEntry {
             entry: b"test entry data".to_vec(),
-            sequence_number: 123,
+            csn,
         }).await;
         
         assert!(result.is_ok());
@@ -2160,9 +2186,10 @@ pub mod tests {
         // Try to stream changelog entry without any consumers
         fsm.state = ReplicationProviderState::Present { entries_streamed: 0 };
         
+        let csn = crate::csn::Csn::new(1);
         let result = fsm.handle_event(ReplicationProviderEvent::ChangelogEntry {
             entry: b"test entry data".to_vec(),
-            sequence_number: 123,
+            csn,
         }).await;
         
         assert!(result.is_err());
@@ -2341,14 +2368,15 @@ pub mod tests {
     
     #[tokio::test]
     async fn test_changelog_entry_methods() {
+        let csn = crate::csn::Csn::new(1);
         let entry = ChangelogEntry::new(
-            42,
+            csn.clone(),
             ChangeType::Add,
             "cn=newuser,dc=example,dc=org".to_string(),
             b"entry data content".to_vec(),
         ).with_originator("admin".to_string());
         
-        assert_eq!(entry.sequence_number, 42);
+        assert_eq!(entry.csn, csn);
         assert_eq!(entry.change_type, ChangeType::Add);
         assert_eq!(entry.dn, "cn=newuser,dc=example,dc=org");
         assert_eq!(entry.originator, Some("admin".to_string()));

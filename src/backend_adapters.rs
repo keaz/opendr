@@ -16,6 +16,7 @@ use crate::backend::{DirectoryBackend, DirectoryEntry, Modification as BackendMo
 use crate::search_fsm::{SearchBackend, SearchEntry};
 use crate::write_fsm::{WriteBackend, Modification as WriteMod};
 use crate::compare_fsm::{CompareBackend, CompareEntry};
+use crate::operational_attrs::{filter_operational_attributes, filter_user_attributes, merge_attributes};
 
 /// Adapter that implements SearchBackend using a DirectoryBackend
 pub struct SearchBackendAdapter {
@@ -41,17 +42,24 @@ impl SearchBackend for SearchBackendAdapter {
         Ok(entries.into_iter().map(|e| e.dn).collect())
     }
 
-    async fn get_entry(&self, dn: &str, _attributes: &[String]) -> Result<Option<SearchEntry>, String> {
+    async fn get_entry(&self, dn: &str, attributes: &[String]) -> Result<Option<SearchEntry>, String> {
         let entry = self.backend.get_entry(dn)
             .await
             .map_err(|e| format!("Backend get_entry error: {}", e))?;
 
-        Ok(entry.map(|e| SearchEntry {
-            dn: e.dn.clone(),
-            attributes: e.attributes.clone(),
-            object_classes: e.attributes.get("objectclass")
-                .cloned()
-                .unwrap_or_default(),
+        Ok(entry.map(|e| {
+            // Filter user and operational attributes based on request
+            let user_attrs = filter_user_attributes(&e.attributes, attributes);
+            let operational = filter_operational_attributes(&e.operational_attributes, attributes);
+            let combined_attrs = merge_attributes(user_attrs, operational);
+
+            SearchEntry {
+                dn: e.dn.clone(),
+                attributes: combined_attrs,
+                object_classes: e.attributes.get("objectclass")
+                    .cloned()
+                    .unwrap_or_default(),
+            }
         }))
     }
 

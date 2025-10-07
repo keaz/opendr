@@ -566,8 +566,8 @@ pub enum ReplicationProviderEvent {
     RefreshComplete { entries_sent: usize },
     /// Present phase completed, ready to persist
     PresentComplete { entries_streamed: usize },
-    /// New changelog entry available for streaming
-    ChangelogEntry { entry: Vec<u8>, sequence_number: u64 },
+    /// New changelog entry available for streaming (CSN-based)
+    ChangelogEntry { entry: Vec<u8>, csn: crate::csn::Csn },
     /// Entry successfully streamed to consumer
     EntryStreamed { consumer_id: String },
     /// Consumer disconnected

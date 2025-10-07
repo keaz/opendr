@@ -60,7 +60,7 @@ async fn test_mock_backend_full_crud_cycle() {
 #[tokio::test]
 async fn test_lmdb_backend_full_crud_cycle() {
     let temp_dir = TempDir::new().unwrap();
-    let backend = Arc::new(LmdbBackend::new(temp_dir.path(), 10).unwrap());
+    let backend = Arc::new(LmdbBackend::new(temp_dir.path(), 10, 1).unwrap());
 
     // Create
     let mut attrs = HashMap::new();

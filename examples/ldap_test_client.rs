@@ -73,12 +73,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!();
 
     // Test 3: Add 1000 random test users
-    println!("5. Adding 10000 random test users...");
+    println!("5. Adding 1000 random test users...");
     let mut rng = rand::thread_rng();
     let mut added_count = 0;
     let mut skipped_count = 0;
 
-    for i in 10001..30000 {
+    for i in 0..1000 {
         // Generate random user data
         let first_name: String = (0..8)
             .map(|_| rng.sample(Alphanumeric) as char)

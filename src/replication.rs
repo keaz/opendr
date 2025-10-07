@@ -54,6 +54,7 @@ use log::{info, error, warn};
 use crate::backend::DirectoryBackend;
 use crate::replication_provider_fsm::*;
 use crate::replication_consumer_fsm::*;
+use crate::csn::{Csn, CsnGenerator};
 
 // ================================================================================================
 // Changelog Implementation
@@ -63,85 +64,143 @@ use crate::replication_consumer_fsm::*;
 ///
 /// This implementation stores a limited history of directory changes for replication.
 /// In a production system, this would be backed by persistent storage (LMDB, etc.).
+///
+/// Uses CSN (Change Sequence Number) per RFC 4533 for change identification.
 #[derive(Clone)]
 pub struct ChangelogTracker {
-    /// Sequence number counter
-    sequence: Arc<Mutex<u64>>,
-    /// Changelog entries (sequence_number -> entry)
-    entries: Arc<Mutex<HashMap<u64, ChangelogEntry>>>,
+    /// CSN generator for creating unique change identifiers
+    csn_generator: Arc<CsnGenerator>,
+    /// Changelog entries (CSN string -> entry)
+    entries: Arc<Mutex<HashMap<String, ChangelogEntry>>>,
     /// Maximum entries to keep in memory
     max_entries: usize,
-    /// Cookie to sequence number mapping
-    cookies: Arc<Mutex<HashMap<String, u64>>>,
+    /// Most recent CSN (for contextCSN)
+    latest_csn: Arc<Mutex<Option<Csn>>>,
 }
 
 impl ChangelogTracker {
-    /// Create new changelog tracker
+    /// Create new changelog tracker with default replica ID (1)
     pub fn new() -> Self {
-        Self::with_capacity(10000)
+        Self::with_replica_id(1)
     }
 
-    /// Create new changelog tracker with specific capacity
+    /// Create new changelog tracker with specific replica ID
+    pub fn with_replica_id(replica_id: u16) -> Self {
+        Self::with_capacity_and_replica(10000, replica_id)
+    }
+
+    /// Create new changelog tracker with specific capacity (uses default replica ID 1)
     pub fn with_capacity(max_entries: usize) -> Self {
+        Self::with_capacity_and_replica(max_entries, 1)
+    }
+
+    /// Create new changelog tracker with specific capacity and replica ID
+    pub fn with_capacity_and_replica(max_entries: usize, replica_id: u16) -> Self {
         Self {
-            sequence: Arc::new(Mutex::new(0)),
+            csn_generator: Arc::new(CsnGenerator::new(replica_id)),
             entries: Arc::new(Mutex::new(HashMap::new())),
             max_entries,
-            cookies: Arc::new(Mutex::new(HashMap::new())),
+            latest_csn: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Record a directory change
+    ///
+    /// # Arguments
+    /// * `change_type` - Type of directory change
+    /// * `dn` - Distinguished name of affected entry
+    /// * `change_data` - Serialized change data
+    ///
+    /// # Returns
+    /// * CSN assigned to this change
     pub fn record_change(
         &self,
         change_type: ChangeType,
         dn: String,
         change_data: Vec<u8>,
-    ) -> u64 {
-        let mut sequence = self.sequence.lock().unwrap();
-        *sequence += 1;
-        let seq_num = *sequence;
+    ) -> Csn {
+        // Generate new CSN for this change
+        let csn = self.csn_generator.generate();
+        let csn_str = csn.to_string();
 
-        let entry = ChangelogEntry::new(seq_num, change_type, dn, change_data);
+        let entry = ChangelogEntry::new(csn.clone(), change_type, dn, change_data);
 
         let mut entries = self.entries.lock().unwrap();
-        entries.insert(seq_num, entry);
+        entries.insert(csn_str, entry);
+
+        // Update latest CSN
+        let mut latest = self.latest_csn.lock().unwrap();
+        *latest = Some(csn.clone());
 
         // Prune old entries if we exceed max_entries
         if entries.len() > self.max_entries {
-            let min_seq = seq_num.saturating_sub(self.max_entries as u64);
-            entries.retain(|k, _| *k > min_seq);
+            // Remove oldest entries (smallest CSNs)
+            let mut csn_list: Vec<_> = entries.keys().cloned().collect();
+            csn_list.sort();
+            let to_remove = csn_list.len() - self.max_entries;
+            for csn_key in csn_list.iter().take(to_remove) {
+                entries.remove(csn_key);
+            }
         }
 
-        seq_num
+        csn
     }
 
-    /// Get all entries since a sequence number
-    pub fn get_since(&self, sequence: u64) -> Vec<ChangelogEntry> {
+    /// Get all entries since a CSN
+    ///
+    /// # Arguments
+    /// * `csn` - Starting CSN (exclusive - returns entries after this CSN)
+    ///
+    /// # Returns
+    /// * Vector of changelog entries after the given CSN, sorted by CSN
+    pub fn get_since_csn(&self, csn: &Csn) -> Vec<ChangelogEntry> {
         let entries = self.entries.lock().unwrap();
         let mut result: Vec<_> = entries
-            .iter()
-            .filter(|(k, _)| **k > sequence)
-            .map(|(_, v)| v.clone())
+            .values()
+            .filter(|e| e.csn > *csn)
+            .cloned()
             .collect();
-        result.sort_by_key(|e| e.sequence_number);
+        result.sort_by(|a, b| a.csn.cmp(&b.csn));
         result
     }
 
-    /// Get current sequence number
-    pub fn current_sequence(&self) -> u64 {
-        *self.sequence.lock().unwrap()
+    /// Get all entries (for full refresh)
+    pub fn get_all(&self) -> Vec<ChangelogEntry> {
+        let entries = self.entries.lock().unwrap();
+        let mut result: Vec<_> = entries.values().cloned().collect();
+        result.sort_by(|a, b| a.csn.cmp(&b.csn));
+        result
     }
 
-    /// Parse cookie to sequence number
-    pub fn parse_cookie(&self, cookie: &str) -> Option<u64> {
-        cookie.strip_prefix("seq-")
-            .and_then(|s| s.parse::<u64>().ok())
+    /// Get current contextCSN (latest CSN)
+    pub fn get_context_csn(&self) -> Option<Csn> {
+        self.latest_csn.lock().unwrap().clone()
     }
 
-    /// Generate cookie from sequence number
-    pub fn generate_cookie_from_seq(&self, sequence: u64) -> String {
-        format!("seq-{}", sequence)
+    /// Parse cookie to CSN
+    ///
+    /// Cookie format: "csn-<csn_string>"
+    /// Example: "csn-20251007123456789012#001#000001#000000"
+    pub fn parse_cookie(&self, cookie: &str) -> Option<Csn> {
+        cookie.strip_prefix("csn-")
+            .and_then(|s| Csn::parse(s).ok())
+    }
+
+    /// Generate cookie from CSN
+    ///
+    /// Creates a replication cookie from a CSN for state tracking
+    pub fn generate_cookie_from_csn(&self, csn: &Csn) -> String {
+        format!("csn-{}", csn)
+    }
+
+    /// Generate cookie from contextCSN (latest CSN)
+    pub fn generate_context_cookie(&self) -> String {
+        if let Some(csn) = self.get_context_csn() {
+            self.generate_cookie_from_csn(&csn)
+        } else {
+            // No changes yet - return empty state cookie
+            "csn-empty".to_string()
+        }
     }
 }
 
@@ -178,23 +237,43 @@ impl ChangelogProvider for ChangelogProviderImpl {
     }
 
     async fn get_changelog_since(&self, cookie: Option<&str>, limit: usize) -> Result<Vec<ChangelogEntry>, String> {
-        let sequence = if let Some(cookie) = cookie {
-            self.tracker.parse_cookie(cookie).unwrap_or(0)
+        let entries = if let Some(cookie_str) = cookie {
+            // Parse cookie to get starting CSN
+            if cookie_str == "csn-empty" {
+                // Empty state - return all entries
+                self.tracker.get_all()
+            } else if let Some(csn) = self.tracker.parse_cookie(cookie_str) {
+                // Get entries since this CSN
+                self.tracker.get_since_csn(&csn)
+            } else {
+                // Invalid cookie - return empty
+                return Err(format!("Invalid replication cookie: {}", cookie_str));
+            }
         } else {
-            0
+            // No cookie - return all entries (full refresh)
+            self.tracker.get_all()
         };
 
-        let mut entries = self.tracker.get_since(sequence);
-        entries.truncate(limit);
-        Ok(entries)
+        // Apply limit
+        let mut limited_entries = entries;
+        limited_entries.truncate(limit);
+        Ok(limited_entries)
     }
 
-    async fn generate_cookie(&self, last_sequence: u64) -> Result<String, String> {
-        Ok(self.tracker.generate_cookie_from_seq(last_sequence))
+    async fn generate_cookie(&self, last_csn: &Csn) -> Result<String, String> {
+        Ok(self.tracker.generate_cookie_from_csn(last_csn))
+    }
+
+    async fn get_context_csn(&self) -> Result<Option<Csn>, String> {
+        Ok(self.tracker.get_context_csn())
     }
 
     async fn validate_cookie(&self, cookie: &str) -> Result<bool, String> {
-        Ok(self.tracker.parse_cookie(cookie).is_some())
+        if cookie == "csn-empty" {
+            Ok(true)
+        } else {
+            Ok(self.tracker.parse_cookie(cookie).is_some())
+        }
     }
 }
 
@@ -439,7 +518,7 @@ impl ProviderConnection for ProviderConnectionImpl {
                     };
                     
                     let header = format!("{}|{}|{}|{}|", 
-                        e.sequence_number, 
+                        e.csn, 
                         change_type_str, 
                         e.dn,
                         e.change_data.len()
@@ -819,38 +898,46 @@ mod tests {
         let tracker = ChangelogTracker::new();
 
         // Record some changes
-        let seq1 = tracker.record_change(
+        let csn1 = tracker.record_change(
             ChangeType::Add,
             "cn=user1,dc=example,dc=org".to_string(),
             b"data1".to_vec(),
         );
-        assert_eq!(seq1, 1);
 
-        let seq2 = tracker.record_change(
+        let csn2 = tracker.record_change(
             ChangeType::Modify,
             "cn=user2,dc=example,dc=org".to_string(),
             b"data2".to_vec(),
         );
-        assert_eq!(seq2, 2);
 
-        // Get changes since sequence 0
-        let changes = tracker.get_since(0);
+        // Get all changes
+        let changes = tracker.get_all();
         assert_eq!(changes.len(), 2);
-        assert_eq!(changes[0].sequence_number, 1);
-        assert_eq!(changes[1].sequence_number, 2);
+        assert_eq!(changes[0].csn, csn1);
+        assert_eq!(changes[1].csn, csn2);
+        
+        // Verify CSNs are ordered
+        assert!(csn2 > csn1);
     }
 
     #[test]
     fn test_changelog_tracker_cookie() {
         let tracker = ChangelogTracker::new();
 
-        // Generate cookie
-        let cookie = tracker.generate_cookie_from_seq(42);
-        assert_eq!(cookie, "seq-42");
+        // Record a change to get a CSN
+        let csn = tracker.record_change(
+            ChangeType::Add,
+            "cn=user1,dc=example,dc=org".to_string(),
+            b"data1".to_vec(),
+        );
+
+        // Generate cookie from CSN
+        let cookie = tracker.generate_cookie_from_csn(&csn);
+        assert!(cookie.starts_with("csn-"));
 
         // Parse cookie
-        let seq = tracker.parse_cookie(&cookie);
-        assert_eq!(seq, Some(42));
+        let parsed_csn = tracker.parse_cookie(&cookie);
+        assert_eq!(parsed_csn, Some(csn));
 
         // Invalid cookie
         let invalid = tracker.parse_cookie("invalid");
@@ -871,10 +958,10 @@ mod tests {
         }
 
         // Should only keep last 5
-        let all_changes = tracker.get_since(0);
+        let all_changes = tracker.get_all();
         assert!(all_changes.len() <= 5);
 
-        // Latest entry should still be there
-        assert_eq!(tracker.current_sequence(), 10);
+        // Latest entry should still be there (check contextCSN exists)
+        assert!(tracker.get_context_csn().is_some());
     }
 }

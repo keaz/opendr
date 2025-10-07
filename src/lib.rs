@@ -19,6 +19,7 @@ pub mod fsm;
 pub mod fsm_runtime;
 pub mod fsm_server;
 pub mod metrics;
+pub mod operational_attrs;
 pub mod parser;
 pub mod rate_limit;
 pub mod referral;
