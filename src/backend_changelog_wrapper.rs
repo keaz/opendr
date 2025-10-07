@@ -87,14 +87,16 @@ impl ChangelogBackendWrapper {
 
     /// Serialize an entry to bytes for changelog storage
     fn serialize_entry(entry: &DirectoryEntry) -> Vec<u8> {
-        // Simple serialization: DN + attributes as JSON
-        // In production, consider using a more efficient binary format
-        let mut data = entry.dn.as_bytes().to_vec();
-        data.push(b'\n');
-        if let Ok(attrs) = serde_json::to_vec(&entry.attributes) {
-            data.extend_from_slice(&attrs);
+        // Serialize the entire entry as JSON for easy deserialization
+        // This includes DN and all attributes
+        match serde_json::to_vec(entry) {
+            Ok(data) => data,
+            Err(e) => {
+                use log::error;
+                error!("Failed to serialize entry {}: {:?}", entry.dn, e);
+                Vec::new()
+            }
         }
-        data
     }
 }
 

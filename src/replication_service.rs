@@ -362,7 +362,11 @@ impl ReplicationService {
             self.original_backend.clone(),
         ));
 
-        let provider_connection = Box::new(ProviderConnectionImpl::new(remote_changelog_provider));
+        let provider_connection = Box::new(ProviderConnectionImpl::with_credentials(
+            remote_changelog_provider,
+            consumer_config.provider_bind_dn.clone(),
+            consumer_config.provider_bind_password.clone(),
+        ));
 
         let batch_processor = Box::new(BatchProcessorImpl::new(self.original_backend.clone()));
 
@@ -412,6 +416,12 @@ impl ReplicationService {
                 tokio::select! {
                     _ = sync_timer.tick() => {
                         info!("Starting replication sync cycle");
+
+                        // Reset FSM to initial state before each sync cycle
+                        if let Err(e) = consumer_fsm.reset().await {
+                            error!("Failed to reset consumer FSM: {:?}", e);
+                            continue;
+                        }
 
                         // Start sync by sending StartConsumption event
                         let event = ReplicationConsumerEvent::StartConsumption {

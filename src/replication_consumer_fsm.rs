@@ -862,12 +862,24 @@ impl ReplicationConsumerFsmImpl {
         
         let entry_count = entries.len();
         
-        // Transition to receiving batches state
-        self.state = ReplicationConsumerState::ReceivingBatches { entries_received: 0 };
-        
-        // If we received entries, add them as a batch
+        // If we received entries, process them immediately
         if !entries.is_empty() {
-            self.pending_batches.push_back(entries);
+            // Transition to applying changes state
+            self.state = ReplicationConsumerState::ApplyingChanges { entries_applied: 0 };
+            
+            log::info!("Processing batch of {} entries", entry_count);
+            
+            // Process the batch
+            self.batch_processor.process_batch(entries).await
+                .map_err(|e| ConsumerError::ProcessingError { 
+                    message: format!("Failed to process batch: {}", e) 
+                })?;
+            
+            // After processing, go to listening state (skip cookie persistence for now)
+            self.state = ReplicationConsumerState::Listening;
+        } else {
+            // No entries, go straight to listening
+            self.state = ReplicationConsumerState::Listening;
         }
         
         Ok(Some(entry_count))

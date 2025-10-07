@@ -3,10 +3,11 @@ use std::fmt;
 
 use async_trait::async_trait;
 use ldap_parser::ldap::SearchScope;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Representation of an LDAP directory entry used by storage backends.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub dn: String,
     pub attributes: HashMap<String, Vec<String>>,

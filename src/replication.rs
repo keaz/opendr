@@ -48,6 +48,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use async_trait::async_trait;
+use ldap3::{LdapConnAsync, LdapConnSettings};
+use log::{info, error, warn};
 
 use crate::backend::DirectoryBackend;
 use crate::replication_provider_fsm::*;
@@ -325,14 +327,28 @@ pub struct ProviderConnectionImpl {
     provider_url: Arc<Mutex<Option<String>>>,
     connected: Arc<Mutex<bool>>,
     changelog_provider: Arc<dyn ChangelogProvider>,
+    ldap_connection: Arc<Mutex<Option<ldap3::Ldap>>>,
+    bind_dn: Option<String>,
+    bind_password: Option<String>,
 }
 
 impl ProviderConnectionImpl {
     pub fn new(changelog_provider: Arc<dyn ChangelogProvider>) -> Self {
+        Self::with_credentials(changelog_provider, None, None)
+    }
+    
+    pub fn with_credentials(
+        changelog_provider: Arc<dyn ChangelogProvider>,
+        bind_dn: Option<String>,
+        bind_password: Option<String>,
+    ) -> Self {
         Self {
             provider_url: Arc::new(Mutex::new(None)),
             connected: Arc::new(Mutex::new(false)),
             changelog_provider,
+            ldap_connection: Arc::new(Mutex::new(None)),
+            bind_dn,
+            bind_password,
         }
     }
 }
@@ -340,25 +356,200 @@ impl ProviderConnectionImpl {
 #[async_trait]
 impl ProviderConnection for ProviderConnectionImpl {
     async fn connect(&self, url: &str) -> Result<(), ConsumerError> {
-        *self.provider_url.lock().unwrap() = Some(url.to_string());
-        *self.connected.lock().unwrap() = true;
-        Ok(())
+        // Parse URL to ensure it's valid
+        if !url.starts_with("ldap://") && !url.starts_with("ldaps://") {
+            return Err(ConsumerError::ConnectionError { 
+                message: format!("Invalid provider URL: {}", url) 
+            });
+        }
+        
+        // Attempt to establish LDAP connection
+        let settings = LdapConnSettings::new().set_conn_timeout(std::time::Duration::from_secs(5));
+        
+        match LdapConnAsync::with_settings(settings, url).await {
+            Ok((conn, mut ldap)) => {
+                // Spawn connection driver in background
+                tokio::spawn(async move {
+                    if let Err(e) = conn.drive().await {
+                        error!("LDAP connection driver error: {}", e);
+                    }
+                });
+                
+                // Bind with provided credentials or anonymous if none provided
+                let bind_dn = self.bind_dn.as_deref().unwrap_or("");
+                let bind_password = self.bind_password.as_deref().unwrap_or("");
+                
+                if bind_dn.is_empty() {
+                    warn!("Attempting anonymous bind to provider {} (no credentials configured)", url);
+                } else {
+                    info!("Binding to provider {} as {}", url, bind_dn);
+                }
+                
+                match ldap.simple_bind(bind_dn, bind_password).await {
+                    Ok(bind_result) => {
+                        if let Err(e) = bind_result.success() {
+                            error!("LDAP bind failed for {}: {}", bind_dn, e);
+                            return Err(ConsumerError::ConnectionError { 
+                                message: format!("Failed to bind to provider {}: {}", url, e) 
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        error!("LDAP bind operation failed for {}: {}", bind_dn, e);
+                        return Err(ConsumerError::ConnectionError { 
+                            message: format!("Failed to bind to provider {}: {}", url, e) 
+                        });
+                    }
+                }
+                
+                // Store connection
+                *self.ldap_connection.lock().unwrap() = Some(ldap);
+                *self.provider_url.lock().unwrap() = Some(url.to_string());
+                *self.connected.lock().unwrap() = true;
+                
+                info!("Successfully connected to replication provider: {}", url);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to connect to provider {}: {}", url, e);
+                Err(ConsumerError::ConnectionError { 
+                    message: format!("Failed to connect to provider {}: {}", url, e) 
+                })
+            }
+        }
     }
 
     async fn request_from_cookie(&self, cookie: Option<&str>) -> Result<Vec<Vec<u8>>, ConsumerError> {
-        let entries = self.changelog_provider.get_changelog_since(cookie, 100).await
-            .map_err(|e| ConsumerError::ConnectionError { message: e })?;
-
-        // Convert to byte vectors (simplified encoding)
-        let result = entries.iter()
-            .map(|e| format!("{}:{}", e.sequence_number, e.dn).into_bytes())
+        // Check if we have an LDAP connection
+        let has_ldap = self.ldap_connection.lock().unwrap().is_some();
+        
+        if !has_ldap {
+            warn!("No LDAP connection available, using local changelog provider (may be empty)");
+            // Fallback to local changelog if no LDAP connection (for testing)
+            let entries = self.changelog_provider.get_changelog_since(cookie, 100).await
+                .map_err(|e| ConsumerError::ConnectionError { message: e })?;
+            
+            return Ok(entries.iter()
+                .map(|e| {
+                    let change_type_str = match e.change_type {
+                        ChangeType::Add => "add",
+                        ChangeType::Modify => "modify",
+                        ChangeType::Delete => "delete",
+                        ChangeType::Rename => "rename",
+                    };
+                    
+                    let header = format!("{}|{}|{}|{}|", 
+                        e.sequence_number, 
+                        change_type_str, 
+                        e.dn,
+                        e.change_data.len()
+                    );
+                    
+                    let mut result = header.into_bytes();
+                    result.extend_from_slice(&e.change_data);
+                    result
+                })
+                .collect());
+        }
+        
+        // Query remote provider via LDAP
+        // For now, we'll do a full sync by searching all entries
+        // TODO: Implement proper RFC 4533 Content Synchronization
+        
+        info!("Requesting changelog entries from remote provider (cookie: {:?})", cookie);
+        
+        // Get all entries from the provider
+        // We'll search for all inetOrgPerson entries under the base DN
+        use ldap3::Scope;
+        
+        // Clone the LDAP connection to avoid holding the lock across await
+        let mut ldap = {
+            let mut guard = self.ldap_connection.lock().unwrap();
+            guard.take().ok_or_else(|| ConsumerError::ConnectionError { 
+                message: "LDAP connection not available".to_string() 
+            })?
+        };
+        
+        // Search for all entries (we'll do a simple full sync for now)
+        let base_dn = "dc=example,dc=com";  // TODO: Get from config
+        let filter = "(objectClass=*)";
+        
+        let (rs, _res) = ldap.search(
+            base_dn,
+            Scope::Subtree,
+            filter,
+            vec!["*"]  // All attributes
+        ).await
+        .map_err(|e| ConsumerError::ConnectionError { 
+            message: format!("LDAP search failed: {}", e) 
+        })?
+        .success()
+        .map_err(|e| ConsumerError::ConnectionError { 
+            message: format!("LDAP search failed: {}", e) 
+        })?;
+        
+        // Restore the connection for future use
+        *self.ldap_connection.lock().unwrap() = Some(ldap);
+        
+        info!("Retrieved {} entries from provider", rs.len());
+        
+        // Convert LDAP search results to changelog format
+        use ldap3::SearchEntry;
+        use serde_json;
+        
+        let result: Vec<Vec<u8>> = rs.into_iter()
+            .filter_map(|entry| {
+                let search_entry = SearchEntry::construct(entry);
+                let dn = search_entry.dn.clone();
+                
+                // Skip base DN and organizational units (they should already exist)
+                if dn == base_dn || dn.starts_with("ou=") {
+                    return None;
+                }
+                
+                // Create a DirectoryEntry from the LDAP search result
+                let dir_entry = crate::backend::DirectoryEntry {
+                    dn: dn.clone(),
+                    attributes: search_entry.attrs.clone(),
+                };
+                
+                // Serialize to JSON
+                let change_data = match serde_json::to_vec(&dir_entry) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        error!("Failed to serialize entry {}: {}", dn, e);
+                        return None;
+                    }
+                };
+                
+                // Format: sequence|change_type|dn|len|data
+                let header = format!("0|add|{}|{}|", dn, change_data.len());
+                let mut result = header.into_bytes();
+                result.extend_from_slice(&change_data);
+                
+                Some(result)
+            })
             .collect();
-
+        
+        info!("Prepared {} entries for replication", result.len());
         Ok(result)
     }
 
     async fn disconnect(&self) -> Result<(), ConsumerError> {
+        // Close LDAP connection if exists
+        let ldap_opt = {
+            // Extract ldap from mutex and immediately drop the guard
+            self.ldap_connection.lock().unwrap().take()
+        };
+        
+        if let Some(mut ldap) = ldap_opt {
+            if let Err(e) = ldap.unbind().await {
+                warn!("Error unbinding LDAP connection: {}", e);
+            }
+        }
+        
         *self.connected.lock().unwrap() = false;
+        info!("Disconnected from replication provider");
         Ok(())
     }
 
@@ -399,11 +590,124 @@ impl BatchProcessor for BatchProcessorImpl {
     async fn apply_entry(&self, entry: &[u8]) -> Result<(), ConsumerError> {
         let start = Instant::now();
 
-        // Parse entry (simplified)
-        let entry_str = String::from_utf8_lossy(entry);
+        // Parse entry format: sequence|change_type|dn|change_data_len|change_data
+        // Find the header (ends with the 4th pipe)
+        let header_end = entry.iter()
+            .enumerate()
+            .filter(|(_, &b)| b == b'|')
+            .nth(3)
+            .map(|(i, _)| i + 1)
+            .ok_or_else(|| ConsumerError::ProcessingError {
+                message: "Invalid entry format: missing header".to_string(),
+            })?;
 
-        // In a real implementation, would parse and apply to backend
-        // For now, just record stats
+        let header = String::from_utf8_lossy(&entry[..header_end - 1]);
+        let parts: Vec<&str> = header.split('|').collect();
+        
+        if parts.len() != 4 {
+            return Err(ConsumerError::ProcessingError {
+                message: format!("Invalid entry header format: {}", header),
+            });
+        }
+
+        let sequence_str = parts[0];
+        let change_type_str = parts[1];
+        let dn = parts[2];
+        let data_len_str = parts[3];
+
+        let _sequence: u64 = sequence_str.parse().map_err(|e| ConsumerError::ProcessingError {
+            message: format!("Invalid sequence number: {}", e),
+        })?;
+
+        let data_len: usize = data_len_str.parse().map_err(|e| ConsumerError::ProcessingError {
+            message: format!("Invalid data length: {}", e),
+        })?;
+
+        // Extract change data
+        let change_data = if data_len > 0 {
+            if entry.len() < header_end + data_len {
+                return Err(ConsumerError::ProcessingError {
+                    message: "Entry data truncated".to_string(),
+                });
+            }
+            &entry[header_end..header_end + data_len]
+        } else {
+            &[]
+        };
+
+        // Apply the change to backend based on change type
+        use log::{info, warn};
+        
+        match change_type_str {
+            "add" => {
+                // Deserialize entry data and add to backend
+                if let Ok(entry_json) = std::str::from_utf8(change_data) {
+                    if let Ok(dir_entry) = serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json) {
+                        // Use empty password for replicated entries
+                        // TODO: Proper password handling in replication
+                        match self.backend.add_entry(dir_entry, vec![]).await {
+                            Ok(_) => {
+                                info!("Replicated ADD: {}", dn);
+                            }
+                            Err(e) => {
+                                warn!("Failed to replicate ADD for {}: {:?}", dn, e);
+                            }
+                        }
+                    } else {
+                        warn!("Failed to deserialize entry data for: {}", dn);
+                    }
+                } else {
+                    warn!("Invalid UTF-8 in entry data for: {}", dn);
+                }
+            }
+            "modify" => {
+                // For modify, we need to apply modifications
+                if let Ok(entry_json) = std::str::from_utf8(change_data) {
+                    if let Ok(dir_entry) = serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json) {
+                        // Convert attributes to Modification format
+                        use crate::backend::{Modification, ModifyOperation};
+                        let modifications: Vec<Modification> = dir_entry.attributes.iter()
+                            .map(|(attr, values)| Modification {
+                                operation: ModifyOperation::Replace,
+                                attribute: attr.clone(),
+                                values: values.clone(),
+                            })
+                            .collect();
+                        
+                        match self.backend.modify_entry(dn, modifications).await {
+                            Ok(_) => {
+                                info!("Replicated MODIFY: {}", dn);
+                            }
+                            Err(e) => {
+                                warn!("Failed to replicate MODIFY for {}: {:?}", dn, e);
+                            }
+                        }
+                    }
+                }
+            }
+            "delete" => {
+                match self.backend.delete_entry(dn).await {
+                    Ok(_) => {
+                        info!("Replicated DELETE: {}", dn);
+                    }
+                    Err(e) => {
+                        warn!("Failed to replicate DELETE for {}: {:?}", dn, e);
+                    }
+                }
+            }
+            "rename" => {
+                // Rename / ModifyDN operation
+                warn!("Rename operation not yet fully implemented for: {}", dn);
+                // TODO: Implement proper rename/modifyDN handling
+            }
+            unknown => {
+                return Err(ConsumerError::ProcessingError {
+                    message: format!("Unknown change type: {}", unknown),
+                });
+            }
+        }
+
+        // Record stats
         let mut stats = self.stats.lock().unwrap();
         stats.record_entry(entry.len(), start.elapsed());
 
