@@ -616,9 +616,11 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
     }
 
     let include_all = requested.is_empty() || requested.iter().any(|attr| attr == "*");
+    let include_all_operational = requested.iter().any(|attr| attr == "+");
 
     let mut selected = Vec::new();
 
+    // Add regular attributes
     for (name, values) in &entry.attributes {
         if include_all
             || requested
@@ -626,6 +628,82 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
                 .any(|attribute| attribute.eq_ignore_ascii_case(name))
         {
             selected.push((name.clone(), values.clone()));
+        }
+    }
+
+    // Add operational attributes if requested
+    // Check for "+" (all operational) or specific operational attribute names
+    if include_all_operational
+        || requested.iter().any(|attr| {
+            attr.eq_ignore_ascii_case("entrycsn")
+                || attr.eq_ignore_ascii_case("createtimestamp")
+                || attr.eq_ignore_ascii_case("modifytimestamp")
+                || attr.eq_ignore_ascii_case("creatorsname")
+                || attr.eq_ignore_ascii_case("modifiersname")
+        })
+    {
+        let op_attrs = &entry.operational_attributes;
+
+        // entryCSN
+        if (include_all_operational || requested.iter().any(|a| a.eq_ignore_ascii_case("entrycsn")))
+            && op_attrs.entry_csn.is_some()
+        {
+            selected.push((
+                "entryCSN".to_string(),
+                vec![op_attrs.entry_csn.as_ref().unwrap().to_ldap_string()],
+            ));
+        }
+
+        // createTimestamp
+        if (include_all_operational
+            || requested
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("createtimestamp")))
+            && op_attrs.create_timestamp.is_some()
+        {
+            selected.push((
+                "createTimestamp".to_string(),
+                vec![op_attrs.create_timestamp.clone().unwrap()],
+            ));
+        }
+
+        // modifyTimestamp
+        if (include_all_operational
+            || requested
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("modifytimestamp")))
+            && op_attrs.modify_timestamp.is_some()
+        {
+            selected.push((
+                "modifyTimestamp".to_string(),
+                vec![op_attrs.modify_timestamp.clone().unwrap()],
+            ));
+        }
+
+        // creatorsName
+        if (include_all_operational
+            || requested
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("creatorsname")))
+            && op_attrs.creators_name.is_some()
+        {
+            selected.push((
+                "creatorsName".to_string(),
+                vec![op_attrs.creators_name.clone().unwrap()],
+            ));
+        }
+
+        // modifiersName
+        if (include_all_operational
+            || requested
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("modifiersname")))
+            && op_attrs.modifiers_name.is_some()
+        {
+            selected.push((
+                "modifiersName".to_string(),
+                vec![op_attrs.modifiers_name.clone().unwrap()],
+            ));
         }
     }
 

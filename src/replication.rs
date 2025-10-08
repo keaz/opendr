@@ -44,17 +44,17 @@
 //!                                    └──────────────────┘
 //! ```
 
+use async_trait::async_trait;
+use ldap3::{LdapConnAsync, LdapConnSettings};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use async_trait::async_trait;
-use ldap3::{LdapConnAsync, LdapConnSettings};
-use log::{info, error, warn};
 
 use crate::backend::DirectoryBackend;
-use crate::replication_provider_fsm::*;
-use crate::replication_consumer_fsm::*;
 use crate::csn::{Csn, CsnGenerator};
+use crate::replication_consumer_fsm::*;
+use crate::replication_provider_fsm::*;
 
 // ================================================================================================
 // Changelog Implementation
@@ -113,12 +113,7 @@ impl ChangelogTracker {
     ///
     /// # Returns
     /// * CSN assigned to this change
-    pub fn record_change(
-        &self,
-        change_type: ChangeType,
-        dn: String,
-        change_data: Vec<u8>,
-    ) -> Csn {
+    pub fn record_change(&self, change_type: ChangeType, dn: String, change_data: Vec<u8>) -> Csn {
         // Generate new CSN for this change
         let csn = self.csn_generator.generate();
         let csn_str = csn.to_string();
@@ -155,11 +150,7 @@ impl ChangelogTracker {
     /// * Vector of changelog entries after the given CSN, sorted by CSN
     pub fn get_since_csn(&self, csn: &Csn) -> Vec<ChangelogEntry> {
         let entries = self.entries.lock().unwrap();
-        let mut result: Vec<_> = entries
-            .values()
-            .filter(|e| e.csn > *csn)
-            .cloned()
-            .collect();
+        let mut result: Vec<_> = entries.values().filter(|e| e.csn > *csn).cloned().collect();
         result.sort_by(|a, b| a.csn.cmp(&b.csn));
         result
     }
@@ -182,8 +173,7 @@ impl ChangelogTracker {
     /// Cookie format: "csn-<csn_string>"
     /// Example: "csn-20251007123456789012#001#000001#000000"
     pub fn parse_cookie(&self, cookie: &str) -> Option<Csn> {
-        cookie.strip_prefix("csn-")
-            .and_then(|s| Csn::parse(s).ok())
+        cookie.strip_prefix("csn-").and_then(|s| Csn::parse(s).ok())
     }
 
     /// Generate cookie from CSN
@@ -222,21 +212,33 @@ impl ChangelogProviderImpl {
 
 #[async_trait]
 impl ChangelogProvider for ChangelogProviderImpl {
-    async fn get_all_entries(&self, base_dn: &str, _filter: Option<&str>) -> Result<Vec<DirectoryEntry>, String> {
+    async fn get_all_entries(
+        &self,
+        base_dn: &str,
+        _filter: Option<&str>,
+    ) -> Result<Vec<DirectoryEntry>, String> {
         // Get all entries from backend (scope 2 = subtree)
         use ldap_parser::ldap::SearchScope;
-        let backend_entries = self.backend.search_entries(base_dn, SearchScope(2)).await
+        let backend_entries = self
+            .backend
+            .search_entries(base_dn, SearchScope(2))
+            .await
             .map_err(|e| format!("Backend search failed: {:?}", e))?;
 
         // Convert backend DirectoryEntry to replication DirectoryEntry
-        let entries = backend_entries.into_iter()
+        let entries = backend_entries
+            .into_iter()
             .map(|e| DirectoryEntry::new(e.dn, e.attributes))
             .collect();
 
         Ok(entries)
     }
 
-    async fn get_changelog_since(&self, cookie: Option<&str>, limit: usize) -> Result<Vec<ChangelogEntry>, String> {
+    async fn get_changelog_since(
+        &self,
+        cookie: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ChangelogEntry>, String> {
         let entries = if let Some(cookie_str) = cookie {
             // Parse cookie to get starting CSN
             if cookie_str == "csn-empty" {
@@ -292,8 +294,15 @@ impl ConsumerRegistryImpl {
 
 #[async_trait]
 impl ConsumerRegistry for ConsumerRegistryImpl {
-    async fn register_consumer(&mut self, consumer_id: &str, connection_info: ConsumerConnection) -> Result<(), String> {
-        self.consumers.lock().unwrap().insert(consumer_id.to_string(), connection_info);
+    async fn register_consumer(
+        &mut self,
+        consumer_id: &str,
+        connection_info: ConsumerConnection,
+    ) -> Result<(), String> {
+        self.consumers
+            .lock()
+            .unwrap()
+            .insert(consumer_id.to_string(), connection_info);
         Ok(())
     }
 
@@ -332,8 +341,15 @@ impl StreamingManagerImpl {
 
 #[async_trait]
 impl StreamingManager for StreamingManagerImpl {
-    async fn start_streaming(&mut self, consumer_id: &str, _start_cookie: Option<&str>) -> Result<(), String> {
-        self.active_streams.lock().unwrap().insert(consumer_id.to_string(), StreamingStats::new());
+    async fn start_streaming(
+        &mut self,
+        consumer_id: &str,
+        _start_cookie: Option<&str>,
+    ) -> Result<(), String> {
+        self.active_streams
+            .lock()
+            .unwrap()
+            .insert(consumer_id.to_string(), StreamingStats::new());
         Ok(())
     }
 
@@ -352,11 +368,17 @@ impl StreamingManager for StreamingManagerImpl {
     }
 
     async fn is_streaming_active(&self, consumer_id: &str) -> Result<bool, String> {
-        Ok(self.active_streams.lock().unwrap().contains_key(consumer_id))
+        Ok(self
+            .active_streams
+            .lock()
+            .unwrap()
+            .contains_key(consumer_id))
     }
 
     async fn get_streaming_stats(&self, consumer_id: &str) -> Result<StreamingStats, String> {
-        self.active_streams.lock().unwrap()
+        self.active_streams
+            .lock()
+            .unwrap()
             .get(consumer_id)
             .cloned()
             .ok_or_else(|| format!("Consumer {} not found", consumer_id))
@@ -415,7 +437,7 @@ impl ProviderConnectionImpl {
     pub fn new(changelog_provider: Arc<dyn ChangelogProvider>) -> Self {
         Self::with_credentials(changelog_provider, None, None)
     }
-    
+
     pub fn with_credentials(
         changelog_provider: Arc<dyn ChangelogProvider>,
         bind_dn: Option<String>,
@@ -437,14 +459,14 @@ impl ProviderConnection for ProviderConnectionImpl {
     async fn connect(&self, url: &str) -> Result<(), ConsumerError> {
         // Parse URL to ensure it's valid
         if !url.starts_with("ldap://") && !url.starts_with("ldaps://") {
-            return Err(ConsumerError::ConnectionError { 
-                message: format!("Invalid provider URL: {}", url) 
+            return Err(ConsumerError::ConnectionError {
+                message: format!("Invalid provider URL: {}", url),
             });
         }
-        
+
         // Attempt to establish LDAP connection
         let settings = LdapConnSettings::new().set_conn_timeout(std::time::Duration::from_secs(5));
-        
+
         match LdapConnAsync::with_settings(settings, url).await {
             Ok((conn, mut ldap)) => {
                 // Spawn connection driver in background
@@ -453,62 +475,72 @@ impl ProviderConnection for ProviderConnectionImpl {
                         error!("LDAP connection driver error: {}", e);
                     }
                 });
-                
+
                 // Bind with provided credentials or anonymous if none provided
                 let bind_dn = self.bind_dn.as_deref().unwrap_or("");
                 let bind_password = self.bind_password.as_deref().unwrap_or("");
-                
+
                 if bind_dn.is_empty() {
-                    warn!("Attempting anonymous bind to provider {} (no credentials configured)", url);
+                    warn!(
+                        "Attempting anonymous bind to provider {} (no credentials configured)",
+                        url
+                    );
                 } else {
                     info!("Binding to provider {} as {}", url, bind_dn);
                 }
-                
+
                 match ldap.simple_bind(bind_dn, bind_password).await {
                     Ok(bind_result) => {
                         if let Err(e) = bind_result.success() {
                             error!("LDAP bind failed for {}: {}", bind_dn, e);
-                            return Err(ConsumerError::ConnectionError { 
-                                message: format!("Failed to bind to provider {}: {}", url, e) 
+                            return Err(ConsumerError::ConnectionError {
+                                message: format!("Failed to bind to provider {}: {}", url, e),
                             });
                         }
                     }
                     Err(e) => {
                         error!("LDAP bind operation failed for {}: {}", bind_dn, e);
-                        return Err(ConsumerError::ConnectionError { 
-                            message: format!("Failed to bind to provider {}: {}", url, e) 
+                        return Err(ConsumerError::ConnectionError {
+                            message: format!("Failed to bind to provider {}: {}", url, e),
                         });
                     }
                 }
-                
+
                 // Store connection
                 *self.ldap_connection.lock().unwrap() = Some(ldap);
                 *self.provider_url.lock().unwrap() = Some(url.to_string());
                 *self.connected.lock().unwrap() = true;
-                
+
                 info!("Successfully connected to replication provider: {}", url);
                 Ok(())
             }
             Err(e) => {
                 error!("Failed to connect to provider {}: {}", url, e);
-                Err(ConsumerError::ConnectionError { 
-                    message: format!("Failed to connect to provider {}: {}", url, e) 
+                Err(ConsumerError::ConnectionError {
+                    message: format!("Failed to connect to provider {}: {}", url, e),
                 })
             }
         }
     }
 
-    async fn request_from_cookie(&self, cookie: Option<&str>) -> Result<Vec<Vec<u8>>, ConsumerError> {
+    async fn request_from_cookie(
+        &self,
+        cookie: Option<&str>,
+    ) -> Result<Vec<Vec<u8>>, ConsumerError> {
         // Check if we have an LDAP connection
         let has_ldap = self.ldap_connection.lock().unwrap().is_some();
-        
+
         if !has_ldap {
             warn!("No LDAP connection available, using local changelog provider (may be empty)");
             // Fallback to local changelog if no LDAP connection (for testing)
-            let entries = self.changelog_provider.get_changelog_since(cookie, 100).await
+            let entries = self
+                .changelog_provider
+                .get_changelog_since(cookie, 100)
+                .await
                 .map_err(|e| ConsumerError::ConnectionError { message: e })?;
-            
-            return Ok(entries.iter()
+
+            return Ok(entries
+                .iter()
                 .map(|e| {
                     let change_type_str = match e.change_type {
                         ChangeType::Add => "add",
@@ -516,83 +548,139 @@ impl ProviderConnection for ProviderConnectionImpl {
                         ChangeType::Delete => "delete",
                         ChangeType::Rename => "rename",
                     };
-                    
-                    let header = format!("{}|{}|{}|{}|", 
-                        e.csn, 
-                        change_type_str, 
+
+                    let header = format!(
+                        "{}|{}|{}|{}|",
+                        e.csn,
+                        change_type_str,
                         e.dn,
                         e.change_data.len()
                     );
-                    
+
                     let mut result = header.into_bytes();
                     result.extend_from_slice(&e.change_data);
                     result
                 })
                 .collect());
         }
-        
+
         // Query remote provider via LDAP
-        // For now, we'll do a full sync by searching all entries
-        // TODO: Implement proper RFC 4533 Content Synchronization
-        
-        info!("Requesting changelog entries from remote provider (cookie: {:?})", cookie);
-        
+        // Parse cookie to get CSN if provided
+        let cookie_csn = if let Some(cookie_str) = cookie {
+            if let Some(csn_str) = cookie_str.strip_prefix("csn-") {
+                Some(csn_str.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        info!(
+            "Requesting changelog entries from remote provider (cookie: {:?}, parsed CSN: {:?})",
+            cookie, cookie_csn
+        );
+
         // Get all entries from the provider
-        // We'll search for all inetOrgPerson entries under the base DN
         use ldap3::Scope;
-        
+
         // Clone the LDAP connection to avoid holding the lock across await
         let mut ldap = {
             let mut guard = self.ldap_connection.lock().unwrap();
-            guard.take().ok_or_else(|| ConsumerError::ConnectionError { 
-                message: "LDAP connection not available".to_string() 
+            guard.take().ok_or_else(|| ConsumerError::ConnectionError {
+                message: "LDAP connection not available".to_string(),
             })?
         };
-        
-        // Search for all entries (we'll do a simple full sync for now)
-        let base_dn = "dc=example,dc=com";  // TODO: Get from config
+
+        // Build search filter
+        // NOTE: entryCSN comparison via LDAP filter is complex and not well-supported
+        // We fetch all entries and filter on the consumer side based on entryCSN
+        let base_dn = "dc=example,dc=com"; // TODO: Get from config
         let filter = "(objectClass=*)";
-        
-        let (rs, _res) = ldap.search(
-            base_dn,
-            Scope::Subtree,
-            filter,
-            vec!["*"]  // All attributes
-        ).await
-        .map_err(|e| ConsumerError::ConnectionError { 
-            message: format!("LDAP search failed: {}", e) 
-        })?
-        .success()
-        .map_err(|e| ConsumerError::ConnectionError { 
-            message: format!("LDAP search failed: {}", e) 
-        })?;
-        
+
+        let (rs, _res) = ldap
+            .search(
+                base_dn,
+                Scope::Subtree,
+                filter,
+                vec!["*", "entryCSN"], // Request all attributes including entryCSN
+            )
+            .await
+            .map_err(|e| ConsumerError::ConnectionError {
+                message: format!("LDAP search failed: {}", e),
+            })?
+            .success()
+            .map_err(|e| ConsumerError::ConnectionError {
+                message: format!("LDAP search failed: {}", e),
+            })?;
+
         // Restore the connection for future use
         *self.ldap_connection.lock().unwrap() = Some(ldap);
-        
+
         info!("Retrieved {} entries from provider", rs.len());
-        
+
         // Convert LDAP search results to changelog format
         use ldap3::SearchEntry;
         use serde_json;
-        
-        let result: Vec<Vec<u8>> = rs.into_iter()
+
+        let result: Vec<Vec<u8>> = rs
+            .into_iter()
             .filter_map(|entry| {
                 let search_entry = SearchEntry::construct(entry);
                 let dn = search_entry.dn.clone();
-                
+
+                // DEBUG: Log all attributes received for first few entries
+                if dn.contains("user0000") || dn.contains("user0001") {
+                    info!("DEBUG - Entry: {}", dn);
+                    info!(
+                        "DEBUG - Attributes: {:?}",
+                        search_entry.attrs.keys().collect::<Vec<_>>()
+                    );
+                }
+
                 // Skip base DN and organizational units (they should already exist)
                 if dn == base_dn || dn.starts_with("ou=") {
                     return None;
                 }
-                
+
+                // Filter by entryCSN if we have a cookie
+                if let Some(ref cookie_csn_str) = cookie_csn {
+                    // Get entryCSN from the entry
+                    if let Some(entry_csn_values) = search_entry.attrs.get("entryCSN") {
+                        if let Some(entry_csn_str) = entry_csn_values.first() {
+                            // Compare CSNs as strings (they are formatted to be sortable)
+                            // Cookie CSN format: timestamp#replica_id#seq#mod
+                            // EntryCSN format: timestamp#replica_id#seq#mod (same format)
+
+                            info!(
+                                "CSN compare: entry='{}' entryCSN='{}' vs cookie='{}'",
+                                dn, entry_csn_str, cookie_csn_str
+                            );
+
+                            if entry_csn_str <= cookie_csn_str {
+                                // Entry is older than or equal to cookie, skip it
+                                return None;
+                            } else {
+                                info!("Including new entry: {}", dn);
+                            }
+                        }
+                    } else {
+                        // No entryCSN means this entry can't be compared, skip it
+                        warn!(
+                            "Entry {} has no entryCSN, skipping during incremental sync",
+                            dn
+                        );
+                        return None;
+                    }
+                }
+
                 // Create a DirectoryEntry from the LDAP search result
                 let dir_entry = crate::backend::DirectoryEntry {
                     dn: dn.clone(),
                     attributes: search_entry.attrs.clone(),
                     operational_attributes: crate::backend::OperationalAttributes::new(),
                 };
-                
+
                 // Serialize to JSON
                 let change_data = match serde_json::to_vec(&dir_entry) {
                     Ok(data) => data,
@@ -601,17 +689,20 @@ impl ProviderConnection for ProviderConnectionImpl {
                         return None;
                     }
                 };
-                
+
                 // Format: sequence|change_type|dn|len|data
                 let header = format!("0|add|{}|{}|", dn, change_data.len());
                 let mut result = header.into_bytes();
                 result.extend_from_slice(&change_data);
-                
+
                 Some(result)
             })
             .collect();
-        
-        info!("Prepared {} entries for replication", result.len());
+
+        info!(
+            "Prepared {} entries for replication (filtered by CSN)",
+            result.len()
+        );
         Ok(result)
     }
 
@@ -621,13 +712,13 @@ impl ProviderConnection for ProviderConnectionImpl {
             // Extract ldap from mutex and immediately drop the guard
             self.ldap_connection.lock().unwrap().take()
         };
-        
+
         if let Some(mut ldap) = ldap_opt {
             if let Err(e) = ldap.unbind().await {
                 warn!("Error unbinding LDAP connection: {}", e);
             }
         }
-        
+
         *self.connected.lock().unwrap() = false;
         info!("Disconnected from replication provider");
         Ok(())
@@ -638,7 +729,12 @@ impl ProviderConnection for ProviderConnectionImpl {
     }
 
     async fn get_connection_info(&self) -> Result<ConnectionInfo, ConsumerError> {
-        let url = self.provider_url.lock().unwrap().clone().unwrap_or_default();
+        let url = self
+            .provider_url
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
         Ok(ConnectionInfo::new(url, "3.0".to_string(), false))
     }
 }
@@ -672,7 +768,8 @@ impl BatchProcessor for BatchProcessorImpl {
 
         // Parse entry format: sequence|change_type|dn|change_data_len|change_data
         // Find the header (ends with the 4th pipe)
-        let header_end = entry.iter()
+        let header_end = entry
+            .iter()
             .enumerate()
             .filter(|(_, &b)| b == b'|')
             .nth(3)
@@ -683,7 +780,7 @@ impl BatchProcessor for BatchProcessorImpl {
 
         let header = String::from_utf8_lossy(&entry[..header_end - 1]);
         let parts: Vec<&str> = header.split('|').collect();
-        
+
         if parts.len() != 4 {
             return Err(ConsumerError::ProcessingError {
                 message: format!("Invalid entry header format: {}", header),
@@ -695,13 +792,17 @@ impl BatchProcessor for BatchProcessorImpl {
         let dn = parts[2];
         let data_len_str = parts[3];
 
-        let _sequence: u64 = sequence_str.parse().map_err(|e| ConsumerError::ProcessingError {
-            message: format!("Invalid sequence number: {}", e),
-        })?;
+        let _sequence: u64 = sequence_str
+            .parse()
+            .map_err(|e| ConsumerError::ProcessingError {
+                message: format!("Invalid sequence number: {}", e),
+            })?;
 
-        let data_len: usize = data_len_str.parse().map_err(|e| ConsumerError::ProcessingError {
-            message: format!("Invalid data length: {}", e),
-        })?;
+        let data_len: usize = data_len_str
+            .parse()
+            .map_err(|e| ConsumerError::ProcessingError {
+                message: format!("Invalid data length: {}", e),
+            })?;
 
         // Extract change data
         let change_data = if data_len > 0 {
@@ -717,12 +818,14 @@ impl BatchProcessor for BatchProcessorImpl {
 
         // Apply the change to backend based on change type
         use log::{info, warn};
-        
+
         match change_type_str {
             "add" => {
                 // Deserialize entry data and add to backend
                 if let Ok(entry_json) = std::str::from_utf8(change_data) {
-                    if let Ok(dir_entry) = serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json) {
+                    if let Ok(dir_entry) =
+                        serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json)
+                    {
                         // Use empty password for replicated entries
                         // TODO: Proper password handling in replication
                         match self.backend.add_entry(dir_entry, vec![]).await {
@@ -743,17 +846,21 @@ impl BatchProcessor for BatchProcessorImpl {
             "modify" => {
                 // For modify, we need to apply modifications
                 if let Ok(entry_json) = std::str::from_utf8(change_data) {
-                    if let Ok(dir_entry) = serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json) {
+                    if let Ok(dir_entry) =
+                        serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json)
+                    {
                         // Convert attributes to Modification format
                         use crate::backend::{Modification, ModifyOperation};
-                        let modifications: Vec<Modification> = dir_entry.attributes.iter()
+                        let modifications: Vec<Modification> = dir_entry
+                            .attributes
+                            .iter()
                             .map(|(attr, values)| Modification {
                                 operation: ModifyOperation::Replace,
                                 attribute: attr.clone(),
                                 values: values.clone(),
                             })
                             .collect();
-                        
+
                         match self.backend.modify_entry(dn, modifications).await {
                             Ok(_) => {
                                 info!("Replicated MODIFY: {}", dn);
@@ -765,16 +872,14 @@ impl BatchProcessor for BatchProcessorImpl {
                     }
                 }
             }
-            "delete" => {
-                match self.backend.delete_entry(dn).await {
-                    Ok(_) => {
-                        info!("Replicated DELETE: {}", dn);
-                    }
-                    Err(e) => {
-                        warn!("Failed to replicate DELETE for {}: {:?}", dn, e);
-                    }
+            "delete" => match self.backend.delete_entry(dn).await {
+                Ok(_) => {
+                    info!("Replicated DELETE: {}", dn);
                 }
-            }
+                Err(e) => {
+                    warn!("Failed to replicate DELETE for {}: {:?}", dn, e);
+                }
+            },
             "rename" => {
                 // Rename / ModifyDN operation
                 warn!("Rename operation not yet fully implemented for: {}", dn);
@@ -801,6 +906,16 @@ impl BatchProcessor for BatchProcessorImpl {
     async fn get_processing_stats(&self) -> Result<ProcessingStats, ConsumerError> {
         Ok(self.stats.lock().unwrap().clone())
     }
+
+    async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, ConsumerError> {
+        // Get the contextCSN from the backend
+        self.backend
+            .get_context_csn()
+            .await
+            .map_err(|e| ConsumerError::ProcessingError {
+                message: format!("Failed to get contextCSN from backend: {:?}", e),
+            })
+    }
 }
 
 /// State manager for consumer replication state
@@ -816,34 +931,138 @@ impl StateManagerImpl {
             cookie: Arc::new(Mutex::new(None)),
         }
     }
+
+    /// Get the path to the cookie file
+    fn cookie_file_path(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.storage_path).join("replication_cookie.txt")
+    }
+
+    /// Ensure the storage directory exists
+    fn ensure_storage_dir(&self) -> Result<(), ConsumerError> {
+        let path = std::path::Path::new(&self.storage_path);
+        if !path.exists() {
+            std::fs::create_dir_all(path).map_err(|e| ConsumerError::StateError {
+                message: format!(
+                    "Failed to create storage directory {}: {}",
+                    self.storage_path, e
+                ),
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl StateManager for StateManagerImpl {
     async fn save_cookie(&self, cookie: &str) -> Result<(), ConsumerError> {
+        // Update in-memory cache
         *self.cookie.lock().unwrap() = Some(cookie.to_string());
 
-        // In production, persist to file/database
-        // For now, just keep in memory
+        // Ensure storage directory exists
+        self.ensure_storage_dir()?;
 
+        // Persist to disk using atomic write
+        let cookie_path = self.cookie_file_path();
+        let temp_path = cookie_path.with_extension("tmp");
+
+        // Write to temporary file
+        tokio::fs::write(&temp_path, cookie)
+            .await
+            .map_err(|e| ConsumerError::StateError {
+                message: format!("Failed to write cookie to temp file: {}", e),
+            })?;
+
+        // Atomically rename temp file to actual cookie file
+        tokio::fs::rename(&temp_path, &cookie_path)
+            .await
+            .map_err(|e| ConsumerError::StateError {
+                message: format!("Failed to rename cookie file: {}", e),
+            })?;
+
+        log::info!("Saved replication cookie to {}", cookie_path.display());
         Ok(())
     }
 
     async fn load_cookie(&self) -> Result<Option<String>, ConsumerError> {
-        Ok(self.cookie.lock().unwrap().clone())
+        let cookie_path = self.cookie_file_path();
+
+        // Check if file exists
+        if !cookie_path.exists() {
+            log::info!("No cookie file found at {}", cookie_path.display());
+            return Ok(None);
+        }
+
+        // Read cookie from file
+        let cookie = tokio::fs::read_to_string(&cookie_path).await.map_err(|e| {
+            ConsumerError::StateError {
+                message: format!(
+                    "Failed to read cookie from {}: {}",
+                    cookie_path.display(),
+                    e
+                ),
+            }
+        })?;
+
+        let cookie = cookie.trim().to_string();
+
+        if cookie.is_empty() {
+            log::warn!("Cookie file is empty at {}", cookie_path.display());
+            return Ok(None);
+        }
+
+        // Update in-memory cache
+        *self.cookie.lock().unwrap() = Some(cookie.clone());
+
+        log::info!(
+            "Loaded replication cookie from {}: {}",
+            cookie_path.display(),
+            cookie
+        );
+        Ok(Some(cookie))
     }
 
     async fn delete_cookie(&self) -> Result<(), ConsumerError> {
+        // Clear in-memory cache
         *self.cookie.lock().unwrap() = None;
+
+        // Delete file if it exists
+        let cookie_path = self.cookie_file_path();
+        if cookie_path.exists() {
+            tokio::fs::remove_file(&cookie_path)
+                .await
+                .map_err(|e| ConsumerError::StateError {
+                    message: format!("Failed to delete cookie file: {}", e),
+                })?;
+            log::info!(
+                "Deleted replication cookie file at {}",
+                cookie_path.display()
+            );
+        }
+
         Ok(())
     }
 
     async fn cookie_exists(&self) -> Result<bool, ConsumerError> {
-        Ok(self.cookie.lock().unwrap().is_some())
+        let cookie_path = self.cookie_file_path();
+        Ok(cookie_path.exists())
     }
 
     async fn get_storage_metadata(&self) -> Result<StorageMetadata, ConsumerError> {
-        Ok(StorageMetadata::new(0, "1.0".to_string(), false))
+        let cookie_path = self.cookie_file_path();
+        let size_bytes = if cookie_path.exists() {
+            tokio::fs::metadata(&cookie_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        Ok(StorageMetadata::new(
+            size_bytes,
+            "1.0".to_string(),
+            cookie_path.exists(),
+        ))
     }
 }
 
@@ -915,7 +1134,7 @@ mod tests {
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].csn, csn1);
         assert_eq!(changes[1].csn, csn2);
-        
+
         // Verify CSNs are ordered
         assert!(csn2 > csn1);
     }
