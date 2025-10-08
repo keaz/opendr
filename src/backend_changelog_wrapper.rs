@@ -31,6 +31,7 @@ use ldap_parser::ldap::SearchScope as Scope;
 use std::sync::Arc;
 
 use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, Modification};
+use crate::change_observer::ChangeObserver;
 use crate::replication::ChangelogTracker;
 use crate::replication_provider_fsm::ChangeType;
 
@@ -44,6 +45,9 @@ pub struct ChangelogBackendWrapper {
 
     /// Optional changelog tracker for replication
     changelog: Option<Arc<ChangelogTracker>>,
+
+    /// Optional change observer for push-based replication notifications
+    observer: Option<Arc<dyn ChangeObserver>>,
 }
 
 impl ChangelogBackendWrapper {
@@ -59,7 +63,19 @@ impl ChangelogBackendWrapper {
         backend: Arc<dyn DirectoryBackend>,
         changelog: Option<Arc<ChangelogTracker>>,
     ) -> Self {
-        Self { backend, changelog }
+        Self {
+            backend,
+            changelog,
+            observer: None,
+        }
+    }
+
+    /// Set the change observer for push-based replication
+    ///
+    /// # Arguments
+    /// * `observer` - Change observer to notify on directory changes
+    pub fn set_observer(&mut self, observer: Arc<dyn ChangeObserver>) {
+        self.observer = Some(observer);
     }
 
     /// Record a change to the changelog
@@ -78,7 +94,27 @@ impl ChangelogBackendWrapper {
         change_data: Vec<u8>,
     ) -> Option<crate::csn::Csn> {
         if let Some(ref changelog) = self.changelog {
-            let csn = changelog.record_change(change_type, dn, change_data);
+            let csn = changelog.record_change(change_type.clone(), dn.clone(), change_data.clone());
+
+            // Notify observer if present (for push-based replication)
+            if let Some(ref observer) = self.observer {
+                let changelog_entry = crate::replication_provider_fsm::ChangelogEntry::new(
+                    csn.clone(),
+                    change_type,
+                    dn,
+                    change_data,
+                );
+
+                // Spawn async task to notify observer without blocking
+                let observer = observer.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = observer.notify_change(&changelog_entry).await {
+                        use log::error;
+                        error!("Failed to notify change observer: {}", e);
+                    }
+                });
+            }
+
             Some(csn)
         } else {
             None
@@ -252,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_modify_entry_records_to_changelog() {
-        let mut backend = MockBackend::new();
+        let backend = MockBackend::new();
         let entry = create_test_entry("cn=test,dc=example,dc=com");
         backend.add_entry(entry.clone(), vec![]).await.unwrap();
 
@@ -279,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_entry_records_to_changelog() {
-        let mut backend = MockBackend::new();
+        let backend = MockBackend::new();
         let entry = create_test_entry("cn=test,dc=example,dc=com");
         backend.add_entry(entry, vec![]).await.unwrap();
 
@@ -301,7 +337,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rename_entry_records_to_changelog() {
-        let mut backend = MockBackend::new();
+        let backend = MockBackend::new();
         let entry = create_test_entry("cn=test,dc=example,dc=com");
         backend.add_entry(entry, vec![]).await.unwrap();
 
@@ -347,17 +383,20 @@ mod tests {
         // Verify CSNs are assigned and ordered
         let entries = changelog.get_all();
         assert_eq!(entries.len(), 5);
-        
+
         // Verify all have the correct replica ID
         for entry in &entries {
             assert_eq!(entry.csn.replica_id(), 5);
         }
-        
+
         // Verify CSNs are in increasing order
         for i in 1..entries.len() {
-            assert!(entries[i].csn > entries[i-1].csn, 
-                "CSN {} should be greater than CSN {}", 
-                entries[i].csn, entries[i-1].csn);
+            assert!(
+                entries[i].csn > entries[i - 1].csn,
+                "CSN {} should be greater than CSN {}",
+                entries[i].csn,
+                entries[i - 1].csn
+            );
         }
     }
 

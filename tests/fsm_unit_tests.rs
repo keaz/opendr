@@ -617,6 +617,18 @@ impl ConsumerRegistry for MockConsumerRegistry {
     async fn update_consumer_activity(&mut self, _consumer_id: &str) -> Result<(), String> {
         Ok(())
     }
+
+    async fn get_persistent_consumers(&self) -> Result<Vec<String>, String> {
+        Ok(vec![])
+    }
+
+    async fn get_consumer(&self, _consumer_id: &str) -> Result<Option<ConsumerConnection>, String> {
+        Ok(None)
+    }
+
+    async fn update_consumer_cookie(&mut self, _consumer_id: &str, _cookie: String) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct MockStreamingManager;

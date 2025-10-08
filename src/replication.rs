@@ -324,6 +324,30 @@ impl ConsumerRegistry for ConsumerRegistryImpl {
         }
         Ok(())
     }
+
+    async fn get_persistent_consumers(&self) -> Result<Vec<String>, String> {
+        let consumers = self.consumers.lock().unwrap();
+        Ok(consumers
+            .iter()
+            .filter(|(_, conn)| conn.is_persistent_mode())
+            .map(|(id, _)| id.clone())
+            .collect())
+    }
+
+    async fn get_consumer(&self, consumer_id: &str) -> Result<Option<ConsumerConnection>, String> {
+        Ok(self.consumers.lock().unwrap().get(consumer_id).cloned())
+    }
+
+    async fn update_consumer_cookie(
+        &mut self,
+        consumer_id: &str,
+        cookie: String,
+    ) -> Result<(), String> {
+        if let Some(conn) = self.consumers.lock().unwrap().get_mut(consumer_id) {
+            conn.update_cookie(cookie);
+        }
+        Ok(())
+    }
 }
 
 /// Streaming manager for real-time change delivery
