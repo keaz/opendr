@@ -93,44 +93,51 @@ async fn test_directory_entry_with_operational_attrs() {
 #[tokio::test]
 async fn test_mockbackend_with_operational_attrs() {
     let backend = Arc::new(MockBackend::new());
-    
+
     let generator = CsnGenerator::new(1);
-    let csn = generator.generate();
-    let op_attrs = OperationalAttributes::for_new_entry(csn.clone(), Some("cn=admin,dc=example,dc=org".to_string()));
-    
+    let op_attrs = OperationalAttributes::for_new_entry(
+        generator.generate(),
+        Some("cn=admin,dc=example,dc=org".to_string()),
+    );
+
     let mut attributes = HashMap::new();
     attributes.insert("cn".to_string(), vec!["test".to_string()]);
     attributes.insert("sn".to_string(), vec!["user".to_string()]);
     attributes.insert("objectClass".to_string(), vec!["person".to_string()]);
-    
+
     let entry = DirectoryEntry::with_operational_attrs(
         "cn=test,dc=example,dc=org",
         attributes,
         op_attrs.clone(),
     );
-    
+
     backend.add_entry(entry.clone(), vec![]).await.unwrap();
-    
-    let retrieved = backend.get_entry("cn=test,dc=example,dc=org").await.unwrap().unwrap();
-    
-    // Verify operational attributes are preserved
-    assert_eq!(retrieved.operational_attributes.entry_csn, Some(csn));
+
+    let retrieved = backend
+        .get_entry("cn=test,dc=example,dc=org")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Backends own operational metadata and assign a fresh CSN on write.
+    let context_csn = backend.get_context_csn().await.unwrap();
+    assert_eq!(retrieved.operational_attributes.entry_csn, context_csn);
     assert!(retrieved.operational_attributes.create_timestamp.is_some());
 }
 
 #[tokio::test]
 async fn test_csn_generator_for_entries() {
     let generator = CsnGenerator::new(5);
-    
+
     let csn1 = generator.generate();
     let csn2 = generator.generate();
     let csn3 = generator.generate();
-    
+
     // All CSNs should have the same replica ID
     assert_eq!(csn1.replica_id(), 5);
     assert_eq!(csn2.replica_id(), 5);
     assert_eq!(csn3.replica_id(), 5);
-    
+
     // All CSNs should be in order
     assert!(csn2 > csn1);
     assert!(csn3 > csn2);

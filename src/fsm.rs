@@ -589,10 +589,9 @@ pub enum ReplicationProviderState {
 
 #[derive(Debug, Clone)]
 pub enum ReplicationProviderEvent {
-    /// Consumer requests sync replication from cookie
+    /// Consumer requests sync replication with a concrete RFC 4533 request.
     StartSyncReplication {
-        consumer_id: String,
-        cookie: Option<String>,
+        request: crate::replication_provider_fsm::SyncRequest,
     },
     /// Refresh phase completed, ready to stream changes
     RefreshComplete {
@@ -604,10 +603,9 @@ pub enum ReplicationProviderEvent {
         consumer_id: String,
         entries_streamed: usize,
     },
-    /// New changelog entry available for streaming (CSN-based)
+    /// New changelog entry available for streaming.
     ChangelogEntry {
-        entry: Vec<u8>,
-        csn: crate::csn::Csn,
+        change: crate::replication_provider_fsm::ChangelogEntry,
     },
     /// Entry successfully streamed to consumer
     EntryStreamed { consumer_id: String },

@@ -1426,11 +1426,19 @@ mod replication_provider_fsm_tests {
         let consumer_registry = Box::new(MockConsumerRegistry);
         let streaming_manager = Box::new(MockStreamingManager);
         let sync_handler = Box::new(MockSyncRequestHandler);
-        let mut fsm = ReplicationProviderFsmImpl::new(changelog, consumer_registry, streaming_manager, sync_handler);
+        let mut fsm = ReplicationProviderFsmImpl::new(
+            changelog,
+            consumer_registry,
+            streaming_manager,
+            sync_handler,
+        );
 
         let event = ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "cn=replica,dc=example,dc=org".to_string(),
-            cookie: None,
+            request: SyncRequest::new(
+                "cn=replica,dc=example,dc=org".to_string(),
+                "dc=example,dc=org".to_string(),
+            )
+            .with_sync_mode(SyncMode::RefreshAndPersist),
         };
 
         let result = fsm.handle_event(event).await;

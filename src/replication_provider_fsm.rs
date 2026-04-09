@@ -1019,6 +1019,8 @@ pub struct ReplicationSession {
     pub connection: ConsumerConnection,
     /// Current sync request being processed
     pub sync_request: Option<SyncRequest>,
+    /// Changelog entries queued for replay during the present phase
+    pub pending_replay_entries: Vec<ChangelogEntry>,
     /// Last replication cookie sent
     pub last_cookie: Option<String>,
     /// Entries sent during refresh phase
@@ -1053,6 +1055,7 @@ impl ReplicationSession {
             start_time: now,
             connection,
             sync_request: None,
+            pending_replay_entries: Vec::new(),
             last_cookie: None,
             refresh_entries_sent: 0,
             refresh_total_entries: 0,
@@ -1071,6 +1074,19 @@ impl ReplicationSession {
     pub fn set_sync_request(&mut self, request: SyncRequest) {
         self.sync_request = Some(request);
         self.last_activity = Instant::now();
+    }
+
+    /// Get the requested sync mode for this session.
+    pub fn sync_mode(&self) -> SyncMode {
+        self.sync_request
+            .as_ref()
+            .map(|request| request.sync_mode.clone())
+            .unwrap_or(SyncMode::RefreshOnly)
+    }
+
+    /// Get the number of queued replay entries for this session.
+    pub fn pending_replay_count(&self) -> usize {
+        self.pending_replay_entries.len()
     }
 
     /// Update session activity timestamp
@@ -1345,19 +1361,91 @@ impl ReplicationProviderFsmImpl {
         }
     }
 
+    async fn validate_request_cookie(
+        &self,
+        request: &SyncRequest,
+    ) -> Result<(), ReplicationProviderError> {
+        if let Some(cookie) = request.cookie.as_deref() {
+            let is_valid = self
+                .changelog_provider
+                .validate_cookie(cookie)
+                .await
+                .map_err(|message| ReplicationProviderError::ChangelogError { message })?;
+
+            if !is_valid {
+                return Err(ReplicationProviderError::InvalidCookie {
+                    cookie: cookie.to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn load_replay_entries(
+        &self,
+        request: &SyncRequest,
+    ) -> Result<Vec<ChangelogEntry>, ReplicationProviderError> {
+        if request.sync_mode == SyncMode::RefreshOnly {
+            return Ok(Vec::new());
+        }
+
+        let Some(cookie) = request.cookie.as_deref() else {
+            return Ok(Vec::new());
+        };
+
+        self.changelog_provider
+            .get_changelog_since(Some(cookie), self.config.changelog_batch_size)
+            .await
+            .map_err(|message| {
+                if message.contains("cookie") {
+                    ReplicationProviderError::InvalidCookie {
+                        cookie: cookie.to_string(),
+                    }
+                } else {
+                    ReplicationProviderError::ChangelogError { message }
+                }
+            })
+    }
+
+    fn sync_mode_label(sync_mode: &SyncMode) -> &'static str {
+        match sync_mode {
+            SyncMode::RefreshOnly => "refresh_only",
+            SyncMode::RefreshAndPersist => "refresh_and_persist",
+            SyncMode::PresentOnly => "present_only",
+        }
+    }
+
+    async fn generate_replication_cookie(&self) -> Result<String, ReplicationProviderError> {
+        let context_csn = self
+            .changelog_provider
+            .get_context_csn()
+            .await
+            .map_err(|message| ReplicationProviderError::ChangelogError { message })?;
+
+        if let Some(csn) = context_csn {
+            self.changelog_provider
+                .generate_cookie(&csn)
+                .await
+                .map_err(|message| ReplicationProviderError::ChangelogError { message })
+        } else {
+            Ok("csn-empty".to_string())
+        }
+    }
+
     /// Handle sync replication start event
     ///
     /// # Arguments
-    /// * `consumer_id` - Consumer identifier
-    /// * `cookie` - Optional replication cookie
+    /// * `request` - Consumer sync replication request
     ///
     /// # Returns
     /// * Result indicating success or error
     async fn handle_start_sync_replication(
         &mut self,
-        consumer_id: String,
-        cookie: Option<String>,
+        request: SyncRequest,
     ) -> Result<Option<usize>, ReplicationProviderError> {
+        let consumer_id = request.consumer_id.clone();
+
         if matches!(self.state, ReplicationProviderState::Error { .. }) {
             return Err(ReplicationProviderError::InvalidStateTransition {
                 from: self.state.clone(),
@@ -1384,46 +1472,52 @@ impl ReplicationProviderFsmImpl {
             });
         }
 
-        // Create consumer connection info
-        let connection = ConsumerConnection::new(format!("consumer-{}", consumer_id));
+        // Validate sync request
+        self.sync_request_handler
+            .validate_sync_request(&request)
+            .await
+            .map_err(|e| ReplicationProviderError::SyncRequestError { message: e })?;
 
-        // Register consumer
+        self.validate_request_cookie(&request).await?;
+
+        let refresh_entries = if request.sync_mode == SyncMode::PresentOnly {
+            Vec::new()
+        } else {
+            self.changelog_provider
+                .get_all_entries(&request.base_dn, request.filter.as_deref())
+                .await
+                .map_err(|e| ReplicationProviderError::ChangelogError { message: e })?
+        };
+
+        let replay_entries = self.load_replay_entries(&request).await?;
+
+        // Create consumer connection info after the request validates successfully.
+        let mut connection = ConsumerConnection::with_sync_mode(
+            format!("consumer-{}", consumer_id),
+            request.sync_mode.clone(),
+        );
+        if let Some(cookie) = request.cookie.clone() {
+            connection.update_cookie(cookie);
+        }
+
+        // Register consumer only after request planning succeeds.
         self.consumer_registry
             .register_consumer(&consumer_id, connection.clone())
             .await
             .map_err(|e| ReplicationProviderError::RegistryError { message: e })?;
 
-        // Create sync request
-        let sync_request = SyncRequest::new(consumer_id.clone(), "dc=example,dc=org".to_string())
-            .with_sync_mode(SyncMode::RefreshAndPersist);
-
-        let sync_request = if let Some(cookie) = cookie {
-            sync_request.with_cookie(cookie)
-        } else {
-            sync_request
-        };
-
-        // Validate sync request
-        self.sync_request_handler
-            .validate_sync_request(&sync_request)
-            .await
-            .map_err(|e| ReplicationProviderError::SyncRequestError { message: e })?;
-
         // Create session
         let mut session = ReplicationSession::new(consumer_id.clone(), connection);
-        session.set_sync_request(sync_request);
-        session.current_phase = ReplicationPhase::Refresh;
-
-        // Get total entries for refresh phase
-        let base_dn = session.sync_request.as_ref().unwrap().base_dn.clone();
-        let entries = self
-            .changelog_provider
-            .get_all_entries(&base_dn, None)
-            .await
-            .map_err(|e| ReplicationProviderError::ChangelogError { message: e })?;
-
-        let total_entries = entries.len();
-        session.refresh_total_entries = total_entries;
+        session.set_sync_request(request.clone());
+        session.pending_replay_entries = replay_entries;
+        session.refresh_total_entries = refresh_entries.len();
+        session.current_phase = match request.sync_mode {
+            SyncMode::PresentOnly => ReplicationPhase::Present,
+            SyncMode::RefreshOnly | SyncMode::RefreshAndPersist => ReplicationPhase::Refresh,
+        };
+        if let Some(cookie) = request.cookie.clone() {
+            session.last_cookie = Some(cookie);
+        }
 
         // Store session
         self.sessions.insert(consumer_id.clone(), session);
@@ -1435,10 +1529,23 @@ impl ReplicationProviderFsmImpl {
 
         // Record metrics
         if let Some(ref metrics) = self.metrics {
-            metrics.record_sync_start(&consumer_id, "refresh_and_persist");
+            metrics.record_sync_start(&consumer_id, Self::sync_mode_label(&request.sync_mode));
         }
 
-        Ok(Some(total_entries))
+        let initial_count = match request.sync_mode {
+            SyncMode::PresentOnly => self
+                .sessions
+                .get(&consumer_id)
+                .map(|session| session.pending_replay_count())
+                .unwrap_or(0),
+            SyncMode::RefreshOnly | SyncMode::RefreshAndPersist => self
+                .sessions
+                .get(&consumer_id)
+                .map(|session| session.refresh_total_entries)
+                .unwrap_or(0),
+        };
+
+        Ok(Some(initial_count))
     }
 
     /// Handle refresh phase completion
@@ -1471,7 +1578,18 @@ impl ReplicationProviderFsmImpl {
             }
 
             session.refresh_entries_sent = entries_sent;
-            session.current_phase = ReplicationPhase::Present;
+            session.current_phase = match session.sync_mode() {
+                SyncMode::RefreshOnly => ReplicationPhase::Complete,
+                SyncMode::RefreshAndPersist => ReplicationPhase::Present,
+                SyncMode::PresentOnly => {
+                    return Err(ReplicationProviderError::InvalidStateTransition {
+                        from: Self::session_state(session, active_consumers),
+                        to: ReplicationProviderState::Present {
+                            entries_streamed: 0,
+                        },
+                    });
+                }
+            };
             session.update_activity();
             session.session_duration()
         };
@@ -1517,22 +1635,7 @@ impl ReplicationProviderFsmImpl {
             }
         }
 
-        // Get contextCSN and generate new replication cookie
-        let context_csn = self
-            .changelog_provider
-            .get_context_csn()
-            .await
-            .map_err(|e| ReplicationProviderError::ChangelogError { message: e })?;
-
-        let new_cookie = if let Some(csn) = context_csn {
-            self.changelog_provider
-                .generate_cookie(&csn)
-                .await
-                .map_err(|e| ReplicationProviderError::ChangelogError { message: e })?
-        } else {
-            // No CSN yet - use empty cookie
-            "csn-empty".to_string()
-        };
+        let new_cookie = self.generate_replication_cookie().await?;
 
         let phase_duration = {
             let session = self.sessions.get_mut(&consumer_id).ok_or_else(|| {
@@ -1541,9 +1644,23 @@ impl ReplicationProviderFsmImpl {
                 }
             })?;
 
+            let next_phase = match session.sync_mode() {
+                SyncMode::RefreshAndPersist => ReplicationPhase::Persist,
+                SyncMode::PresentOnly => ReplicationPhase::Complete,
+                SyncMode::RefreshOnly => {
+                    return Err(ReplicationProviderError::InvalidStateTransition {
+                        from: Self::session_state(session, active_consumers),
+                        to: ReplicationProviderState::Persist {
+                            cookie: String::new(),
+                        },
+                    });
+                }
+            };
+
             session.present_entries_sent = entries_streamed;
+            session.pending_replay_entries.clear();
             session.last_cookie = Some(new_cookie.clone());
-            session.current_phase = ReplicationPhase::Persist;
+            session.current_phase = next_phase;
             session.update_activity();
             session.session_duration()
         };
@@ -1567,15 +1684,13 @@ impl ReplicationProviderFsmImpl {
     /// Handle changelog entry streaming (CSN-based)
     ///
     /// # Arguments
-    /// * `entry` - Changelog entry data
-    /// * `csn` - Change Sequence Number for this entry
+    /// * `change` - Changelog entry to stream
     ///
     /// # Returns
     /// * Result indicating success or error
     async fn handle_changelog_entry(
         &mut self,
-        entry: Vec<u8>,
-        csn: crate::csn::Csn,
+        change: ChangelogEntry,
     ) -> Result<Option<usize>, ReplicationProviderError> {
         if self.sessions.is_empty() {
             return Err(ReplicationProviderError::NoActiveConsumer);
@@ -1585,9 +1700,7 @@ impl ReplicationProviderFsmImpl {
             .sessions
             .iter()
             .filter_map(|(consumer_id, session)| match session.current_phase {
-                ReplicationPhase::Present
-                | ReplicationPhase::Persist
-                | ReplicationPhase::Stream => Some(consumer_id.clone()),
+                ReplicationPhase::Stream => Some(consumer_id.clone()),
                 _ => None,
             })
             .collect();
@@ -1601,29 +1714,20 @@ impl ReplicationProviderFsmImpl {
             });
         }
 
-        // Create changelog entry with CSN
-        let changelog_entry = ChangelogEntry::new(
-            csn,
-            ChangeType::Modify, // Default to modify
-            "cn=example,dc=example,dc=org".to_string(),
-            entry,
-        );
-
-        let entry_size = changelog_entry.data_size();
+        let entry_size = change.data_size();
         let mut successful_streams = 0;
 
         // Stream to all active consumers
         for consumer_id in &consumer_ids {
-            let (needs_stream_start, start_cookie) = self
+            let start_cookie = self
                 .sessions
                 .get(consumer_id)
-                .map(|session| {
-                    (
-                        session.current_phase != ReplicationPhase::Stream,
-                        session.last_cookie.clone(),
-                    )
-                })
-                .unwrap_or((false, None));
+                .and_then(|session| session.last_cookie.clone());
+            let needs_stream_start = !self
+                .streaming_manager
+                .is_streaming_active(consumer_id)
+                .await
+                .map_err(|message| ReplicationProviderError::StreamingError { message })?;
 
             if needs_stream_start {
                 if let Err(e) = self
@@ -1645,7 +1749,7 @@ impl ReplicationProviderFsmImpl {
 
             match self
                 .streaming_manager
-                .send_entry(consumer_id, &changelog_entry)
+                .send_entry(consumer_id, &change)
                 .await
             {
                 Ok(()) => {
@@ -1654,7 +1758,6 @@ impl ReplicationProviderFsmImpl {
                     // Update session
                     if let Some(session) = self.sessions.get_mut(consumer_id) {
                         session.record_present_entry(entry_size);
-                        session.current_phase = ReplicationPhase::Stream;
                     }
 
                     // Record metrics
@@ -1870,12 +1973,8 @@ impl StateMachine for ReplicationProviderFsmImpl {
         event: Self::Event,
     ) -> Result<Option<Self::Output>, Self::Error> {
         match event {
-            ReplicationProviderEvent::StartSyncReplication {
-                consumer_id,
-                cookie,
-            } => {
-                self.handle_start_sync_replication(consumer_id, cookie)
-                    .await
+            ReplicationProviderEvent::StartSyncReplication { request } => {
+                self.handle_start_sync_replication(request).await
             }
             ReplicationProviderEvent::RefreshComplete {
                 consumer_id,
@@ -1891,8 +1990,8 @@ impl StateMachine for ReplicationProviderFsmImpl {
                 self.handle_present_complete(consumer_id, entries_streamed)
                     .await
             }
-            ReplicationProviderEvent::ChangelogEntry { entry, csn } => {
-                self.handle_changelog_entry(entry, csn).await
+            ReplicationProviderEvent::ChangelogEntry { change } => {
+                self.handle_changelog_entry(change).await
             }
             ReplicationProviderEvent::EntryStreamed { consumer_id } => {
                 self.handle_entry_streamed(consumer_id).await
@@ -2022,6 +2121,7 @@ impl ReplicationProviderFsm for ReplicationProviderFsmImpl {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio;
 
     // Mock implementations for testing
@@ -2029,6 +2129,7 @@ pub mod tests {
         should_fail: bool,
         entries: Vec<DirectoryEntry>,
         changelog: Vec<ChangelogEntry>,
+        invalid_cookies: HashSet<String>,
     }
 
     impl MockChangelogProvider {
@@ -2045,6 +2146,7 @@ pub mod tests {
                     "cn=user3,dc=example,dc=org".to_string(),
                     b"entry data".to_vec(),
                 )],
+                invalid_cookies: HashSet::new(),
             }
         }
 
@@ -2055,6 +2157,16 @@ pub mod tests {
 
         pub fn with_entries(mut self, entries: Vec<DirectoryEntry>) -> Self {
             self.entries = entries;
+            self
+        }
+
+        pub fn with_changelog(mut self, changelog: Vec<ChangelogEntry>) -> Self {
+            self.changelog = changelog;
+            self
+        }
+
+        pub fn with_invalid_cookie(mut self, cookie: &str) -> Self {
+            self.invalid_cookies.insert(cookie.to_string());
             self
         }
     }
@@ -2103,11 +2215,11 @@ pub mod tests {
             }
         }
 
-        async fn validate_cookie(&self, _cookie: &str) -> Result<bool, String> {
+        async fn validate_cookie(&self, cookie: &str) -> Result<bool, String> {
             if self.should_fail {
                 Err("Mock cookie validation failure".to_string())
             } else {
-                Ok(true)
+                Ok(!self.invalid_cookies.contains(cookie))
             }
         }
     }
@@ -2225,6 +2337,7 @@ pub mod tests {
     pub struct MockStreamingManager {
         should_fail: bool,
         active_streams: HashSet<String>,
+        sent_entries: Arc<Mutex<Vec<(String, ChangelogEntry)>>>,
     }
 
     impl MockStreamingManager {
@@ -2232,12 +2345,17 @@ pub mod tests {
             Self {
                 should_fail: false,
                 active_streams: HashSet::new(),
+                sent_entries: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         pub fn with_failure(mut self) -> Self {
             self.should_fail = true;
             self
+        }
+
+        pub fn sent_entries_handle(&self) -> Arc<Mutex<Vec<(String, ChangelogEntry)>>> {
+            self.sent_entries.clone()
         }
     }
 
@@ -2267,12 +2385,16 @@ pub mod tests {
 
         async fn send_entry(
             &self,
-            _consumer_id: &str,
-            _entry: &ChangelogEntry,
+            consumer_id: &str,
+            entry: &ChangelogEntry,
         ) -> Result<(), String> {
             if self.should_fail {
                 Err("Mock streaming failure".to_string())
             } else {
+                self.sent_entries
+                    .lock()
+                    .unwrap()
+                    .push((consumer_id.to_string(), entry.clone()));
                 Ok(())
             }
         }
@@ -2406,6 +2528,38 @@ pub mod tests {
         create_test_fsm().with_metrics(Box::new(MockReplicationMetrics))
     }
 
+    fn create_test_fsm_with_recording_streaming_manager() -> (
+        ReplicationProviderFsmImpl,
+        Arc<Mutex<Vec<(String, ChangelogEntry)>>>,
+    ) {
+        let changelog_provider = Box::new(MockChangelogProvider::new());
+        let consumer_registry = Box::new(MockConsumerRegistry::new());
+        let streaming_manager = MockStreamingManager::new();
+        let sent_entries = streaming_manager.sent_entries_handle();
+        let sync_request_handler = Box::new(MockSyncRequestHandler::new());
+
+        (
+            ReplicationProviderFsmImpl::new(
+                changelog_provider,
+                consumer_registry,
+                Box::new(streaming_manager),
+                sync_request_handler,
+            ),
+            sent_entries,
+        )
+    }
+
+    fn default_sync_request(consumer_id: &str) -> SyncRequest {
+        SyncRequest::new(consumer_id.to_string(), "dc=example,dc=org".to_string())
+            .with_sync_mode(SyncMode::RefreshAndPersist)
+    }
+
+    fn default_start_event(consumer_id: &str) -> ReplicationProviderEvent {
+        ReplicationProviderEvent::StartSyncReplication {
+            request: default_sync_request(consumer_id),
+        }
+    }
+
     // Basic FSM creation and initialization tests
     #[tokio::test]
     async fn test_new_replication_provider_fsm() {
@@ -2467,10 +2621,10 @@ pub mod tests {
     async fn test_start_sync_replication_success() {
         let mut fsm = create_test_fsm();
 
+        let request = default_sync_request("consumer1");
         let result = fsm
             .handle_event(ReplicationProviderEvent::StartSyncReplication {
-                consumer_id: "consumer1".to_string(),
-                cookie: None,
+                request: request.clone(),
             })
             .await;
 
@@ -2485,6 +2639,12 @@ pub mod tests {
         ));
         assert_eq!(fsm.active_consumers(), 1);
         assert_eq!(fsm.current_phase(), ReplicationPhase::Refresh);
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .and_then(|session| session.sync_request.as_ref())
+                .map(|stored| stored.base_dn.as_str()),
+            Some(request.base_dn.as_str())
+        );
 
         let (total, _, _, _, _) = fsm.get_stats();
         assert_eq!(total, 1);
@@ -2493,11 +2653,13 @@ pub mod tests {
     #[tokio::test]
     async fn test_start_sync_replication_with_cookie() {
         let mut fsm = create_test_fsm();
+        let request = default_sync_request("consumer1")
+            .with_cookie("existing-cookie-123".to_string())
+            .with_filter("(objectClass=person)".to_string());
 
         let result = fsm
             .handle_event(ReplicationProviderEvent::StartSyncReplication {
-                consumer_id: "consumer1".to_string(),
-                cookie: Some("existing-cookie-123".to_string()),
+                request: request.clone(),
             })
             .await;
 
@@ -2506,6 +2668,18 @@ pub mod tests {
             fsm.current_state(),
             ReplicationProviderState::Refresh { .. }
         ));
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .and_then(|session| session.sync_request.as_ref())
+                .and_then(|stored| stored.cookie.as_deref()),
+            Some("existing-cookie-123")
+        );
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .and_then(|session| session.sync_request.as_ref())
+                .and_then(|stored| stored.filter.as_deref()),
+            Some("(objectClass=person)")
+        );
     }
 
     #[tokio::test]
@@ -2524,8 +2698,7 @@ pub mod tests {
 
         let result = fsm
             .handle_event(ReplicationProviderEvent::StartSyncReplication {
-                consumer_id: "consumer1".to_string(),
-                cookie: None,
+                request: default_sync_request("consumer1"),
             })
             .await;
 
@@ -2541,12 +2714,9 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         // First start sync replication
-        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer1".to_string(),
-            cookie: None,
-        })
-        .await
-        .unwrap();
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
 
         // Then complete refresh phase
         let result = fsm
@@ -2595,12 +2765,9 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         // Setup: start sync and complete refresh
-        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer1".to_string(),
-            cookie: None,
-        })
-        .await
-        .unwrap();
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
 
         fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
             consumer_id: "consumer1".to_string(),
@@ -2650,13 +2817,10 @@ pub mod tests {
     async fn test_changelog_entry_streaming() {
         let mut fsm = create_test_fsm();
 
-        // Setup: start sync and reach present phase
-        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer1".to_string(),
-            cookie: None,
-        })
-        .await
-        .unwrap();
+        // Setup: start sync, complete replay, and persist the generated cookie.
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
 
         fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
             consumer_id: "consumer1".to_string(),
@@ -2665,13 +2829,28 @@ pub mod tests {
         .await
         .unwrap();
 
+        fsm.handle_event(ReplicationProviderEvent::PresentComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_streamed: 0,
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::CookiePersisted {
+            consumer_id: "consumer1".to_string(),
+            new_cookie: "stream-cookie".to_string(),
+        })
+        .await
+        .unwrap();
+
         // Stream changelog entry with CSN
-        let csn = crate::csn::Csn::new(1);
+        let change = ChangelogEntry::new(
+            crate::csn::Csn::new(1),
+            ChangeType::Modify,
+            "cn=user1,dc=example,dc=org".to_string(),
+            b"test entry data".to_vec(),
+        );
         let result = fsm
-            .handle_event(ReplicationProviderEvent::ChangelogEntry {
-                entry: b"test entry data".to_vec(),
-                csn,
-            })
+            .handle_event(ReplicationProviderEvent::ChangelogEntry { change })
             .await;
 
         assert!(result.is_ok());
@@ -2695,12 +2874,14 @@ pub mod tests {
             entries_streamed: 0,
         };
 
-        let csn = crate::csn::Csn::new(1);
+        let change = ChangelogEntry::new(
+            crate::csn::Csn::new(1),
+            ChangeType::Modify,
+            "cn=user1,dc=example,dc=org".to_string(),
+            b"test entry data".to_vec(),
+        );
         let result = fsm
-            .handle_event(ReplicationProviderEvent::ChangelogEntry {
-                entry: b"test entry data".to_vec(),
-                csn,
-            })
+            .handle_event(ReplicationProviderEvent::ChangelogEntry { change })
             .await;
 
         assert!(result.is_err());
@@ -2715,12 +2896,9 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         // Setup: start sync
-        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer1".to_string(),
-            cookie: None,
-        })
-        .await
-        .unwrap();
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
 
         // Confirm entry streamed
         let result = fsm
@@ -2756,12 +2934,9 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         // Setup: start sync
-        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer1".to_string(),
-            cookie: None,
-        })
-        .await
-        .unwrap();
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
 
         assert_eq!(fsm.active_consumers(), 1);
 
@@ -2790,8 +2965,7 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer1".to_string(),
-            cookie: Some("old-cookie".to_string()),
+            request: default_sync_request("consumer1").with_cookie("old-cookie".to_string()),
         })
         .await
         .unwrap();
@@ -2861,12 +3035,9 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         // Setup: start sync and progress through states
-        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer1".to_string(),
-            cookie: None,
-        })
-        .await
-        .unwrap();
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
 
         assert_eq!(fsm.active_consumers(), 1);
         assert!(matches!(
@@ -2921,12 +3092,7 @@ pub mod tests {
         let mut fsm = create_test_fsm_with_metrics();
 
         // Test that operations work with metrics enabled
-        let result = fsm
-            .handle_event(ReplicationProviderEvent::StartSyncReplication {
-                consumer_id: "consumer1".to_string(),
-                cookie: None,
-            })
-            .await;
+        let result = fsm.handle_event(default_start_event("consumer1")).await;
 
         assert!(result.is_ok());
         assert!(matches!(
@@ -2940,15 +3106,21 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer1".to_string(),
-            cookie: Some("cookie-1".to_string()),
+            request: default_sync_request("consumer1")
+                .with_cookie("cookie-1".to_string())
+                .with_filter("(cn=user1)".to_string()),
         })
         .await
         .unwrap();
 
         fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-            consumer_id: "consumer2".to_string(),
-            cookie: Some("cookie-2".to_string()),
+            request: SyncRequest::new(
+                "consumer2".to_string(),
+                "ou=people,dc=example,dc=org".to_string(),
+            )
+            .with_cookie("cookie-2".to_string())
+            .with_filter("(cn=user2)".to_string())
+            .with_sync_mode(SyncMode::PresentOnly),
         })
         .await
         .unwrap();
@@ -2963,8 +3135,20 @@ pub mod tests {
         assert_eq!(
             fsm.get_session("consumer2")
                 .and_then(|session| session.sync_request.as_ref())
+                .map(|request| request.base_dn.as_str()),
+            Some("ou=people,dc=example,dc=org")
+        );
+        assert_eq!(
+            fsm.get_session("consumer2")
+                .and_then(|session| session.sync_request.as_ref())
                 .and_then(|request| request.cookie.as_deref()),
             Some("cookie-2")
+        );
+        assert_eq!(
+            fsm.get_session("consumer2")
+                .and_then(|session| session.sync_request.as_ref())
+                .map(|request| request.sync_mode.clone()),
+            Some(SyncMode::PresentOnly)
         );
         assert_eq!(fsm.consumer_id(), None);
         assert_eq!(fsm.cookie(), None);
@@ -2975,12 +3159,9 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         for consumer_id in ["consumer1", "consumer2"] {
-            fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-                consumer_id: consumer_id.to_string(),
-                cookie: None,
-            })
-            .await
-            .unwrap();
+            fsm.handle_event(default_start_event(consumer_id))
+                .await
+                .unwrap();
         }
 
         fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
@@ -3017,12 +3198,9 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         for consumer_id in ["consumer1", "consumer2"] {
-            fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-                consumer_id: consumer_id.to_string(),
-                cookie: None,
-            })
-            .await
-            .unwrap();
+            fsm.handle_event(default_start_event(consumer_id))
+                .await
+                .unwrap();
             fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
                 consumer_id: consumer_id.to_string(),
                 entries_sent: 2,
@@ -3076,12 +3254,9 @@ pub mod tests {
         let mut fsm = create_test_fsm();
 
         for consumer_id in ["consumer1", "consumer2"] {
-            fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-                consumer_id: consumer_id.to_string(),
-                cookie: None,
-            })
-            .await
-            .unwrap();
+            fsm.handle_event(default_start_event(consumer_id))
+                .await
+                .unwrap();
         }
 
         fsm.handle_event(ReplicationProviderEvent::ConsumerDisconnected {
@@ -3101,6 +3276,191 @@ pub mod tests {
                 total_entries: 2,
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_start_sync_replication_rejects_invalid_cookie_before_session_creation() {
+        let changelog_provider =
+            Box::new(MockChangelogProvider::new().with_invalid_cookie("invalid-cookie"));
+        let consumer_registry = Box::new(MockConsumerRegistry::new());
+        let streaming_manager = Box::new(MockStreamingManager::new());
+        let sync_request_handler = Box::new(MockSyncRequestHandler::new());
+
+        let mut fsm = ReplicationProviderFsmImpl::new(
+            changelog_provider,
+            consumer_registry,
+            streaming_manager,
+            sync_request_handler,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationProviderEvent::StartSyncReplication {
+                request: default_sync_request("consumer1")
+                    .with_cookie("invalid-cookie".to_string())
+                    .with_sync_mode(SyncMode::PresentOnly),
+            })
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            ReplicationProviderError::InvalidCookie { .. }
+        ));
+        assert_eq!(fsm.active_consumers(), 0);
+        assert!(fsm.get_session("consumer1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_present_only_start_replays_pending_changes() {
+        let changelog_provider = Box::new(MockChangelogProvider::new().with_changelog(vec![
+            ChangelogEntry::new(
+                crate::csn::Csn::new(2),
+                ChangeType::Add,
+                "cn=user2,dc=example,dc=org".to_string(),
+                b"entry data 2".to_vec(),
+            ),
+            ChangelogEntry::new(
+                crate::csn::Csn::new(3),
+                ChangeType::Delete,
+                "cn=user3,dc=example,dc=org".to_string(),
+                b"entry data 3".to_vec(),
+            ),
+        ]));
+        let consumer_registry = Box::new(MockConsumerRegistry::new());
+        let streaming_manager = Box::new(MockStreamingManager::new());
+        let sync_request_handler = Box::new(MockSyncRequestHandler::new());
+
+        let mut fsm = ReplicationProviderFsmImpl::new(
+            changelog_provider,
+            consumer_registry,
+            streaming_manager,
+            sync_request_handler,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationProviderEvent::StartSyncReplication {
+                request: SyncRequest::new("consumer1".to_string(), "dc=example,dc=org".to_string())
+                    .with_cookie("csn-20250101000000000000#001#000001#000000".to_string())
+                    .with_sync_mode(SyncMode::PresentOnly),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(2));
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .map(|session| &session.current_phase),
+            Some(&ReplicationPhase::Present)
+        );
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .map(|session| session.pending_replay_count()),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_only_completes_after_refresh_phase() {
+        let mut fsm = create_test_fsm();
+
+        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+            request: SyncRequest::new("consumer1".to_string(), "dc=example,dc=org".to_string())
+                .with_sync_mode(SyncMode::RefreshOnly),
+        })
+        .await
+        .unwrap();
+
+        fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .map(|session| &session.current_phase),
+            Some(&ReplicationPhase::Complete)
+        );
+        assert!(matches!(
+            fsm.current_state(),
+            ReplicationProviderState::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_present_only_present_complete_finishes_session() {
+        let mut fsm = create_test_fsm();
+
+        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+            request: SyncRequest::new("consumer1".to_string(), "dc=example,dc=org".to_string())
+                .with_cookie("csn-empty".to_string())
+                .with_sync_mode(SyncMode::PresentOnly),
+        })
+        .await
+        .unwrap();
+
+        fsm.handle_event(ReplicationProviderEvent::PresentComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_streamed: 0,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .map(|session| &session.current_phase),
+            Some(&ReplicationPhase::Complete)
+        );
+        assert!(matches!(
+            fsm.current_state(),
+            ReplicationProviderState::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_changelog_entry_preserves_metadata() {
+        let (mut fsm, sent_entries) = create_test_fsm_with_recording_streaming_manager();
+
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::PresentComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_streamed: 0,
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::CookiePersisted {
+            consumer_id: "consumer1".to_string(),
+            new_cookie: "stream-cookie".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let change = ChangelogEntry::new(
+            crate::csn::Csn::new(42),
+            ChangeType::Delete,
+            "cn=obsolete,dc=example,dc=org".to_string(),
+            b"delete payload".to_vec(),
+        );
+        fsm.handle_event(ReplicationProviderEvent::ChangelogEntry {
+            change: change.clone(),
+        })
+        .await
+        .unwrap();
+
+        let sent_entries = sent_entries.lock().unwrap();
+        assert_eq!(sent_entries.len(), 1);
+        assert_eq!(sent_entries[0].0, "consumer1");
+        assert_eq!(sent_entries[0].1.csn, change.csn);
+        assert_eq!(sent_entries[0].1.change_type, change.change_type);
+        assert_eq!(sent_entries[0].1.dn, change.dn);
     }
 
     // Data structure tests

@@ -171,6 +171,16 @@ impl ChangelogTracker {
         self.latest_csn.lock().unwrap().clone()
     }
 
+    /// Get the oldest retained CSN in the current changelog window.
+    pub fn get_oldest_csn(&self) -> Option<Csn> {
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .map(|entry| entry.csn.clone())
+            .min()
+    }
+
     /// Parse cookie to CSN
     ///
     /// Cookie format: "csn-<csn_string>"
@@ -355,6 +365,16 @@ impl ChangelogProvider for ChangelogProviderImpl {
                 // Empty state - return all entries
                 self.tracker.get_all()
             } else if let Some(csn) = self.tracker.parse_cookie(cookie_str) {
+                if let Some(oldest_csn) = self.tracker.get_oldest_csn() {
+                    if csn < oldest_csn {
+                        return Err(format!("Stale replication cookie: {}", cookie_str));
+                    }
+                }
+                if let Some(latest_csn) = self.tracker.get_context_csn() {
+                    if csn > latest_csn {
+                        return Err(format!("Invalid replication cookie: {}", cookie_str));
+                    }
+                }
                 // Get entries since this CSN
                 self.tracker.get_since_csn(&csn)
             } else {
@@ -383,8 +403,20 @@ impl ChangelogProvider for ChangelogProviderImpl {
     async fn validate_cookie(&self, cookie: &str) -> Result<bool, String> {
         if cookie == "csn-empty" {
             Ok(true)
+        } else if let Some(csn) = self.tracker.parse_cookie(cookie) {
+            if let Some(oldest_csn) = self.tracker.get_oldest_csn() {
+                if csn < oldest_csn {
+                    return Ok(false);
+                }
+            }
+            if let Some(latest_csn) = self.tracker.get_context_csn() {
+                if csn > latest_csn {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         } else {
-            Ok(self.tracker.parse_cookie(cookie).is_some())
+            Ok(false)
         }
     }
 }
