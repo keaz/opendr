@@ -11,7 +11,10 @@
 //! - 1 BerDecoderFsm: LDAP message decoding
 //! - 1 Authentication FSM: Simple or SASL authentication
 //! - N Operation FSMs: One per concurrent LDAP operation (search, modify, etc.)
-//! - Optional Replication FSMs: For replication sessions
+//!
+//! Replication provider/consumer FSMs are exposed as standalone modules and are
+//! not embedded in the connection-scoped runtime. Backend transaction FSMs are
+//! internal storage/runtime plumbing rather than part of `ConnectionFsmSet`.
 //!
 //! ## Message Routing
 //!
@@ -31,7 +34,7 @@ use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::compare_fsm::CompareFsmImpl;
 use crate::connection_fsm::{ConnectionFsmImpl, TlsHandler};
 use crate::extended_op_fsm::ExtendedOpFsmImpl;
-use crate::fsm::{AuthState, SaslFsm, StateMachine, TimeoutFsm};
+use crate::fsm::{AuthState, SaslFsm, StateMachine};
 use crate::sasl_fsm::SaslFsmImpl;
 use crate::search_fsm::SearchFsmImpl;
 use crate::write_fsm::{SchemaValidator, WriteFsmImpl};
@@ -187,6 +190,8 @@ pub enum OperationType {
 ///
 /// This structure manages all FSM instances associated with one client connection.
 /// It handles message routing, FSM lifecycle, and cleanup of completed operations.
+/// The runtime surface is intentionally limited to transport, decoding,
+/// authentication, and request/response LDAP operations for one connection.
 pub struct ConnectionFsmSet {
     /// Connection/transport FSM
     connection: ConnectionFsmImpl,

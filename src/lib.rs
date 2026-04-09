@@ -5,6 +5,7 @@ pub mod backend;
 pub mod backend_adapters;
 pub mod backend_changelog_wrapper;
 pub mod backend_lmdb;
+// Internal storage/runtime FSM; not part of the public crate API.
 mod backend_txn_fsm;
 pub mod ber_decoder_fsm;
 pub mod change_observer;
@@ -32,7 +33,9 @@ pub mod real_time_propagation;
 pub mod referral;
 pub mod referral_fsm;
 pub mod replication;
+/// Public standalone consumer-side replication FSMs.
 pub mod replication_consumer_fsm;
+/// Public standalone provider-side replication FSMs.
 pub mod replication_provider_fsm;
 pub mod replication_service;
 pub mod sasl_fsm;

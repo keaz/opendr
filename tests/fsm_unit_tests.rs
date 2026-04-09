@@ -18,8 +18,10 @@
 //! 9. ReferralFsm - Referral handling
 //! 10. ReplicationProviderFsm - Replication provider
 //!
-//! Note: ReplicationConsumerFsm and BackendTxnFsm are not exported from lib.rs yet,
-//! so their tests are commented out for now.
+//! Note: `ConnectionFsmSet` is the authoritative connection-scoped runtime and
+//! lives in `fsm_runtime`. Replication consumer/provider FSMs are public
+//! standalone modules tested in their dedicated integration coverage, while the
+//! backend transaction FSM remains an internal storage/runtime detail.
 
 use opendr::fsm::*;
 use opendr::connection_fsm::*;
@@ -32,9 +34,6 @@ use opendr::compare_fsm::*;
 use opendr::extended_op_fsm::*;
 use opendr::referral_fsm::*;
 use opendr::replication_provider_fsm::*;
-// Note: These modules are not yet exported from lib.rs
-// use opendr::replication_consumer_fsm::*;
-// use opendr::backend_txn_fsm::*;
 
 use async_trait::async_trait;
 use std::time::{Duration, Instant};
@@ -713,19 +712,13 @@ impl SyncRequestHandler for MockSyncRequestHandler {
 }
 
 // ===== ReplicationConsumerFsm Mocks =====
-// Commented out: replication_consumer_fsm module not exported from lib.rs yet
-// These mocks would go here when the module is exported:
-/*
- * MockProviderConnection, MockBatchProcessor, MockStateManager,
- * MockChangeListener, MockConsumerMetrics
- */
+// Consumer-side replication is a public standalone module with dedicated
+// integration coverage. This connection-runtime focused suite keeps its mocks
+// and assertions scoped to the provider/runtime surface it exercises directly.
 
 // ===== BackendTxnFsm Mocks =====
-// Commented out: backend_txn_fsm module not exported from lib.rs yet
-// These mocks would go here when the module is exported:
-/*
- * MockTransactionManager, MockDataStore, MockIndexManager, MockTxnMetrics
- */
+// Backend transaction coordination remains internal to the storage/runtime
+// layer, so this external test suite intentionally does not import it.
 
 // ================================================================================================
 // CONNECTION FSM TESTS
@@ -1461,16 +1454,14 @@ mod replication_provider_fsm_tests {
 // ================================================================================================
 // REPLICATION CONSUMER FSM TESTS
 // ================================================================================================
-// Commented out: replication_consumer_fsm module not exported from lib.rs yet
-//
-// Tests would go here when replication_consumer_fsm is exported from lib.rs
+// Consumer-side replication tests live in dedicated integration suites because
+// the consumer FSM is public but not part of the connection-scoped runtime.
 
 // ================================================================================================
 // BACKEND TXN FSM TESTS
 // ================================================================================================
-// Commented out: backend_txn_fsm module not exported from lib.rs yet
-//
-// Tests would go here when backend_txn_fsm is exported from lib.rs
+// Backend transaction coordination is internal-only and intentionally excluded
+// from the external crate test surface.
 
 // ================================================================================================
 // TIMEOUT FSM TESTS
