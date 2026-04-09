@@ -51,5 +51,6 @@ pub mod search_fsm;
 pub mod server;
 pub mod setup;
 pub mod shutdown;
+pub mod sync_controls;
 pub mod tls;
 pub mod write_fsm;

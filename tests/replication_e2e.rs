@@ -17,11 +17,17 @@ use ldap_parser::parse_ldap_messages;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
 use opendr::config::ServerConfig;
+use opendr::ldap_controls::{LdapControl, RequestControls};
 use opendr::replication::ChangelogTracker;
 use opendr::replication_provider_fsm::ChangeType;
 use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
+use opendr::sync_controls::{
+    decode_sync_info_value, decode_sync_state_control, encode_sync_request_control, SyncInfoValue,
+    SyncRefreshMode, SyncRequestControl, SyncStateType, SYNC_INFO_OID, SYNC_REQUEST_OID,
+    SYNC_STATE_OID,
+};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,19 +116,7 @@ async fn read_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     buf
 }
 
-fn create_replication_search_request(cookie: Option<&str>) -> SearchRequest<'static> {
-    let mut attributes = vec![LdapString(Cow::Owned(
-        opendr::replication::REPLICATION_STREAM_ATTRIBUTE.to_string(),
-    ))];
-
-    if let Some(cookie) = cookie {
-        attributes.push(LdapString(Cow::Owned(format!(
-            "{}{}",
-            opendr::replication::REPLICATION_COOKIE_ATTRIBUTE_PREFIX,
-            cookie
-        ))));
-    }
-
+fn create_replication_search_request() -> SearchRequest<'static> {
     SearchRequest {
         base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
         scope: SearchScope(2),
@@ -134,7 +128,57 @@ fn create_replication_search_request(cookie: Option<&str>) -> SearchRequest<'sta
             attribute_desc: LdapString(Cow::Owned("objectClass".to_string())),
             assertion_value: b"top",
         }),
-        attributes,
+        attributes: Vec::new(),
+    }
+}
+
+fn create_replication_request_controls(cookie: Option<&str>) -> RequestControls {
+    RequestControls::new(vec![LdapControl::new(
+        SYNC_REQUEST_OID,
+        true,
+        Some(
+            encode_sync_request_control(&SyncRequestControl {
+                mode: SyncRefreshMode::RefreshAndPersist,
+                cookie: cookie.map(|cookie| cookie.as_bytes().to_vec()),
+                reload_hint: false,
+            })
+            .unwrap(),
+        ),
+    )])
+}
+
+fn sync_state_response(
+    message: &ldap_parser::ldap::LdapMessage<'_>,
+) -> opendr::sync_controls::SyncStateControl {
+    let controls = message.controls.as_ref().expect("response controls");
+    let control = controls
+        .iter()
+        .find(|control| control.control_type.0.as_ref() == SYNC_STATE_OID)
+        .expect("sync state response control");
+    decode_sync_state_control(control.control_value.as_deref()).unwrap()
+}
+
+fn sync_info_response(message: &ldap_parser::ldap::LdapMessage<'_>) -> SyncInfoValue {
+    match &message.protocol_op {
+        ProtocolOp::IntermediateResponse(response) => {
+            assert_eq!(
+                response
+                    .response_name
+                    .as_ref()
+                    .expect("sync info response name")
+                    .0
+                    .as_ref(),
+                SYNC_INFO_OID
+            );
+            decode_sync_info_value(
+                response
+                    .response_value
+                    .as_deref()
+                    .expect("sync info response value"),
+            )
+            .unwrap()
+        }
+        other => panic!("unexpected response: {:?}", other),
     }
 }
 
@@ -645,16 +689,30 @@ async fn test_e2e_reads_dont_replicate() {
 async fn test_e2e_listening_replication_stream_emits_live_change() {
     let provider_backend = create_listening_provider_backend();
     let (mut server_stream, mut client_stream) = connected_stream_pair().await;
-    let request = create_replication_search_request(None);
+    let request = create_replication_search_request();
+    let request_controls = create_replication_request_controls(None);
     let server_backend = provider_backend.clone();
 
     let handler = tokio::spawn(async move {
-        server::handle_search_request(&mut server_stream, server_backend.as_ref(), 1, request)
-            .await
-            .unwrap();
+        server::handle_search_request_with_controls(
+            &mut server_stream,
+            server_backend.as_ref(),
+            1,
+            request,
+            &request_controls,
+        )
+        .await
+        .unwrap();
     });
 
     sleep(Duration::from_millis(100)).await;
+    let initial = read_response(&mut client_stream).await;
+    let (_, initial_messages) = parse_ldap_messages(&initial).unwrap();
+    assert_eq!(initial_messages.len(), 1);
+    assert!(matches!(
+        sync_info_response(&initial_messages[0]),
+        SyncInfoValue::RefreshPresent { .. }
+    ));
 
     let entry = create_test_entry(
         "cn=listener-user,dc=example,dc=org",
@@ -668,32 +726,17 @@ async fn test_e2e_listening_replication_stream_emits_live_change() {
 
     let data = read_response(&mut client_stream).await;
     let (_, messages) = parse_ldap_messages(&data).unwrap();
-    assert!(!messages.is_empty(), "expected a replication stream entry");
-
-    match &messages[0].protocol_op {
+    let message = messages
+        .iter()
+        .find(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_)))
+        .expect("replication stream entry");
+    match &message.protocol_op {
         ProtocolOp::SearchResultEntry(response) => {
             assert_eq!(response.object_name.0.as_ref(), entry.dn);
-            assert!(response
-                .attributes
-                .iter()
-                .any(|attr| attr.attr_type.0.as_ref()
-                    == opendr::replication::REPLICATION_CHANGE_TYPE_ATTRIBUTE
-                    && std::str::from_utf8(attr.attr_vals[0].0.as_ref()).unwrap() == "add"));
-            assert!(response
-                .attributes
-                .iter()
-                .any(|attr| attr.attr_type.0.as_ref()
-                    == opendr::replication::REPLICATION_CHANGE_DATA_ATTRIBUTE
-                    && !attr.attr_vals[0].0.as_ref().is_empty()));
-            assert!(response
-                .attributes
-                .iter()
-                .any(|attr| attr.attr_type.0.as_ref()
-                    == opendr::replication::REPLICATION_CSN_ATTRIBUTE
-                    && !attr.attr_vals[0].0.as_ref().is_empty()));
         }
         other => panic!("unexpected replication response: {:?}", other),
     }
+    assert_eq!(sync_state_response(message).state, SyncStateType::Add);
 
     handler.abort();
     let _ = handler.await;
@@ -718,16 +761,30 @@ async fn test_e2e_listening_replication_stream_respects_cookie_resume() {
         .generate_context_cookie();
 
     let (mut server_stream, mut client_stream) = connected_stream_pair().await;
-    let request = create_replication_search_request(Some(&cookie));
+    let request = create_replication_search_request();
+    let request_controls = create_replication_request_controls(Some(&cookie));
     let server_backend = provider_backend.clone();
 
     let handler = tokio::spawn(async move {
-        server::handle_search_request(&mut server_stream, server_backend.as_ref(), 1, request)
-            .await
-            .unwrap();
+        server::handle_search_request_with_controls(
+            &mut server_stream,
+            server_backend.as_ref(),
+            1,
+            request,
+            &request_controls,
+        )
+        .await
+        .unwrap();
     });
 
     sleep(Duration::from_millis(100)).await;
+    let initial = read_response(&mut client_stream).await;
+    let (_, initial_messages) = parse_ldap_messages(&initial).unwrap();
+    assert_eq!(initial_messages.len(), 1);
+    assert!(matches!(
+        sync_info_response(&initial_messages[0]),
+        SyncInfoValue::RefreshPresent { .. }
+    ));
 
     let second_entry = create_test_entry(
         "cn=fresh-user,dc=example,dc=org",
@@ -759,6 +816,11 @@ async fn test_e2e_listening_replication_stream_respects_cookie_resume() {
         stream_entries.iter().any(|dn| dn == &second_entry.dn),
         "cookie should still deliver the new change"
     );
+    let entry_message = messages
+        .iter()
+        .find(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_)))
+        .expect("search result entry");
+    assert_eq!(sync_state_response(entry_message).state, SyncStateType::Add);
 
     handler.abort();
     let _ = handler.await;

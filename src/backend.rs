@@ -19,6 +19,8 @@ use crate::csn::Csn;
 pub struct OperationalAttributes {
     /// entryCSN - Change Sequence Number for this entry (RFC 4533)
     pub entry_csn: Option<Csn>,
+    /// entryUUID - Stable UUID for the entry
+    pub entry_uuid: Option<String>,
     /// createTimestamp - When the entry was created (RFC 4512)
     pub create_timestamp: Option<String>,
     /// modifyTimestamp - When the entry was last modified (RFC 4512)
@@ -34,6 +36,7 @@ impl OperationalAttributes {
     pub fn new() -> Self {
         Self {
             entry_csn: None,
+            entry_uuid: None,
             create_timestamp: None,
             modify_timestamp: None,
             creators_name: None,
@@ -46,6 +49,7 @@ impl OperationalAttributes {
         let timestamp = Self::current_timestamp();
         Self {
             entry_csn: Some(csn),
+            entry_uuid: Some(uuid::Uuid::new_v4().to_string()),
             create_timestamp: Some(timestamp.clone()),
             modify_timestamp: Some(timestamp),
             creators_name: creator_dn.clone(),
@@ -82,6 +86,9 @@ impl OperationalAttributes {
         if let Some(ref csn) = self.entry_csn {
             attrs.insert("entrycsn".to_string(), vec![csn.to_ldap_string()]);
         }
+        if let Some(ref uuid) = self.entry_uuid {
+            attrs.insert("entryuuid".to_string(), vec![uuid.clone()]);
+        }
         if let Some(ref ts) = self.create_timestamp {
             attrs.insert("createtimestamp".to_string(), vec![ts.clone()]);
         }
@@ -103,6 +110,7 @@ impl OperationalAttributes {
         matches!(
             attr_name.to_lowercase().as_str(),
             "entrycsn"
+                | "entryuuid"
                 | "createtimestamp"
                 | "modifytimestamp"
                 | "creatorsname"

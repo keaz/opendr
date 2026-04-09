@@ -37,15 +37,13 @@ use crate::ldap_controls::{ControlRegistry, ControlValidationError, LdapControl,
 use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
     encode_bind_response, encode_custom_extended_response, encode_custom_search_result_done,
-    encode_extended_response_with_controls, encode_result_response_with_controls,
-    encode_search_entry_with_controls, CustomResultCode, ResponseOp,
+    encode_extended_response_with_controls, encode_intermediate_response,
+    encode_result_response_with_controls, encode_search_entry_with_controls, CustomResultCode,
+    ResponseOp,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::real_time_propagation::is_dn_in_scope;
-use crate::replication::{
-    changelog_entry_to_replication_attrs, REPLICATION_COOKIE_ATTRIBUTE_PREFIX,
-    REPLICATION_STREAM_ATTRIBUTE,
-};
+use crate::replication::RenameChange;
 use crate::schema::LdapSchema;
 use crate::search_controls::{
     decode_paged_results_control, decode_server_side_sort_request_control,
@@ -53,7 +51,14 @@ use crate::search_controls::{
     ServerSideSortResultCode, SortKey, PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID,
     SERVER_SIDE_SORT_RESPONSE_OID,
 };
+use crate::sync_controls::{
+    decode_sync_request_control, encode_sync_done_control, encode_sync_info_value,
+    encode_sync_state_control, SyncDoneControl, SyncInfoValue, SyncRefreshMode, SyncRequestControl,
+    SyncStateControl, SyncStateType, SYNC_DONE_OID, SYNC_INFO_OID, SYNC_REQUEST_OID,
+    SYNC_STATE_OID,
+};
 use crate::tls::RustlsTlsHandler;
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -1601,7 +1606,10 @@ fn active_runtime_control_registry() -> ControlRegistry {
         .register_request_control(PAGED_RESULTS_OID)
         .register_response_control(PAGED_RESULTS_OID)
         .register_request_control(SERVER_SIDE_SORT_REQUEST_OID)
-        .register_response_control(SERVER_SIDE_SORT_RESPONSE_OID);
+        .register_response_control(SERVER_SIDE_SORT_RESPONSE_OID)
+        .register_request_control(SYNC_REQUEST_OID)
+        .register_response_control(SYNC_STATE_OID)
+        .register_response_control(SYNC_DONE_OID);
     registry
 }
 
@@ -1792,7 +1800,6 @@ struct SearchExecutionError {
 enum PagedSearchRequestError {
     ProtocolError(String),
     InvalidCookie(String),
-    UnsupportedCombination(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1812,21 +1819,30 @@ enum ServerSideSortRequestError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestedSyncControl {
+    request: SyncRequestControl,
+    critical: bool,
+}
+
+#[derive(Debug)]
+enum SyncRequestError {
+    ProtocolError(String),
+    InvalidCookie(String),
+    Unsupported(String),
+}
+
 impl PagedSearchRequestError {
     fn result_code(&self) -> ResultCode {
         match self {
             Self::ProtocolError(_) => ResultCode::ProtocolError,
-            Self::InvalidCookie(_) | Self::UnsupportedCombination(_) => {
-                ResultCode::UnwillingToPerform
-            }
+            Self::InvalidCookie(_) => ResultCode::UnwillingToPerform,
         }
     }
 
     fn diagnostic(&self) -> &str {
         match self {
-            Self::ProtocolError(message)
-            | Self::InvalidCookie(message)
-            | Self::UnsupportedCombination(message) => message.as_str(),
+            Self::ProtocolError(message) | Self::InvalidCookie(message) => message.as_str(),
         }
     }
 }
@@ -1851,6 +1867,52 @@ fn server_side_sort_response_control(
         false,
         Some(value),
     ))
+}
+
+fn sync_state_response_control(
+    state: SyncStateType,
+    entry_uuid: Uuid,
+    cookie: Option<Vec<u8>>,
+) -> Result<LdapControl, ServerError> {
+    let value = encode_sync_state_control(&SyncStateControl {
+        state,
+        entry_uuid,
+        cookie,
+    })
+    .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?;
+    Ok(LdapControl::new(SYNC_STATE_OID, false, Some(value)))
+}
+
+fn sync_done_response_control(
+    cookie: Option<Vec<u8>>,
+    refresh_deletes: bool,
+) -> Result<LdapControl, ServerError> {
+    let value = encode_sync_done_control(&SyncDoneControl {
+        cookie,
+        refresh_deletes,
+    })
+    .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?;
+    Ok(LdapControl::new(SYNC_DONE_OID, false, Some(value)))
+}
+
+fn parse_sync_request_control(
+    request_controls: &RequestControls,
+) -> Result<Option<RequestedSyncControl>, SyncRequestError> {
+    let control = request_controls
+        .singleton(SYNC_REQUEST_OID)
+        .map_err(|err| SyncRequestError::ProtocolError(err.to_string()))?;
+    let Some(control) = control else {
+        return Ok(None);
+    };
+
+    let request = decode_sync_request_control(control.value()).map_err(|err| {
+        SyncRequestError::ProtocolError(format!("malformed sync request control: {err}"))
+    })?;
+
+    Ok(Some(RequestedSyncControl {
+        request,
+        critical: control.criticality(),
+    }))
 }
 
 fn parse_paged_results_request(
@@ -1982,7 +2044,6 @@ async fn reject_paged_search_request(
     let error_kind = match error {
         PagedSearchRequestError::ProtocolError(_) => "protocol_error",
         PagedSearchRequestError::InvalidCookie(_) => "invalid_cookie",
-        PagedSearchRequestError::UnsupportedCombination(_) => "unsupported_combination",
     };
 
     log_generic_audit_event(
@@ -2780,6 +2841,19 @@ async fn send_search_entry_with_controls(
     Ok(())
 }
 
+async fn send_intermediate_response(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    response_name: Option<String>,
+    response_value: Option<Vec<u8>>,
+    controls: &[LdapControl],
+) -> Result<(), ServerError> {
+    let encoded =
+        encode_intermediate_response(message_id, response_name, response_value, controls)?;
+    socket.write_all(&encoded).await?;
+    Ok(())
+}
+
 async fn try_handle_virtual_search_request(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
@@ -3050,10 +3124,26 @@ pub async fn handle_search_request(
     message_id: u32,
     request: SearchRequest<'_>,
 ) -> Result<(), ServerError> {
+    handle_search_request_with_controls(
+        socket,
+        backend,
+        message_id,
+        request,
+        &RequestControls::default(),
+    )
+    .await
+}
+
+pub async fn handle_search_request_with_controls(
+    socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    request: SearchRequest<'_>,
+    request_controls: &RequestControls,
+) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
     let schema = LdapSchema::default();
     let runtime_config = LegacyServerConfig::default();
-    let request_controls = RequestControls::default();
     let mut operation_registry = ConnectionOperationRegistry::default();
     handle_search_request_with_context_and_registry(
         socket,
@@ -3065,7 +3155,7 @@ pub async fn handle_search_request(
         &session,
         &mut operation_registry,
         &RequestContext::default(),
-        &request_controls,
+        request_controls,
         false,
         false,
     )
@@ -3183,6 +3273,34 @@ async fn handle_search_request_with_context_and_registry(
             .await?;
             return Ok(());
         }
+    }
+
+    let requested_sync = match parse_sync_request_control(request_controls) {
+        Ok(sync) => sync,
+        Err(err) => {
+            reject_sync_request(socket, message_id, &base_dn, &err).await?;
+            return Ok(());
+        }
+    };
+
+    if requested_sync.is_some() {
+        increment_control_counter(request_context, "ldap_sync_requests_total", 1);
+    }
+
+    if requested_sync.is_some() && paged_results.is_some() {
+        let err = SyncRequestError::Unsupported(
+            "sync request control cannot be combined with paged results".to_string(),
+        );
+        reject_sync_request(socket, message_id, &base_dn, &err).await?;
+        return Ok(());
+    }
+
+    if requested_sync.is_some() && requested_sort.is_some() {
+        let err = SyncRequestError::Unsupported(
+            "sync request control cannot be combined with server-side sort".to_string(),
+        );
+        reject_sync_request(socket, message_id, &base_dn, &err).await?;
+        return Ok(());
     }
 
     if let Some(control) = paged_results.as_ref() {
@@ -3305,58 +3423,19 @@ async fn handle_search_request_with_context_and_registry(
         }
     };
 
-    if attribute_selection
-        .iter()
-        .any(|attribute| attribute.eq_ignore_ascii_case(REPLICATION_STREAM_ATTRIBUTE))
-    {
-        if let Some(_sort) = requested_sort.as_ref() {
-            let err = ServerSideSortRequestError::Unsupported {
-                result: ServerSideSortResultCode::UnwillingToPerform,
-                attribute_type: None,
-                diagnostic: "server-side sort is not supported for replication stream searches"
-                    .to_string(),
-                critical: requested_sort
-                    .as_ref()
-                    .map(|sort| sort.critical)
-                    .unwrap_or(false),
-            };
-            reject_server_side_sort_request(
-                socket,
-                message_id,
-                &base_dn,
-                session,
-                request_context,
-                &err,
-            )
-            .await?;
-            return Ok(());
-        }
-
-        if let Some(_control) = paged_results.as_ref() {
-            let err = PagedSearchRequestError::UnsupportedCombination(
-                "paged results are not supported for replication stream searches".to_string(),
-            );
-            reject_paged_search_request(
-                socket,
-                message_id,
-                &base_dn,
-                session,
-                request_context,
-                &err,
-            )
-            .await?;
-            return Ok(());
-        }
-
-        return handle_replication_stream_request(
+    if let Some(sync_request) = requested_sync.as_ref() {
+        return handle_sync_search_request(
             socket,
             backend,
             message_id,
+            &request,
             &effective_base_dn,
             &attribute_selection,
+            sync_request,
             session,
             operation_registry,
             request_context,
+            search_deadline,
         )
         .await;
     }
@@ -3965,15 +4044,290 @@ async fn resolve_search_candidate_entry(
     resolve_alias_chain(backend, entry, &mut visited_dns).await
 }
 
-async fn handle_replication_stream_request(
+struct SyncSearchEntry {
+    entry: DirectoryEntry,
+    attributes: Vec<(String, Vec<String>)>,
+    state: SyncStateType,
+    cookie: Option<Vec<u8>>,
+}
+
+fn sync_scope_matches(dn: &str, base_dn: &str, scope: ldap_parser::ldap::SearchScope) -> bool {
+    match scope.0 {
+        0 => dn.eq_ignore_ascii_case(base_dn),
+        1 => {
+            let Some((_, parent)) = dn.split_once(',') else {
+                return false;
+            };
+            parent.eq_ignore_ascii_case(base_dn)
+        }
+        _ => is_dn_in_scope(dn, base_dn),
+    }
+}
+
+fn sync_cookie_string(cookie: Option<&[u8]>) -> Result<Option<String>, SyncRequestError> {
+    cookie
+        .map(|cookie| {
+            std::str::from_utf8(cookie)
+                .map(|cookie| cookie.to_string())
+                .map_err(|_| {
+                    SyncRequestError::ProtocolError("sync cookie must be valid UTF-8".to_string())
+                })
+        })
+        .transpose()
+}
+
+fn sync_cookie_from_csn(csn: &crate::csn::Csn) -> Vec<u8> {
+    format!("csn-{csn}").into_bytes()
+}
+
+fn current_sync_cookie(changelog: &crate::replication::ChangelogTracker) -> Vec<u8> {
+    changelog.generate_context_cookie().into_bytes()
+}
+
+fn validate_sync_cookie(
+    changelog: &crate::replication::ChangelogTracker,
+    cookie: Option<&str>,
+) -> Result<Option<crate::csn::Csn>, SyncRequestError> {
+    let Some(cookie) = cookie else {
+        return Ok(None);
+    };
+    if cookie == "csn-empty" {
+        return Ok(None);
+    }
+
+    let Some(csn) = changelog.parse_cookie(cookie) else {
+        return Err(SyncRequestError::InvalidCookie(format!(
+            "invalid sync cookie {cookie}"
+        )));
+    };
+
+    if let Some(oldest) = changelog.get_oldest_csn() {
+        if csn < oldest {
+            return Err(SyncRequestError::InvalidCookie(format!(
+                "stale sync cookie {cookie}"
+            )));
+        }
+    }
+
+    if let Some(latest) = changelog.get_context_csn() {
+        if csn > latest {
+            return Err(SyncRequestError::InvalidCookie(format!(
+                "invalid sync cookie {cookie}"
+            )));
+        }
+    }
+
+    Ok(Some(csn))
+}
+
+fn sync_entry_uuid(entry: &DirectoryEntry) -> Uuid {
+    entry
+        .operational_attributes
+        .entry_uuid
+        .as_deref()
+        .and_then(|uuid| Uuid::parse_str(uuid).ok())
+        .unwrap_or_else(|| {
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_X500,
+                normalize_search_dn(&entry.dn).as_bytes(),
+            )
+        })
+}
+
+fn serialized_entry_from_change(
+    change: &crate::replication_provider_fsm::ChangelogEntry,
+) -> Option<DirectoryEntry> {
+    serde_json::from_slice::<DirectoryEntry>(&change.change_data).ok()
+}
+
+async fn build_sync_search_entry_from_change(
+    backend: &dyn DirectoryBackend,
+    change: &crate::replication_provider_fsm::ChangelogEntry,
+    base_dn: &str,
+    request: &SearchRequest<'_>,
+    attribute_selection: &[String],
+) -> Result<Option<SyncSearchEntry>, ServerError> {
+    let cookie = Some(sync_cookie_from_csn(&change.csn));
+    match change.change_type {
+        crate::replication_provider_fsm::ChangeType::Add
+        | crate::replication_provider_fsm::ChangeType::Modify => {
+            let Some(entry) = serialized_entry_from_change(change) else {
+                return Ok(None);
+            };
+            if !sync_scope_matches(&entry.dn, base_dn, request.scope)
+                || !entry_matches_filter(&entry, &request.filter)
+            {
+                return Ok(None);
+            }
+            let state = if matches!(
+                change.change_type,
+                crate::replication_provider_fsm::ChangeType::Add
+            ) {
+                SyncStateType::Add
+            } else {
+                SyncStateType::Modify
+            };
+            Ok(Some(SyncSearchEntry {
+                attributes: select_attributes(&entry, attribute_selection),
+                entry,
+                state,
+                cookie,
+            }))
+        }
+        crate::replication_provider_fsm::ChangeType::Delete => {
+            let entry = serialized_entry_from_change(change)
+                .unwrap_or_else(|| DirectoryEntry::new(change.dn.clone(), HashMap::new()));
+            if !sync_scope_matches(&entry.dn, base_dn, request.scope) {
+                return Ok(None);
+            }
+            if !entry.attributes.is_empty() && !entry_matches_filter(&entry, &request.filter) {
+                return Ok(None);
+            }
+            Ok(Some(SyncSearchEntry {
+                entry,
+                attributes: Vec::new(),
+                state: SyncStateType::Delete,
+                cookie,
+            }))
+        }
+        crate::replication_provider_fsm::ChangeType::Rename => {
+            let rename: RenameChange = match serde_json::from_slice(&change.change_data) {
+                Ok(rename) => rename,
+                Err(_) => return Ok(None),
+            };
+            let target_dn = if let Some(new_superior) = rename.new_superior.as_deref() {
+                format!("{},{}", rename.new_rdn, new_superior)
+            } else if let Some((_, parent)) = change.dn.split_once(',') {
+                format!("{},{}", rename.new_rdn, parent)
+            } else {
+                rename.new_rdn.clone()
+            };
+
+            let entry = backend
+                .get_entry(&target_dn)
+                .await
+                .map_err(|err| {
+                    ServerError::Io(std::io::Error::other(format!(
+                        "failed to resolve renamed entry {target_dn}: {err}"
+                    )))
+                })?
+                .ok_or_else(|| {
+                    ServerError::Io(std::io::Error::other(format!(
+                        "renamed entry {target_dn} missing during sync replay"
+                    )))
+                })?;
+            if !sync_scope_matches(&entry.dn, base_dn, request.scope)
+                || !entry_matches_filter(&entry, &request.filter)
+            {
+                return Ok(None);
+            }
+            Ok(Some(SyncSearchEntry {
+                attributes: select_attributes(&entry, attribute_selection),
+                entry,
+                state: SyncStateType::Modify,
+                cookie,
+            }))
+        }
+    }
+}
+
+async fn emit_sync_entry(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    sync_entry: &SyncSearchEntry,
+    types_only: bool,
+) -> Result<(), ServerError> {
+    let control = sync_state_response_control(
+        sync_entry.state,
+        sync_entry_uuid(&sync_entry.entry),
+        sync_entry.cookie.clone(),
+    )?;
+    send_search_entry_with_controls(
+        socket,
+        message_id,
+        &sync_entry.entry,
+        &sync_entry.attributes,
+        types_only,
+        &[control],
+    )
+    .await
+}
+
+async fn emit_sync_refresh_entries(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    entries: &[DirectoryEntry],
+    attribute_selection: &[String],
+    types_only: bool,
+    search_deadline: Option<Instant>,
+) -> Result<(usize, bool), ServerError> {
+    let mut returned = 0usize;
+    for entry in entries {
+        if search_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok((returned, true));
+        }
+
+        let sync_entry = SyncSearchEntry {
+            attributes: select_attributes(entry, attribute_selection),
+            entry: entry.clone(),
+            state: SyncStateType::Present,
+            cookie: entry
+                .operational_attributes
+                .entry_csn
+                .as_ref()
+                .map(sync_cookie_from_csn),
+        };
+        emit_sync_entry(socket, message_id, &sync_entry, types_only).await?;
+        returned += 1;
+    }
+
+    Ok((returned, false))
+}
+
+async fn reject_sync_request(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    base_dn: &str,
+    error: &SyncRequestError,
+) -> Result<(), ServerError> {
+    match error {
+        SyncRequestError::ProtocolError(diagnostic) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                ResultCode::ProtocolError,
+                base_dn,
+                diagnostic,
+            )
+            .await
+        }
+        SyncRequestError::InvalidCookie(diagnostic) | SyncRequestError::Unsupported(diagnostic) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                ResultCode::UnwillingToPerform,
+                base_dn,
+                diagnostic,
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_sync_search_request(
     socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
+    request: &SearchRequest<'_>,
     base_dn: &str,
     attribute_selection: &[String],
+    sync_request: &RequestedSyncControl,
     connection_session: &ConnectionSession,
     operation_registry: &mut ConnectionOperationRegistry,
     request_context: &RequestContext,
+    search_deadline: Option<Instant>,
 ) -> Result<(), ServerError> {
     operation_registry.register(message_id, ConnectionOperationKind::ReplicationStream, true);
     let mut session = ProviderOwnedReplicationSession::new(socket, message_id, base_dn);
@@ -3994,34 +4348,78 @@ async fn handle_replication_stream_request(
         None
     };
 
-    let mut receiver = if let Some(receiver) = backend.subscribe_to_replication_changes() {
-        receiver
-    } else {
+    let Some(changelog) = backend.replication_changelog() else {
         session
-            .send_unavailable("replication stream not available")
+            .send_unavailable("replication sync not available")
             .await?;
         operation_registry.finish(message_id, FinishedOperationState::Completed);
         return Ok(());
     };
+
+    let cookie_text = match sync_cookie_string(sync_request.request.cookie.as_deref()) {
+        Ok(cookie_text) => cookie_text,
+        Err(error) => {
+            reject_sync_request(session.socket, message_id, base_dn, &error).await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
+        }
+    };
+    let cookie_csn = match validate_sync_cookie(&changelog, cookie_text.as_deref()) {
+        Ok(cookie_csn) => cookie_csn,
+        Err(error) => {
+            reject_sync_request(session.socket, message_id, base_dn, &error).await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
+        }
+    };
     let mut control_decoder = BerDecoderFsmImpl::new();
     let mut control_buffer = vec![0_u8; 4096];
 
-    let start_cookie = attribute_selection.iter().find_map(|attribute| {
-        attribute
-            .strip_prefix(REPLICATION_COOKIE_ATTRIBUTE_PREFIX)
-            .map(|cookie| cookie.to_string())
-    });
-
-    if let Some(changelog) = backend.replication_changelog() {
-        let replay_entries = match start_cookie.as_deref() {
-            Some("csn-empty") | None => Vec::new(),
-            Some(cookie) => changelog
-                .parse_cookie(cookie)
-                .map(|csn| changelog.get_since_csn(&csn))
-                .unwrap_or_default(),
-        };
-
-        for entry in replay_entries {
+    if cookie_csn.is_none() {
+        let result_set = collect_search_result_set(
+            backend,
+            base_dn,
+            request,
+            request.deref_aliases,
+            search_deadline,
+        )
+        .await
+        .map_err(|err| ServerError::Io(std::io::Error::other(err.diagnostic)))?;
+        let (_returned, time_limit_hit) = emit_sync_refresh_entries(
+            session.socket,
+            message_id,
+            &result_set.entries,
+            attribute_selection,
+            request.types_only,
+            search_deadline,
+        )
+        .await?;
+        if sync_request.request.mode == SyncRefreshMode::RefreshOnly {
+            let sync_done =
+                sync_done_response_control(Some(current_sync_cookie(&changelog)), false)?;
+            send_result_with_controls(
+                session.socket,
+                message_id,
+                ResponseOp::SearchDone,
+                if time_limit_hit {
+                    ResultCode::TimeLimitExceeded
+                } else {
+                    ResultCode::Success
+                },
+                base_dn,
+                if time_limit_hit {
+                    "time limit exceeded"
+                } else {
+                    ""
+                },
+                &[sync_done],
+            )
+            .await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
+        }
+    } else {
+        for change in changelog.get_since_csn(cookie_csn.as_ref().expect("validated cookie")) {
             if provider_lifecycle
                 .as_ref()
                 .is_some_and(|lifecycle| lifecycle.is_draining())
@@ -4033,12 +4431,62 @@ async fn handle_replication_stream_request(
                 )
                 .await;
             }
-            if !is_dn_in_scope(&entry.dn, base_dn) {
-                continue;
+            if let Some(sync_entry) = build_sync_search_entry_from_change(
+                backend,
+                &change,
+                base_dn,
+                request,
+                attribute_selection,
+            )
+            .await?
+            {
+                emit_sync_entry(session.socket, message_id, &sync_entry, request.types_only)
+                    .await?;
             }
-            session.send_change(&entry).await?;
+        }
+
+        if sync_request.request.mode == SyncRefreshMode::RefreshOnly {
+            let sync_done =
+                sync_done_response_control(Some(current_sync_cookie(&changelog)), false)?;
+            send_result_with_controls(
+                session.socket,
+                message_id,
+                ResponseOp::SearchDone,
+                ResultCode::Success,
+                base_dn,
+                "",
+                &[sync_done],
+            )
+            .await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
         }
     }
+
+    let mut receiver = if let Some(receiver) = backend.subscribe_to_replication_changes() {
+        receiver
+    } else {
+        session
+            .send_unavailable("replication stream not available")
+            .await?;
+        operation_registry.finish(message_id, FinishedOperationState::Completed);
+        return Ok(());
+    };
+
+    send_intermediate_response(
+        session.socket,
+        message_id,
+        Some(SYNC_INFO_OID.to_string()),
+        Some(
+            encode_sync_info_value(&SyncInfoValue::RefreshPresent {
+                cookie: Some(current_sync_cookie(&changelog)),
+                refresh_done: true,
+            })
+            .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?,
+        ),
+        &[],
+    )
+    .await?;
 
     loop {
         let recv_result = if let Some(lifecycle) = provider_lifecycle.as_ref() {
@@ -4135,10 +4583,22 @@ async fn handle_replication_stream_request(
                     )
                     .await;
                 }
-                if !is_dn_in_scope(&entry.dn, base_dn) {
-                    continue;
-                }
-                if let Err(err) = session.send_change(&entry).await {
+                let sync_entry = match build_sync_search_entry_from_change(
+                    backend,
+                    &entry,
+                    base_dn,
+                    request,
+                    attribute_selection,
+                )
+                .await?
+                {
+                    Some(sync_entry) => sync_entry,
+                    None => continue,
+                };
+                if let Err(err) =
+                    emit_sync_entry(session.socket, message_id, &sync_entry, request.types_only)
+                        .await
+                {
                     warn!("Replication stream send failed: {}", err);
                     operation_registry.finish(message_id, FinishedOperationState::Completed);
                     break;
@@ -4365,24 +4825,6 @@ impl<'a, S: AsyncWrite + Unpin> ProviderOwnedReplicationSession<'a, S> {
             message_id,
             base_dn,
         }
-    }
-
-    async fn send_change(
-        &mut self,
-        entry: &crate::replication_provider_fsm::ChangelogEntry,
-    ) -> Result<(), ServerError> {
-        let synthetic_entry = DirectoryEntry::new(entry.dn.clone(), HashMap::new());
-        let attributes = changelog_entry_to_replication_attrs(entry);
-        send_search_entry_with_controls(
-            self.socket,
-            self.message_id,
-            &synthetic_entry,
-            &attributes,
-            false,
-            &[],
-        )
-        .await?;
-        Ok(())
     }
 
     async fn send_unavailable(&mut self, message: &str) -> Result<(), ServerError> {
@@ -5792,6 +6234,7 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
     if include_all_operational
         || requested.iter().any(|attr| {
             attr.eq_ignore_ascii_case("entrycsn")
+                || attr.eq_ignore_ascii_case("entryuuid")
                 || attr.eq_ignore_ascii_case("createtimestamp")
                 || attr.eq_ignore_ascii_case("modifytimestamp")
                 || attr.eq_ignore_ascii_case("creatorsname")
@@ -5804,6 +6247,16 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
         if include_all_operational || requested.iter().any(|a| a.eq_ignore_ascii_case("entrycsn")) {
             if let Some(entry_csn) = op_attrs.entry_csn.as_ref() {
                 selected.push(("entryCSN".to_string(), vec![entry_csn.to_ldap_string()]));
+            }
+        }
+
+        if include_all_operational
+            || requested
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("entryuuid"))
+        {
+            if let Some(entry_uuid) = op_attrs.entry_uuid.as_ref() {
+                selected.push(("entryUUID".to_string(), vec![entry_uuid.clone()]));
             }
         }
 
@@ -5940,7 +6393,6 @@ mod tests {
     use crate::config::ServerConfig;
     use crate::extended_ops::encode_cancel_request_value;
     use crate::ldap_controls::LdapControl;
-    use crate::replication::REPLICATION_STREAM_ATTRIBUTE;
     use crate::replication_service::ReplicationService;
     use crate::schema::LdapSchema;
     use crate::search_controls::{
@@ -5948,6 +6400,12 @@ mod tests {
         encode_paged_results_control, encode_server_side_sort_request_control, PagedResultsControl,
         ServerSideSortResponseControl, ServerSideSortResultCode, SortKey, PAGED_RESULTS_OID,
         SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
+    };
+    use crate::sync_controls::{
+        decode_sync_done_control, decode_sync_info_value, decode_sync_state_control,
+        encode_sync_request_control, SyncDoneControl, SyncInfoValue, SyncRefreshMode,
+        SyncRequestControl, SyncStateControl, SyncStateType, SYNC_DONE_OID, SYNC_INFO_OID,
+        SYNC_REQUEST_OID, SYNC_STATE_OID,
     };
     use ldap_parser::filter::{
         Attribute as FilterAttribute, AttributeValue, AttributeValueAssertion, Filter,
@@ -6200,18 +6658,73 @@ mod tests {
             .collect()
     }
 
-    fn replication_stream_request() -> SearchRequest<'static> {
+    fn sync_search_request() -> SearchRequest<'static> {
         SearchRequest {
             base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
-            scope: SearchScope::BaseObject,
+            scope: SearchScope::WholeSubtree,
             deref_aliases: DerefAliases(0),
             size_limit: 0,
             time_limit: 0,
             types_only: false,
             filter: Filter::Present(LdapString(Cow::Owned("objectClass".to_string()))),
-            attributes: vec![LdapString(Cow::Owned(
-                REPLICATION_STREAM_ATTRIBUTE.to_string(),
-            ))],
+            attributes: Vec::new(),
+        }
+    }
+
+    fn sync_request_controls(mode: SyncRefreshMode, cookie: Option<&[u8]>) -> RequestControls {
+        RequestControls::new(vec![LdapControl::new(
+            SYNC_REQUEST_OID,
+            true,
+            Some(
+                encode_sync_request_control(&SyncRequestControl {
+                    mode,
+                    cookie: cookie.map(|cookie| cookie.to_vec()),
+                    reload_hint: false,
+                })
+                .unwrap(),
+            ),
+        )])
+    }
+
+    fn sync_state_response(message: &ldap_parser::ldap::LdapMessage<'_>) -> SyncStateControl {
+        let controls = message.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == SYNC_STATE_OID)
+            .expect("sync state response control");
+        decode_sync_state_control(control.control_value.as_deref()).unwrap()
+    }
+
+    fn sync_done_response(message: &ldap_parser::ldap::LdapMessage<'_>) -> SyncDoneControl {
+        let controls = message.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == SYNC_DONE_OID)
+            .expect("sync done response control");
+        decode_sync_done_control(control.control_value.as_deref()).unwrap()
+    }
+
+    fn sync_info_response(message: &ldap_parser::ldap::LdapMessage<'_>) -> SyncInfoValue {
+        match &message.protocol_op {
+            ProtocolOp::IntermediateResponse(response) => {
+                assert_eq!(
+                    response
+                        .response_name
+                        .as_ref()
+                        .expect("sync info response name")
+                        .0
+                        .as_ref(),
+                    SYNC_INFO_OID
+                );
+                decode_sync_info_value(
+                    response
+                        .response_value
+                        .as_deref()
+                        .expect("sync info response value"),
+                )
+                .unwrap()
+            }
+            other => panic!("unexpected protocol op: {:?}", other),
         }
     }
 
@@ -7299,6 +7812,9 @@ mod tests {
             PAGED_RESULTS_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
             SERVER_SIDE_SORT_RESPONSE_OID.to_string(),
+            SYNC_REQUEST_OID.to_string(),
+            SYNC_STATE_OID.to_string(),
+            SYNC_DONE_OID.to_string(),
         ];
         expected_controls.sort();
         assert_eq!(supported_controls, expected_controls);
@@ -8339,11 +8855,12 @@ mod tests {
         let backend = MockBackend::new();
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
 
-        handle_search_request(
+        handle_search_request_with_controls(
             &mut server_stream,
             &backend,
             9,
-            replication_stream_request(),
+            sync_search_request(),
+            &sync_request_controls(SyncRefreshMode::RefreshAndPersist, None),
         )
         .await
         .unwrap();
@@ -8372,16 +8889,36 @@ mod tests {
         let provider_backend = service.backend();
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
-        let request = replication_stream_request();
+        let request = sync_search_request();
+        let request_controls = sync_request_controls(SyncRefreshMode::RefreshAndPersist, None);
         let stream_backend = provider_backend.clone();
 
         let handler = tokio::spawn(async move {
-            handle_search_request(&mut server_stream, stream_backend.as_ref(), 11, request)
-                .await
-                .unwrap();
+            handle_search_request_with_controls(
+                &mut server_stream,
+                stream_backend.as_ref(),
+                11,
+                request,
+                &request_controls,
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let initial = read_response(&mut client_stream).await;
+        let (_, initial_messages) = parse_ldap_messages(&initial).unwrap();
+        assert_eq!(initial_messages.len(), 1);
+        match sync_info_response(&initial_messages[0]) {
+            SyncInfoValue::RefreshPresent {
+                cookie,
+                refresh_done,
+            } => {
+                assert!(refresh_done);
+                assert!(cookie.is_some());
+            }
+            other => panic!("unexpected sync info response: {:?}", other),
+        }
 
         provider_backend
             .add_entry(
@@ -8399,10 +8936,20 @@ mod tests {
 
         let response = read_response(&mut client_stream).await;
         let (_, messages) = parse_ldap_messages(&response).unwrap();
-
-        assert!(messages
+        let entry = messages
             .iter()
-            .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_))));
+            .find(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_)))
+            .expect("search result entry");
+        match &entry.protocol_op {
+            ProtocolOp::SearchResultEntry(result_entry) => {
+                assert_eq!(
+                    result_entry.object_name.0.as_ref(),
+                    "cn=stream-user,dc=example,dc=org"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert_eq!(sync_state_response(entry).state, SyncStateType::Add);
 
         handler.abort();
         let _ = handler.await;
@@ -8425,11 +8972,12 @@ mod tests {
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
 
-        handle_search_request(
+        handle_search_request_with_controls(
             &mut server_stream,
             provider_backend.as_ref(),
             12,
-            replication_stream_request(),
+            sync_search_request(),
+            &sync_request_controls(SyncRefreshMode::RefreshAndPersist, None),
         )
         .await
         .unwrap();
@@ -8461,23 +9009,40 @@ mod tests {
             .expect("provider lifecycle should be available");
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
-        let request = replication_stream_request();
+        let request = sync_search_request();
+        let request_controls = sync_request_controls(SyncRefreshMode::RefreshAndPersist, None);
         let stream_backend = provider_backend.clone();
 
         let handler = tokio::spawn(async move {
-            handle_search_request(&mut server_stream, stream_backend.as_ref(), 13, request)
-                .await
-                .unwrap();
+            handle_search_request_with_controls(
+                &mut server_stream,
+                stream_backend.as_ref(),
+                13,
+                request,
+                &request_controls,
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let initial = read_response(&mut client_stream).await;
+        let (_, initial_messages) = parse_ldap_messages(&initial).unwrap();
+        assert_eq!(initial_messages.len(), 1);
+        assert!(matches!(
+            sync_info_response(&initial_messages[0]),
+            SyncInfoValue::RefreshPresent { .. }
+        ));
         lifecycle.begin_shutdown();
 
         let response = read_response(&mut client_stream).await;
         let (_, messages) = parse_ldap_messages(&response).unwrap();
 
-        assert_eq!(messages.len(), 1);
-        match &messages[0].protocol_op {
+        let done = messages
+            .iter()
+            .find(|message| matches!(message.protocol_op, ProtocolOp::SearchResultDone(_)))
+            .expect("search result done");
+        match &done.protocol_op {
             ProtocolOp::SearchResultDone(done) => {
                 assert_eq!(done.result_code, ParserResultCode::Unavailable);
             }
@@ -8503,16 +9068,30 @@ mod tests {
         let provider_backend = service.backend();
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
-        let request = replication_stream_request();
+        let request = sync_search_request();
+        let request_controls = sync_request_controls(SyncRefreshMode::RefreshAndPersist, None);
         let stream_backend = provider_backend.clone();
 
         let handler = tokio::spawn(async move {
-            handle_search_request(&mut server_stream, stream_backend.as_ref(), 31, request)
-                .await
-                .unwrap();
+            handle_search_request_with_controls(
+                &mut server_stream,
+                stream_backend.as_ref(),
+                31,
+                request,
+                &request_controls,
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let initial = read_response(&mut client_stream).await;
+        let (_, initial_messages) = parse_ldap_messages(&initial).unwrap();
+        assert_eq!(initial_messages.len(), 1);
+        assert!(matches!(
+            sync_info_response(&initial_messages[0]),
+            SyncInfoValue::RefreshPresent { .. }
+        ));
         client_stream
             .write_all(&cancel_request_message(32, 31))
             .await
@@ -8521,7 +9100,6 @@ mod tests {
         let response = read_response(&mut client_stream).await;
         let (_, messages) = parse_ldap_messages(&response).unwrap();
 
-        assert_eq!(messages.len(), 2);
         assert!(messages.iter().any(|message| {
             matches!(
                 &message.protocol_op,
@@ -8556,18 +9134,32 @@ mod tests {
         let provider_backend = service.backend();
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
-        let request = replication_stream_request();
+        let request = sync_search_request();
+        let request_controls = sync_request_controls(SyncRefreshMode::RefreshAndPersist, None);
         let stream_backend = provider_backend.clone();
 
         let handler = tokio::spawn(async move {
-            handle_search_request(&mut server_stream, stream_backend.as_ref(), 41, request)
-                .await
-                .unwrap();
+            handle_search_request_with_controls(
+                &mut server_stream,
+                stream_backend.as_ref(),
+                41,
+                request,
+                &request_controls,
+            )
+            .await
+            .unwrap();
             tokio::time::sleep(Duration::from_millis(250)).await;
             let _ = server_stream.peer_addr();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let initial = read_response(&mut client_stream).await;
+        let (_, initial_messages) = parse_ldap_messages(&initial).unwrap();
+        assert_eq!(initial_messages.len(), 1);
+        assert!(matches!(
+            sync_info_response(&initial_messages[0]),
+            SyncInfoValue::RefreshPresent { .. }
+        ));
         client_stream
             .write_all(&abandon_request_message(42, 41))
             .await
@@ -8585,5 +9177,257 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_refresh_only_request_returns_present_entries_and_sync_done_cookie() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=sync-user,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["sync-user".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_controls(
+            &mut server_stream,
+            provider_backend.as_ref(),
+            51,
+            sync_search_request(),
+            &sync_request_controls(SyncRefreshMode::RefreshOnly, None),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(
+                    entry.object_name.0.as_ref(),
+                    "cn=sync-user,dc=example,dc=org"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert_eq!(
+            sync_state_response(&messages[0]).state,
+            SyncStateType::Present
+        );
+        match &messages[1].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected completion: {:?}", other),
+        }
+        let sync_done = sync_done_response(&messages[1]);
+        assert!(!sync_done.refresh_deletes);
+        assert_eq!(
+            String::from_utf8(sync_done.cookie.expect("sync done cookie")).unwrap(),
+            format!(
+                "csn-{}",
+                provider_backend
+                    .replication_changelog()
+                    .unwrap()
+                    .get_context_csn()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_refresh_only_request_resumes_from_cookie() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=existing,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["existing".to_string()]),
+                        ("sn".to_string(), vec!["Existing".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let resume_cookie = format!(
+            "csn-{}",
+            provider_backend
+                .replication_changelog()
+                .unwrap()
+                .get_context_csn()
+                .unwrap()
+        );
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=new,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["new".to_string()]),
+                        ("sn".to_string(), vec!["New".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_controls(
+            &mut server_stream,
+            provider_backend.as_ref(),
+            52,
+            sync_search_request(),
+            &sync_request_controls(SyncRefreshMode::RefreshOnly, Some(resume_cookie.as_bytes())),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "cn=new,dc=example,dc=org");
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert_eq!(sync_state_response(&messages[0]).state, SyncStateType::Add);
+        assert!(matches!(
+            &messages[1].protocol_op,
+            ProtocolOp::SearchResultDone(done) if done.result_code == ParserResultCode::Success
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_refresh_only_request_rejects_malformed_cookie() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_controls(
+            &mut server_stream,
+            provider_backend.as_ref(),
+            53,
+            sync_search_request(),
+            &sync_request_controls(SyncRefreshMode::RefreshOnly, Some(&[0xff, 0xfe])),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::ProtocolError);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_refresh_only_request_rejects_stale_cookie() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+        config.replication.changelog_capacity = 1;
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=old,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["old".to_string()]),
+                        ("sn".to_string(), vec!["Old".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let stale_cookie = format!(
+            "csn-{}",
+            provider_backend
+                .replication_changelog()
+                .unwrap()
+                .get_context_csn()
+                .unwrap()
+        );
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=newer,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["newer".to_string()]),
+                        ("sn".to_string(), vec!["Newer".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_controls(
+            &mut server_stream,
+            provider_backend.as_ref(),
+            54,
+            sync_search_request(),
+            &sync_request_controls(SyncRefreshMode::RefreshOnly, Some(stale_cookie.as_bytes())),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::UnwillingToPerform);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
     }
 }

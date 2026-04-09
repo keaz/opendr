@@ -46,7 +46,11 @@
 
 use async_trait::async_trait;
 use base64::Engine;
-use ldap3::{LdapConnAsync, LdapConnSettings};
+use ldap3::controls::{
+    parse_syncinfo, Control, ControlType, EntryState, MakeCritical, RefreshMode as LdapRefreshMode,
+    SyncRequest as LdapSyncRequest, SyncState as LdapSyncState,
+};
+use ldap3::{LdapConnAsync, LdapConnSettings, ResultEntry, Scope, SearchEntry};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -549,6 +553,130 @@ fn encode_directory_entry_as_change(entry: crate::backend::DirectoryEntry) -> Op
         Err(e) => {
             error!("Failed to serialize replication entry {}: {}", entry.dn, e);
             None
+        }
+    }
+}
+
+fn encode_directory_entry_with_change_type(
+    entry: &crate::backend::DirectoryEntry,
+    change_type: ChangeType,
+) -> Result<Vec<u8>, ConsumerError> {
+    let change_data = serde_json::to_vec(entry).map_err(|e| ConsumerError::ListeningError {
+        message: format!("Failed to serialize sync entry {}: {}", entry.dn, e),
+    })?;
+    Ok(encode_change_bytes(&change_type, &entry.dn, &change_data))
+}
+
+fn take_first_attr_case_insensitive(
+    attrs: &mut HashMap<String, Vec<String>>,
+    name: &str,
+) -> Option<String> {
+    let key = attrs
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(name))
+        .cloned()?;
+    attrs
+        .remove(&key)
+        .and_then(|values| values.into_iter().next())
+}
+
+fn directory_entry_from_search_entry(
+    mut entry: SearchEntry,
+    entry_uuid: Option<&[u8]>,
+) -> crate::backend::DirectoryEntry {
+    let operational_attributes = crate::backend::OperationalAttributes {
+        entry_csn: take_first_attr_case_insensitive(&mut entry.attrs, "entryCSN")
+            .and_then(|csn| Csn::parse(&csn).ok()),
+        entry_uuid: entry_uuid
+            .and_then(|raw| {
+                uuid::Uuid::from_slice(raw)
+                    .ok()
+                    .map(|uuid| uuid.to_string())
+            })
+            .or_else(|| take_first_attr_case_insensitive(&mut entry.attrs, "entryUUID")),
+        create_timestamp: take_first_attr_case_insensitive(&mut entry.attrs, "createTimestamp"),
+        modify_timestamp: take_first_attr_case_insensitive(&mut entry.attrs, "modifyTimestamp"),
+        creators_name: take_first_attr_case_insensitive(&mut entry.attrs, "creatorsName"),
+        modifiers_name: take_first_attr_case_insensitive(&mut entry.attrs, "modifiersName"),
+    };
+
+    crate::backend::DirectoryEntry::with_operational_attrs(
+        entry.dn,
+        entry.attrs,
+        operational_attributes,
+    )
+}
+
+fn parse_sync_state_from_controls(controls: &[Control]) -> Result<LdapSyncState, ConsumerError> {
+    let control = controls
+        .iter()
+        .find(|control| matches!(control.0, Some(ControlType::SyncState)))
+        .ok_or_else(|| ConsumerError::ListeningError {
+            message: "Sync search entry missing Sync State control".to_string(),
+        })?;
+    Ok(control.1.parse::<LdapSyncState>())
+}
+
+fn encode_sync_result_entry(
+    entry: ResultEntry,
+    base_dn: &str,
+) -> Result<Option<Vec<u8>>, ConsumerError> {
+    if entry.is_intermediate() {
+        let _ = parse_syncinfo(entry);
+        return Ok(None);
+    }
+
+    if entry.is_ref() {
+        return Ok(None);
+    }
+
+    let sync_state = parse_sync_state_from_controls(&entry.1)?;
+    let search_entry = SearchEntry::construct(entry);
+    if search_entry.dn == base_dn || search_entry.dn.starts_with("ou=") {
+        return Ok(None);
+    }
+
+    match sync_state.state {
+        EntryState::Delete => Ok(Some(encode_change_bytes(
+            &ChangeType::Delete,
+            &search_entry.dn,
+            &[],
+        ))),
+        EntryState::Present | EntryState::Add => {
+            let dir_entry = directory_entry_from_search_entry(
+                search_entry,
+                Some(sync_state.entry_uuid.as_slice()),
+            );
+            Ok(encode_directory_entry_as_change(dir_entry))
+        }
+        EntryState::Modify => {
+            let dir_entry = directory_entry_from_search_entry(
+                search_entry,
+                Some(sync_state.entry_uuid.as_slice()),
+            );
+            Ok(Some(encode_directory_entry_with_change_type(
+                &dir_entry,
+                ChangeType::Modify,
+            )?))
+        }
+    }
+}
+
+async fn forward_sync_stream_entry(
+    entry: ResultEntry,
+    base_dn: &str,
+    change_tx: &mpsc::Sender<Vec<u8>>,
+    stats: &Arc<AsyncMutex<ListeningStats>>,
+) -> Result<(), String> {
+    match encode_sync_result_entry(entry, base_dn) {
+        Ok(Some(change)) => change_tx
+            .send(change)
+            .await
+            .map_err(|_| "Replication change stream receiver dropped".to_string()),
+        Ok(None) => Ok(()),
+        Err(err) => {
+            stats.lock().await.record_error();
+            Err(err.to_string())
         }
     }
 }
@@ -1200,24 +1328,6 @@ impl ProviderConnection for ProviderConnectionImpl {
                 .collect());
         }
 
-        // Query remote provider via LDAP
-        // Parse cookie to get CSN if provided
-        let cookie_csn = if let Some(cookie_str) = cookie {
-            cookie_str
-                .strip_prefix("csn-")
-                .map(|csn_str| csn_str.to_string())
-        } else {
-            None
-        };
-
-        info!(
-            "Requesting changelog entries from remote provider (cookie: {:?}, parsed CSN: {:?})",
-            cookie, cookie_csn
-        );
-
-        // Get all entries from the provider
-        use ldap3::Scope;
-
         // Clone the LDAP connection to avoid holding the lock across await
         let mut ldap = {
             let mut guard = self.ldap_connection.lock().await;
@@ -1226,106 +1336,61 @@ impl ProviderConnection for ProviderConnectionImpl {
             })?
         };
 
-        // Build search filter
-        // NOTE: entryCSN comparison via LDAP filter is complex and not well-supported
-        // We fetch all entries and filter on the consumer side based on entryCSN
-        let filter = "(objectClass=*)";
+        let sync_cookie = cookie.map(|cookie| cookie.as_bytes().to_vec());
+        let result = async {
+            let mut search = ldap
+                .with_controls(
+                    LdapSyncRequest {
+                        mode: LdapRefreshMode::RefreshOnly,
+                        cookie: sync_cookie,
+                        reload_hint: false,
+                    }
+                    .critical(),
+                )
+                .streaming_search(
+                    &self.base_dn,
+                    Scope::Subtree,
+                    "(objectClass=*)",
+                    vec!["*", "+"],
+                )
+                .await
+                .map_err(|e| ConsumerError::ConnectionError {
+                    message: format!("LDAP sync search failed: {}", e),
+                })?;
 
-        let (rs, _res) = ldap
-            .search(
-                &self.base_dn,
-                Scope::Subtree,
-                filter,
-                vec!["*", "entryCSN"], // Request all attributes including entryCSN
-            )
-            .await
-            .map_err(|e| ConsumerError::ConnectionError {
-                message: format!("LDAP search failed: {}", e),
-            })?
-            .success()
-            .map_err(|e| ConsumerError::ConnectionError {
-                message: format!("LDAP search failed: {}", e),
-            })?;
-
-        // Restore the connection for future use
-        *self.ldap_connection.lock().await = Some(ldap);
-
-        info!("Retrieved {} entries from provider", rs.len());
-
-        // Convert LDAP search results to changelog format
-        use ldap3::SearchEntry;
-
-        let result: Vec<Vec<u8>> = rs
-            .into_iter()
-            .filter_map(|entry| {
-                let search_entry = SearchEntry::construct(entry);
-                let dn = search_entry.dn.clone();
-
-                // DEBUG: Log all attributes received for first few entries
-                if dn.contains("user0000") || dn.contains("user0001") {
-                    info!("DEBUG - Entry: {}", dn);
-                    info!(
-                        "DEBUG - Attributes: {:?}",
-                        search_entry.attrs.keys().collect::<Vec<_>>()
-                    );
-                }
-
-                // Skip base DN and organizational units (they should already exist)
-                if dn == self.base_dn || dn.starts_with("ou=") {
-                    return None;
-                }
-
-                // Filter by entryCSN if we have a cookie
-                if let Some(ref cookie_csn_str) = cookie_csn {
-                    // Get entryCSN from the entry
-                    if let Some(entry_csn_values) = search_entry
-                        .attrs
-                        .get("entryCSN")
-                        .or_else(|| search_entry.attrs.get("entrycsn"))
-                    {
-                        if let Some(entry_csn_str) = entry_csn_values.first() {
-                            // Compare CSNs as strings (they are formatted to be sortable)
-                            // Cookie CSN format: timestamp#replica_id#seq#mod
-                            // EntryCSN format: timestamp#replica_id#seq#mod (same format)
-
-                            info!(
-                                "CSN compare: entry='{}' entryCSN='{}' vs cookie='{}'",
-                                dn, entry_csn_str, cookie_csn_str
-                            );
-
-                            if entry_csn_str <= cookie_csn_str {
-                                // Entry is older than or equal to cookie, skip it
-                                return None;
-                            } else {
-                                info!("Including new entry: {}", dn);
-                            }
+            let mut result = Vec::new();
+            loop {
+                match search.next().await {
+                    Ok(Some(entry)) => {
+                        if let Some(change) = encode_sync_result_entry(entry, &self.base_dn)? {
+                            result.push(change);
                         }
-                    } else {
-                        // No entryCSN means this entry can't be compared, skip it
-                        warn!(
-                            "Entry {} has no entryCSN, skipping during incremental sync",
-                            dn
-                        );
-                        return None;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(ConsumerError::ConnectionError {
+                            message: format!("LDAP sync search failed: {}", e),
+                        });
                     }
                 }
+            }
 
-                // Create a DirectoryEntry from the LDAP search result
-                let dir_entry = crate::backend::DirectoryEntry {
-                    dn: dn.clone(),
-                    attributes: search_entry.attrs.clone(),
-                    operational_attributes: crate::backend::OperationalAttributes::new(),
-                };
+            let ldap_result = search.finish().await;
+            if ldap_result.rc != 0 {
+                return Err(ConsumerError::ConnectionError {
+                    message: format!(
+                        "LDAP sync search failed with rc {}: {}",
+                        ldap_result.rc, ldap_result.text
+                    ),
+                });
+            }
 
-                encode_directory_entry_as_change(dir_entry)
-            })
-            .collect();
+            Ok(result)
+        }
+        .await;
 
-        info!(
-            "Prepared {} entries for replication (filtered by CSN)",
-            result.len()
-        );
-        Ok(result)
+        *self.ldap_connection.lock().await = Some(ldap);
+        result
     }
 
     async fn request_batch_from_cookie(
@@ -2024,13 +2089,16 @@ impl ChangeListener for LdapChangeListener {
                 return;
             }
 
-            let mut attrs = vec![REPLICATION_STREAM_ATTRIBUTE.to_string()];
-            if let Some(cookie) = cookie {
-                attrs.push(format!("{}{}", REPLICATION_COOKIE_ATTRIBUTE_PREFIX, cookie));
-            }
-
             let mut search = match ldap
-                .streaming_search(&base_dn, ldap3::Scope::Base, "(objectClass=*)", attrs)
+                .with_controls(
+                    LdapSyncRequest {
+                        mode: LdapRefreshMode::RefreshAndPersist,
+                        cookie: cookie.map(|cookie| cookie.into_bytes()),
+                        reload_hint: false,
+                    }
+                    .critical(),
+                )
+                .streaming_search(&base_dn, Scope::Subtree, "(objectClass=*)", vec!["*", "+"])
                 .await
             {
                 Ok(search) => search,
@@ -2045,9 +2113,48 @@ impl ChangeListener for LdapChangeListener {
                 }
             };
 
-            listening.store(true, Ordering::SeqCst);
-            if let Some(sender) = ready_tx.take() {
-                let _ = sender.send(Ok(()));
+            match search.next().await {
+                Ok(Some(entry)) => {
+                    listening.store(true, Ordering::SeqCst);
+                    if let Some(sender) = ready_tx.take() {
+                        let _ = sender.send(Ok(()));
+                    }
+
+                    if let Err(message) =
+                        forward_sync_stream_entry(entry, &base_dn, &change_tx, &stats).await
+                    {
+                        *last_error.lock().await = Some(message.clone());
+                        warn!("{}", message);
+                    }
+                }
+                Ok(None) => {
+                    let ldap_result = search.finish().await;
+                    let message = if ldap_result.rc == 0 {
+                        "LDAP replication stream ended before delivering sync results".to_string()
+                    } else {
+                        format!(
+                            "LDAP replication stream failed with rc {}: {}",
+                            ldap_result.rc, ldap_result.text
+                        )
+                    };
+                    *last_error.lock().await = Some(message.clone());
+                    error!("{}", message);
+                    if let Some(sender) = ready_tx.take() {
+                        let _ = sender.send(Err(message));
+                    }
+                    let _ = ldap.unbind().await;
+                    return;
+                }
+                Err(e) => {
+                    let message = format!("Failed to read initial LDAP sync result: {}", e);
+                    *last_error.lock().await = Some(message.clone());
+                    error!("{}", message);
+                    if let Some(sender) = ready_tx.take() {
+                        let _ = sender.send(Err(message));
+                    }
+                    let _ = ldap.unbind().await;
+                    return;
+                }
             }
 
             loop {
@@ -2057,17 +2164,12 @@ impl ChangeListener for LdapChangeListener {
 
                 match search.next().await {
                     Ok(Some(entry)) => {
-                        match parse_replication_stream_entry(&ldap3::SearchEntry::construct(entry))
+                        if let Err(message) =
+                            forward_sync_stream_entry(entry, &base_dn, &change_tx, &stats).await
                         {
-                            Ok(change) => {
-                                if change_tx.send(change).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                stats.lock().await.record_error();
-                                warn!("Skipping invalid replication stream entry: {}", e);
-                            }
+                            *last_error.lock().await = Some(message.clone());
+                            warn!("{}", message);
+                            break;
                         }
                     }
                     Ok(None) => break,
@@ -2517,6 +2619,7 @@ mod tests {
                 modify_timestamp: Some("20260409000001Z".to_string()),
                 creators_name: Some(creator.clone()),
                 modifiers_name: Some(modifier.clone()),
+                entry_uuid: Some(uuid::Uuid::new_v4().to_string()),
             },
         );
         let encoded = encode_change_bytes(
