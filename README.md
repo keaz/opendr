@@ -137,6 +137,7 @@ Place this in `/srv/opendr-provider/config/server.toml`:
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 1389
+replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
 root_password = "{SSHA512}<generated-hash>"
@@ -163,6 +164,7 @@ Place this in `/srv/opendr-consumer/config/server.toml`:
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 2389
+replica_id = 2
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
 root_password = "{SSHA512}<generated-hash>"
@@ -188,7 +190,7 @@ heartbeat_interval_secs = 60
 state_storage_path = "./data/replication_state"
 ```
 
-`bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` are still accepted as aliases. In production, point them at a dedicated read-only replication account on the provider.
+`bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` are still accepted as aliases. In production, point them at a dedicated read-only replication account on the provider. `replica_id` must be unique per replicated node so CSNs remain globally ordered.
 
 ### 4. Start Both Servers
 
@@ -272,6 +274,7 @@ Listener mode is active when the consumer logs `Replication consumer entered lis
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 389
+replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
 root_password = "{SSHA512}<generated-hash>"

@@ -7,6 +7,7 @@ use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
 use opendr::config::ServerConfig;
 use opendr::replication::ChangelogTracker;
+use opendr::replication_provider_fsm::ChangeType;
 use opendr::replication_service::ReplicationService;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use std::collections::HashMap;
@@ -32,6 +33,26 @@ async fn test_replication_service_provider_initialization() {
     assert!(service.is_enabled());
     assert!(service.is_provider());
     assert!(service.changelog().is_some());
+}
+
+#[tokio::test]
+async fn test_replication_service_uses_configured_replica_id() {
+    let mut config = ServerConfig::default();
+    config.replication.enabled = true;
+    config.replication.mode = "provider".to_string();
+    config.server.replica_id = 42;
+
+    let backend = Arc::new(MockBackend::with_replica_id(config.server.replica_id));
+    let service = ReplicationService::from_config(&config, backend).unwrap();
+
+    let changelog = service.changelog().unwrap();
+    let csn = changelog.record_change(
+        ChangeType::Add,
+        "cn=test,dc=example,dc=com".to_string(),
+        Vec::new(),
+    );
+
+    assert_eq!(csn.replica_id(), 42);
 }
 
 #[tokio::test]

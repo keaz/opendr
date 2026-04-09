@@ -112,6 +112,10 @@ pub struct ServerSettings {
     #[serde(default = "default_hostname")]
     pub hostname: String,
 
+    /// Replica ID used in generated CSNs
+    #[serde(default = "default_replica_id")]
+    pub replica_id: u16,
+
     /// Base DN
     #[serde(default = "default_base_dn")]
     pub base_dn: String,
@@ -362,7 +366,11 @@ pub struct ReplicationSettings {
     pub state_storage_path: PathBuf,
 
     /// TCP port used for the live replication stream (0 = derive from LDAP port)
-    #[serde(default, alias = "replication_stream_port", alias = "change_listener_port")]
+    #[serde(
+        default,
+        alias = "replication_stream_port",
+        alias = "change_listener_port"
+    )]
     pub stream_port: u16,
 }
 
@@ -478,6 +486,9 @@ fn default_ldaps_port() -> u16 {
 }
 fn default_hostname() -> String {
     "localhost".to_string()
+}
+fn default_replica_id() -> u16 {
+    1
 }
 fn default_base_dn() -> String {
     "dc=example,dc=com".to_string()
@@ -681,6 +692,7 @@ impl Default for ServerSettings {
             ldap_port: default_ldap_port(),
             ldaps_port: default_ldaps_port(),
             hostname: default_hostname(),
+            replica_id: default_replica_id(),
             base_dn: default_base_dn(),
             root_user_dn: default_root_user_dn(),
             root_password: default_root_password(),
@@ -982,6 +994,11 @@ impl ServerConfig {
                 "Base DN cannot be empty".to_string(),
             ));
         }
+        if self.server.replica_id == 0 {
+            return Err(ConfigError::ValidationError(
+                "replica_id must be between 1 and 65535".to_string(),
+            ));
+        }
 
         // Validate backend type
         if !["memory", "lmdb"].contains(&self.backend.backend_type.to_lowercase().as_str()) {
@@ -1181,6 +1198,7 @@ mod tests {
         assert_eq!(config.server.ldap_port, 1389);
         assert_eq!(config.server.ldaps_port, 1636);
         assert_eq!(config.server.bind_address, "127.0.0.1");
+        assert_eq!(config.server.replica_id, 1);
         assert!(config.rate_limit.enabled);
         assert!(config.monitoring.enabled);
     }
@@ -1210,6 +1228,13 @@ mod tests {
     fn test_config_validation_empty_base_dn() {
         let mut config = ServerConfig::default();
         config.server.base_dn = String::new();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_invalid_replica_id() {
+        let mut config = ServerConfig::default();
+        config.server.replica_id = 0;
         assert!(config.validate().is_err());
     }
 
@@ -1251,6 +1276,7 @@ mod tests {
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 389
+replica_id = 7
 base_dn = "dc=test,dc=org"
 
 [backend]
@@ -1260,6 +1286,7 @@ backend_type = "memory"
         let config = ServerConfig::from_toml_str(toml).unwrap();
         assert_eq!(config.server.bind_address, "0.0.0.0");
         assert_eq!(config.server.ldap_port, 389);
+        assert_eq!(config.server.replica_id, 7);
         assert_eq!(config.server.base_dn, "dc=test,dc=org");
         assert_eq!(config.backend.backend_type, "memory");
     }

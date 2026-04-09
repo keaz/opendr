@@ -44,9 +44,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Create LMDB backend with configured max size (convert to MB)
                 let max_size_mb = (config.backend.lmdb_max_size / (1024 * 1024)) as usize;
-                // TODO: Get replica_id from configuration (for now, use default 1)
-                let replica_id = 1;
-                let mut backend = LmdbBackend::new(&config.backend.data_directory, max_size_mb, replica_id)?;
+                let replica_id = config.server.replica_id;
+                let mut backend =
+                    LmdbBackend::new(&config.backend.data_directory, max_size_mb, replica_id)?;
 
                 // Initialize with base structure if needed
                 match backend.get_entry(&config.server.base_dn).await {
@@ -65,10 +65,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("Initializing in-memory backend (MockBackend)");
 
                 // Create mock backend with credentials from config
-                let mut backend = MockBackend::from_credentials([(
-                    &format!("{},{}", config.server.root_user_dn, config.server.base_dn),
-                    config.server.root_password.as_bytes().to_vec(),
-                )]);
+                let mut backend = MockBackend::from_credentials_with_replica_id(
+                    [(
+                        &format!("{},{}", config.server.root_user_dn, config.server.base_dn),
+                        config.server.root_password.as_bytes().to_vec(),
+                    )],
+                    config.server.replica_id,
+                );
 
                 // Add base structure entries
                 initialize_base_structure(&mut backend, &config).await?;

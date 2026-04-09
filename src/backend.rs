@@ -65,10 +65,9 @@ impl OperationalAttributes {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("System time before UNIX epoch");
-        
+
         let secs = duration.as_secs();
-        let tm = chrono::DateTime::from_timestamp(secs as i64, 0)
-            .expect("Invalid timestamp");
+        let tm = chrono::DateTime::from_timestamp(secs as i64, 0).expect("Invalid timestamp");
         tm.format("%Y%m%d%H%M%SZ").to_string()
     }
 
@@ -227,7 +226,7 @@ pub trait DirectoryBackend: Send + Sync {
     ) -> Result<Vec<DirectoryEntry>, BackendError>;
 
     /// Get the current contextCSN for the database
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Some(Csn))` - The current contextCSN
     /// * `Ok(None)` - No contextCSN set yet (empty database)
@@ -235,10 +234,10 @@ pub trait DirectoryBackend: Send + Sync {
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError>;
 
     /// Set the contextCSN for the database
-    /// 
+    ///
     /// # Arguments
     /// * `csn` - The new contextCSN value
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` - contextCSN updated successfully
     /// * `Err(BackendError)` - Error updating contextCSN
@@ -303,6 +302,15 @@ impl MockBackend {
         D: Into<String>,
         P: Into<Vec<u8>>,
     {
+        Self::from_credentials_with_replica_id(credentials, 1)
+    }
+
+    pub fn from_credentials_with_replica_id<I, D, P>(credentials: I, replica_id: u16) -> Self
+    where
+        I: IntoIterator<Item = (D, P)>,
+        D: Into<String>,
+        P: Into<Vec<u8>>,
+    {
         let mut entries = HashMap::new();
 
         for (dn, password) in credentials {
@@ -323,7 +331,7 @@ impl MockBackend {
         Self {
             entries: RwLock::new(entries),
             context_csn: RwLock::new(None),
-            csn_generator: Arc::new(crate::csn::CsnGenerator::new(1)),
+            csn_generator: Arc::new(crate::csn::CsnGenerator::new(replica_id)),
         }
     }
 }
@@ -398,7 +406,10 @@ impl DirectoryBackend for MockBackend {
 
         // Generate new CSN for this modification
         let csn = self.csn_generator.generate();
-        stored.entry.operational_attributes.for_modified_entry(csn.clone(), None);
+        stored
+            .entry
+            .operational_attributes
+            .for_modified_entry(csn.clone(), None);
 
         for modification in modifications {
             apply_modification(&mut stored.entry, &mut stored.password, &modification);
@@ -466,10 +477,13 @@ impl DirectoryBackend for MockBackend {
                     delete_old,
                 );
                 stored.entry.dn = new_dn.clone();
-                
+
                 // Update operational attributes for renamed entry
-                stored.entry.operational_attributes.for_modified_entry(csn.clone(), None);
-                
+                stored
+                    .entry
+                    .operational_attributes
+                    .for_modified_entry(csn.clone(), None);
+
                 entries.insert(new_dn, stored);
             }
         }

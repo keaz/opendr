@@ -85,6 +85,7 @@ bind_address = "127.0.0.1"          # Address to bind to
 ldap_port = 1389                     # LDAP port (non-TLS)
 ldaps_port = 1636                    # LDAPS port (TLS/SSL)
 hostname = "localhost"               # Server hostname
+replica_id = 1                       # Unique CSN replica ID for this server
 base_dn = "dc=example,dc=com"        # Base DN for directory
 root_user_dn = "cn=admin"            # Admin user DN
 root_password = "secret"             # Admin password (hashed on first use)
@@ -97,6 +98,7 @@ max_concurrent_operations = 100     # Max operations per connection
 
 **Key Settings:**
 - `ldap_port` and `ldaps_port` must be different
+- `replica_id` must be non-zero, and must be unique per replicated node
 - `base_dn` cannot be empty
 - `root_password` is hashed using SSHA512 on first use
 
@@ -229,6 +231,7 @@ state_storage_path = "./data/replication_state" # Consumer cookie/state storage
 **Consumer Configuration:**
 - Requires `provider_url`; `bind_dn` and `bind_password` are optional
 - `bind_dn` / `bind_password` are the canonical keys; `provider_bind_dn` / `provider_bind_password` are accepted as aliases
+- `server.replica_id` must be unique per replicated node so generated CSNs do not collide
 - `sync_interval_secs` controls refresh and reconnect cadence; it is not the steady-state live update latency when listening is enabled
 - `enable_change_listening` keeps a long-lived LDAP search open for live updates after refresh
 - `state_storage_path` stores the replication cookie between restarts

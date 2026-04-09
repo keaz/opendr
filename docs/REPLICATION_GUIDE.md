@@ -43,6 +43,7 @@ Create `/srv/opendr-provider/config/server.toml`:
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 1389
+replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
 root_password = "{SSHA512}<generated-hash>"
@@ -65,6 +66,7 @@ Notes:
 
 - The provider automatically wraps the backend with changelog tracking in `provider` and `both` modes.
 - `root_user_dn` is the relative DN. The full bind DN is `cn=manager,dc=example,dc=com`.
+- `replica_id` must be unique per replicated node.
 - The provider serves replication data through the normal LDAP server. There is no separate polling service to start.
 
 ## Consumer Configuration
@@ -75,6 +77,7 @@ Create `/srv/opendr-consumer/config/server.toml`:
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 2389
+replica_id = 2
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
 root_password = "{SSHA512}<generated-hash>"
@@ -267,6 +270,8 @@ state_storage_path = "./data/replication_state"
 ## Both Mode
 
 `mode = "both"` starts the provider and consumer services inside the same process. Use it when a node must consume from an upstream provider and also serve downstream consumers.
+
+Set a unique `server.replica_id` on every node participating in replication so CSNs remain globally ordered.
 
 ```toml
 [replication]

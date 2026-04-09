@@ -38,8 +38,8 @@
 use log::{error, info};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use crate::backend::DirectoryBackend;
 use crate::backend_changelog_wrapper::ChangelogBackendWrapper;
@@ -132,7 +132,10 @@ impl ReplicationService {
                 .as_ref()
                 .map(|c| c.changelog_capacity)
                 .unwrap_or(10000);
-            Some(Arc::new(ChangelogTracker::with_capacity(capacity)))
+            Some(Arc::new(ChangelogTracker::with_capacity_and_replica(
+                capacity,
+                config.server.replica_id,
+            )))
         } else {
             None
         };
