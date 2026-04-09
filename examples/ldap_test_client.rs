@@ -1,7 +1,7 @@
 use ldap3::{LdapConnAsync, Scope, SearchEntry};
+use rand::{distributions::Alphanumeric, Rng};
 use std::collections::HashSet;
 use std::error::Error;
-use rand::{Rng, distributions::Alphanumeric};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -80,12 +80,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     for i in 0..1000 {
         // Generate random user data
-        let first_name: String = (0..8)
-            .map(|_| rng.sample(Alphanumeric) as char)
-            .collect();
-        let last_name: String = (0..10)
-            .map(|_| rng.sample(Alphanumeric) as char)
-            .collect();
+        let first_name: String = (0..8).map(|_| rng.sample(Alphanumeric) as char).collect();
+        let last_name: String = (0..10).map(|_| rng.sample(Alphanumeric) as char).collect();
         let uid: String = format!("user{:04}", i);
         let cn = format!("{} {}", first_name, last_name);
         let email = format!("{}@example.com", uid);
@@ -120,7 +116,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    println!("   ✓ Added {} users, skipped {} existing", added_count, skipped_count);
+    println!(
+        "   ✓ Added {} users, skipped {} existing",
+        added_count, skipped_count
+    );
     println!();
 
     // Test 4: Search for added users
@@ -140,8 +139,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("   First 5 users:");
         for entry in rs.iter().take(5) {
             let entry = SearchEntry::construct(entry.clone());
-            println!("     - {} ({})", entry.dn,
-                entry.attrs.get("mail").map(|v| v[0].as_str()).unwrap_or(""));
+            println!(
+                "     - {} ({})",
+                entry.dn,
+                entry.attrs.get("mail").map(|v| v[0].as_str()).unwrap_or("")
+            );
         }
     }
     println!();
@@ -221,7 +223,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let entry = SearchEntry::construct(entry.clone());
         println!(
             "     - {}",
-            entry.attrs.get("uid").map(|v| v[0].as_str()).unwrap_or("unknown")
+            entry
+                .attrs
+                .get("uid")
+                .map(|v| v[0].as_str())
+                .unwrap_or("unknown")
         );
     }
     println!();

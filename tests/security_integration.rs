@@ -6,21 +6,18 @@
 //! - Extended operations
 //! - Access Control Information (ACI) system
 
-use opendr::aci::{AciEngine, AciRuleBuilder, Permission, AciTarget, AciSubject};
-use opendr::connection_fsm::{TlsHandler, ConnectionFsmImpl};
+use async_trait::async_trait;
+use opendr::aci::{AciEngine, AciRuleBuilder, Permission};
+use opendr::connection_fsm::{ConnectionFsmImpl, TlsHandler};
+use opendr::extended_op_fsm::{ExtendedOpBackend, ExtendedOpMetrics, ExtendedOpParser};
 use opendr::extended_ops::{
-    StandardExtendedOpBackend, StandardExtendedOpParser, NoOpDelegator,
-    PermissiveAccessControl, ExtendedOpMetricsCollector, PasswordModifier,
-    OperationCanceller, oids,
+    oids, ExtendedOpMetricsCollector, OperationCanceller, PasswordModifier,
+    StandardExtendedOpBackend, StandardExtendedOpParser,
 };
-use opendr::extended_op_fsm::{
-    ExtendedOpFsmImpl, ExtendedOpBackend, ExtendedOpParser, ExtendedOpMetrics,
-};
-use opendr::fsm::{StateMachine, ConnectionState, ConnectionEvent, SaslFsm, SaslEvent};
-use opendr::sasl_fsm::{SaslFsmImpl, SaslMechanismHandler, CredentialVerifier, SaslChallengeResult};
+use opendr::fsm::{ConnectionEvent, ConnectionState, SaslEvent, SaslFsm, StateMachine};
+use opendr::sasl_fsm::{CredentialVerifier, SaslFsmImpl, SaslMechanismHandler};
 use opendr::sasl_mechanisms::MultiMechanismHandler;
 use opendr::tls::{RustlsTlsHandler, TlsConfig, TlsVersion};
-use async_trait::async_trait;
 use std::sync::Arc;
 
 // ========================================================================
@@ -44,7 +41,9 @@ async fn test_connection_fsm_with_tls() {
     let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", tls_handler);
 
     // Establish connection
-    let result = fsm.handle_event(ConnectionEvent::ConnectionEstablished).await;
+    let result = fsm
+        .handle_event(ConnectionEvent::ConnectionEstablished)
+        .await;
     assert!(result.is_ok());
     assert_eq!(fsm.current_state(), &ConnectionState::Connected);
 
@@ -72,9 +71,15 @@ impl TestCredentialVerifier {
     fn new() -> Self {
         Self {
             valid_users: vec![
-                ("alice".to_string(), "cn=alice,dc=example,dc=org".to_string()),
+                (
+                    "alice".to_string(),
+                    "cn=alice,dc=example,dc=org".to_string(),
+                ),
                 ("bob".to_string(), "cn=bob,dc=example,dc=org".to_string()),
-                ("admin".to_string(), "cn=admin,dc=example,dc=org".to_string()),
+                (
+                    "admin".to_string(),
+                    "cn=admin,dc=example,dc=org".to_string(),
+                ),
             ],
         }
     }
@@ -87,7 +92,8 @@ impl CredentialVerifier for TestCredentialVerifier {
     }
 
     async fn get_user_dn(&self, identity: &str) -> Result<Option<String>, String> {
-        Ok(self.valid_users
+        Ok(self
+            .valid_users
             .iter()
             .find(|(user, _)| user == identity)
             .map(|(_, dn)| dn.clone()))
@@ -103,14 +109,19 @@ async fn test_sasl_plain_authentication_success() {
 
     // Authenticate with PLAIN mechanism
     let credentials = b"\0alice\0password";
-    let result = fsm.handle_event(SaslEvent::InitiateBind {
-        mechanism: "PLAIN".to_string(),
-        initial_data: Some(credentials.to_vec()),
-    }).await;
+    let result = fsm
+        .handle_event(SaslEvent::InitiateBind {
+            mechanism: "PLAIN".to_string(),
+            initial_data: Some(credentials.to_vec()),
+        })
+        .await;
 
     assert!(result.is_ok());
     assert!(fsm.is_terminal());
-    assert_eq!(fsm.authenticated_identity(), Some("cn=alice,dc=example,dc=org"));
+    assert_eq!(
+        fsm.authenticated_identity(),
+        Some("cn=alice,dc=example,dc=org")
+    );
 }
 
 #[tokio::test]
@@ -122,10 +133,12 @@ async fn test_sasl_plain_authentication_failure() {
 
     // Authenticate with invalid user
     let credentials = b"\0invalid\0password";
-    let result = fsm.handle_event(SaslEvent::InitiateBind {
-        mechanism: "PLAIN".to_string(),
-        initial_data: Some(credentials.to_vec()),
-    }).await;
+    let result = fsm
+        .handle_event(SaslEvent::InitiateBind {
+            mechanism: "PLAIN".to_string(),
+            initial_data: Some(credentials.to_vec()),
+        })
+        .await;
 
     assert!(result.is_err());
     assert!(fsm.is_terminal());
@@ -140,10 +153,12 @@ async fn test_sasl_digest_md5_authentication() {
     let mut fsm = SaslFsmImpl::new(mechanism_handler, verifier_box);
 
     // Initiate DIGEST-MD5 authentication
-    let result = fsm.handle_event(SaslEvent::InitiateBind {
-        mechanism: "DIGEST-MD5".to_string(),
-        initial_data: None,
-    }).await;
+    let result = fsm
+        .handle_event(SaslEvent::InitiateBind {
+            mechanism: "DIGEST-MD5".to_string(),
+            initial_data: None,
+        })
+        .await;
 
     assert!(result.is_ok());
     assert!(fsm.needs_more_steps());
@@ -177,11 +192,17 @@ async fn test_sasl_mechanism_properties() {
 
     let plain_props = mechanism_handler.get_mechanism_properties("PLAIN");
     assert_eq!(plain_props.get("steps"), Some(&"1".to_string()));
-    assert_eq!(plain_props.get("security"), Some(&"requires-tls".to_string()));
+    assert_eq!(
+        plain_props.get("security"),
+        Some(&"requires-tls".to_string())
+    );
 
     let digest_props = mechanism_handler.get_mechanism_properties("DIGEST-MD5");
     assert_eq!(digest_props.get("steps"), Some(&"2".to_string()));
-    assert_eq!(digest_props.get("security"), Some(&"hash-based".to_string()));
+    assert_eq!(
+        digest_props.get("security"),
+        Some(&"hash-based".to_string())
+    );
 }
 
 // ========================================================================
@@ -241,7 +262,9 @@ async fn test_extended_op_password_modify() {
     );
 
     let request = b"userIdentity=cn=alice,dc=example,dc=org|oldPassword=old123|newPassword=new456";
-    let result = backend.execute_operation(oids::PASSWORD_MODIFY, Some(request)).await;
+    let result = backend
+        .execute_operation(oids::PASSWORD_MODIFY, Some(request))
+        .await;
     assert!(result.is_ok());
 }
 
@@ -267,7 +290,9 @@ async fn test_extended_op_cancel() {
     );
 
     let message_id = b"42";
-    let result = backend.execute_operation(oids::CANCEL, Some(message_id)).await;
+    let result = backend
+        .execute_operation(oids::CANCEL, Some(message_id))
+        .await;
     assert!(result.is_ok());
 }
 
@@ -327,21 +352,25 @@ async fn test_aci_basic_access_control() {
     engine.add_rule(rule).await;
 
     // Alice should be allowed to read
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        None,
-        Permission::Read,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            Permission::Read,
+        )
+        .await;
     assert!(result.is_ok());
 
     // Bob should be denied
-    let result = engine.check_permission(
-        Some("cn=bob,dc=example,dc=org"),
-        "cn=alice,dc=example,dc=org",
-        None,
-        Permission::Read,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=bob,dc=example,dc=org"),
+            "cn=alice,dc=example,dc=org",
+            None,
+            Permission::Read,
+        )
+        .await;
     assert!(result.is_err());
 }
 
@@ -360,21 +389,25 @@ async fn test_aci_self_entry_access() {
     engine.add_rule(rule).await;
 
     // Alice can modify her own entry
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=alice,dc=example,dc=org",
-        None,
-        Permission::Modify,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=alice,dc=example,dc=org",
+            None,
+            Permission::Modify,
+        )
+        .await;
     assert!(result.is_ok());
 
     // Alice cannot modify Bob's entry
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        None,
-        Permission::Modify,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            Permission::Modify,
+        )
+        .await;
     assert!(result.is_err());
 }
 
@@ -393,21 +426,20 @@ async fn test_aci_all_authenticated_access() {
     engine.add_rule(rule).await;
 
     // Any authenticated user can search
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        None,
-        Permission::Search,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            Permission::Search,
+        )
+        .await;
     assert!(result.is_ok());
 
     // Anonymous cannot search
-    let result = engine.check_permission(
-        None,
-        "cn=bob,dc=example,dc=org",
-        None,
-        Permission::Search,
-    ).await;
+    let result = engine
+        .check_permission(None, "cn=bob,dc=example,dc=org", None, Permission::Search)
+        .await;
     assert!(result.is_err());
 }
 
@@ -426,21 +458,25 @@ async fn test_aci_attribute_level_access() {
     engine.add_rule(rule).await;
 
     // Can read cn attribute
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        Some("cn"),
-        Permission::Read,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            Some("cn"),
+            Permission::Read,
+        )
+        .await;
     assert!(result.is_ok());
 
     // Cannot read mail attribute (not in allowed list)
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        Some("mail"),
-        Permission::Read,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            Some("mail"),
+            Permission::Read,
+        )
+        .await;
     assert!(result.is_err());
 }
 
@@ -459,21 +495,25 @@ async fn test_aci_deny_rules() {
     engine.add_rule(rule).await;
 
     // Alice cannot delete
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        None,
-        Permission::Delete,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            Permission::Delete,
+        )
+        .await;
     assert!(result.is_err());
 
     // Alice can still read (permissive default)
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        None,
-        Permission::Read,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            Permission::Read,
+        )
+        .await;
     assert!(result.is_ok());
 }
 
@@ -503,12 +543,14 @@ async fn test_aci_priority_resolution() {
     engine.add_rule(deny_rule).await;
 
     // Deny should win due to higher priority
-    let result = engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        None,
-        Permission::Write,
-    ).await;
+    let result = engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            Permission::Write,
+        )
+        .await;
     assert!(result.is_err());
 }
 
@@ -552,7 +594,11 @@ async fn test_aci_multiple_permissions_check() {
 
     let rule = AciRuleBuilder::grant("multi-perm")
         .target_subtree("dc=example,dc=org")
-        .permissions(vec![Permission::Read, Permission::Search, Permission::Compare])
+        .permissions(vec![
+            Permission::Read,
+            Permission::Search,
+            Permission::Compare,
+        ])
         .subject_all_authenticated()
         .build()
         .unwrap();
@@ -560,21 +606,25 @@ async fn test_aci_multiple_permissions_check() {
     engine.add_rule(rule).await;
 
     // Check multiple allowed permissions
-    let result = engine.check_permissions(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        None,
-        &[Permission::Read, Permission::Search],
-    ).await;
+    let result = engine
+        .check_permissions(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            &[Permission::Read, Permission::Search],
+        )
+        .await;
     assert!(result.is_ok());
 
     // Check with one disallowed permission
-    let result = engine.check_permissions(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=bob,dc=example,dc=org",
-        None,
-        &[Permission::Read, Permission::Write],
-    ).await;
+    let result = engine
+        .check_permissions(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            &[Permission::Read, Permission::Write],
+        )
+        .await;
     assert!(result.is_err());
 }
 
@@ -591,10 +641,12 @@ async fn test_authentication_and_authorization_flow() {
     let mut sasl_fsm = SaslFsmImpl::new(mechanism_handler, verifier_box);
 
     let credentials = b"\0alice\0password";
-    let result = sasl_fsm.handle_event(SaslEvent::InitiateBind {
-        mechanism: "PLAIN".to_string(),
-        initial_data: Some(credentials.to_vec()),
-    }).await;
+    let result = sasl_fsm
+        .handle_event(SaslEvent::InitiateBind {
+            mechanism: "PLAIN".to_string(),
+            initial_data: Some(credentials.to_vec()),
+        })
+        .await;
 
     assert!(result.is_ok());
     let user_dn = sasl_fsm.authenticated_identity();
@@ -613,12 +665,9 @@ async fn test_authentication_and_authorization_flow() {
     aci_engine.add_rule(rule).await;
 
     // Alice can read entries
-    let result = aci_engine.check_permission(
-        user_dn,
-        "cn=bob,dc=example,dc=org",
-        None,
-        Permission::Read,
-    ).await;
+    let result = aci_engine
+        .check_permission(user_dn, "cn=bob,dc=example,dc=org", None, Permission::Read)
+        .await;
     assert!(result.is_ok());
 }
 
@@ -637,12 +686,14 @@ async fn test_extended_op_with_access_control() {
     aci_engine.add_rule(rule).await;
 
     // Check if alice can modify password
-    let result = aci_engine.check_permission(
-        Some("cn=alice,dc=example,dc=org"),
-        "cn=alice,dc=example,dc=org",
-        None,
-        Permission::Modify,
-    ).await;
+    let result = aci_engine
+        .check_permission(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=alice,dc=example,dc=org",
+            None,
+            Permission::Modify,
+        )
+        .await;
     assert!(result.is_ok());
 
     // Execute password modify operation
@@ -652,6 +703,8 @@ async fn test_extended_op_with_access_control() {
     );
 
     let request = b"userIdentity=cn=alice,dc=example,dc=org|oldPassword=old123|newPassword=new456";
-    let result = backend.execute_operation(oids::PASSWORD_MODIFY, Some(request)).await;
+    let result = backend
+        .execute_operation(oids::PASSWORD_MODIFY, Some(request))
+        .await;
     assert!(result.is_ok());
 }

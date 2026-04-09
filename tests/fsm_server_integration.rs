@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use opendr::backend::MockBackend;
 use opendr::connection_pool::ResourceLimits;
-use opendr::fsm_server::FsmServerConfig;
 use opendr::fsm_runtime::ConnectionFsmSet;
+use opendr::fsm_server::FsmServerConfig;
 use opendr::rate_limit::RateLimitConfig;
 use tokio::net::TcpStream;
 

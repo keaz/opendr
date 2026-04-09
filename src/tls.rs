@@ -79,11 +79,7 @@ impl RustlsTlsHandler {
     /// * `Err(String)` if configuration fails
     pub fn new(tls_config: &TlsConfig) -> Result<Self, String> {
         let server_config = Self::build_server_config(tls_config)?;
-        let protocol_version = if tls_config.min_tls_version == TlsVersion::Tls13 {
-            TlsVersion::Tls13.as_str().to_string()
-        } else {
-            TlsVersion::Tls13.as_str().to_string()
-        };
+        let protocol_version = tls_config.min_tls_version.as_str().to_string();
 
         Ok(Self {
             server_config: Arc::new(server_config),

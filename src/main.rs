@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 );
 
                 // Create LMDB backend with configured max size (convert to MB)
-                let max_size_mb = (config.backend.lmdb_max_size / (1024 * 1024)) as usize;
+                let max_size_mb = config.backend.lmdb_max_size / (1024 * 1024);
                 let replica_id = config.server.replica_id;
                 let index_config = IndexConfig {
                     indexed_attributes: if config.performance.indexing_enabled {
@@ -494,7 +494,7 @@ async fn initialize_base_structure(
 
     // Add root user entry with password
     let root_user_entry = DirectoryEntry::new(
-        &format!("{},{}", config.server.root_user_dn, config.server.base_dn),
+        format!("{},{}", config.server.root_user_dn, config.server.base_dn),
         HashMap::from([
             (
                 "objectClass".to_string(),
@@ -519,7 +519,7 @@ async fn initialize_base_structure(
 
     // Add organizational units
     let people_ou_entry = DirectoryEntry::new(
-        &format!("ou=People,{}", config.server.base_dn),
+        format!("ou=People,{}", config.server.base_dn),
         HashMap::from([
             (
                 "objectClass".to_string(),
@@ -535,7 +535,7 @@ async fn initialize_base_structure(
     backend.add_entry(people_ou_entry, vec![]).await?;
 
     let groups_ou_entry = DirectoryEntry::new(
-        &format!("ou=Groups,{}", config.server.base_dn),
+        format!("ou=Groups,{}", config.server.base_dn),
         HashMap::from([
             (
                 "objectClass".to_string(),
@@ -551,7 +551,7 @@ async fn initialize_base_structure(
     backend.add_entry(groups_ou_entry, vec![]).await?;
 
     let apps_ou_entry = DirectoryEntry::new(
-        &format!("ou=Applications,{}", config.server.base_dn),
+        format!("ou=Applications,{}", config.server.base_dn),
         HashMap::from([
             (
                 "objectClass".to_string(),
@@ -627,7 +627,7 @@ async fn initialize_lmdb_base_structure(
 
     // Add organizational units
     let people_ou_entry = DirectoryEntry::new(
-        &format!("ou=People,{}", config.server.base_dn),
+        format!("ou=People,{}", config.server.base_dn),
         HashMap::from([
             (
                 "objectClass".to_string(),
@@ -643,7 +643,7 @@ async fn initialize_lmdb_base_structure(
     backend.add_entry(people_ou_entry, vec![]).await?;
 
     let groups_ou_entry = DirectoryEntry::new(
-        &format!("ou=Groups,{}", config.server.base_dn),
+        format!("ou=Groups,{}", config.server.base_dn),
         HashMap::from([
             (
                 "objectClass".to_string(),
@@ -659,7 +659,7 @@ async fn initialize_lmdb_base_structure(
     backend.add_entry(groups_ou_entry, vec![]).await?;
 
     let apps_ou_entry = DirectoryEntry::new(
-        &format!("ou=Applications,{}", config.server.base_dn),
+        format!("ou=Applications,{}", config.server.base_dn),
         HashMap::from([
             (
                 "objectClass".to_string(),

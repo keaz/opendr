@@ -66,7 +66,7 @@
 //! ```
 
 use async_trait::async_trait;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -146,6 +146,12 @@ pub struct FilterStats {
     pub last_evaluation: Option<Instant>,
 }
 
+impl Default for FilterStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FilterStats {
     pub fn new() -> Self {
         Self {
@@ -202,6 +208,12 @@ pub struct PropagationStats {
 
     /// Started timestamp
     pub started_at: Option<Instant>,
+}
+
+impl Default for PropagationStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PropagationStats {
@@ -298,7 +310,7 @@ impl RealTimePropagationEngine {
         // Register self as change callback
         let callback: Arc<dyn ChangeCallback> = Arc::new(PropagationCallback {
             engine_state: Arc::new(RwLock::new(PropagationEngineState {
-                push_manager: self.push_manager.clone(),
+                _push_manager: self.push_manager.clone(),
                 consumer_filters: self.consumer_filters.clone(),
                 stats: self.stats.clone(),
                 config: self.config.clone(),
@@ -413,7 +425,7 @@ impl RealTimePropagationEngine {
 
 /// Internal state for the propagation callback
 struct PropagationEngineState {
-    push_manager: Arc<RwLock<PushManager>>,
+    _push_manager: Arc<RwLock<PushManager>>,
     consumer_filters: Arc<RwLock<HashMap<String, ConsumerFilter>>>,
     stats: Arc<RwLock<PropagationStats>>,
     config: PropagationConfig,
@@ -595,6 +607,7 @@ pub fn is_dn_in_scope(dn: &str, base_dn: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use crate::change_observer::ChangeObserverImpl;

@@ -1,21 +1,21 @@
 //! Connection/Transport FSM Implementation
-//! 
+//!
 //! This module provides a concrete implementation of the ConnectionFsm trait,
 //! handling TCP connection lifecycle, StartTLS upgrade, and connection closure.
-//! 
+//!
 //! ## Design Principles
-//! 
+//!
 //! - **Single Responsibility**: Only handles connection/transport state transitions
 //! - **External Dependencies**: All external operations abstracted through traits
 //! - **State Safety**: Prevents invalid state transitions at compile time
 //! - **Async/Await**: Full async support for non-blocking operations
-//! 
+//!
 //! ## Usage Example
-//! 
+//!
 //! ```rust,no_run
 //! use opendr::connection_fsm::*;
 //! use opendr::fsm::{StateMachine, ConnectionState, ConnectionEvent};
-//! 
+//!
 //! // Note: This example shows the API structure.
 //! // In real usage, you would implement your own TlsHandler.
 //! # struct MockTlsHandler;
@@ -25,15 +25,15 @@
 //! #     fn supports_tls(&self) -> bool { true }
 //! #     fn protocol_version(&self) -> String { "TLSv1.3".to_string() }
 //! # }
-//! 
+//!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let tls_handler = Box::new(MockTlsHandler);
 //! let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", tls_handler);
-//! 
+//!
 //! // Connect would typically be handled by the connection logic
 //! // let _result = fsm.handle_event(ConnectionEvent::Connect).await?;
 //! // assert_eq!(fsm.current_state(), &ConnectionState::Connected);
-//! 
+//!
 //! // Start TLS would be initiated after connection is established
 //! // let _result = fsm.handle_event(ConnectionEvent::StartTlsRequest).await?;
 //! // assert_eq!(fsm.current_state(), &ConnectionState::Secure);
@@ -41,86 +41,87 @@
 //! # }
 //! ```
 
+use async_trait::async_trait;
 use std::fmt;
 use std::time::{Duration, Instant};
-use async_trait::async_trait;
 // Note: AsyncRead and AsyncWrite are used in tests
 use tokio::net::TcpStream;
 
-use crate::fsm::{
-    StateMachine, ConnectionFsm, ConnectionState, ConnectionEvent, ConnectionInfo
-};
+use crate::fsm::{ConnectionEvent, ConnectionFsm, ConnectionInfo, ConnectionState, StateMachine};
 
 /// Errors specific to connection FSM operations
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionFsmError {
     #[error("Invalid state transition from {from:?} to {to:?}")]
-    InvalidTransition { from: ConnectionState, to: ConnectionState },
-    
+    InvalidTransition {
+        from: ConnectionState,
+        to: ConnectionState,
+    },
+
     #[error("Connection already established")]
     AlreadyConnected,
-    
+
     #[error("No active connection")]
     NotConnected,
-    
+
     #[error("TLS handshake failed: {reason}")]
     TlsHandshakeFailed { reason: String },
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Connection timeout after {duration:?}")]
     Timeout { duration: Duration },
-    
+
     #[error("Connection closed unexpectedly")]
     ConnectionClosed,
-    
+
     #[error("TLS not supported")]
     TlsNotSupported,
 }
 
 /// Trait for handling TLS operations
-/// 
+///
 /// This abstracts the TLS implementation details from the connection FSM,
 /// allowing for different TLS backends and easy testing with mocks.
 #[async_trait]
 pub trait TlsHandler: Send + Sync {
     /// Perform TLS handshake on the given stream
-    /// 
+    ///
     /// # Arguments
     /// * `stream` - The TCP stream to upgrade to TLS
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` if handshake successful
     /// * `Err(String)` with error description if failed
     async fn perform_handshake(&self, stream: &mut TcpStream) -> Result<(), String>;
-    
+
     /// Check if TLS is supported by this handler
     fn supports_tls(&self) -> bool;
-    
+
     /// Get TLS protocol version after successful handshake
     fn protocol_version(&self) -> String;
 }
 
 /// Trait for network operations
-/// 
+///
 /// Abstracts network connectivity to allow for testing and different
 /// network implementations.
 #[async_trait]
 pub trait NetworkHandler: Send + Sync {
     /// Establish a TCP connection to the given address
-    /// 
+    ///
     /// # Arguments
     /// * `addr` - The address to connect to (e.g., "127.0.0.1:1389")
-    /// 
+    ///
     /// # Returns
     /// * `Ok(TcpStream)` if connection successful
     /// * `Err(std::io::Error)` if connection failed
     async fn connect(&self, addr: &str) -> Result<TcpStream, std::io::Error>;
-    
+
     /// Get the local address of a connected stream
     fn local_addr(&self, stream: &TcpStream) -> Result<String, std::io::Error>;
-    
+
     /// Get the remote address of a connected stream  
     fn remote_addr(&self, stream: &TcpStream) -> Result<String, std::io::Error>;
 }
@@ -164,12 +165,12 @@ impl TlsHandler for NoOpTlsHandler {
 }
 
 /// Concrete implementation of the ConnectionFsm trait
-/// 
+///
 /// This FSM manages the complete lifecycle of an LDAP connection from
 /// initial connection through optional TLS upgrade to final closure.
-/// 
+///
 /// ## State Transitions
-/// 
+///
 /// ```text
 /// [Initial] -> Connect -> Connecting -> Connected -> StartTLS -> StartTlsNegotiation -> Secure
 ///                                    |                                                    |
@@ -180,36 +181,36 @@ impl TlsHandler for NoOpTlsHandler {
 pub struct ConnectionFsmImpl {
     /// Current state of the connection FSM
     state: ConnectionState,
-    
+
     /// The TCP stream (if connected)
     stream: Option<TcpStream>,
-    
+
     /// Target address for connection
     target_addr: String,
-    
+
     /// TLS handler for StartTLS operations
     tls_handler: Box<dyn TlsHandler>,
-    
+
     /// Network handler for connection operations
     network_handler: Box<dyn NetworkHandler>,
-    
+
     /// Whether the connection is currently secure (TLS)
     is_secure: bool,
-    
+
     /// Connection start time for timeout calculations
     connect_start: Option<Instant>,
-    
+
     /// Connection timeout duration
     connect_timeout: Duration,
 }
 
 impl ConnectionFsmImpl {
     /// Create a new ConnectionFsm instance
-    /// 
+    ///
     /// # Arguments
     /// * `target_addr` - The address to connect to (e.g., "127.0.0.1:1389")
     /// * `tls_handler` - Handler for TLS operations
-    /// 
+    ///
     /// # Returns
     /// * New ConnectionFsmImpl instance in Connecting state
     pub fn new(target_addr: impl Into<String>, tls_handler: Box<dyn TlsHandler>) -> Self {
@@ -224,7 +225,7 @@ impl ConnectionFsmImpl {
             connect_timeout: Duration::from_secs(30),
         }
     }
-    
+
     /// Create a new ConnectionFsm with custom network handler (for testing)
     pub fn with_network_handler(
         target_addr: impl Into<String>,
@@ -242,7 +243,7 @@ impl ConnectionFsmImpl {
             connect_timeout: Duration::from_secs(30),
         }
     }
-    
+
     /// Create a new ConnectionFsm with an already established stream
     ///
     /// This is used when accepting incoming connections from a server socket.
@@ -279,41 +280,43 @@ impl ConnectionFsmImpl {
         self.connect_timeout = timeout;
         self
     }
-    
+
     /// Handle connection establishment
     async fn handle_connect(&mut self) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
         match self.state {
             ConnectionState::Connecting => {
                 self.connect_start = Some(Instant::now());
-                
+
                 // Establish TCP connection
                 let stream = self.network_handler.connect(&self.target_addr).await?;
                 self.stream = Some(stream);
                 self.state = ConnectionState::Connected;
-                
+
                 Ok(Some(self.connection_info()))
             }
-            _ => Err(ConnectionFsmError::InvalidTransition { 
-                from: self.state.clone(), 
-                to: ConnectionState::Connected 
+            _ => Err(ConnectionFsmError::InvalidTransition {
+                from: self.state.clone(),
+                to: ConnectionState::Connected,
             }),
         }
     }
-    
+
     /// Handle connection already established event
-    async fn handle_connection_established(&mut self) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
+    async fn handle_connection_established(
+        &mut self,
+    ) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
         match self.state {
             ConnectionState::Connecting => {
                 self.state = ConnectionState::Connected;
                 Ok(Some(self.connection_info()))
             }
-            _ => Err(ConnectionFsmError::InvalidTransition { 
-                from: self.state.clone(), 
-                to: ConnectionState::Connected 
+            _ => Err(ConnectionFsmError::InvalidTransition {
+                from: self.state.clone(),
+                to: ConnectionState::Connected,
             }),
         }
     }
-    
+
     /// Handle StartTLS request
     async fn handle_start_tls(&mut self) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
         match self.state {
@@ -321,9 +324,9 @@ impl ConnectionFsmImpl {
                 if !self.tls_handler.supports_tls() {
                     return Err(ConnectionFsmError::TlsNotSupported);
                 }
-                
+
                 self.state = ConnectionState::StartTlsNegotiation;
-                
+
                 // Perform TLS handshake
                 if let Some(ref mut stream) = self.stream {
                     match self.tls_handler.perform_handshake(stream).await {
@@ -342,13 +345,13 @@ impl ConnectionFsmImpl {
                     Err(ConnectionFsmError::NotConnected)
                 }
             }
-            _ => Err(ConnectionFsmError::InvalidTransition { 
-                from: self.state.clone(), 
-                to: ConnectionState::StartTlsNegotiation 
+            _ => Err(ConnectionFsmError::InvalidTransition {
+                from: self.state.clone(),
+                to: ConnectionState::StartTlsNegotiation,
             }),
         }
     }
-    
+
     /// Handle TLS handshake completion
     async fn handle_tls_complete(&mut self) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
         match self.state {
@@ -357,38 +360,41 @@ impl ConnectionFsmImpl {
                 self.is_secure = true;
                 Ok(Some(self.connection_info()))
             }
-            _ => Err(ConnectionFsmError::InvalidTransition { 
-                from: self.state.clone(), 
-                to: ConnectionState::Secure 
+            _ => Err(ConnectionFsmError::InvalidTransition {
+                from: self.state.clone(),
+                to: ConnectionState::Secure,
             }),
         }
     }
-    
+
     /// Handle TLS handshake failure
-    async fn handle_tls_failed(&mut self, reason: String) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
+    async fn handle_tls_failed(
+        &mut self,
+        reason: String,
+    ) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
         match self.state {
             ConnectionState::StartTlsNegotiation => {
                 self.state = ConnectionState::Error;
                 Err(ConnectionFsmError::TlsHandshakeFailed { reason })
             }
-            _ => Err(ConnectionFsmError::InvalidTransition { 
-                from: self.state.clone(), 
-                to: ConnectionState::Error 
+            _ => Err(ConnectionFsmError::InvalidTransition {
+                from: self.state.clone(),
+                to: ConnectionState::Error,
             }),
         }
     }
-    
+
     /// Handle connection close request
     async fn handle_close(&mut self) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
         match self.state {
             ConnectionState::Connected | ConnectionState::Secure => {
                 self.state = ConnectionState::Closing;
-                
+
                 // Close the stream if it exists
                 if let Some(stream) = self.stream.take() {
                     drop(stream); // Dropping TcpStream closes the connection
                 }
-                
+
                 self.state = ConnectionState::Closed;
                 Ok(None)
             }
@@ -397,44 +403,48 @@ impl ConnectionFsmImpl {
                 self.state = ConnectionState::Closed;
                 Ok(None)
             }
-            _ => Err(ConnectionFsmError::InvalidTransition { 
-                from: self.state.clone(), 
-                to: ConnectionState::Closing 
+            _ => Err(ConnectionFsmError::InvalidTransition {
+                from: self.state.clone(),
+                to: ConnectionState::Closing,
             }),
         }
     }
-    
+
     /// Handle connection lost unexpectedly
-    async fn handle_connection_lost(&mut self) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
+    async fn handle_connection_lost(
+        &mut self,
+    ) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
         // Connection can be lost from any connected state
         match self.state {
-            ConnectionState::Connected | ConnectionState::Secure | ConnectionState::StartTlsNegotiation => {
+            ConnectionState::Connected
+            | ConnectionState::Secure
+            | ConnectionState::StartTlsNegotiation => {
                 self.stream = None;
                 self.state = ConnectionState::Closed;
                 Err(ConnectionFsmError::ConnectionClosed)
             }
-            _ => Err(ConnectionFsmError::InvalidTransition { 
-                from: self.state.clone(), 
-                to: ConnectionState::Closed 
+            _ => Err(ConnectionFsmError::InvalidTransition {
+                from: self.state.clone(),
+                to: ConnectionState::Closed,
             }),
         }
     }
-    
+
     /// Handle generic error
-    async fn handle_error(&mut self, error: String) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
+    async fn handle_error(
+        &mut self,
+        error: String,
+    ) -> Result<Option<ConnectionInfo>, ConnectionFsmError> {
         self.state = ConnectionState::Error;
-        Err(ConnectionFsmError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other, 
-            error
-        )))
+        Err(ConnectionFsmError::Io(std::io::Error::other(error)))
     }
-    
+
     /// Check if connection has timed out
     fn check_timeout(&self) -> Result<(), ConnectionFsmError> {
         if let Some(start_time) = self.connect_start {
             if start_time.elapsed() > self.connect_timeout {
-                return Err(ConnectionFsmError::Timeout { 
-                    duration: self.connect_timeout 
+                return Err(ConnectionFsmError::Timeout {
+                    duration: self.connect_timeout,
                 });
             }
         }
@@ -464,12 +474,15 @@ impl StateMachine for ConnectionFsmImpl {
         &self.state
     }
 
-    async fn handle_event(&mut self, event: Self::Event) -> Result<Option<Self::Output>, Self::Error> {
+    async fn handle_event(
+        &mut self,
+        event: Self::Event,
+    ) -> Result<Option<Self::Output>, Self::Error> {
         // Check for timeout before processing event
         if matches!(self.state, ConnectionState::Connecting) {
             self.check_timeout()?;
         }
-        
+
         match event {
             ConnectionEvent::Connect => self.handle_connect().await,
             ConnectionEvent::ConnectionEstablished => self.handle_connection_established().await,
@@ -513,9 +526,13 @@ impl ConnectionFsm for ConnectionFsmImpl {
 
     fn connection_info(&self) -> ConnectionInfo {
         let (local_addr, remote_addr) = if let Some(ref stream) = self.stream {
-            let local = self.network_handler.local_addr(stream)
+            let local = self
+                .network_handler
+                .local_addr(stream)
                 .unwrap_or_else(|_| "unknown".to_string());
-            let remote = self.network_handler.remote_addr(stream)
+            let remote = self
+                .network_handler
+                .remote_addr(stream)
                 .unwrap_or_else(|_| self.target_addr.clone());
             (local, remote)
         } else {
@@ -536,12 +553,13 @@ impl ConnectionFsm for ConnectionFsmImpl {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncRead, AsyncWrite};
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite};
 
     /// Mock TLS handler for testing
     #[derive(Debug)]
@@ -568,18 +586,18 @@ mod tests {
                 handshake_calls: Arc::new(Mutex::new(0)),
             }
         }
-        
+
         pub fn with_tls_support(mut self, supports: bool) -> Self {
             self.supports_tls = supports;
             self
         }
-        
+
         pub fn with_handshake_failure(mut self, error: impl Into<String>) -> Self {
             self.handshake_should_succeed = false;
             self.handshake_error = error.into();
             self
         }
-        
+
         pub fn handshake_call_count(&self) -> usize {
             *self.handshake_calls.lock().unwrap()
         }
@@ -589,7 +607,7 @@ mod tests {
     impl TlsHandler for MockTlsHandler {
         async fn perform_handshake(&self, _stream: &mut TcpStream) -> Result<(), String> {
             *self.handshake_calls.lock().unwrap() += 1;
-            
+
             if self.handshake_should_succeed {
                 Ok(())
             } else {
@@ -625,21 +643,21 @@ mod tests {
             Self {
                 connect_should_succeed: true,
                 connect_error: std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused, 
-                    "Connection refused"
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Connection refused",
                 ),
                 local_addr: "127.0.0.1:12345".to_string(),
                 remote_addr: "127.0.0.1:1389".to_string(),
                 connect_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
-        
+
         pub fn with_connection_failure(mut self, error: std::io::Error) -> Self {
             self.connect_should_succeed = false;
             self.connect_error = error;
             self
         }
-        
+
         pub fn connect_calls(&self) -> Vec<String> {
             self.connect_calls.lock().unwrap().clone()
         }
@@ -668,11 +686,17 @@ mod tests {
             Poll::Ready(Ok(buf.len()))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -681,18 +705,15 @@ mod tests {
     impl NetworkHandler for MockNetworkHandler {
         async fn connect(&self, addr: &str) -> Result<TcpStream, std::io::Error> {
             self.connect_calls.lock().unwrap().push(addr.to_string());
-            
+
             if self.connect_should_succeed {
                 // We can't easily create a real TcpStream in tests, so we'll return an error
                 // but mark it as a special test success error
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "TEST_SUCCESS"
-                ))
+                Err(std::io::Error::other("TEST_SUCCESS"))
             } else {
                 Err(std::io::Error::new(
                     self.connect_error.kind(),
-                    self.connect_error.to_string()
+                    self.connect_error.to_string(),
                 ))
             }
         }
@@ -710,7 +731,7 @@ mod tests {
     fn test_new_connection_fsm() {
         let tls_handler = MockTlsHandler::new();
         let fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         assert_eq!(fsm.current_state(), &ConnectionState::Connecting);
         assert!(!fsm.is_secure());
         assert_eq!(fsm.target_addr, "127.0.0.1:1389");
@@ -721,11 +742,11 @@ mod tests {
         let tls_handler = MockTlsHandler::new();
         let network_handler = MockNetworkHandler::new();
         let fsm = ConnectionFsmImpl::with_network_handler(
-            "127.0.0.1:1389", 
-            Box::new(tls_handler), 
-            Box::new(network_handler)
+            "127.0.0.1:1389",
+            Box::new(tls_handler),
+            Box::new(network_handler),
         );
-        
+
         assert_eq!(fsm.current_state(), &ConnectionState::Connecting);
         assert!(!fsm.is_secure());
     }
@@ -734,9 +755,9 @@ mod tests {
     fn test_with_timeout() {
         let tls_handler = MockTlsHandler::new();
         let timeout = Duration::from_secs(60);
-        let fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler))
-            .with_timeout(timeout);
-        
+        let fsm =
+            ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler)).with_timeout(timeout);
+
         assert_eq!(fsm.connect_timeout, timeout);
     }
 
@@ -744,13 +765,15 @@ mod tests {
     async fn test_connection_established_event() {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         // Should transition from Connecting to Connected
-        let result = fsm.handle_event(ConnectionEvent::ConnectionEstablished).await;
-        
+        let result = fsm
+            .handle_event(ConnectionEvent::ConnectionEstablished)
+            .await;
+
         assert!(result.is_ok());
         assert_eq!(fsm.current_state(), &ConnectionState::Connected);
-        
+
         let connection_info = result.unwrap().unwrap();
         assert_eq!(connection_info.remote_addr, "127.0.0.1:1389");
         assert!(!connection_info.is_secure);
@@ -761,13 +784,17 @@ mod tests {
     async fn test_invalid_state_transition() {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         // Move to Connected state first
-        let _ = fsm.handle_event(ConnectionEvent::ConnectionEstablished).await;
-        
+        let _ = fsm
+            .handle_event(ConnectionEvent::ConnectionEstablished)
+            .await;
+
         // Try to handle ConnectionEstablished again (invalid transition)
-        let result = fsm.handle_event(ConnectionEvent::ConnectionEstablished).await;
-        
+        let result = fsm
+            .handle_event(ConnectionEvent::ConnectionEstablished)
+            .await;
+
         assert!(result.is_err());
         if let Err(ConnectionFsmError::InvalidTransition { from, to }) = result {
             assert_eq!(from, ConnectionState::Connected);
@@ -786,20 +813,27 @@ mod tests {
             Box::new(tls_handler),
             Box::new(network_handler),
         );
-        
+
         // First establish connection
-        let _ = fsm.handle_event(ConnectionEvent::ConnectionEstablished).await;
-        
+        let _ = fsm
+            .handle_event(ConnectionEvent::ConnectionEstablished)
+            .await;
+
         // Create a mock stream (in real implementation, this would be done by connect)
         // For testing, we'll simulate having a stream by moving to Connected state
         assert_eq!(fsm.current_state(), &ConnectionState::Connected);
-        
+
         // Since we can't easily mock TcpStream creation, we'll test the TLS not supported case
         let tls_handler_no_support = MockTlsHandler::new().with_tls_support(false);
-        let mut fsm_no_tls = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler_no_support));
-        let _ = fsm_no_tls.handle_event(ConnectionEvent::ConnectionEstablished).await;
-        
-        let result = fsm_no_tls.handle_event(ConnectionEvent::StartTlsRequest).await;
+        let mut fsm_no_tls =
+            ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler_no_support));
+        let _ = fsm_no_tls
+            .handle_event(ConnectionEvent::ConnectionEstablished)
+            .await;
+
+        let result = fsm_no_tls
+            .handle_event(ConnectionEvent::StartTlsRequest)
+            .await;
         assert!(matches!(result, Err(ConnectionFsmError::TlsNotSupported)));
     }
 
@@ -807,16 +841,18 @@ mod tests {
     async fn test_tls_handshake_complete() {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         // Move to StartTlsNegotiation state
         fsm.state = ConnectionState::StartTlsNegotiation;
-        
-        let result = fsm.handle_event(ConnectionEvent::TlsHandshakeComplete).await;
-        
+
+        let result = fsm
+            .handle_event(ConnectionEvent::TlsHandshakeComplete)
+            .await;
+
         assert!(result.is_ok());
         assert_eq!(fsm.current_state(), &ConnectionState::Secure);
         assert!(fsm.is_secure());
-        
+
         let connection_info = result.unwrap().unwrap();
         assert!(connection_info.is_secure);
         assert_eq!(connection_info.protocol_version, "TLSv1.3");
@@ -826,15 +862,19 @@ mod tests {
     async fn test_tls_handshake_failed() {
         let tls_handler = MockTlsHandler::new().with_handshake_failure("Certificate error");
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         // Move to StartTlsNegotiation state
         fsm.state = ConnectionState::StartTlsNegotiation;
-        
-        let result = fsm.handle_event(ConnectionEvent::TlsHandshakeFailed("Certificate error".to_string())).await;
-        
+
+        let result = fsm
+            .handle_event(ConnectionEvent::TlsHandshakeFailed(
+                "Certificate error".to_string(),
+            ))
+            .await;
+
         assert!(result.is_err());
         assert_eq!(fsm.current_state(), &ConnectionState::Error);
-        
+
         if let Err(ConnectionFsmError::TlsHandshakeFailed { reason }) = result {
             assert_eq!(reason, "Certificate error");
         } else {
@@ -846,12 +886,14 @@ mod tests {
     async fn test_connection_close_from_connected() {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         // Move to Connected state
-        let _ = fsm.handle_event(ConnectionEvent::ConnectionEstablished).await;
-        
+        let _ = fsm
+            .handle_event(ConnectionEvent::ConnectionEstablished)
+            .await;
+
         let result = fsm.handle_event(ConnectionEvent::Close).await;
-        
+
         assert!(result.is_ok());
         assert_eq!(fsm.current_state(), &ConnectionState::Closed);
         assert!(fsm.is_terminal());
@@ -861,13 +903,13 @@ mod tests {
     async fn test_connection_close_from_secure() {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         // Move to Secure state
         fsm.state = ConnectionState::Secure;
         fsm.is_secure = true;
-        
+
         let result = fsm.handle_event(ConnectionEvent::Close).await;
-        
+
         assert!(result.is_ok());
         assert_eq!(fsm.current_state(), &ConnectionState::Closed);
         assert!(fsm.is_terminal());
@@ -877,16 +919,18 @@ mod tests {
     async fn test_connection_lost() {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         // Move to Connected state
-        let _ = fsm.handle_event(ConnectionEvent::ConnectionEstablished).await;
-        
+        let _ = fsm
+            .handle_event(ConnectionEvent::ConnectionEstablished)
+            .await;
+
         let result = fsm.handle_event(ConnectionEvent::ConnectionLost).await;
-        
+
         assert!(result.is_err());
         assert_eq!(fsm.current_state(), &ConnectionState::Closed);
         assert!(fsm.is_terminal());
-        
+
         if let Err(ConnectionFsmError::ConnectionClosed) = result {
             // Expected
         } else {
@@ -898,9 +942,11 @@ mod tests {
     async fn test_generic_error() {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
-        let result = fsm.handle_event(ConnectionEvent::Error("Generic error".to_string())).await;
-        
+
+        let result = fsm
+            .handle_event(ConnectionEvent::Error("Generic error".to_string()))
+            .await;
+
         assert!(result.is_err());
         assert_eq!(fsm.current_state(), &ConnectionState::Error);
         assert!(fsm.is_terminal());
@@ -910,14 +956,16 @@ mod tests {
     async fn test_fsm_reset() {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         // Move to Connected state and set secure
-        let _ = fsm.handle_event(ConnectionEvent::ConnectionEstablished).await;
+        let _ = fsm
+            .handle_event(ConnectionEvent::ConnectionEstablished)
+            .await;
         fsm.is_secure = true;
-        
+
         // Reset
         let result = fsm.reset().await;
-        
+
         assert!(result.is_ok());
         assert_eq!(fsm.current_state(), &ConnectionState::Connecting);
         assert!(!fsm.is_secure());
@@ -928,9 +976,9 @@ mod tests {
     fn test_connection_info_without_stream() {
         let tls_handler = MockTlsHandler::new();
         let fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         let info = fsm.connection_info();
-        
+
         assert_eq!(info.remote_addr, "127.0.0.1:1389");
         assert_eq!(info.local_addr, "unknown");
         assert!(!info.is_secure);
@@ -941,9 +989,9 @@ mod tests {
     fn test_debug_implementation() {
         let tls_handler = MockTlsHandler::new();
         let fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler));
-        
+
         let debug_str = format!("{:?}", fsm);
-        
+
         assert!(debug_str.contains("ConnectionFsmImpl"));
         assert!(debug_str.contains("Connecting"));
         assert!(debug_str.contains("127.0.0.1:1389"));
@@ -956,10 +1004,10 @@ mod tests {
         let handler = MockTlsHandler::new()
             .with_tls_support(false)
             .with_handshake_failure("Test error");
-        
+
         assert!(!handler.supports_tls());
         assert_eq!(handler.protocol_version(), "TLSv1.3");
-        
+
         // Test handshake call counting
         assert_eq!(handler.handshake_call_count(), 0);
         // Note: We can't easily test the actual handshake method without a real TcpStream
@@ -967,16 +1015,15 @@ mod tests {
 
     #[test]
     fn test_mock_network_handler() {
-        let handler = MockNetworkHandler::new()
-            .with_connection_failure(std::io::Error::new(
-                std::io::ErrorKind::TimedOut, 
-                "Connection timeout"
-            ));
-        
+        let handler = MockNetworkHandler::new().with_connection_failure(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Connection timeout",
+        ));
+
         assert!(!handler.connect_should_succeed);
         assert_eq!(handler.local_addr, "127.0.0.1:12345");
         assert_eq!(handler.remote_addr, "127.0.0.1:1389");
-        
+
         // Test call tracking
         assert!(handler.connect_calls().is_empty());
     }
@@ -986,12 +1033,12 @@ mod tests {
         let tls_handler = MockTlsHandler::new();
         let mut fsm = ConnectionFsmImpl::new("127.0.0.1:1389", Box::new(tls_handler))
             .with_timeout(Duration::from_millis(1)); // Very short timeout
-        
+
         // Set start time to trigger timeout
         fsm.connect_start = Some(Instant::now() - Duration::from_millis(2));
-        
+
         let result = fsm.handle_event(ConnectionEvent::Connect).await;
-        
+
         assert!(result.is_err());
         if let Err(ConnectionFsmError::Timeout { duration }) = result {
             assert_eq!(duration, Duration::from_millis(1));

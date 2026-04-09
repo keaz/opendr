@@ -505,7 +505,7 @@ impl DirectoryBackend for MockBackend {
             return Err(BackendError::AlreadyExists);
         }
 
-        let renames = plan_dn_renames(&*entries, dn, &target_dn)?;
+        let renames = plan_dn_renames(&entries, dn, &target_dn)?;
 
         // Generate CSN for rename operation
         let csn = self.csn_generator.generate();

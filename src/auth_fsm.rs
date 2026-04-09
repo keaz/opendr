@@ -321,6 +321,12 @@ impl AuthFsmImpl {
     }
 }
 
+impl Default for AuthFsmImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Implementation of StateMachine trait
 #[async_trait]
 impl StateMachine for AuthFsmImpl {
@@ -385,6 +391,7 @@ impl AuthFsm for AuthFsmImpl {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use crate::fsm::StateMachine;
@@ -478,7 +485,7 @@ mod tests {
         };
 
         let fsm = AuthFsmImpl::with_config(config.clone());
-        assert_eq!(fsm.config.allow_anonymous, false);
+        assert!(!fsm.config.allow_anonymous);
         assert_eq!(fsm.config.max_auth_attempts, 5);
     }
 

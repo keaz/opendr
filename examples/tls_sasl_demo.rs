@@ -24,15 +24,14 @@
 //! cargo run --example tls_sasl_demo
 //! ```
 
-use opendr::tls::{TlsConfig, TlsVersion, RustlsTlsHandler};
+use async_trait::async_trait;
+use opendr::connection_fsm::TlsHandler;
+use opendr::fsm::{SaslEvent, SaslFsm, StateMachine};
 use opendr::sasl_fsm::{
-    SaslFsmImpl, SaslMechanismHandler, CredentialVerifier,
-    SaslChallengeResult, SaslFsmConfig,
+    CredentialVerifier, SaslChallengeResult, SaslFsmConfig, SaslFsmImpl, SaslMechanismHandler,
 };
 use opendr::sasl_mechanisms::MultiMechanismHandler;
-use opendr::fsm::{StateMachine, SaslFsm, SaslEvent};
-use opendr::connection_fsm::TlsHandler;
-use async_trait::async_trait;
+use opendr::tls::{RustlsTlsHandler, TlsConfig, TlsVersion};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +46,7 @@ struct DemoCredentialVerifier {
 #[derive(Debug, Clone)]
 struct UserCredentials {
     dn: String,
-    password_hash: String,
+    _password_hash: String,
 }
 
 impl DemoCredentialVerifier {
@@ -59,7 +58,7 @@ impl DemoCredentialVerifier {
             "alice".to_string(),
             UserCredentials {
                 dn: "cn=alice,ou=users,dc=example,dc=org".to_string(),
-                password_hash: "hashed_password_alice".to_string(),
+                _password_hash: "hashed_password_alice".to_string(),
             },
         );
 
@@ -67,7 +66,7 @@ impl DemoCredentialVerifier {
             "bob".to_string(),
             UserCredentials {
                 dn: "cn=bob,ou=users,dc=example,dc=org".to_string(),
-                password_hash: "hashed_password_bob".to_string(),
+                _password_hash: "hashed_password_bob".to_string(),
             },
         );
 
@@ -75,7 +74,7 @@ impl DemoCredentialVerifier {
             "admin".to_string(),
             UserCredentials {
                 dn: "cn=admin,dc=example,dc=org".to_string(),
-                password_hash: "hashed_password_admin".to_string(),
+                _password_hash: "hashed_password_admin".to_string(),
             },
         );
 
@@ -86,22 +85,29 @@ impl DemoCredentialVerifier {
 #[async_trait]
 impl CredentialVerifier for DemoCredentialVerifier {
     async fn verify_credentials(&self, mechanism: &str, identity: &str) -> Result<bool, String> {
-        println!("  [CredentialVerifier] Verifying {} authentication for user: {}",
-                 mechanism, identity);
+        println!(
+            "  [CredentialVerifier] Verifying {} authentication for user: {}",
+            mechanism, identity
+        );
 
         // In production, implement proper credential verification based on mechanism
         Ok(self.users.contains_key(identity))
     }
 
     async fn get_user_dn(&self, identity: &str) -> Result<Option<String>, String> {
-        println!("  [CredentialVerifier] Looking up DN for user: {}", identity);
+        println!(
+            "  [CredentialVerifier] Looking up DN for user: {}",
+            identity
+        );
 
         Ok(self.users.get(identity).map(|creds| creds.dn.clone()))
     }
 
     async fn is_mechanism_allowed(&self, identity: &str, mechanism: &str) -> Result<bool, String> {
-        println!("  [CredentialVerifier] Checking if {} can use {} mechanism",
-                 identity, mechanism);
+        println!(
+            "  [CredentialVerifier] Checking if {} can use {} mechanism",
+            identity, mechanism
+        );
 
         // Admin can use all mechanisms, others only DIGEST-MD5 and CRAM-MD5
         if identity == "admin" {
@@ -129,9 +135,18 @@ async fn demo_tls_setup() {
 
     println!("   - Certificate path: {}", tls_config.cert_path);
     println!("   - Key path: {}", tls_config.key_path);
-    println!("   - Min TLS version: {}", tls_config.min_tls_version.as_str());
-    println!("   - Max TLS version: {}", tls_config.max_tls_version.as_str());
-    println!("   - Require client cert: {}", tls_config.require_client_cert);
+    println!(
+        "   - Min TLS version: {}",
+        tls_config.min_tls_version.as_str()
+    );
+    println!(
+        "   - Max TLS version: {}",
+        tls_config.max_tls_version.as_str()
+    );
+    println!(
+        "   - Require client cert: {}",
+        tls_config.require_client_cert
+    );
 
     // 2. Create TLS handler (using test mode for demo without actual certs)
     println!("\n2. Creating TLS handler (test mode)...");
@@ -180,7 +195,11 @@ async fn demo_sasl_authentication() {
 
     for mechanism in &["PLAIN", "DIGEST-MD5", "CRAM-MD5", "GSSAPI"] {
         let supported = mechanism_handler.supports_mechanism(mechanism).await;
-        println!("     - {}: {}", mechanism, if supported { "✓" } else { "✗" });
+        println!(
+            "     - {}: {}",
+            mechanism,
+            if supported { "✓" } else { "✗" }
+        );
 
         if supported {
             let props = mechanism_handler.get_mechanism_properties(mechanism);
@@ -204,10 +223,7 @@ async fn demo_sasl_authentication() {
 
     // 6. Demonstrate SASL FSM with session management
     println!("\n6. Testing SASL FSM with full session lifecycle...");
-    demo_sasl_fsm_lifecycle(
-        mechanism_handler.clone(),
-        credential_verifier.clone(),
-    ).await;
+    demo_sasl_fsm_lifecycle(mechanism_handler.clone(), credential_verifier.clone()).await;
 }
 
 /// Demonstrate PLAIN mechanism authentication
@@ -217,7 +233,10 @@ async fn demo_plain_authentication(handler: Arc<MultiMechanismHandler>) {
     // PLAIN format: [authzid]\0authcid\0passwd
     let credentials = b"\0alice\0password123";
 
-    match handler.start_authentication("PLAIN", Some(credentials)).await {
+    match handler
+        .start_authentication("PLAIN", Some(credentials))
+        .await
+    {
         Ok(SaslChallengeResult::Success { dn }) => {
             println!("   ✓ Authentication successful!");
             println!("     - Authenticated DN: {}", dn);
@@ -256,7 +275,10 @@ async fn demo_digest_md5_authentication(handler: Arc<MultiMechanismHandler>) {
             println!("     {}", response);
 
             // Step 3: Process response
-            match handler.process_response("DIGEST-MD5", 1, response.as_bytes()).await {
+            match handler
+                .process_response("DIGEST-MD5", 1, response.as_bytes())
+                .await
+            {
                 Ok(SaslChallengeResult::Success { dn }) => {
                     println!("   ✓ Authentication successful!");
                     println!("     - Authenticated DN: {}", dn);
@@ -299,7 +321,10 @@ async fn demo_cram_md5_authentication(handler: Arc<MultiMechanismHandler>) {
             let response = "alice computed-hmac-hash";
             println!("   ← Sending response: {}", response);
 
-            match handler.process_response("CRAM-MD5", 1, response.as_bytes()).await {
+            match handler
+                .process_response("CRAM-MD5", 1, response.as_bytes())
+                .await
+            {
                 Ok(SaslChallengeResult::Success { dn }) => {
                     println!("   ✓ Authentication successful!");
                     println!("     - Authenticated DN: {}", dn);
@@ -320,7 +345,7 @@ async fn demo_cram_md5_authentication(handler: Arc<MultiMechanismHandler>) {
 
 /// Demonstrate complete SASL FSM lifecycle
 async fn demo_sasl_fsm_lifecycle(
-    mechanism_handler: Arc<MultiMechanismHandler>,
+    _mechanism_handler: Arc<MultiMechanismHandler>,
     credential_verifier: Arc<DemoCredentialVerifier>,
 ) {
     println!("   [SASL FSM] Creating FSM with custom configuration...");
@@ -349,15 +374,21 @@ async fn demo_sasl_fsm_lifecycle(
     println!("\n   → Initiating PLAIN authentication...");
     let credentials = b"\0bob\0password456";
 
-    match fsm.handle_event(SaslEvent::InitiateBind {
-        mechanism: "PLAIN".to_string(),
-        initial_data: Some(credentials.to_vec()),
-    }).await {
+    match fsm
+        .handle_event(SaslEvent::InitiateBind {
+            mechanism: "PLAIN".to_string(),
+            initial_data: Some(credentials.to_vec()),
+        })
+        .await
+    {
         Ok(output) => {
             println!("   ✓ Event handled successfully");
             println!("     - State: {:?}", fsm.current_state());
             println!("     - Mechanism: {:?}", fsm.mechanism());
-            println!("     - Authenticated identity: {:?}", fsm.authenticated_identity());
+            println!(
+                "     - Authenticated identity: {:?}",
+                fsm.authenticated_identity()
+            );
             println!("     - Is terminal: {}", fsm.is_terminal());
             println!("     - Needs more steps: {}", fsm.needs_more_steps());
 

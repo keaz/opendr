@@ -8,11 +8,11 @@
 //! cargo run --example config_server_demo
 //! ```
 
-use opendr::config::ServerConfig;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
+use opendr::config::ServerConfig;
 use opendr::fsm_server;
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,7 +60,10 @@ global_requests_per_second = 500
     println!("  Base DN: {}", config.server.base_dn);
     println!("  Backend: {}", config.backend.backend_type);
     println!("  Rate Limiting: {}", config.rate_limit.enabled);
-    println!("  Global Rate Limit: {} req/sec", config.rate_limit.global_requests_per_second);
+    println!(
+        "  Global Rate Limit: {} req/sec",
+        config.rate_limit.global_requests_per_second
+    );
 
     // Validate configuration
     config.validate()?;
@@ -80,14 +83,23 @@ async fn demo_default_config() -> Result<(), Box<dyn std::error::Error>> {
     println!("  LDAPS Address: {}", config.ldaps_bind_address());
     println!("  Base DN: {}", config.server.base_dn);
     println!("  Max Connections: {}", config.resources.max_connections);
-    println!("  Per-IP Limit: {}", config.resources.max_connections_per_ip);
+    println!(
+        "  Per-IP Limit: {}",
+        config.resources.max_connections_per_ip
+    );
     println!("  Operation Timeout: {:?}", config.operation_timeout());
     println!("  Cleanup Interval: {:?}", config.cleanup_interval());
 
     println!("\nRate Limiting:");
     println!("  Enabled: {}", config.rate_limit.enabled);
-    println!("  Global Limit: {} req/sec", config.rate_limit.global_requests_per_second);
-    println!("  Per-Client: {} req/sec", config.rate_limit.per_client_requests_per_second);
+    println!(
+        "  Global Limit: {} req/sec",
+        config.rate_limit.global_requests_per_second
+    );
+    println!(
+        "  Per-Client: {} req/sec",
+        config.rate_limit.per_client_requests_per_second
+    );
     println!("  Adaptive: {}", config.rate_limit.adaptive_enabled);
 
     println!("\nMonitoring:");
@@ -115,16 +127,31 @@ async fn demo_config_conversion() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Rate Limiting: {}", fsm_config.rate_limiting_enabled);
 
     println!("\nResource Limits:");
-    println!("  Max Connections: {}", fsm_config.resource_limits.max_connections);
-    println!("  Per-IP Limit: {}", fsm_config.resource_limits.max_connections_per_ip);
-    println!("  Memory Per Connection: {} bytes", fsm_config.resource_limits.max_memory_per_connection);
+    println!(
+        "  Max Connections: {}",
+        fsm_config.resource_limits.max_connections
+    );
+    println!(
+        "  Per-IP Limit: {}",
+        fsm_config.resource_limits.max_connections_per_ip
+    );
+    println!(
+        "  Memory Per Connection: {} bytes",
+        fsm_config.resource_limits.max_memory_per_connection
+    );
 
     // Convert to rate limit config
     let rate_config = server_config.to_rate_limit_config();
 
     println!("\nRate Limit Config:");
-    println!("  Global: {} req/sec", rate_config.global_requests_per_second);
-    println!("  Per-Client: {} req/sec", rate_config.per_client_requests_per_second);
+    println!(
+        "  Global: {} req/sec",
+        rate_config.global_requests_per_second
+    );
+    println!(
+        "  Per-Client: {} req/sec",
+        rate_config.per_client_requests_per_second
+    );
     println!("  Window: {:?}", rate_config.window_duration);
     println!("  Adaptive: {}", rate_config.adaptive_enabled);
 
@@ -194,15 +221,21 @@ async fn example_run_server_with_config() -> Result<(), Box<dyn std::error::Erro
 
     // Create backend (simplified example)
     let backend: Arc<dyn DirectoryBackend> = {
-        let mut mock = MockBackend::default();
+        let mock = MockBackend::default();
 
         // Initialize base structure
         let base_entry = DirectoryEntry::new(
             &config.server.base_dn,
             HashMap::from([
-                ("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]),
-                ("o".to_string(), vec![config.server.organization_name.clone()]),
-            ])
+                (
+                    "objectClass".to_string(),
+                    vec!["top".to_string(), "organization".to_string()],
+                ),
+                (
+                    "o".to_string(),
+                    vec![config.server.organization_name.clone()],
+                ),
+            ]),
         );
         mock.add_entry(base_entry, vec![]).await?;
 

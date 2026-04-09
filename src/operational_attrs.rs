@@ -15,8 +15,8 @@
 //!   - ["*", "+"] → all user and operational attributes
 //!   - ["cn", "mail", "entryCSN"] → specific user attrs + specific operational attr
 
-use std::collections::HashMap;
 use crate::backend::OperationalAttributes;
+use std::collections::HashMap;
 
 /// Check if the requested attributes include operational attributes
 ///
@@ -39,10 +39,10 @@ pub fn parse_attribute_request(requested_attrs: &[String]) -> (bool, bool, Vec<S
     let mut specific_operational = Vec::new();
 
     let mut has_user_attrs = false;
-    
+
     for attr in requested_attrs {
         let attr_lower = attr.to_lowercase();
-        
+
         match attr_lower.as_str() {
             "*" => include_user = true,
             "+" => include_all_operational = true,
@@ -76,7 +76,8 @@ pub fn filter_operational_attributes(
     operational_attrs: &OperationalAttributes,
     requested_attrs: &[String],
 ) -> HashMap<String, Vec<String>> {
-    let (_, include_all_operational, specific_operational) = parse_attribute_request(requested_attrs);
+    let (_, include_all_operational, specific_operational) =
+        parse_attribute_request(requested_attrs);
 
     // If neither "+" nor specific operational attrs requested, return empty
     if !include_all_operational && specific_operational.is_empty() {
@@ -122,17 +123,15 @@ pub fn filter_user_attributes(
     }
 
     // Return only specifically requested user attributes
-    let requested_lower: Vec<String> = requested_attrs
-        .iter()
-        .map(|a| a.to_lowercase())
-        .collect();
+    let requested_lower: Vec<String> = requested_attrs.iter().map(|a| a.to_lowercase()).collect();
 
     user_attrs
         .iter()
         .filter(|(key, _)| {
             let key_lower = key.to_lowercase();
             // Include if requested and not operational
-            requested_lower.contains(&key_lower) && !OperationalAttributes::is_operational(&key_lower)
+            requested_lower.contains(&key_lower)
+                && !OperationalAttributes::is_operational(&key_lower)
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
@@ -164,8 +163,14 @@ mod tests {
     fn test_parse_empty_request() {
         let (user, operational, specific) = parse_attribute_request(&[]);
         assert!(user, "Empty request should include user attributes");
-        assert!(!operational, "Empty request should not include operational attributes");
-        assert!(specific.is_empty(), "Empty request should have no specific operational attributes");
+        assert!(
+            !operational,
+            "Empty request should not include operational attributes"
+        );
+        assert!(
+            specific.is_empty(),
+            "Empty request should have no specific operational attributes"
+        );
     }
 
     #[test]
@@ -199,8 +204,14 @@ mod tests {
     fn test_parse_specific_operational() {
         let attrs = vec!["entrycsn".to_string(), "modifytimestamp".to_string()];
         let (user, operational, specific) = parse_attribute_request(&attrs);
-        assert!(!user, "Only operational attrs should not include user attributes");
-        assert!(!operational, "Specific operational should not set include_all flag");
+        assert!(
+            !user,
+            "Only operational attrs should not include user attributes"
+        );
+        assert!(
+            !operational,
+            "Specific operational should not set include_all flag"
+        );
         assert_eq!(specific.len(), 2);
         assert!(specific.contains(&"entrycsn".to_string()));
         assert!(specific.contains(&"modifytimestamp".to_string()));
@@ -221,9 +232,12 @@ mod tests {
         let csn = Csn::new(1);
         let op_attrs = OperationalAttributes::for_new_entry(csn, Some("cn=admin".to_string()));
         let requested = vec!["cn".to_string(), "mail".to_string()];
-        
+
         let result = filter_operational_attributes(&op_attrs, &requested);
-        assert!(result.is_empty(), "Should not return operational attrs when not requested");
+        assert!(
+            result.is_empty(),
+            "Should not return operational attrs when not requested"
+        );
     }
 
     #[test]
@@ -231,11 +245,17 @@ mod tests {
         let csn = Csn::new(1);
         let op_attrs = OperationalAttributes::for_new_entry(csn, Some("cn=admin".to_string()));
         let requested = vec!["+".to_string()];
-        
+
         let result = filter_operational_attributes(&op_attrs, &requested);
-        assert!(!result.is_empty(), "Should return operational attrs when '+' requested");
+        assert!(
+            !result.is_empty(),
+            "Should return operational attrs when '+' requested"
+        );
         assert!(result.contains_key("entrycsn"), "Should include entryCSN");
-        assert!(result.contains_key("createtimestamp"), "Should include createTimestamp");
+        assert!(
+            result.contains_key("createtimestamp"),
+            "Should include createTimestamp"
+        );
     }
 
     #[test]
@@ -243,11 +263,18 @@ mod tests {
         let csn = Csn::new(1);
         let op_attrs = OperationalAttributes::for_new_entry(csn, Some("cn=admin".to_string()));
         let requested = vec!["entrycsn".to_string()];
-        
+
         let result = filter_operational_attributes(&op_attrs, &requested);
-        assert_eq!(result.len(), 1, "Should return only requested operational attr");
+        assert_eq!(
+            result.len(),
+            1,
+            "Should return only requested operational attr"
+        );
         assert!(result.contains_key("entrycsn"), "Should include entryCSN");
-        assert!(!result.contains_key("createtimestamp"), "Should not include non-requested attr");
+        assert!(
+            !result.contains_key("createtimestamp"),
+            "Should not include non-requested attr"
+        );
     }
 
     #[test]
@@ -257,10 +284,13 @@ mod tests {
         user_attrs.insert("mail".to_string(), vec!["john@example.com".to_string()]);
 
         let mut op_attrs = HashMap::new();
-        op_attrs.insert("entrycsn".to_string(), vec!["20250107120000.000000Z#000001#000#000000".to_string()]);
+        op_attrs.insert(
+            "entrycsn".to_string(),
+            vec!["20250107120000.000000Z#000001#000#000000".to_string()],
+        );
 
         let result = merge_attributes(user_attrs.clone(), op_attrs.clone());
-        
+
         assert_eq!(result.len(), 3);
         assert_eq!(result.get("cn"), user_attrs.get("cn"));
         assert_eq!(result.get("mail"), user_attrs.get("mail"));

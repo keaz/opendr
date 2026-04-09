@@ -124,25 +124,13 @@ impl ConsumerPushStats {
 }
 
 /// Overall Push Manager statistics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PushManagerStats {
     pub total_changes_pushed: u64,
     pub total_changes_failed: u64,
     pub total_retries: u64,
     pub active_consumers: usize,
     pub started_at: Option<Instant>,
-}
-
-impl Default for PushManagerStats {
-    fn default() -> Self {
-        Self {
-            total_changes_pushed: 0,
-            total_changes_failed: 0,
-            total_retries: 0,
-            active_consumers: 0,
-            started_at: None,
-        }
-    }
 }
 
 /// Manages persistent consumers and pushes changes to them
@@ -728,7 +716,7 @@ mod tests {
     #[test]
     fn test_convert_changelog_to_entry_modify() {
         let change = create_test_change("cn=test,dc=example,dc=com", ChangeType::Modify);
-        let (entry, state) = convert_changelog_to_entry(&change);
+        let (_entry, state) = convert_changelog_to_entry(&change);
 
         assert_eq!(state, SyncState::Modify);
     }
@@ -736,7 +724,7 @@ mod tests {
     #[test]
     fn test_convert_changelog_to_entry_delete() {
         let change = create_test_change("cn=test,dc=example,dc=com", ChangeType::Delete);
-        let (entry, state) = convert_changelog_to_entry(&change);
+        let (_entry, state) = convert_changelog_to_entry(&change);
 
         assert_eq!(state, SyncState::Delete);
     }

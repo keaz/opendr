@@ -3,7 +3,7 @@
 //! These tests verify the rate limiting functionality works correctly
 //! in realistic scenarios with multiple clients and operations.
 
-use opendr::rate_limit::{RateLimiter, RateLimitConfig, OperationType};
+use opendr::rate_limit::{OperationType, RateLimitConfig, RateLimiter};
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -70,7 +70,7 @@ async fn test_burst_handling() {
     }
 
     // Should allow around 10 requests (per-client limit)
-    assert!(allowed >= 9 && allowed <= 11);
+    assert!((9..=11).contains(&allowed));
 
     let stats = limiter.get_stats().await;
     assert_eq!(stats.total_requests, 25);
@@ -100,7 +100,7 @@ async fn test_operation_priority() {
             bind_allowed += 1;
         }
     }
-    assert!(bind_allowed >= 4 && bind_allowed <= 6); // Should be around 5
+    assert!((4..=6).contains(&bind_allowed)); // Should be around 5
 
     // Reset for search test
     sleep(Duration::from_millis(1100)).await;
@@ -112,7 +112,7 @@ async fn test_operation_priority() {
             search_allowed += 1;
         }
     }
-    assert!(search_allowed >= 19 && search_allowed <= 21); // Should be around 20
+    assert!((19..=21).contains(&search_allowed)); // Should be around 20
 }
 
 #[tokio::test]
@@ -362,7 +362,7 @@ async fn test_mixed_operations() {
     let mut modify_count = 0;
 
     for i in 0..20 {
-        let op = match i % 3 {
+        let _op = match i % 3 {
             0 => {
                 if limiter.check_rate_limit(client_ip, "bind").await {
                     bind_count += 1;
@@ -386,8 +386,8 @@ async fn test_mixed_operations() {
 
     // Each operation should be limited independently
     assert!(bind_count <= 4); // ~3 limit
-    assert!(search_count >= 6 && search_count <= 7); // ~10 limit but only ~7 tries
-    assert!(modify_count >= 5 && modify_count <= 6); // ~5 limit
+    assert!((6..=7).contains(&search_count)); // ~10 limit but only ~7 tries
+    assert!((5..=6).contains(&modify_count)); // ~5 limit
 }
 
 #[tokio::test]

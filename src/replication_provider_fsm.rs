@@ -759,6 +759,12 @@ impl StreamingStats {
     }
 }
 
+impl Default for StreamingStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Sync replication request from consumer
 #[derive(Debug, Clone)]
 pub struct SyncRequest {
@@ -951,6 +957,12 @@ impl ReplicationStats {
         } else {
             0.0
         }
+    }
+}
+
+impl Default for ReplicationStats {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1495,11 +1507,8 @@ impl ReplicationProviderFsmImpl {
         let timed_out_consumers: Vec<String> = self
             .sessions
             .iter()
-            .filter_map(|(consumer_id, session)| {
-                session
-                    .is_timed_out(self.config.consumer_timeout)
-                    .then(|| consumer_id.clone())
-            })
+            .filter(|&(_consumer_id, session)| session.is_timed_out(self.config.consumer_timeout))
+            .map(|(consumer_id, _session)| consumer_id.clone())
             .collect();
 
         for consumer_id in timed_out_consumers {
@@ -2392,6 +2401,12 @@ pub mod tests {
         stale_cookies: HashSet<String>,
     }
 
+    impl Default for MockChangelogProvider {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockChangelogProvider {
         pub fn new() -> Self {
             Self {
@@ -2495,6 +2510,12 @@ pub mod tests {
     pub struct MockConsumerRegistry {
         should_fail: bool,
         consumers: HashMap<String, ConsumerConnection>,
+    }
+
+    impl Default for MockConsumerRegistry {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockConsumerRegistry {
@@ -2609,6 +2630,12 @@ pub mod tests {
         sent_entries: Arc<Mutex<Vec<(String, ChangelogEntry)>>>,
     }
 
+    impl Default for MockStreamingManager {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockStreamingManager {
         pub fn new() -> Self {
             Self {
@@ -2693,6 +2720,12 @@ pub mod tests {
 
     pub struct MockSyncRequestHandler {
         should_fail: bool,
+    }
+
+    impl Default for MockSyncRequestHandler {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockSyncRequestHandler {
@@ -2803,10 +2836,11 @@ pub mod tests {
         create_test_fsm().with_metrics(Box::new(MockReplicationMetrics))
     }
 
-    fn create_test_fsm_with_recording_streaming_manager() -> (
-        ReplicationProviderFsmImpl,
-        Arc<Mutex<Vec<(String, ChangelogEntry)>>>,
-    ) {
+    type SentEntryRecord = (String, ChangelogEntry);
+    type SentEntryLog = Arc<Mutex<Vec<SentEntryRecord>>>;
+
+    fn create_test_fsm_with_recording_streaming_manager(
+    ) -> (ReplicationProviderFsmImpl, SentEntryLog) {
         let changelog_provider = Box::new(MockChangelogProvider::new());
         let consumer_registry = Box::new(MockConsumerRegistry::new());
         let streaming_manager = MockStreamingManager::new();

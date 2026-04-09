@@ -184,6 +184,12 @@ pub struct CoordinatorStats {
     pub started_at: Instant,
 }
 
+impl Default for CoordinatorStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CoordinatorStats {
     pub fn new() -> Self {
         Self {
@@ -945,8 +951,10 @@ mod tests {
         let observer = Arc::new(ChangeObserverImpl::new());
         let push_config = PushManagerConfig::default();
         let push_manager = Arc::new(RwLock::new(PushManager::new(observer, push_config)));
-        let mut config = ProviderPushConfig::default();
-        config.max_persistent_consumers = 2; // Set limit to 2
+        let config = ProviderPushConfig {
+            max_persistent_consumers: 2,
+            ..ProviderPushConfig::default()
+        };
 
         let coordinator = ProviderPushCoordinator::with_consumer_factory(
             push_manager,

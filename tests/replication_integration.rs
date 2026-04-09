@@ -16,7 +16,6 @@ use opendr::replication_provider_fsm::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio;
 
 const LOCAL_PROVIDER_URL: &str = "in-memory://provider.example.com";
 

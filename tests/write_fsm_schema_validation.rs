@@ -74,6 +74,12 @@ pub struct TrackingSchemaValidator {
     pub should_fail: bool,
 }
 
+impl Default for TrackingSchemaValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrackingSchemaValidator {
     pub fn new() -> Self {
         Self {

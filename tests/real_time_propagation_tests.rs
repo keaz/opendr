@@ -108,8 +108,10 @@ async fn test_propagation_with_dn_scope_filtering() {
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
 
-    let mut config = PropagationConfig::default();
-    config.enable_filtering = true;
+    let config = PropagationConfig {
+        enable_filtering: true,
+        ..PropagationConfig::default()
+    };
 
     let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
     engine.start().await.unwrap();
@@ -157,8 +159,10 @@ async fn test_propagation_filters_out_of_scope() {
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
 
-    let mut config = PropagationConfig::default();
-    config.enable_filtering = true;
+    let config = PropagationConfig {
+        enable_filtering: true,
+        ..PropagationConfig::default()
+    };
 
     let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
     engine.start().await.unwrap();
@@ -198,8 +202,10 @@ async fn test_propagation_multiple_consumers() {
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
 
-    let mut config = PropagationConfig::default();
-    config.enable_filtering = true;
+    let config = PropagationConfig {
+        enable_filtering: true,
+        ..PropagationConfig::default()
+    };
 
     let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
     engine.start().await.unwrap();
@@ -276,8 +282,10 @@ async fn test_propagation_without_filtering() {
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
 
-    let mut config = PropagationConfig::default();
-    config.enable_filtering = false; // Disable filtering
+    let config = PropagationConfig {
+        enable_filtering: false, // Disable filtering
+        ..PropagationConfig::default()
+    };
 
     let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
     engine.start().await.unwrap();
@@ -318,8 +326,10 @@ async fn test_propagation_statistics() {
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
 
-    let mut config = PropagationConfig::default();
-    config.enable_filtering = true;
+    let config = PropagationConfig {
+        enable_filtering: true,
+        ..PropagationConfig::default()
+    };
 
     let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
     engine.start().await.unwrap();
@@ -536,8 +546,10 @@ async fn test_propagation_latency_tracking() {
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
 
-    let mut config = PropagationConfig::default();
-    config.target_latency = Duration::from_secs(1);
+    let config = PropagationConfig {
+        target_latency: Duration::from_secs(1),
+        ..PropagationConfig::default()
+    };
 
     let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
     engine.start().await.unwrap();
@@ -576,8 +588,10 @@ async fn test_filter_match_rate_calculation() {
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
 
-    let mut config = PropagationConfig::default();
-    config.enable_filtering = true;
+    let config = PropagationConfig {
+        enable_filtering: true,
+        ..PropagationConfig::default()
+    };
 
     let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
     engine.start().await.unwrap();

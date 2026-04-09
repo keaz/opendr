@@ -3,14 +3,10 @@
 //! This example demonstrates schema validation by directly testing the WriteFSM
 //! with various entries that should pass or fail validation.
 
-use opendr::write_fsm::{
-    WriteFsmImpl, WriteFsmConfig, WriteBackend, SchemaValidator, AciChecker,
-    WriteEntry, Modification, WriteFsmError,
-};
-use opendr::schema_adapter::LdapSchemaValidator;
-use opendr::fsm::{StateMachine, WriteOperation, WriteEvent, WriteState};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use opendr::fsm::{StateMachine, WriteEvent, WriteOperation};
+use opendr::schema_adapter::LdapSchemaValidator;
+use opendr::write_fsm::{AciChecker, Modification, SchemaValidator, WriteBackend, WriteFsmImpl};
 
 /// Mock write backend for testing
 #[derive(Debug)]
@@ -38,11 +34,23 @@ impl WriteBackend for MockWriteBackend {
         Ok(())
     }
 
-    async fn modify_entry(&self, _txn_id: &str, _dn: &str, _modifications: &[Modification]) -> Result<(), String> {
+    async fn modify_entry(
+        &self,
+        _txn_id: &str,
+        _dn: &str,
+        _modifications: &[Modification],
+    ) -> Result<(), String> {
         Ok(())
     }
 
-    async fn modify_dn(&self, _txn_id: &str, _dn: &str, _new_rdn: &str, _delete_old: bool, _new_superior: Option<&str>) -> Result<(), String> {
+    async fn modify_dn(
+        &self,
+        _txn_id: &str,
+        _dn: &str,
+        _new_rdn: &str,
+        _delete_old: bool,
+        _new_superior: Option<&str>,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -61,7 +69,11 @@ struct MockAciChecker;
 
 #[async_trait]
 impl AciChecker for MockAciChecker {
-    async fn check_write_permission(&self, _user_dn: Option<&str>, _operation: &WriteOperation) -> Result<(), String> {
+    async fn check_write_permission(
+        &self,
+        _user_dn: Option<&str>,
+        _operation: &WriteOperation,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -77,13 +89,15 @@ async fn test_entry(
     println!("{}", "=".repeat(test_name.len()));
 
     // Start write operation
-    let result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
-        dn: dn.to_string(),
-        entry: entry.as_bytes().to_vec(),
-    })).await;
+    let result = fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+            dn: dn.to_string(),
+            entry: entry.as_bytes().to_vec(),
+        }))
+        .await;
 
-    if result.is_err() {
-        println!("✗ Failed to start write: {:?}", result.unwrap_err());
+    if let Err(err) = result {
+        println!("✗ Failed to start write: {:?}", err);
         println!();
         return;
     }
@@ -146,7 +160,8 @@ description: Valid person entry
         "cn=John Doe,ou=People,dc=example,dc=com",
         valid_person,
         true,
-    ).await;
+    )
+    .await;
 
     // Test 2: Invalid - missing required 'sn' attribute (should fail)
     let missing_sn = r#"dn: cn=Jane Smith,ou=People,dc=example,dc=com
@@ -162,7 +177,8 @@ description: Missing required sn attribute
         "cn=Jane Smith,ou=People,dc=example,dc=com",
         missing_sn,
         false,
-    ).await;
+    )
+    .await;
 
     // Test 3: Invalid - missing required 'cn' attribute (should fail)
     let missing_cn = r#"dn: cn=Test,ou=People,dc=example,dc=com
@@ -178,7 +194,8 @@ description: Missing required cn attribute
         "cn=Test,ou=People,dc=example,dc=com",
         missing_cn,
         false,
-    ).await;
+    )
+    .await;
 
     // Test 4: Invalid - unknown object class (should fail)
     let unknown_class = r#"dn: cn=Test User,ou=People,dc=example,dc=com
@@ -194,7 +211,8 @@ sn: User
         "cn=Test User,ou=People,dc=example,dc=com",
         unknown_class,
         false,
-    ).await;
+    )
+    .await;
 
     // Test 5: Invalid - only abstract object class (should fail)
     let only_abstract = r#"dn: cn=Abstract Only,ou=People,dc=example,dc=com
@@ -208,7 +226,8 @@ cn: Abstract Only
         "cn=Abstract Only,ou=People,dc=example,dc=com",
         only_abstract,
         false,
-    ).await;
+    )
+    .await;
 
     // Test 6: Valid inetOrgPerson entry (should succeed)
     let valid_inetorg = r#"dn: uid=ajohnson,ou=People,dc=example,dc=com
@@ -229,7 +248,8 @@ givenName: Alice
         "uid=ajohnson,ou=People,dc=example,dc=com",
         valid_inetorg,
         true,
-    ).await;
+    )
+    .await;
 
     // Test 7: Valid organizationalUnit entry (should succeed)
     let valid_ou = r#"dn: ou=Engineering,dc=example,dc=com
@@ -245,7 +265,8 @@ description: Engineering Department
         "ou=Engineering,dc=example,dc=com",
         valid_ou,
         true,
-    ).await;
+    )
+    .await;
 
     // Test 8: Valid organization entry (should succeed)
     let valid_org = r#"dn: o=Example Corp,dc=example,dc=com
@@ -261,7 +282,8 @@ description: Example Corporation
         "o=Example Corp,dc=example,dc=com",
         valid_org,
         true,
-    ).await;
+    )
+    .await;
 
     // Test 9: Invalid - missing required 'o' for organization (should fail)
     let missing_o = r#"dn: o=Test Org,dc=example,dc=com
@@ -276,7 +298,8 @@ description: Missing required o attribute
         "o=Test Org,dc=example,dc=com",
         missing_o,
         false,
-    ).await;
+    )
+    .await;
 
     // Test 10: Invalid - missing required 'ou' for organizationalUnit (should fail)
     let missing_ou = r#"dn: ou=Sales,dc=example,dc=com
@@ -291,7 +314,8 @@ description: Missing required ou attribute
         "ou=Sales,dc=example,dc=com",
         missing_ou,
         false,
-    ).await;
+    )
+    .await;
 
     println!("=== Test Summary ===");
     println!();

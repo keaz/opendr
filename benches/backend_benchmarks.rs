@@ -3,7 +3,7 @@
 //! This benchmark suite compares the performance of different backend
 //! implementations, with a focus on read operations.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
 use std::collections::HashMap;
@@ -26,7 +26,8 @@ fn setup_mock_backend() -> Arc<MockBackend> {
                 attributes,
             );
 
-            backend.add_entry(entry, format!("password{}", i).as_bytes().to_vec())
+            backend
+                .add_entry(entry, format!("password{}", i).as_bytes().to_vec())
                 .await
                 .unwrap();
         }
@@ -52,7 +53,8 @@ fn setup_lmdb_backend() -> Arc<LmdbBackend> {
                 attributes,
             );
 
-            backend.add_entry(entry, format!("password{}", i).as_bytes().to_vec())
+            backend
+                .add_entry(entry, format!("password{}", i).as_bytes().to_vec())
                 .await
                 .unwrap();
         }
@@ -71,7 +73,9 @@ fn bench_read_operations(c: &mut Criterion) {
         b.iter(|| {
             let backend = mock_backend.clone();
             rt.block_on(async move {
-                let _ = backend.get_entry(black_box("uid=user500,ou=people,dc=example,dc=org")).await;
+                let _ = backend
+                    .get_entry(black_box("uid=user500,ou=people,dc=example,dc=org"))
+                    .await;
             })
         });
     });
@@ -82,7 +86,9 @@ fn bench_read_operations(c: &mut Criterion) {
         b.iter(|| {
             let backend = lmdb_backend.clone();
             rt.block_on(async move {
-                let _ = backend.get_entry(black_box("uid=user500,ou=people,dc=example,dc=org")).await;
+                let _ = backend
+                    .get_entry(black_box("uid=user500,ou=people,dc=example,dc=org"))
+                    .await;
             })
         });
     });
@@ -100,10 +106,12 @@ fn bench_authentication(c: &mut Criterion) {
         b.iter(|| {
             let backend = mock_backend.clone();
             rt.block_on(async move {
-                let _ = backend.authenticate(
-                    black_box("uid=user500,ou=people,dc=example,dc=org"),
-                    black_box(b"password500")
-                ).await;
+                let _ = backend
+                    .authenticate(
+                        black_box("uid=user500,ou=people,dc=example,dc=org"),
+                        black_box(b"password500"),
+                    )
+                    .await;
             })
         });
     });
@@ -114,10 +122,12 @@ fn bench_authentication(c: &mut Criterion) {
         b.iter(|| {
             let backend = lmdb_backend.clone();
             rt.block_on(async move {
-                let _ = backend.authenticate(
-                    black_box("uid=user500,ou=people,dc=example,dc=org"),
-                    black_box(b"password500")
-                ).await;
+                let _ = backend
+                    .authenticate(
+                        black_box("uid=user500,ou=people,dc=example,dc=org"),
+                        black_box(b"password500"),
+                    )
+                    .await;
             })
         });
     });
@@ -137,10 +147,12 @@ fn bench_search_operations(c: &mut Criterion) {
         b.iter(|| {
             let backend = mock_backend.clone();
             rt.block_on(async move {
-                let _ = backend.search_entries(
-                    black_box("ou=people,dc=example,dc=org"),
-                    black_box(SearchScope(2))
-                ).await;
+                let _ = backend
+                    .search_entries(
+                        black_box("ou=people,dc=example,dc=org"),
+                        black_box(SearchScope(2)),
+                    )
+                    .await;
             })
         });
     });
@@ -162,5 +174,10 @@ fn bench_search_operations(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_read_operations, bench_authentication, bench_search_operations);
+criterion_group!(
+    benches,
+    bench_read_operations,
+    bench_authentication,
+    bench_search_operations
+);
 criterion_main!(benches);

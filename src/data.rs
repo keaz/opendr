@@ -17,6 +17,7 @@ pub struct Attribute {
 }
 
 impl LdapEntry {
+    #[allow(dead_code)]
     fn new(dn: String, attributes: Vec<Attribute>) -> Self {
         LdapEntry { dn, attributes }
     }
@@ -37,17 +38,20 @@ impl LdapEntry {
     }
 }
 
+#[allow(dead_code)]
 async fn save_ldap_entry(entry: &LdapEntry) -> std::io::Result<()> {
     let path = dn_to_path(&entry.dn).await;
     fs::create_dir_all(path.parent().unwrap()).await?;
     entry.to_file(&path).await
 }
 
+#[allow(dead_code)]
 async fn load_ldap_entry(dn: &str) -> std::io::Result<LdapEntry> {
     let path = dn_to_path(dn).await;
     LdapEntry::from_file(&path).await
 }
 
+#[allow(dead_code)]
 async fn dn_to_path(dn: &str) -> PathBuf {
     let components: Vec<&str> = dn.split(',').collect();
     let mut path = PathBuf::new();

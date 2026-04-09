@@ -13,21 +13,21 @@ use std::time::Duration;
 
 use opendr::backend::{DirectoryBackend, DirectoryEntry};
 use opendr::backend_lmdb::LmdbBackend;
-use opendr::setup::{BackendType, SetupConfig, ReplicationConfig};
+use opendr::setup::{BackendType, ReplicationConfig, SetupConfig};
 use tempfile::TempDir;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
 
 /// Helper function to initialize LMDB backend with test data
 async fn create_test_backend(temp_dir: &TempDir) -> LmdbBackend {
-    let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
+    let backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
 
     // Add base DN
     let base_entry = DirectoryEntry::new(
         "dc=test,dc=com",
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organization".to_string()],
+            ),
             ("o".to_string(), vec!["Test Organization".to_string()]),
         ]),
     );
@@ -37,12 +37,18 @@ async fn create_test_backend(temp_dir: &TempDir) -> LmdbBackend {
     let admin_entry = DirectoryEntry::new(
         "cn=admin,dc=test,dc=com",
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
             ("cn".to_string(), vec!["admin".to_string()]),
             ("sn".to_string(), vec!["Administrator".to_string()]),
         ]),
     );
-    backend.add_entry(admin_entry, b"admin123".to_vec()).await.unwrap();
+    backend
+        .add_entry(admin_entry, b"admin123".to_vec())
+        .await
+        .unwrap();
 
     backend
 }
@@ -59,12 +65,22 @@ async fn test_lmdb_backend_initialization() {
     assert!(entry.attributes.contains_key("objectclass"));
 
     // Verify admin entry exists
-    let admin_entry = backend.get_entry("cn=admin,dc=test,dc=com").await.unwrap().unwrap();
+    let admin_entry = backend
+        .get_entry("cn=admin,dc=test,dc=com")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(admin_entry.dn, "cn=admin,dc=test,dc=com");
 
     // Verify authentication works
-    assert!(backend.authenticate("cn=admin,dc=test,dc=com", b"admin123").await.unwrap());
-    assert!(!backend.authenticate("cn=admin,dc=test,dc=com", b"wrong").await.unwrap());
+    assert!(backend
+        .authenticate("cn=admin,dc=test,dc=com", b"admin123")
+        .await
+        .unwrap());
+    assert!(!backend
+        .authenticate("cn=admin,dc=test,dc=com", b"wrong")
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
@@ -73,12 +89,15 @@ async fn test_lmdb_backend_persistence() {
 
     // Create backend and add data
     {
-        let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
+        let backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
 
         let entry = DirectoryEntry::new(
             "dc=persist,dc=test",
             HashMap::from([
-                ("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]),
+                (
+                    "objectClass".to_string(),
+                    vec!["top".to_string(), "organization".to_string()],
+                ),
                 ("o".to_string(), vec!["Persistence Test".to_string()]),
             ]),
         );
@@ -92,7 +111,11 @@ async fn test_lmdb_backend_persistence() {
         let backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
 
         // Verify data persisted
-        let entry = backend.get_entry("dc=persist,dc=test").await.unwrap().unwrap();
+        let entry = backend
+            .get_entry("dc=persist,dc=test")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.dn, "dc=persist,dc=test");
         assert_eq!(entry.attributes["o"][0], "Persistence Test");
     }
@@ -126,58 +149,82 @@ async fn test_lmdb_backend_concurrent_reads() {
 #[tokio::test]
 async fn test_lmdb_backend_add_modify_delete() {
     let temp_dir = TempDir::new().unwrap();
-    let mut backend = create_test_backend(&temp_dir).await;
+    let backend = create_test_backend(&temp_dir).await;
 
     // Add a new entry
     let user_entry = DirectoryEntry::new(
         "uid=testuser,dc=test,dc=com",
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
             ("uid".to_string(), vec!["testuser".to_string()]),
             ("cn".to_string(), vec!["Test User".to_string()]),
             ("sn".to_string(), vec!["User".to_string()]),
         ]),
     );
-    backend.add_entry(user_entry, b"password".to_vec()).await.unwrap();
+    backend
+        .add_entry(user_entry, b"password".to_vec())
+        .await
+        .unwrap();
 
     // Verify entry was added
-    let entry = backend.get_entry("uid=testuser,dc=test,dc=com").await.unwrap().unwrap();
+    let entry = backend
+        .get_entry("uid=testuser,dc=test,dc=com")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(entry.attributes["uid"][0], "testuser");
 
     // Modify the entry
     use opendr::backend::{Modification, ModifyOperation};
-    let modifications = vec![
-        Modification {
-            operation: ModifyOperation::Replace,
-            attribute: "cn".to_string(),
-            values: vec!["Modified User".to_string()],
-        },
-    ];
-    backend.modify_entry("uid=testuser,dc=test,dc=com", modifications).await.unwrap();
+    let modifications = vec![Modification {
+        operation: ModifyOperation::Replace,
+        attribute: "cn".to_string(),
+        values: vec!["Modified User".to_string()],
+    }];
+    backend
+        .modify_entry("uid=testuser,dc=test,dc=com", modifications)
+        .await
+        .unwrap();
 
     // Verify modification
-    let modified_entry = backend.get_entry("uid=testuser,dc=test,dc=com").await.unwrap().unwrap();
+    let modified_entry = backend
+        .get_entry("uid=testuser,dc=test,dc=com")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(modified_entry.attributes["cn"][0], "Modified User");
 
     // Delete the entry
-    backend.delete_entry("uid=testuser,dc=test,dc=com").await.unwrap();
+    backend
+        .delete_entry("uid=testuser,dc=test,dc=com")
+        .await
+        .unwrap();
 
     // Verify entry was deleted
-    let result = backend.get_entry("uid=testuser,dc=test,dc=com").await.unwrap();
+    let result = backend
+        .get_entry("uid=testuser,dc=test,dc=com")
+        .await
+        .unwrap();
     assert!(result.is_none());
 }
 
 #[tokio::test]
 async fn test_lmdb_backend_search_operations() {
     let temp_dir = TempDir::new().unwrap();
-    let mut backend = create_test_backend(&temp_dir).await;
+    let backend = create_test_backend(&temp_dir).await;
 
     // Add multiple entries
     for i in 1..=5 {
         let entry = DirectoryEntry::new(
-            &format!("uid=user{},dc=test,dc=com", i),
+            format!("uid=user{},dc=test,dc=com", i),
             HashMap::from([
-                ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+                (
+                    "objectClass".to_string(),
+                    vec!["top".to_string(), "person".to_string()],
+                ),
                 ("uid".to_string(), vec![format!("user{}", i)]),
                 ("cn".to_string(), vec![format!("User {}", i)]),
                 ("sn".to_string(), vec!["TestUser".to_string()]),
@@ -222,13 +269,21 @@ async fn test_lmdb_backend_password_authentication() {
     let backend = create_test_backend(&temp_dir).await;
 
     // Test successful authentication
-    assert!(backend.authenticate("cn=admin,dc=test,dc=com", b"admin123").await.unwrap());
+    assert!(backend
+        .authenticate("cn=admin,dc=test,dc=com", b"admin123")
+        .await
+        .unwrap());
 
     // Test failed authentication with wrong password
-    assert!(!backend.authenticate("cn=admin,dc=test,dc=com", b"wrongpass").await.unwrap());
+    assert!(!backend
+        .authenticate("cn=admin,dc=test,dc=com", b"wrongpass")
+        .await
+        .unwrap());
 
     // Test failed authentication with non-existent user
-    let result = backend.authenticate("cn=nobody,dc=test,dc=com", b"password").await;
+    let result = backend
+        .authenticate("cn=nobody,dc=test,dc=com", b"password")
+        .await;
     // Should return Ok(false) for non-existent user, or Err
     assert!(result.is_err() || !result.unwrap());
 }
@@ -236,13 +291,16 @@ async fn test_lmdb_backend_password_authentication() {
 #[tokio::test]
 async fn test_lmdb_backend_large_dataset() {
     let temp_dir = TempDir::new().unwrap();
-    let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
+    let backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
 
     // Add base DN
     let base_entry = DirectoryEntry::new(
         "dc=large,dc=test",
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organization".to_string()],
+            ),
             ("o".to_string(), vec!["Large Test".to_string()]),
         ]),
     );
@@ -251,9 +309,12 @@ async fn test_lmdb_backend_large_dataset() {
     // Add 100 entries
     for i in 0..100 {
         let entry = DirectoryEntry::new(
-            &format!("uid=user{:03},dc=large,dc=test", i),
+            format!("uid=user{:03},dc=large,dc=test", i),
             HashMap::from([
-                ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+                (
+                    "objectClass".to_string(),
+                    vec!["top".to_string(), "person".to_string()],
+                ),
                 ("uid".to_string(), vec![format!("user{:03}", i)]),
                 ("cn".to_string(), vec![format!("User Number {}", i)]),
                 ("sn".to_string(), vec!["Batch".to_string()]),
@@ -289,13 +350,16 @@ async fn test_setup_config_with_lmdb_backend() {
     };
 
     // Create backend
-    let mut backend = LmdbBackend::new(&config.data_directory, 100, 1).unwrap();
+    let backend = LmdbBackend::new(&config.data_directory, 100, 1).unwrap();
 
     // Add base structure (similar to what main.rs does)
     let base_entry = DirectoryEntry::new(
         &config.base_dn,
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organization".to_string()],
+            ),
             ("o".to_string(), vec![config.organization_name.clone()]),
         ]),
     );
@@ -306,17 +370,26 @@ async fn test_setup_config_with_lmdb_backend() {
     let root_entry = DirectoryEntry::new(
         &root_dn,
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
             ("cn".to_string(), vec!["manager".to_string()]),
             ("sn".to_string(), vec!["Manager".to_string()]),
         ]),
     );
-    backend.add_entry(root_entry, config.root_password.as_bytes().to_vec()).await.unwrap();
+    backend
+        .add_entry(root_entry, config.root_password.as_bytes().to_vec())
+        .await
+        .unwrap();
 
     // Verify configuration
     let base = backend.get_entry(&config.base_dn).await.unwrap().unwrap();
     assert_eq!(base.attributes["o"][0], "Config Test Org");
 
     // Verify root user authentication
-    assert!(backend.authenticate(&root_dn, config.root_password.as_bytes()).await.unwrap());
+    assert!(backend
+        .authenticate(&root_dn, config.root_password.as_bytes())
+        .await
+        .unwrap());
 }

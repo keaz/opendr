@@ -528,7 +528,10 @@ impl MetricsCollector {
         // Server uptime
         output.push_str("# HELP ldap_server_uptime_seconds Server uptime in seconds\n");
         output.push_str("# TYPE ldap_server_uptime_seconds gauge\n");
-        output.push_str(&format!("ldap_server_uptime_seconds {}\n", self.uptime_seconds()));
+        output.push_str(&format!(
+            "ldap_server_uptime_seconds {}\n",
+            self.uptime_seconds()
+        ));
         output.push('\n');
 
         // Connection metrics
@@ -618,7 +621,11 @@ impl MetricsCollector {
         // Custom counters
         let counters = self.custom_counters.read().unwrap();
         for (name, counter) in counters.iter() {
-            output.push_str(&format!("ldap_custom_counter{{name=\"{}\"}} {}\n", name, counter.load(Ordering::Relaxed)));
+            output.push_str(&format!(
+                "ldap_custom_counter{{name=\"{}\"}} {}\n",
+                name,
+                counter.load(Ordering::Relaxed)
+            ));
         }
         if !counters.is_empty() {
             output.push('\n');
@@ -628,7 +635,11 @@ impl MetricsCollector {
         // Custom gauges
         let gauges = self.custom_gauges.read().unwrap();
         for (name, gauge) in gauges.iter() {
-            output.push_str(&format!("ldap_custom_gauge{{name=\"{}\"}} {}\n", name, gauge.load(Ordering::Relaxed)));
+            output.push_str(&format!(
+                "ldap_custom_gauge{{name=\"{}\"}} {}\n",
+                name,
+                gauge.load(Ordering::Relaxed)
+            ));
         }
 
         output
@@ -653,12 +664,8 @@ impl MetricsCollector {
         }
 
         // Check operation health
-        let mut has_active_ops = false;
         let mut has_failed_ops = false;
         for (op_type, stats) in self.get_all_operation_stats() {
-            if stats.active > 0 {
-                has_active_ops = true;
-            }
             if stats.failures > 0 {
                 has_failed_ops = true;
                 details.push(format!(
@@ -671,17 +678,21 @@ impl MetricsCollector {
 
         let ops_health = if has_failed_ops {
             HealthStatus::Degraded
-        } else if has_active_ops {
-            HealthStatus::Healthy
         } else {
             HealthStatus::Healthy
         };
         components.insert("operations".to_string(), ops_health.clone());
 
         // Overall status
-        let overall_status = if components.values().any(|s| matches!(s, HealthStatus::Unhealthy)) {
+        let overall_status = if components
+            .values()
+            .any(|s| matches!(s, HealthStatus::Unhealthy))
+        {
             HealthStatus::Unhealthy
-        } else if components.values().any(|s| matches!(s, HealthStatus::Degraded)) {
+        } else if components
+            .values()
+            .any(|s| matches!(s, HealthStatus::Degraded))
+        {
             HealthStatus::Degraded
         } else {
             HealthStatus::Healthy
@@ -789,11 +800,7 @@ mod tests {
         assert_eq!(stats.active, 1);
 
         // Complete the operation
-        metrics.record_operation_complete(
-            OperationType::Bind,
-            Duration::from_millis(10),
-            true,
-        );
+        metrics.record_operation_complete(OperationType::Bind, Duration::from_millis(10), true);
 
         let stats = metrics.get_operation_stats(OperationType::Bind).unwrap();
         assert_eq!(stats.count, 1);
@@ -808,11 +815,7 @@ mod tests {
         let metrics = MetricsCollector::new();
 
         metrics.record_operation_start(OperationType::Search, "127.0.0.1:1234");
-        metrics.record_operation_complete(
-            OperationType::Search,
-            Duration::from_millis(5),
-            false,
-        );
+        metrics.record_operation_complete(OperationType::Search, Duration::from_millis(5), false);
 
         let stats = metrics.get_operation_stats(OperationType::Search).unwrap();
         assert_eq!(stats.count, 1);
@@ -842,8 +845,14 @@ mod tests {
         assert_eq!(stats.success, 3);
 
         // Check min/max latencies
-        assert_eq!(stats.min_latency_ns, Duration::from_millis(5).as_nanos() as u64);
-        assert_eq!(stats.max_latency_ns, Duration::from_millis(15).as_nanos() as u64);
+        assert_eq!(
+            stats.min_latency_ns,
+            Duration::from_millis(5).as_nanos() as u64
+        );
+        assert_eq!(
+            stats.max_latency_ns,
+            Duration::from_millis(15).as_nanos() as u64
+        );
 
         // Check average
         let expected_avg = Duration::from_millis(10).as_nanos() as u64;
@@ -925,11 +934,7 @@ mod tests {
         // Record some metrics
         metrics.record_connection_accepted();
         metrics.record_operation_start(OperationType::Bind, "127.0.0.1:1234");
-        metrics.record_operation_complete(
-            OperationType::Bind,
-            Duration::from_millis(10),
-            true,
-        );
+        metrics.record_operation_complete(OperationType::Bind, Duration::from_millis(10), true);
         metrics.record_fsm_state(FsmType::Auth, "authenticated");
 
         let output = metrics.export_prometheus();
@@ -960,11 +965,7 @@ mod tests {
 
         metrics.record_connection_accepted();
         metrics.record_operation_start(OperationType::Bind, "127.0.0.1:1234");
-        metrics.record_operation_complete(
-            OperationType::Bind,
-            Duration::from_millis(10),
-            true,
-        );
+        metrics.record_operation_complete(OperationType::Bind, Duration::from_millis(10), true);
 
         let health = metrics.health_check().await;
         assert!(health.is_healthy());
@@ -977,11 +978,7 @@ mod tests {
 
         metrics.record_connection_accepted();
         metrics.record_operation_start(OperationType::Search, "127.0.0.1:1234");
-        metrics.record_operation_complete(
-            OperationType::Search,
-            Duration::from_millis(10),
-            false,
-        );
+        metrics.record_operation_complete(OperationType::Search, Duration::from_millis(10), false);
 
         let health = metrics.health_check().await;
         assert_eq!(health.status, HealthStatus::Degraded);

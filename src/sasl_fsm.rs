@@ -1,7 +1,7 @@
 //! SASL Bind Finite State Machine Implementation
 //!
 //! This module implements a streaming SASL (Simple Authentication and Security Layer) FSM
-//! for multi-roundtrip challenge/response authentication in LDAP. The FSM manages the 
+//! for multi-roundtrip challenge/response authentication in LDAP. The FSM manages the
 //! complete SASL authentication lifecycle including mechanism negotiation, challenge/response
 //! exchanges, and final authentication verification.
 //!
@@ -20,7 +20,7 @@
 //!
 //! The FSM supports pluggable SASL mechanisms through the `SaslMechanismHandler` trait:
 //! - PLAIN
-//! - DIGEST-MD5 
+//! - DIGEST-MD5
 //! - CRAM-MD5
 //! - GSSAPI (Kerberos)
 //! - Custom mechanisms
@@ -38,12 +38,12 @@
 //! ```rust,no_run
 //! use opendr::sasl_fsm::*;
 //! use opendr::fsm::{StateMachine, SaslState, SaslEvent};
-//! 
+//!
 //! # struct MockSaslMechanismHandler;
 //! # #[async_trait::async_trait]
 //! # impl SaslMechanismHandler for MockSaslMechanismHandler {
 //! #     async fn supports_mechanism(&self, mechanism: &str) -> bool { true }
-//! #     async fn start_authentication(&self, mechanism: &str, initial_data: Option<&[u8]>) -> Result<SaslChallengeResult, String> { 
+//! #     async fn start_authentication(&self, mechanism: &str, initial_data: Option<&[u8]>) -> Result<SaslChallengeResult, String> {
 //! #         Ok(SaslChallengeResult::Challenge(vec![]))
 //! #     }
 //! #     async fn process_response(&self, mechanism: &str, step: u32, response: &[u8]) -> Result<SaslChallengeResult, String> {
@@ -62,7 +62,7 @@
 //! let mechanism_handler = Box::new(MockSaslMechanismHandler);
 //! let credential_verifier = Box::new(MockCredentialVerifier);
 //! let mut fsm = SaslFsmImpl::new(mechanism_handler, credential_verifier);
-//! 
+//!
 //! // Start SASL PLAIN authentication
 //! let result = fsm.handle_event(SaslEvent::InitiateBind {
 //!     mechanism: "PLAIN".to_string(),
@@ -72,7 +72,7 @@
 //! # }
 //! ```
 
-use crate::fsm::{StateMachine, SaslFsm, SaslState, SaslEvent};
+use crate::fsm::{SaslEvent, SaslFsm, SaslState, StateMachine};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -83,31 +83,31 @@ use thiserror::Error;
 pub enum SaslFsmError {
     #[error("Unsupported SASL mechanism: {mechanism}")]
     UnsupportedMechanism { mechanism: String },
-    
+
     #[error("Invalid state transition from {from:?} to {to:?}")]
     InvalidStateTransition { from: SaslState, to: SaslState },
-    
+
     #[error("Invalid SASL response for mechanism {mechanism} at step {step}")]
     InvalidResponse { mechanism: String, step: u32 },
-    
+
     #[error("Authentication failed: {reason}")]
     AuthenticationFailed { reason: String },
-    
+
     #[error("SASL mechanism error: {message}")]
     MechanismError { message: String },
-    
+
     #[error("Credential verification failed: {message}")]
     CredentialError { message: String },
-    
+
     #[error("Too many authentication attempts")]
     TooManyAttempts,
-    
+
     #[error("Authentication timeout")]
     Timeout,
-    
+
     #[error("No active SASL session")]
     NoActiveSession,
-    
+
     #[error("Generic SASL error: {message}")]
     Generic { message: String },
 }
@@ -124,68 +124,68 @@ pub enum SaslChallengeResult {
 }
 
 /// Trait for handling SASL mechanism-specific operations
-/// 
+///
 /// This trait abstracts the mechanism-specific SASL handling, allowing
 /// different SASL mechanisms to be plugged into the FSM.
 #[async_trait]
 pub trait SaslMechanismHandler: Send + Sync {
     /// Check if a SASL mechanism is supported
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism name (e.g., "PLAIN", "DIGEST-MD5")
-    /// 
+    ///
     /// # Returns
     /// * `true` if the mechanism is supported, `false` otherwise
     async fn supports_mechanism(&self, mechanism: &str) -> bool;
-    
+
     /// Start SASL authentication for a mechanism
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism name
     /// * `initial_data` - Optional initial client data
-    /// 
+    ///
     /// # Returns
     /// * `Ok(SaslChallengeResult)` - Next step in authentication
     /// * `Err(String)` - Error message if authentication fails
     async fn start_authentication(
-        &self, 
-        mechanism: &str, 
-        initial_data: Option<&[u8]>
+        &self,
+        mechanism: &str,
+        initial_data: Option<&[u8]>,
     ) -> Result<SaslChallengeResult, String>;
-    
+
     /// Process a SASL response and generate next challenge or complete authentication
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism name
     /// * `step` - Current step number in the authentication process
     /// * `response` - Client response data
-    /// 
+    ///
     /// # Returns
     /// * `Ok(SaslChallengeResult)` - Next step or completion
     /// * `Err(String)` - Error message if processing fails
     async fn process_response(
-        &self, 
-        mechanism: &str, 
-        step: u32, 
-        response: &[u8]
+        &self,
+        mechanism: &str,
+        step: u32,
+        response: &[u8],
     ) -> Result<SaslChallengeResult, String>;
-    
+
     /// Get mechanism-specific properties
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism name
-    /// 
+    ///
     /// # Returns
     /// * HashMap of mechanism properties
     fn get_mechanism_properties(&self, _mechanism: &str) -> HashMap<String, String> {
         HashMap::new()
     }
-    
+
     /// Get maximum number of steps for a mechanism
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism name
-    /// 
+    ///
     /// # Returns
     /// * Maximum number of authentication steps allowed
     fn max_steps(&self, mechanism: &str) -> u32 {
@@ -200,45 +200,49 @@ pub trait SaslMechanismHandler: Send + Sync {
 }
 
 /// Trait for verifying user credentials
-/// 
+///
 /// This trait abstracts credential verification, allowing different
 /// credential storage backends to be used.
 #[async_trait]
 pub trait CredentialVerifier: Send + Sync {
     /// Verify user credentials for a SASL mechanism
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism used
     /// * `identity` - User identity/username
-    /// 
+    ///
     /// # Returns
     /// * `Ok(true)` if credentials are valid
     /// * `Ok(false)` if credentials are invalid
     /// * `Err(String)` if verification fails
     async fn verify_credentials(&self, mechanism: &str, identity: &str) -> Result<bool, String>;
-    
+
     /// Get the distinguished name for a user identity
-    /// 
+    ///
     /// # Arguments
     /// * `identity` - User identity/username
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Some(dn))` if user exists
     /// * `Ok(None)` if user doesn't exist
     /// * `Err(String)` if lookup fails
     async fn get_user_dn(&self, identity: &str) -> Result<Option<String>, String>;
-    
+
     /// Check if an identity is allowed to use a specific mechanism
-    /// 
+    ///
     /// # Arguments
     /// * `identity` - User identity
     /// * `mechanism` - SASL mechanism
-    /// 
+    ///
     /// # Returns
     /// * `Ok(true)` if mechanism is allowed for user
     /// * `Ok(false)` if mechanism is not allowed
     /// * `Err(String)` if check fails
-    async fn is_mechanism_allowed(&self, _identity: &str, _mechanism: &str) -> Result<bool, String> {
+    async fn is_mechanism_allowed(
+        &self,
+        _identity: &str,
+        _mechanism: &str,
+    ) -> Result<bool, String> {
         // Default implementation allows all mechanisms
         Ok(true)
     }
@@ -289,10 +293,10 @@ pub struct SaslSession {
 
 impl SaslSession {
     /// Create a new SASL session
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism name
-    /// 
+    ///
     /// # Returns
     /// * New SASL session instance
     pub fn new(mechanism: String) -> Self {
@@ -306,22 +310,22 @@ impl SaslSession {
             mechanism_state: HashMap::new(),
         }
     }
-    
+
     /// Increment the step counter
     pub fn increment_step(&mut self) {
         self.step += 1;
     }
-    
+
     /// Record a failed attempt
     pub fn record_failure(&mut self) {
         self.failed_attempts += 1;
     }
-    
+
     /// Check if session has timed out
-    /// 
+    ///
     /// # Arguments
     /// * `timeout` - Timeout duration
-    /// 
+    ///
     /// # Returns
     /// * `true` if session has timed out
     pub fn is_timed_out(&self, timeout: Duration) -> bool {
@@ -330,7 +334,7 @@ impl SaslSession {
 }
 
 /// SASL Bind FSM Implementation
-/// 
+///
 /// This FSM manages the complete SASL authentication lifecycle, including:
 /// - Mechanism negotiation
 /// - Multi-roundtrip challenge/response exchanges
@@ -340,22 +344,22 @@ impl SaslSession {
 pub struct SaslFsmImpl {
     /// Current FSM state
     state: SaslState,
-    
+
     /// Current SASL session (if active)
     session: Option<SaslSession>,
-    
+
     /// SASL mechanism handler for protocol-specific operations
     mechanism_handler: Box<dyn SaslMechanismHandler>,
-    
+
     /// Credential verifier for user authentication
-    credential_verifier: Box<dyn CredentialVerifier>,
-    
+    _credential_verifier: Box<dyn CredentialVerifier>,
+
     /// FSM configuration
     config: SaslFsmConfig,
-    
+
     /// Authenticated user DN (if authentication successful)
     authenticated_dn: Option<String>,
-    
+
     /// Statistics tracking
     total_attempts: u64,
     successful_auths: u64,
@@ -364,11 +368,11 @@ pub struct SaslFsmImpl {
 
 impl SaslFsmImpl {
     /// Create a new SASL FSM instance
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism_handler` - Handler for SASL mechanism operations
     /// * `credential_verifier` - Verifier for user credentials
-    /// 
+    ///
     /// # Returns
     /// * New SASL FSM instance
     pub fn new(
@@ -379,7 +383,7 @@ impl SaslFsmImpl {
             state: SaslState::Initial,
             session: None,
             mechanism_handler,
-            credential_verifier,
+            _credential_verifier: credential_verifier,
             config: SaslFsmConfig::default(),
             authenticated_dn: None,
             total_attempts: 0,
@@ -387,14 +391,14 @@ impl SaslFsmImpl {
             failed_auths: 0,
         }
     }
-    
+
     /// Create a new SASL FSM with custom configuration
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism_handler` - Handler for SASL mechanism operations
     /// * `credential_verifier` - Verifier for user credentials
     /// * `config` - FSM configuration
-    /// 
+    ///
     /// # Returns
     /// * New SASL FSM instance with custom configuration
     pub fn with_config(
@@ -406,7 +410,7 @@ impl SaslFsmImpl {
             state: SaslState::Initial,
             session: None,
             mechanism_handler,
-            credential_verifier,
+            _credential_verifier: credential_verifier,
             config,
             authenticated_dn: None,
             total_attempts: 0,
@@ -414,49 +418,40 @@ impl SaslFsmImpl {
             failed_auths: 0,
         }
     }
-    
+
     /// Get authentication statistics
-    /// 
+    ///
     /// # Returns
     /// * Tuple of (total_attempts, successful_auths, failed_auths)
     pub fn stats(&self) -> (u64, u64, u64) {
-        (self.total_attempts, self.successful_auths, self.failed_auths)
+        (
+            self.total_attempts,
+            self.successful_auths,
+            self.failed_auths,
+        )
     }
-    
-    /// Check if session has timed out
-    /// 
-    /// # Returns
-    /// * `true` if current session has timed out
-    fn is_session_timed_out(&self) -> bool {
-        if let Some(timeout) = self.config.auth_timeout {
-            if let Some(session) = &self.session {
-                return session.is_timed_out(timeout);
-            }
-        }
-        false
-    }
-    
+
     /// Handle SASL bind initiation
-    /// 
+    ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism name
     /// * `initial_data` - Optional initial client data
-    /// 
+    ///
     /// # Returns
     /// * Result containing optional challenge data
     async fn handle_initiate_bind(
-        &mut self, 
-        mechanism: String, 
-        initial_data: Option<Vec<u8>>
+        &mut self,
+        mechanism: String,
+        initial_data: Option<Vec<u8>>,
     ) -> Result<Option<Vec<u8>>, SaslFsmError> {
         self.total_attempts += 1;
-        
+
         // Check if mechanism is supported
         if !self.mechanism_handler.supports_mechanism(&mechanism).await {
             self.failed_auths += 1;
             return Err(SaslFsmError::UnsupportedMechanism { mechanism });
         }
-        
+
         // Check data size limits
         if let Some(data) = &initial_data {
             if data.len() > self.config.max_data_size {
@@ -466,31 +461,35 @@ impl SaslFsmImpl {
                 });
             }
         }
-        
+
         // Start authentication
-        let result = self.mechanism_handler
+        let result = self
+            .mechanism_handler
             .start_authentication(&mechanism, initial_data.as_deref())
             .await
             .map_err(|e| SaslFsmError::MechanismError { message: e })?;
-        
+
         match result {
             SaslChallengeResult::Success { dn } => {
                 // Single-step authentication successful
-                self.state = SaslState::Authenticated { mechanism, dn: dn.clone() };
+                self.state = SaslState::Authenticated {
+                    mechanism,
+                    dn: dn.clone(),
+                };
                 self.authenticated_dn = Some(dn);
                 self.successful_auths += 1;
                 Ok(None)
-            },
+            }
             SaslChallengeResult::Challenge(challenge_data) => {
                 // Multi-step authentication - send challenge
                 let mut session = SaslSession::new(mechanism.clone());
                 session.increment_step();
                 session.last_challenge = Some(challenge_data.clone());
-                
+
                 self.session = Some(session);
                 self.state = SaslState::Challenge { mechanism, step: 1 };
                 Ok(Some(challenge_data))
-            },
+            }
             SaslChallengeResult::Failure(reason) => {
                 self.state = SaslState::Failed;
                 self.failed_auths += 1;
@@ -498,44 +497,44 @@ impl SaslFsmImpl {
             }
         }
     }
-    
+
     /// Handle challenge generation
-    /// 
+    ///
     /// # Arguments
     /// * `challenge_data` - Challenge data to send to client
-    /// 
+    ///
     /// # Returns
     /// * Result indicating success
     async fn handle_challenge_generated(
-        &mut self, 
-        challenge_data: Vec<u8>
+        &mut self,
+        challenge_data: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, SaslFsmError> {
         if let Some(session) = &mut self.session {
             session.last_challenge = Some(challenge_data.clone());
-            
+
             if let SaslState::Challenge { mechanism, step } = &self.state {
-                self.state = SaslState::Response { 
-                    mechanism: mechanism.clone(), 
-                    step: *step 
+                self.state = SaslState::Response {
+                    mechanism: mechanism.clone(),
+                    step: *step,
                 };
             }
-            
+
             Ok(Some(challenge_data))
         } else {
             Err(SaslFsmError::NoActiveSession)
         }
     }
-    
+
     /// Handle client response
-    /// 
+    ///
     /// # Arguments
     /// * `response_data` - Client response data
-    /// 
+    ///
     /// # Returns
     /// * Result containing optional next challenge or completion
     async fn handle_response_received(
-        &mut self, 
-        response_data: Vec<u8>
+        &mut self,
+        response_data: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, SaslFsmError> {
         // Check data size limits
         if response_data.len() > self.config.max_data_size {
@@ -543,7 +542,7 @@ impl SaslFsmImpl {
                 message: format!("Response data too large: {} bytes", response_data.len()),
             });
         }
-        
+
         if let Some(session) = &mut self.session {
             // Check for timeout
             let is_timed_out = if let Some(timeout) = self.config.auth_timeout {
@@ -551,20 +550,20 @@ impl SaslFsmImpl {
             } else {
                 false
             };
-            
+
             if is_timed_out {
                 self.state = SaslState::Failed;
                 self.failed_auths += 1;
                 return Err(SaslFsmError::Timeout);
             }
-            
+
             // Check maximum attempts
             if session.failed_attempts >= self.config.max_attempts {
                 self.state = SaslState::Failed;
                 self.failed_auths += 1;
                 return Err(SaslFsmError::TooManyAttempts);
             }
-            
+
             // Check maximum steps
             let max_steps = self.mechanism_handler.max_steps(&session.mechanism);
             if session.step >= max_steps {
@@ -574,42 +573,43 @@ impl SaslFsmImpl {
                     message: format!("Too many authentication steps: {}", session.step),
                 });
             }
-            
+
             let mechanism = session.mechanism.clone();
             let step = session.step;
-            
+
             // Process the response
-            let result = self.mechanism_handler
+            let result = self
+                .mechanism_handler
                 .process_response(&mechanism, step, &response_data)
                 .await
                 .map_err(|e| SaslFsmError::MechanismError { message: e })?;
-            
+
             match result {
                 SaslChallengeResult::Success { dn } => {
                     // Authentication successful
-                    self.state = SaslState::Authenticated { 
-                        mechanism: mechanism.clone(), 
-                        dn: dn.clone() 
+                    self.state = SaslState::Authenticated {
+                        mechanism: mechanism.clone(),
+                        dn: dn.clone(),
                     };
                     self.authenticated_dn = Some(dn);
                     self.successful_auths += 1;
                     self.session = None; // Clear session
                     Ok(None)
-                },
+                }
                 SaslChallengeResult::Challenge(challenge_data) => {
                     // More steps needed
                     session.increment_step();
                     session.last_challenge = Some(challenge_data.clone());
-                    
-                    self.state = SaslState::Challenge { 
-                        mechanism: mechanism.clone(), 
-                        step: session.step 
+
+                    self.state = SaslState::Challenge {
+                        mechanism: mechanism.clone(),
+                        step: session.step,
                     };
                     Ok(Some(challenge_data))
-                },
+                }
                 SaslChallengeResult::Failure(reason) => {
                     session.record_failure();
-                    
+
                     if session.failed_attempts >= self.config.max_attempts {
                         self.state = SaslState::Failed;
                         self.failed_auths += 1;
@@ -623,22 +623,22 @@ impl SaslFsmImpl {
             Err(SaslFsmError::NoActiveSession)
         }
     }
-    
+
     /// Handle authentication completion
-    /// 
+    ///
     /// # Arguments
     /// * `dn` - Authenticated user DN
-    /// 
+    ///
     /// # Returns
     /// * Result indicating success
     async fn handle_authentication_complete(
-        &mut self, 
-        dn: String
+        &mut self,
+        dn: String,
     ) -> Result<Option<Vec<u8>>, SaslFsmError> {
         if let Some(session) = &self.session {
-            self.state = SaslState::Authenticated { 
-                mechanism: session.mechanism.clone(), 
-                dn: dn.clone() 
+            self.state = SaslState::Authenticated {
+                mechanism: session.mechanism.clone(),
+                dn: dn.clone(),
             };
             self.authenticated_dn = Some(dn);
             self.successful_auths += 1;
@@ -648,9 +648,9 @@ impl SaslFsmImpl {
             Err(SaslFsmError::NoActiveSession)
         }
     }
-    
+
     /// Handle authentication failure
-    /// 
+    ///
     /// # Returns
     /// * Result indicating failure
     async fn handle_authentication_failed(&mut self) -> Result<Option<Vec<u8>>, SaslFsmError> {
@@ -659,8 +659,8 @@ impl SaslFsmImpl {
         if let Some(session) = &mut self.session {
             session.record_failure();
         }
-        Err(SaslFsmError::AuthenticationFailed { 
-            reason: "Authentication failed".to_string() 
+        Err(SaslFsmError::AuthenticationFailed {
+            reason: "Authentication failed".to_string(),
         })
     }
 }
@@ -671,39 +671,44 @@ impl StateMachine for SaslFsmImpl {
     type Event = SaslEvent;
     type Error = SaslFsmError;
     type Output = Vec<u8>; // Challenge data or empty for completion
-    
+
     fn current_state(&self) -> &Self::State {
         &self.state
     }
-    
-    async fn handle_event(&mut self, event: Self::Event) -> Result<Option<Self::Output>, Self::Error> {
+
+    async fn handle_event(
+        &mut self,
+        event: Self::Event,
+    ) -> Result<Option<Self::Output>, Self::Error> {
         match event {
-            SaslEvent::InitiateBind { mechanism, initial_data } => {
-                self.handle_initiate_bind(mechanism, initial_data).await
-            },
+            SaslEvent::InitiateBind {
+                mechanism,
+                initial_data,
+            } => self.handle_initiate_bind(mechanism, initial_data).await,
             SaslEvent::ChallengeGenerated(challenge_data) => {
                 self.handle_challenge_generated(challenge_data).await
-            },
+            }
             SaslEvent::ResponseReceived(response_data) => {
                 self.handle_response_received(response_data).await
-            },
+            }
             SaslEvent::AuthenticationComplete { dn } => {
                 self.handle_authentication_complete(dn).await
-            },
-            SaslEvent::AuthenticationFailed => {
-                self.handle_authentication_failed().await
-            },
+            }
+            SaslEvent::AuthenticationFailed => self.handle_authentication_failed().await,
             SaslEvent::Reset => {
                 self.reset().await?;
                 Ok(None)
-            },
+            }
         }
     }
-    
+
     fn is_terminal(&self) -> bool {
-        matches!(self.state, SaslState::Authenticated { .. } | SaslState::Failed)
+        matches!(
+            self.state,
+            SaslState::Authenticated { .. } | SaslState::Failed
+        )
     }
-    
+
     async fn reset(&mut self) -> Result<(), Self::Error> {
         self.state = SaslState::Initial;
         self.session = None;
@@ -716,17 +721,16 @@ impl StateMachine for SaslFsmImpl {
 impl SaslFsm for SaslFsmImpl {
     fn mechanism(&self) -> Option<&str> {
         match &self.state {
-            SaslState::Challenge { mechanism, .. } |
-            SaslState::Response { mechanism, .. } |
-            SaslState::Authenticated { mechanism, .. } => Some(mechanism),
+            SaslState::Challenge { mechanism, .. }
+            | SaslState::Response { mechanism, .. }
+            | SaslState::Authenticated { mechanism, .. } => Some(mechanism),
             _ => None,
         }
     }
-    
+
     fn step(&self) -> u32 {
         match &self.state {
-            SaslState::Challenge { step, .. } |
-            SaslState::Response { step, .. } => *step,
+            SaslState::Challenge { step, .. } | SaslState::Response { step, .. } => *step,
             SaslState::Authenticated { .. } => {
                 // Authentication completed
                 if let Some(session) = &self.session {
@@ -734,21 +738,25 @@ impl SaslFsm for SaslFsmImpl {
                 } else {
                     0
                 }
-            },
+            }
             _ => 0,
         }
     }
-    
+
     fn authenticated_identity(&self) -> Option<&str> {
         self.authenticated_dn.as_deref()
     }
-    
+
     fn needs_more_steps(&self) -> bool {
-        matches!(self.state, SaslState::Challenge { .. } | SaslState::Response { .. })
+        matches!(
+            self.state,
+            SaslState::Challenge { .. } | SaslState::Response { .. }
+        )
     }
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
@@ -800,18 +808,21 @@ mod tests {
     #[async_trait]
     impl SaslMechanismHandler for MockSaslMechanismHandler {
         async fn supports_mechanism(&self, mechanism: &str) -> bool {
-            self.call_log.lock().unwrap().push(format!("supports_mechanism({})", mechanism));
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("supports_mechanism({})", mechanism));
             self.supported_mechanisms.contains(&mechanism.to_string())
         }
 
         async fn start_authentication(
-            &self, 
-            mechanism: &str, 
-            initial_data: Option<&[u8]>
+            &self,
+            mechanism: &str,
+            initial_data: Option<&[u8]>,
         ) -> Result<SaslChallengeResult, String> {
             self.call_log.lock().unwrap().push(format!(
-                "start_authentication({}, {:?})", 
-                mechanism, 
+                "start_authentication({}, {:?})",
+                mechanism,
                 initial_data.map(|d| d.len())
             ));
 
@@ -820,8 +831,8 @@ mod tests {
             }
 
             if self.steps_needed == 1 {
-                Ok(SaslChallengeResult::Success { 
-                    dn: "cn=testuser,dc=example,dc=org".to_string() 
+                Ok(SaslChallengeResult::Success {
+                    dn: "cn=testuser,dc=example,dc=org".to_string(),
                 })
             } else {
                 Ok(SaslChallengeResult::Challenge(self.challenge_data.clone()))
@@ -829,14 +840,16 @@ mod tests {
         }
 
         async fn process_response(
-            &self, 
-            mechanism: &str, 
-            step: u32, 
-            response: &[u8]
+            &self,
+            mechanism: &str,
+            step: u32,
+            response: &[u8],
         ) -> Result<SaslChallengeResult, String> {
             self.call_log.lock().unwrap().push(format!(
-                "process_response({}, {}, {} bytes)", 
-                mechanism, step, response.len()
+                "process_response({}, {}, {} bytes)",
+                mechanism,
+                step,
+                response.len()
             ));
 
             let mut current_step = self.current_step.lock().unwrap();
@@ -847,8 +860,8 @@ mod tests {
             }
 
             if *current_step >= self.steps_needed {
-                Ok(SaslChallengeResult::Success { 
-                    dn: "cn=testuser,dc=example,dc=org".to_string() 
+                Ok(SaslChallengeResult::Success {
+                    dn: "cn=testuser,dc=example,dc=org".to_string(),
                 })
             } else {
                 Ok(SaslChallengeResult::Challenge(self.challenge_data.clone()))
@@ -885,12 +898,16 @@ mod tests {
 
     #[async_trait]
     impl CredentialVerifier for MockCredentialVerifier {
-        async fn verify_credentials(&self, mechanism: &str, identity: &str) -> Result<bool, String> {
-            self.call_log.lock().unwrap().push(format!(
-                "verify_credentials({}, {})", 
-                mechanism, identity
-            ));
-            
+        async fn verify_credentials(
+            &self,
+            mechanism: &str,
+            identity: &str,
+        ) -> Result<bool, String> {
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("verify_credentials({}, {})", mechanism, identity));
+
             if self.should_succeed {
                 Ok(true)
             } else {
@@ -899,8 +916,11 @@ mod tests {
         }
 
         async fn get_user_dn(&self, identity: &str) -> Result<Option<String>, String> {
-            self.call_log.lock().unwrap().push(format!("get_user_dn({})", identity));
-            
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("get_user_dn({})", identity));
+
             if self.should_succeed {
                 Ok(Some(self.user_dn.clone()))
             } else {
@@ -947,19 +967,27 @@ mod tests {
         let credential_verifier = Box::new(MockCredentialVerifier::new());
         let mut fsm = SaslFsmImpl::new(mechanism_handler, credential_verifier);
 
-        let result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "PLAIN".to_string(),
-            initial_data: Some(b"\0testuser\0password".to_vec()),
-        }).await;
+        let result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "PLAIN".to_string(),
+                initial_data: Some(b"\0testuser\0password".to_vec()),
+            })
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None); // No challenge data for successful single-step
-        assert_eq!(fsm.current_state(), &SaslState::Authenticated {
-            mechanism: "PLAIN".to_string(),
-            dn: "cn=testuser,dc=example,dc=org".to_string(),
-        });
+        assert_eq!(
+            fsm.current_state(),
+            &SaslState::Authenticated {
+                mechanism: "PLAIN".to_string(),
+                dn: "cn=testuser,dc=example,dc=org".to_string(),
+            }
+        );
         assert_eq!(fsm.mechanism(), Some("PLAIN"));
-        assert_eq!(fsm.authenticated_identity(), Some("cn=testuser,dc=example,dc=org"));
+        assert_eq!(
+            fsm.authenticated_identity(),
+            Some("cn=testuser,dc=example,dc=org")
+        );
         assert!(!fsm.needs_more_steps());
         assert!(fsm.is_terminal());
 
@@ -976,26 +1004,31 @@ mod tests {
         let mut fsm = SaslFsmImpl::new(mechanism_handler, credential_verifier);
 
         // Step 1: Initiate bind
-        let result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "DIGEST-MD5".to_string(),
-            initial_data: None,
-        }).await;
+        let result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "DIGEST-MD5".to_string(),
+                initial_data: None,
+            })
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(vec![1, 2, 3, 4])); // Challenge data
-        assert_eq!(fsm.current_state(), &SaslState::Challenge {
-            mechanism: "DIGEST-MD5".to_string(),
-            step: 1,
-        });
+        assert_eq!(
+            fsm.current_state(),
+            &SaslState::Challenge {
+                mechanism: "DIGEST-MD5".to_string(),
+                step: 1,
+            }
+        );
         assert_eq!(fsm.mechanism(), Some("DIGEST-MD5"));
         assert_eq!(fsm.step(), 1);
         assert!(fsm.needs_more_steps());
         assert!(!fsm.is_terminal());
 
         // Step 2: Send response - this should generate another challenge since we need 2 steps total
-        let result = fsm.handle_event(SaslEvent::ResponseReceived(
-            b"client response".to_vec()
-        )).await;
+        let result = fsm
+            .handle_event(SaslEvent::ResponseReceived(b"client response".to_vec()))
+            .await;
 
         assert!(result.is_ok());
         // For 2-step auth: step 1 sends challenge, step 2 processes and completes
@@ -1007,27 +1040,36 @@ mod tests {
         if result_data.is_some() {
             // Another challenge - need one more step
             assert_eq!(result_data, Some(vec![1, 2, 3, 4]));
-            assert_eq!(fsm.current_state(), &SaslState::Challenge {
-                mechanism: "DIGEST-MD5".to_string(),
-                step: 2,
-            });
-            
+            assert_eq!(
+                fsm.current_state(),
+                &SaslState::Challenge {
+                    mechanism: "DIGEST-MD5".to_string(),
+                    step: 2,
+                }
+            );
+
             // Step 3: Final response
-            let result = fsm.handle_event(SaslEvent::ResponseReceived(
-                b"final response".to_vec()
-            )).await;
-            
+            let result = fsm
+                .handle_event(SaslEvent::ResponseReceived(b"final response".to_vec()))
+                .await;
+
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), None); // Authentication complete
         } else {
             // Authentication completed in one response step
         }
-        
-        assert_eq!(fsm.current_state(), &SaslState::Authenticated {
-            mechanism: "DIGEST-MD5".to_string(),
-            dn: "cn=testuser,dc=example,dc=org".to_string(),
-        });
-        assert_eq!(fsm.authenticated_identity(), Some("cn=testuser,dc=example,dc=org"));
+
+        assert_eq!(
+            fsm.current_state(),
+            &SaslState::Authenticated {
+                mechanism: "DIGEST-MD5".to_string(),
+                dn: "cn=testuser,dc=example,dc=org".to_string(),
+            }
+        );
+        assert_eq!(
+            fsm.authenticated_identity(),
+            Some("cn=testuser,dc=example,dc=org")
+        );
         assert!(!fsm.needs_more_steps());
         assert!(fsm.is_terminal());
 
@@ -1043,13 +1085,18 @@ mod tests {
         let credential_verifier = Box::new(MockCredentialVerifier::new());
         let mut fsm = SaslFsmImpl::new(mechanism_handler, credential_verifier);
 
-        let result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "UNSUPPORTED".to_string(),
-            initial_data: None,
-        }).await;
+        let result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "UNSUPPORTED".to_string(),
+                initial_data: None,
+            })
+            .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SaslFsmError::UnsupportedMechanism { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SaslFsmError::UnsupportedMechanism { .. }
+        ));
         assert_eq!(fsm.current_state(), &SaslState::Initial);
 
         let (total, success, failed) = fsm.stats();
@@ -1064,13 +1111,18 @@ mod tests {
         let credential_verifier = Box::new(MockCredentialVerifier::new());
         let mut fsm = SaslFsmImpl::new(mechanism_handler, credential_verifier);
 
-        let result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "PLAIN".to_string(),
-            initial_data: Some(b"\0baduser\0badpass".to_vec()),
-        }).await;
+        let result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "PLAIN".to_string(),
+                initial_data: Some(b"\0baduser\0badpass".to_vec()),
+            })
+            .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SaslFsmError::AuthenticationFailed { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SaslFsmError::AuthenticationFailed { .. }
+        ));
         assert_eq!(fsm.current_state(), &SaslState::Failed);
         assert!(fsm.is_terminal());
 
@@ -1091,10 +1143,12 @@ mod tests {
         let mut fsm = SaslFsmImpl::with_config(mechanism_handler, credential_verifier, config);
 
         let large_data = vec![0u8; 20]; // Exceeds limit
-        let result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "PLAIN".to_string(),
-            initial_data: Some(large_data),
-        }).await;
+        let result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "PLAIN".to_string(),
+                initial_data: Some(large_data),
+            })
+            .await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), SaslFsmError::Generic { .. }));
@@ -1108,15 +1162,21 @@ mod tests {
         let mut fsm = SaslFsmImpl::new(mechanism_handler, credential_verifier);
 
         // Start authentication
-        let _result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "DIGEST-MD5".to_string(),
-            initial_data: None,
-        }).await.unwrap();
+        let _result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "DIGEST-MD5".to_string(),
+                initial_data: None,
+            })
+            .await
+            .unwrap();
 
-        assert_eq!(fsm.current_state(), &SaslState::Challenge {
-            mechanism: "DIGEST-MD5".to_string(),
-            step: 1,
-        });
+        assert_eq!(
+            fsm.current_state(),
+            &SaslState::Challenge {
+                mechanism: "DIGEST-MD5".to_string(),
+                step: 1,
+            }
+        );
 
         // Reset FSM
         let result = fsm.handle_event(SaslEvent::Reset).await;
@@ -1134,21 +1194,29 @@ mod tests {
         let mut fsm = SaslFsmImpl::new(mechanism_handler, credential_verifier);
 
         // Start with initial bind that creates a challenge
-        let _result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "DIGEST-MD5".to_string(),
-            initial_data: None,
-        }).await.unwrap();
+        let _result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "DIGEST-MD5".to_string(),
+                initial_data: None,
+            })
+            .await
+            .unwrap();
 
         // Generate additional challenge
         let challenge_data = vec![5, 6, 7, 8];
-        let result = fsm.handle_event(SaslEvent::ChallengeGenerated(challenge_data.clone())).await;
+        let result = fsm
+            .handle_event(SaslEvent::ChallengeGenerated(challenge_data.clone()))
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(challenge_data));
-        assert_eq!(fsm.current_state(), &SaslState::Response {
-            mechanism: "DIGEST-MD5".to_string(),
-            step: 1,
-        });
+        assert_eq!(
+            fsm.current_state(),
+            &SaslState::Response {
+                mechanism: "DIGEST-MD5".to_string(),
+                step: 1,
+            }
+        );
     }
 
     #[tokio::test]
@@ -1158,23 +1226,31 @@ mod tests {
         let mut fsm = SaslFsmImpl::new(mechanism_handler, credential_verifier);
 
         // Start authentication
-        let _result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "DIGEST-MD5".to_string(),
-            initial_data: None,
-        }).await.unwrap();
+        let _result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "DIGEST-MD5".to_string(),
+                initial_data: None,
+            })
+            .await
+            .unwrap();
 
         // Complete authentication directly
         let test_dn = "cn=testuser,dc=example,dc=org".to_string();
-        let result = fsm.handle_event(SaslEvent::AuthenticationComplete {
-            dn: test_dn.clone(),
-        }).await;
+        let result = fsm
+            .handle_event(SaslEvent::AuthenticationComplete {
+                dn: test_dn.clone(),
+            })
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
-        assert_eq!(fsm.current_state(), &SaslState::Authenticated {
-            mechanism: "DIGEST-MD5".to_string(),
-            dn: test_dn.clone(),
-        });
+        assert_eq!(
+            fsm.current_state(),
+            &SaslState::Authenticated {
+                mechanism: "DIGEST-MD5".to_string(),
+                dn: test_dn.clone(),
+            }
+        );
         assert_eq!(fsm.authenticated_identity(), Some(test_dn.as_str()));
         assert!(fsm.is_terminal());
     }
@@ -1188,7 +1264,10 @@ mod tests {
         let result = fsm.handle_event(SaslEvent::AuthenticationFailed).await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SaslFsmError::AuthenticationFailed { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SaslFsmError::AuthenticationFailed { .. }
+        ));
         assert_eq!(fsm.current_state(), &SaslState::Failed);
         assert!(fsm.is_terminal());
     }
@@ -1196,23 +1275,23 @@ mod tests {
     #[tokio::test]
     async fn test_sasl_session() {
         let mut session = SaslSession::new("DIGEST-MD5".to_string());
-        
+
         assert_eq!(session.mechanism, "DIGEST-MD5");
         assert_eq!(session.step, 0);
         assert_eq!(session.identity, None);
         assert_eq!(session.failed_attempts, 0);
-        
+
         session.increment_step();
         assert_eq!(session.step, 1);
-        
+
         session.record_failure();
         assert_eq!(session.failed_attempts, 1);
-        
+
         // Test timeout
         let very_short_timeout = Duration::from_nanos(1);
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert!(session.is_timed_out(very_short_timeout));
-        
+
         let long_timeout = Duration::from_secs(3600);
         assert!(!session.is_timed_out(long_timeout));
     }
@@ -1224,13 +1303,19 @@ mod tests {
         let credential_verifier = Box::new(MockCredentialVerifier::new());
         let mut fsm = SaslFsmImpl::new(Box::new(mechanism_handler), credential_verifier);
 
-        let _result = fsm.handle_event(SaslEvent::InitiateBind {
-            mechanism: "PLAIN".to_string(),
-            initial_data: Some(b"test".to_vec()),
-        }).await;
+        let _result = fsm
+            .handle_event(SaslEvent::InitiateBind {
+                mechanism: "PLAIN".to_string(),
+                initial_data: Some(b"test".to_vec()),
+            })
+            .await;
 
         let calls = call_log.lock().unwrap();
-        assert!(calls.iter().any(|call| call.contains("supports_mechanism(PLAIN)")));
-        assert!(calls.iter().any(|call| call.contains("start_authentication(PLAIN")));
+        assert!(calls
+            .iter()
+            .any(|call| call.contains("supports_mechanism(PLAIN)")));
+        assert!(calls
+            .iter()
+            .any(|call| call.contains("start_authentication(PLAIN")));
     }
 }

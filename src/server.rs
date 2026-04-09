@@ -185,7 +185,7 @@ enum RejectionResponse {
 
 pub enum ConnectionStream {
     Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
     Closed,
 }
 
@@ -195,7 +195,7 @@ impl ConnectionStream {
     }
 
     fn tls(stream: TlsStream<TcpStream>) -> Self {
-        Self::Tls(stream)
+        Self::Tls(Box::new(stream))
     }
 
     fn is_secure(&self) -> bool {
@@ -230,7 +230,7 @@ impl ConnectionStream {
 
         match tls_handler.accept(plain_stream).await {
             Ok(stream) => {
-                *self = Self::Tls(stream);
+                *self = Self::Tls(Box::new(stream));
                 Ok(())
             }
             Err(err) => {
@@ -690,25 +690,6 @@ pub async fn handle_client(
     .await;
 }
 
-async fn handle_client_with_metrics(
-    socket: TcpStream,
-    backend: Arc<dyn DirectoryBackend>,
-    schema: Arc<LdapSchema>,
-    metrics: Option<Arc<MetricsCollector>>,
-    controls: Option<ConnectionControls>,
-) {
-    handle_client_with_metrics_and_tls(
-        ConnectionStream::plain(socket),
-        backend,
-        schema,
-        None,
-        metrics,
-        controls,
-        RequestContext::default(),
-    )
-    .await;
-}
-
 async fn handle_client_with_metrics_and_tls(
     mut socket: ConnectionStream,
     backend: Arc<dyn DirectoryBackend>,
@@ -833,7 +814,7 @@ async fn handle_client_with_metrics_and_tls(
                                                 let result = send_rejection_response(
                                                     &mut socket,
                                                     message.message_id.0,
-                                                    response_kind.clone(),
+                                                    response_kind,
                                                     ResultCode::Busy,
                                                     "Rate limit exceeded - please slow down",
                                                 )
@@ -863,7 +844,7 @@ async fn handle_client_with_metrics_and_tls(
                                         let result = send_rejection_response(
                                             &mut socket,
                                             message.message_id.0,
-                                            response_kind.clone(),
+                                            response_kind,
                                             ResultCode::Busy,
                                             "Server is busy - operation limit exceeded",
                                         )
@@ -1373,6 +1354,7 @@ fn is_root_dn(session: &ConnectionSession, request_context: &RequestContext) -> 
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn log_generic_audit_event(
     request_context: &RequestContext,
     session: &ConnectionSession,
@@ -1531,6 +1513,7 @@ async fn log_authz_denial(
         .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn authorize_operation(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -3036,13 +3019,10 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
         let op_attrs = &entry.operational_attributes;
 
         // entryCSN
-        if (include_all_operational || requested.iter().any(|a| a.eq_ignore_ascii_case("entrycsn")))
-            && op_attrs.entry_csn.is_some()
-        {
-            selected.push((
-                "entryCSN".to_string(),
-                vec![op_attrs.entry_csn.as_ref().unwrap().to_ldap_string()],
-            ));
+        if include_all_operational || requested.iter().any(|a| a.eq_ignore_ascii_case("entrycsn")) {
+            if let Some(entry_csn) = op_attrs.entry_csn.as_ref() {
+                selected.push(("entryCSN".to_string(), vec![entry_csn.to_ldap_string()]));
+            }
         }
 
         // createTimestamp

@@ -11,8 +11,8 @@
 //! - File I/O and persistence
 
 use opendr::audit::{
-    AuditConfig, AuditEvent, AuditEventType, AuditFormat, AuditLevel, AuditLogger,
-    AuthOperation, ModifyOperation,
+    AuditConfig, AuditEvent, AuditEventType, AuditFormat, AuditLevel, AuditLogger, AuthOperation,
+    ModifyOperation,
 };
 use std::fs;
 use tempfile::NamedTempFile;
@@ -53,10 +53,7 @@ fn test_audit_event_builder_pattern() {
     .with_detail("operation", "write")
     .with_detail("attribute", "userPassword");
 
-    assert_eq!(
-        event.user_dn.as_deref(),
-        Some("cn=user,dc=example,dc=com")
-    );
+    assert_eq!(event.user_dn.as_deref(), Some("cn=user,dc=example,dc=com"));
     assert_eq!(
         event.target_dn.as_deref(),
         Some("cn=admin,dc=example,dc=com")
@@ -205,44 +202,54 @@ async fn test_audit_logger_level_filtering() {
     logger.initialize().await.unwrap();
 
     // Debug event (should be filtered out)
-    logger.log_event(AuditEvent::new(
-        AuditLevel::Debug,
-        AuditEventType::Connection,
-        "debug_event".to_string(),
-        true,
-    )).await;
+    logger
+        .log_event(AuditEvent::new(
+            AuditLevel::Debug,
+            AuditEventType::Connection,
+            "debug_event".to_string(),
+            true,
+        ))
+        .await;
 
     // Info event (should be filtered out)
-    logger.log_event(AuditEvent::new(
-        AuditLevel::Info,
-        AuditEventType::Authentication,
-        "info_event".to_string(),
-        true,
-    )).await;
+    logger
+        .log_event(AuditEvent::new(
+            AuditLevel::Info,
+            AuditEventType::Authentication,
+            "info_event".to_string(),
+            true,
+        ))
+        .await;
 
     // Warning event (should be logged)
-    logger.log_event(AuditEvent::new(
-        AuditLevel::Warning,
-        AuditEventType::Authorization,
-        "warning_event".to_string(),
-        false,
-    )).await;
+    logger
+        .log_event(AuditEvent::new(
+            AuditLevel::Warning,
+            AuditEventType::Authorization,
+            "warning_event".to_string(),
+            false,
+        ))
+        .await;
 
     // Error event (should be logged)
-    logger.log_event(AuditEvent::new(
-        AuditLevel::Error,
-        AuditEventType::DataModification,
-        "error_event".to_string(),
-        false,
-    )).await;
+    logger
+        .log_event(AuditEvent::new(
+            AuditLevel::Error,
+            AuditEventType::DataModification,
+            "error_event".to_string(),
+            false,
+        ))
+        .await;
 
     // Critical event (should be logged)
-    logger.log_event(AuditEvent::new(
-        AuditLevel::Critical,
-        AuditEventType::System,
-        "critical_event".to_string(),
-        false,
-    )).await;
+    logger
+        .log_event(AuditEvent::new(
+            AuditLevel::Critical,
+            AuditEventType::System,
+            "critical_event".to_string(),
+            false,
+        ))
+        .await;
 
     assert_eq!(logger.events_logged().await, 3); // Only Warning, Error, Critical
 }
@@ -562,7 +569,7 @@ async fn test_json_format_output() {
     let content = fs::read_to_string(temp_file.path()).unwrap();
 
     // Verify it's valid JSON
-    assert!(serde_json::from_str::<serde_json::Value>(&content.trim()).is_ok());
+    assert!(serde_json::from_str::<serde_json::Value>(content.trim()).is_ok());
 }
 
 #[tokio::test]

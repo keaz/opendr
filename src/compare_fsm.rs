@@ -1100,6 +1100,7 @@ impl CompareFsm for CompareFsmImpl {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
@@ -1918,6 +1919,6 @@ mod tests {
 
         assert!(session.entry_read_duration().is_some());
         assert!(session.comparison_duration().is_some());
-        assert!(session.total_duration().as_millis() >= 0);
+        assert!(session.total_duration() <= Duration::from_secs(1));
     }
 }

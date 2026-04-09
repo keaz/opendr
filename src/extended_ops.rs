@@ -4,13 +4,13 @@
 //! including StartTLS, Password Modify, WhoAmI, and Cancel.
 
 use crate::extended_op_fsm::{
-    ExtendedOpBackend, ExtendedOpParser, ExtendedOpDelegator,
-    ExtendedOpAccessControl, ExtendedOpMetrics, ParsedOperation, ExtendedOperationType,
+    ExtendedOpAccessControl, ExtendedOpBackend, ExtendedOpDelegator, ExtendedOpMetrics,
+    ExtendedOpParser, ExtendedOperationType, ParsedOperation,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// OIDs for standard extended operations
 pub mod oids {
@@ -106,11 +106,9 @@ impl StandardExtendedOpBackend {
             })
             .collect();
 
-        let user_dn = parts.get("userIdentity")
-            .ok_or("Missing userIdentity")?;
+        let user_dn = parts.get("userIdentity").ok_or("Missing userIdentity")?;
         let old_password = parts.get("oldPassword").map(|s| s.as_str());
-        let new_password = parts.get("newPassword")
-            .ok_or("Missing newPassword")?;
+        let new_password = parts.get("newPassword").ok_or("Missing newPassword")?;
 
         // Modify password
         self.password_modifier
@@ -134,10 +132,13 @@ impl StandardExtendedOpBackend {
         // Parse message ID (simplified)
         let message_id_str = String::from_utf8(data.to_vec())
             .map_err(|e| format!("Invalid message ID encoding: {}", e))?;
-        let message_id: i32 = message_id_str.parse()
+        let message_id: i32 = message_id_str
+            .parse()
             .map_err(|e| format!("Invalid message ID: {}", e))?;
 
-        self.operation_canceller.cancel_operation(message_id).await?;
+        self.operation_canceller
+            .cancel_operation(message_id)
+            .await?;
 
         Ok(vec![])
     }
@@ -156,11 +157,9 @@ impl ExtendedOpBackend for StandardExtendedOpBackend {
     }
 
     fn is_operation_supported(&self, oid: &str) -> bool {
-        matches!(oid,
-            oids::START_TLS |
-            oids::PASSWORD_MODIFY |
-            oids::WHO_AM_I |
-            oids::CANCEL
+        matches!(
+            oid,
+            oids::START_TLS | oids::PASSWORD_MODIFY | oids::WHO_AM_I | oids::CANCEL
         )
     }
 
@@ -366,8 +365,11 @@ mod tests {
             Arc::new(MockOperationCanceller),
         );
 
-        let request = b"userIdentity=cn=testuser,dc=example,dc=org|oldPassword=old123|newPassword=new456";
-        let result = backend.execute_operation(oids::PASSWORD_MODIFY, Some(request)).await;
+        let request =
+            b"userIdentity=cn=testuser,dc=example,dc=org|oldPassword=old123|newPassword=new456";
+        let result = backend
+            .execute_operation(oids::PASSWORD_MODIFY, Some(request))
+            .await;
         if let Err(ref e) = result {
             eprintln!("Password modify failed: {}", e);
         }
@@ -382,7 +384,9 @@ mod tests {
         );
 
         let message_id = b"42";
-        let result = backend.execute_operation(oids::CANCEL, Some(message_id)).await;
+        let result = backend
+            .execute_operation(oids::CANCEL, Some(message_id))
+            .await;
         assert!(result.is_ok());
     }
 

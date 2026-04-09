@@ -102,11 +102,7 @@ async fn demo_operation_metrics(metrics: &MetricsCollector) {
     for i in 1..=3 {
         metrics.record_operation_start(OperationType::Bind, &format!("client-{}", i));
         sleep(Duration::from_millis(5)).await;
-        metrics.record_operation_complete(
-            OperationType::Bind,
-            Duration::from_millis(5),
-            true,
-        );
+        metrics.record_operation_complete(OperationType::Bind, Duration::from_millis(5), true);
         println!("  ✓ Bind operation {} completed", i);
     }
 
@@ -130,12 +126,16 @@ async fn demo_operation_metrics(metrics: &MetricsCollector) {
     // Display statistics
     println!("\nOperation Statistics:");
     if let Some(bind_stats) = metrics.get_operation_stats(OperationType::Bind) {
-        println!("  Bind: {} total, {} success, {} failures",
-                 bind_stats.count, bind_stats.success, bind_stats.failures);
+        println!(
+            "  Bind: {} total, {} success, {} failures",
+            bind_stats.count, bind_stats.success, bind_stats.failures
+        );
     }
     if let Some(search_stats) = metrics.get_operation_stats(OperationType::Search) {
-        println!("  Search: {} total, {} success, {} failures",
-                 search_stats.count, search_stats.success, search_stats.failures);
+        println!(
+            "  Search: {} total, {} success, {} failures",
+            search_stats.count, search_stats.success, search_stats.failures
+        );
     }
 }
 
@@ -143,7 +143,7 @@ async fn demo_operation_metrics(metrics: &MetricsCollector) {
 async fn demo_latency_tracking(metrics: &MetricsCollector) {
     println!("Simulating operations with varying latencies...");
 
-    let latencies = vec![5, 10, 15, 20, 25, 30, 35, 40];
+    let latencies = [5, 10, 15, 20, 25, 30, 35, 40];
 
     for (i, latency_ms) in latencies.iter().enumerate() {
         metrics.record_operation_start(OperationType::Add, &format!("client-{}", i));
@@ -228,16 +228,40 @@ async fn demo_custom_metrics(metrics: &MetricsCollector) {
 
     // Display custom metrics
     println!("\nCustom Counters:");
-    println!("  cache_hits: {}", metrics.get_counter("cache_hits").unwrap_or(0));
-    println!("  cache_misses: {}", metrics.get_counter("cache_misses").unwrap_or(0));
-    println!("  schema_validations: {}", metrics.get_counter("schema_validations").unwrap_or(0));
-    println!("  acl_checks: {}", metrics.get_counter("acl_checks").unwrap_or(0));
+    println!(
+        "  cache_hits: {}",
+        metrics.get_counter("cache_hits").unwrap_or(0)
+    );
+    println!(
+        "  cache_misses: {}",
+        metrics.get_counter("cache_misses").unwrap_or(0)
+    );
+    println!(
+        "  schema_validations: {}",
+        metrics.get_counter("schema_validations").unwrap_or(0)
+    );
+    println!(
+        "  acl_checks: {}",
+        metrics.get_counter("acl_checks").unwrap_or(0)
+    );
 
     println!("\nCustom Gauges:");
-    println!("  queue_depth: {}", metrics.get_gauge("queue_depth").unwrap_or(0));
-    println!("  memory_usage_mb: {}", metrics.get_gauge("memory_usage_mb").unwrap_or(0));
-    println!("  active_sessions: {}", metrics.get_gauge("active_sessions").unwrap_or(0));
-    println!("  thread_pool_size: {}", metrics.get_gauge("thread_pool_size").unwrap_or(0));
+    println!(
+        "  queue_depth: {}",
+        metrics.get_gauge("queue_depth").unwrap_or(0)
+    );
+    println!(
+        "  memory_usage_mb: {}",
+        metrics.get_gauge("memory_usage_mb").unwrap_or(0)
+    );
+    println!(
+        "  active_sessions: {}",
+        metrics.get_gauge("active_sessions").unwrap_or(0)
+    );
+    println!(
+        "  thread_pool_size: {}",
+        metrics.get_gauge("thread_pool_size").unwrap_or(0)
+    );
 }
 
 /// Demo 6: Prometheus metrics export
@@ -430,8 +454,10 @@ async fn demo_realistic_scenario(metrics: &MetricsCollector) {
 
     let conn_stats = metrics.get_connection_stats();
     println!("\n📡 Connections:");
-    println!("   Total: {}, Active: {}, Closed: {}, Failed: {}",
-             conn_stats.total, conn_stats.active, conn_stats.closed, conn_stats.failed);
+    println!(
+        "   Total: {}, Active: {}, Closed: {}, Failed: {}",
+        conn_stats.total, conn_stats.active, conn_stats.closed, conn_stats.failed
+    );
 
     println!("\n⚙️  Operations:");
     let all_stats = metrics.get_all_operation_stats();
@@ -442,18 +468,29 @@ async fn demo_realistic_scenario(metrics: &MetricsCollector) {
             } else {
                 0.0
             };
-            println!("   {:?}: {} ops, {:.1}% success, avg latency: {}ms",
-                     op_type,
-                     stats.count,
-                     success_rate,
-                     stats.avg_latency_ns / 1_000_000);
+            println!(
+                "   {:?}: {} ops, {:.1}% success, avg latency: {}ms",
+                op_type,
+                stats.count,
+                success_rate,
+                stats.avg_latency_ns / 1_000_000
+            );
         }
     }
 
     println!("\n🎯 Custom Metrics:");
-    println!("   total_requests: {}", metrics.get_counter("total_requests").unwrap_or(0));
-    println!("   active_workers: {}", metrics.get_gauge("active_workers").unwrap_or(0));
-    println!("   queue_depth: {}", metrics.get_gauge("queue_depth").unwrap_or(0));
+    println!(
+        "   total_requests: {}",
+        metrics.get_counter("total_requests").unwrap_or(0)
+    );
+    println!(
+        "   active_workers: {}",
+        metrics.get_gauge("active_workers").unwrap_or(0)
+    );
+    println!(
+        "   queue_depth: {}",
+        metrics.get_gauge("queue_depth").unwrap_or(0)
+    );
 
     println!("\n📊 FSM State Distribution:");
     let distribution = metrics.get_fsm_state_distribution();

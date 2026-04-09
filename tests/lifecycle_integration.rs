@@ -4,11 +4,10 @@
 //! work correctly in realistic scenarios.
 
 use opendr::backend::MockBackend;
-use opendr::fsm_server::{FsmServerConfig, run_with_shutdown};
-use opendr::shutdown::{ShutdownCoordinator, ShutdownConfig, ShutdownState};
+use opendr::fsm_server::{run_with_shutdown, FsmServerConfig};
+use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator, ShutdownState};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[tokio::test]
@@ -259,8 +258,10 @@ async fn test_server_with_shutdown() {
 #[tokio::test]
 async fn test_shutdown_with_active_connections() {
     let backend = Arc::new(MockBackend::default());
-    let mut config = FsmServerConfig::default();
-    config.cleanup_interval = Duration::from_secs(60); // Don't interfere with test
+    let config = FsmServerConfig {
+        cleanup_interval: Duration::from_secs(60),
+        ..FsmServerConfig::default()
+    }; // Don't interfere with test
 
     let shutdown_config = ShutdownConfig {
         shutdown_timeout: Duration::from_secs(5),

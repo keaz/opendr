@@ -663,7 +663,7 @@ pub struct ReferralFsmImpl {
     /// External dependency: Proxy request handler  
     proxy_handler: Box<dyn ProxyHandler>,
     /// External dependency: Network client
-    network_client: Box<dyn NetworkClient>,
+    _network_client: Box<dyn NetworkClient>,
     /// External dependency: Metrics collector (optional)
     metrics: Option<Box<dyn ReferralMetrics>>,
 }
@@ -697,7 +697,7 @@ impl ReferralFsmImpl {
             resolver,
             chain_handler,
             proxy_handler,
-            network_client,
+            _network_client: network_client,
             metrics: None,
         }
     }
@@ -732,7 +732,7 @@ impl ReferralFsmImpl {
             resolver,
             chain_handler,
             proxy_handler,
-            network_client,
+            _network_client: network_client,
             metrics: None,
         }
     }
@@ -1430,6 +1430,7 @@ impl ReferralFsm for ReferralFsmImpl {
 // ================================================================================================
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub mod mocks {
     use super::*;
     use std::collections::HashSet;
@@ -1442,6 +1443,12 @@ pub mod mocks {
         should_fail_resolve: bool,
         resolved_endpoints: Vec<ResolvedEndpoint>,
         call_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Default for MockReferralResolver {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockReferralResolver {
@@ -1521,6 +1528,12 @@ pub mod mocks {
         call_log: Arc<Mutex<Vec<String>>>,
     }
 
+    impl Default for MockChainHandler {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockChainHandler {
         pub fn new() -> Self {
             Self {
@@ -1586,6 +1599,12 @@ pub mod mocks {
         call_log: Arc<Mutex<Vec<String>>>,
     }
 
+    impl Default for MockProxyHandler {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockProxyHandler {
         pub fn new() -> Self {
             Self {
@@ -1644,6 +1663,12 @@ pub mod mocks {
         call_log: Arc<Mutex<Vec<String>>>,
     }
 
+    impl Default for MockNetworkClient {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockNetworkClient {
         pub fn new() -> Self {
             Self {
@@ -1695,6 +1720,12 @@ pub mod mocks {
     pub struct MockReferralMetrics {
         call_log: Arc<Mutex<Vec<String>>>,
         stats: Arc<Mutex<(u64, u64, u64, f64)>>,
+    }
+
+    impl Default for MockReferralMetrics {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockReferralMetrics {
@@ -1789,6 +1820,7 @@ pub mod mocks {
 // ================================================================================================
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::mocks::*;
     use super::*;

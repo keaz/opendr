@@ -23,21 +23,21 @@
 //! standalone modules tested in their dedicated integration coverage, while the
 //! backend transaction FSM remains an internal storage/runtime detail.
 
-use opendr::fsm::*;
-use opendr::connection_fsm::*;
-use opendr::ber_decoder_fsm::*;
 use opendr::auth_fsm::*;
+use opendr::ber_decoder_fsm::*;
+use opendr::compare_fsm::*;
+use opendr::connection_fsm::*;
+use opendr::extended_op_fsm::*;
+use opendr::fsm::*;
+use opendr::referral_fsm::*;
+use opendr::replication_provider_fsm::*;
 use opendr::sasl_fsm::*;
 use opendr::search_fsm::*;
 use opendr::write_fsm::*;
-use opendr::compare_fsm::*;
-use opendr::extended_op_fsm::*;
-use opendr::referral_fsm::*;
-use opendr::replication_provider_fsm::*;
 
 use async_trait::async_trait;
-use std::time::{Duration, Instant};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
 // ================================================================================================
@@ -70,6 +70,7 @@ impl TlsHandler for MockTlsHandler {
     }
 }
 
+#[allow(dead_code)]
 struct MockNetworkHandler {
     pub should_fail: bool,
 }
@@ -78,7 +79,10 @@ struct MockNetworkHandler {
 impl NetworkHandler for MockNetworkHandler {
     async fn connect(&self, _addr: &str) -> Result<TcpStream, std::io::Error> {
         if self.should_fail {
-            Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Connection refused"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "Connection refused",
+            ))
         } else {
             // This will fail in tests since we're not actually binding, but that's expected
             TcpStream::connect("127.0.0.1:1389").await
@@ -194,11 +198,20 @@ impl SaslMechanismHandler for MockSaslMechanismHandler {
         self.supported_mechanisms.contains(&mechanism.to_string())
     }
 
-    async fn start_authentication(&self, _mechanism: &str, _initial_data: Option<&[u8]>) -> Result<SaslChallengeResult, String> {
+    async fn start_authentication(
+        &self,
+        _mechanism: &str,
+        _initial_data: Option<&[u8]>,
+    ) -> Result<SaslChallengeResult, String> {
         Ok(SaslChallengeResult::Challenge(b"challenge".to_vec()))
     }
 
-    async fn process_response(&self, _mechanism: &str, _step: u32, _response: &[u8]) -> Result<SaslChallengeResult, String> {
+    async fn process_response(
+        &self,
+        _mechanism: &str,
+        _step: u32,
+        _response: &[u8],
+    ) -> Result<SaslChallengeResult, String> {
         Ok(SaslChallengeResult::Success {
             dn: "cn=test,dc=example,dc=org".to_string(),
         })
@@ -226,11 +239,20 @@ struct MockSearchBackend {
 
 #[async_trait]
 impl SearchBackend for MockSearchBackend {
-    async fn find_candidates(&self, _base_dn: &str, _scope: i32, _filter: &str) -> Result<Vec<String>, String> {
+    async fn find_candidates(
+        &self,
+        _base_dn: &str,
+        _scope: i32,
+        _filter: &str,
+    ) -> Result<Vec<String>, String> {
         Ok(self.entries.keys().cloned().collect())
     }
 
-    async fn get_entry(&self, dn: &str, _attributes: &[String]) -> Result<Option<SearchEntry>, String> {
+    async fn get_entry(
+        &self,
+        dn: &str,
+        _attributes: &[String],
+    ) -> Result<Option<SearchEntry>, String> {
         Ok(self.entries.get(dn).cloned())
     }
 }
@@ -248,18 +270,29 @@ struct MockEntryFormatter;
 
 #[async_trait]
 impl EntryFormatter for MockEntryFormatter {
-    async fn format_entry(&self, _entry: &SearchEntry, _attributes: &[String]) -> Result<Vec<u8>, String> {
+    async fn format_entry(
+        &self,
+        _entry: &SearchEntry,
+        _attributes: &[String],
+    ) -> Result<Vec<u8>, String> {
         Ok(b"formatted_entry".to_vec())
     }
 }
 
+#[allow(dead_code)]
 struct MockSearchMetrics;
 
 impl SearchMetrics for MockSearchMetrics {
     fn record_search_start(&self, _params: &SearchParams) {}
     fn record_candidates_found(&self, _count: usize) {}
     fn record_entry_processed(&self, _dn: &str, _matched: bool) {}
-    fn record_search_complete(&self, _result_code: &SearchResultCode, _entries_sent: usize, _duration: Duration) {}
+    fn record_search_complete(
+        &self,
+        _result_code: &SearchResultCode,
+        _entries_sent: usize,
+        _duration: Duration,
+    ) {
+    }
     fn record_search_abandoned(&self) {}
 }
 
@@ -303,7 +336,12 @@ impl WriteBackend for MockWriteBackend {
         }
     }
 
-    async fn modify_entry(&self, _txn_id: &str, _dn: &str, _modifications: &[Modification]) -> Result<(), String> {
+    async fn modify_entry(
+        &self,
+        _txn_id: &str,
+        _dn: &str,
+        _modifications: &[Modification],
+    ) -> Result<(), String> {
         if self.should_fail {
             Err("Modify failed".to_string())
         } else {
@@ -311,7 +349,14 @@ impl WriteBackend for MockWriteBackend {
         }
     }
 
-    async fn modify_dn(&self, _txn_id: &str, _dn: &str, _new_rdn: &str, _delete_old: bool, _new_superior: Option<&str>) -> Result<(), String> {
+    async fn modify_dn(
+        &self,
+        _txn_id: &str,
+        _dn: &str,
+        _new_rdn: &str,
+        _delete_old: bool,
+        _new_superior: Option<&str>,
+    ) -> Result<(), String> {
         if self.should_fail {
             Err("ModifyDN failed".to_string())
         } else {
@@ -346,7 +391,11 @@ impl SchemaValidator for MockSchemaValidator {
         }
     }
 
-    async fn validate_modifications(&self, _dn: &str, _modifications: &[Modification]) -> Result<(), String> {
+    async fn validate_modifications(
+        &self,
+        _dn: &str,
+        _modifications: &[Modification],
+    ) -> Result<(), String> {
         if self.should_fail {
             Err("Modification schema validation failed".to_string())
         } else {
@@ -361,7 +410,11 @@ struct MockAciChecker {
 
 #[async_trait]
 impl AciChecker for MockAciChecker {
-    async fn check_write_permission(&self, _user_dn: Option<&str>, _operation: &WriteOperation) -> Result<(), String> {
+    async fn check_write_permission(
+        &self,
+        _user_dn: Option<&str>,
+        _operation: &WriteOperation,
+    ) -> Result<(), String> {
         if self.allow_access {
             Ok(())
         } else {
@@ -370,6 +423,7 @@ impl AciChecker for MockAciChecker {
     }
 }
 
+#[allow(dead_code)]
 struct MockWriteMetrics;
 
 impl WriteMetrics for MockWriteMetrics {
@@ -378,7 +432,13 @@ impl WriteMetrics for MockWriteMetrics {
     fn record_schema_check_complete(&self, _operation_type: &str, _duration: Duration) {}
     fn record_aci_check_complete(&self, _operation_type: &str, _duration: Duration) {}
     fn record_transaction_started(&self, _txn_id: &str) {}
-    fn record_write_complete(&self, _operation: &WriteOperation, _result_code: &WriteResultCode, _duration: Duration) {}
+    fn record_write_complete(
+        &self,
+        _operation: &WriteOperation,
+        _result_code: &WriteResultCode,
+        _duration: Duration,
+    ) {
+    }
     fn record_write_rollback(&self, _operation: &WriteOperation, _reason: &str) {}
 }
 
@@ -390,7 +450,11 @@ struct MockCompareBackend {
 
 #[async_trait]
 impl CompareBackend for MockCompareBackend {
-    async fn get_entry_attributes(&self, dn: &str, _attributes: &[String]) -> Result<Option<CompareEntry>, String> {
+    async fn get_entry_attributes(
+        &self,
+        dn: &str,
+        _attributes: &[String],
+    ) -> Result<Option<CompareEntry>, String> {
         Ok(self.entries.get(dn).cloned())
     }
 
@@ -405,7 +469,12 @@ struct MockCompareAccessControl {
 
 #[async_trait]
 impl CompareAccessControl for MockCompareAccessControl {
-    async fn check_compare_permission(&self, _user_dn: Option<&str>, _entry_dn: &str, _attribute: &str) -> Result<(), String> {
+    async fn check_compare_permission(
+        &self,
+        _user_dn: Option<&str>,
+        _entry_dn: &str,
+        _attribute: &str,
+    ) -> Result<(), String> {
         if self.allow_access {
             Ok(())
         } else {
@@ -418,7 +487,12 @@ struct MockAttributeComparator;
 
 #[async_trait]
 impl AttributeComparator for MockAttributeComparator {
-    async fn compare_attribute(&self, entry: &CompareEntry, attr_name: &str, value: &[u8]) -> Result<bool, String> {
+    async fn compare_attribute(
+        &self,
+        entry: &CompareEntry,
+        attr_name: &str,
+        value: &[u8],
+    ) -> Result<bool, String> {
         if let Some(values) = entry.get_attribute(attr_name) {
             Ok(values.iter().any(|v| v == value))
         } else {
@@ -427,6 +501,7 @@ impl AttributeComparator for MockAttributeComparator {
     }
 }
 
+#[allow(dead_code)]
 struct MockCompareMetrics;
 
 impl CompareMetrics for MockCompareMetrics {
@@ -443,7 +518,11 @@ struct MockExtendedOpBackend;
 
 #[async_trait]
 impl ExtendedOpBackend for MockExtendedOpBackend {
-    async fn execute_operation(&self, _oid: &str, _value: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    async fn execute_operation(
+        &self,
+        _oid: &str,
+        _value: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
         Ok(b"response".to_vec())
     }
 
@@ -516,7 +595,10 @@ struct MockReferralResolver {
 
 #[async_trait]
 impl ReferralResolver for MockReferralResolver {
-    async fn resolve_referral_urls(&self, _urls: &[String]) -> Result<Vec<ResolvedEndpoint>, String> {
+    async fn resolve_referral_urls(
+        &self,
+        _urls: &[String],
+    ) -> Result<Vec<ResolvedEndpoint>, String> {
         Ok(self.endpoints.clone())
     }
 
@@ -529,7 +611,12 @@ struct MockChainHandler;
 
 #[async_trait]
 impl ChainHandler for MockChainHandler {
-    async fn chain_request(&self, _target: &str, _request: &[u8], _hop_count: u32) -> Result<Vec<u8>, String> {
+    async fn chain_request(
+        &self,
+        _target: &str,
+        _request: &[u8],
+        _hop_count: u32,
+    ) -> Result<Vec<u8>, String> {
         Ok(b"chained_response".to_vec())
     }
 }
@@ -547,20 +634,37 @@ struct MockNetworkClient;
 
 #[async_trait]
 impl NetworkClient for MockNetworkClient {
-    async fn send_request(&self, _endpoint: &ResolvedEndpoint, _request: &[u8], _timeout_ms: u64) -> Result<Vec<u8>, String> {
+    async fn send_request(
+        &self,
+        _endpoint: &ResolvedEndpoint,
+        _request: &[u8],
+        _timeout_ms: u64,
+    ) -> Result<Vec<u8>, String> {
         Ok(b"network_response".to_vec())
     }
 }
 
+#[allow(dead_code)]
 struct MockReferralMetrics;
 
 impl ReferralMetrics for MockReferralMetrics {
     fn record_referral_start(&self, _urls: &[String], _hop_count: u32) {}
-    fn record_resolution_complete(&self, _urls: &[String], _resolved_count: usize, _duration: Duration) {}
+    fn record_resolution_complete(
+        &self,
+        _urls: &[String],
+        _resolved_count: usize,
+        _duration: Duration,
+    ) {
+    }
     fn record_chain_request(&self, _target: &str, _hop_count: u32) {}
     fn record_proxy_request(&self, _target: &str) {}
     fn record_response_received(&self, _target: &str, _response_size: usize, _duration: Duration) {}
-    fn record_referral_complete(&self, _result_code: &ReferralResultCode, _total_duration: Duration) {}
+    fn record_referral_complete(
+        &self,
+        _result_code: &ReferralResultCode,
+        _total_duration: Duration,
+    ) {
+    }
     fn record_referral_error(&self, _error: &ReferralFsmError, _context: &str) {}
 }
 
@@ -572,11 +676,19 @@ struct MockChangelogProvider {
 
 #[async_trait]
 impl ChangelogProvider for MockChangelogProvider {
-    async fn get_all_entries(&self, _base_dn: &str, _filter: Option<&str>) -> Result<Vec<DirectoryEntry>, String> {
+    async fn get_all_entries(
+        &self,
+        _base_dn: &str,
+        _filter: Option<&str>,
+    ) -> Result<Vec<DirectoryEntry>, String> {
         Ok(self.entries.clone())
     }
 
-    async fn get_changelog_since(&self, _cookie: Option<&str>, _limit: usize) -> Result<Vec<ChangelogEntry>, String> {
+    async fn get_changelog_since(
+        &self,
+        _cookie: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<ChangelogEntry>, String> {
         Ok(vec![])
     }
 
@@ -597,7 +709,11 @@ struct MockConsumerRegistry;
 
 #[async_trait]
 impl ConsumerRegistry for MockConsumerRegistry {
-    async fn register_consumer(&mut self, _consumer_id: &str, _connection_info: ConsumerConnection) -> Result<(), String> {
+    async fn register_consumer(
+        &mut self,
+        _consumer_id: &str,
+        _connection_info: ConsumerConnection,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -625,7 +741,11 @@ impl ConsumerRegistry for MockConsumerRegistry {
         Ok(None)
     }
 
-    async fn update_consumer_cookie(&mut self, _consumer_id: &str, _cookie: String) -> Result<(), String> {
+    async fn update_consumer_cookie(
+        &mut self,
+        _consumer_id: &str,
+        _cookie: String,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -634,7 +754,11 @@ struct MockStreamingManager;
 
 #[async_trait]
 impl StreamingManager for MockStreamingManager {
-    async fn start_streaming(&mut self, _consumer_id: &str, _start_cookie: Option<&str>) -> Result<(), String> {
+    async fn start_streaming(
+        &mut self,
+        _consumer_id: &str,
+        _start_cookie: Option<&str>,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -661,14 +785,40 @@ impl StreamingManager for MockStreamingManager {
     }
 }
 
+#[allow(dead_code)]
 struct MockReplicationMetrics;
 
 impl ReplicationMetrics for MockReplicationMetrics {
     fn record_sync_start(&self, _consumer_id: &str, _operation_type: &str) {}
-    fn record_phase_complete(&self, _consumer_id: &str, _phase: &str, _entries_processed: usize, _duration: Duration) {}
-    fn record_entry_streamed(&self, _consumer_id: &str, _entry_size: usize, _processing_time: Duration) {}
-    fn record_replication_error(&self, _consumer_id: &str, _error_type: &str, _error_message: &str) {}
-    fn record_consumer_disconnection(&self, _consumer_id: &str, _reason: &str, _session_duration: Duration) {}
+    fn record_phase_complete(
+        &self,
+        _consumer_id: &str,
+        _phase: &str,
+        _entries_processed: usize,
+        _duration: Duration,
+    ) {
+    }
+    fn record_entry_streamed(
+        &self,
+        _consumer_id: &str,
+        _entry_size: usize,
+        _processing_time: Duration,
+    ) {
+    }
+    fn record_replication_error(
+        &self,
+        _consumer_id: &str,
+        _error_type: &str,
+        _error_message: &str,
+    ) {
+    }
+    fn record_consumer_disconnection(
+        &self,
+        _consumer_id: &str,
+        _reason: &str,
+        _session_duration: Duration,
+    ) {
+    }
     fn get_replication_stats(&self) -> ReplicationStats {
         ReplicationStats {
             total_sessions: 0,
@@ -700,7 +850,13 @@ impl SyncRequestHandler for MockSyncRequestHandler {
         Ok(())
     }
 
-    async fn generate_sync_response(&self, _consumer_id: &str, _result_code: u32, _cookie: Option<&str>, _entry_count: usize) -> Result<SyncResponse, String> {
+    async fn generate_sync_response(
+        &self,
+        _consumer_id: &str,
+        _result_code: u32,
+        _cookie: Option<&str>,
+        _entry_count: usize,
+    ) -> Result<SyncResponse, String> {
         Ok(SyncResponse {
             result_code: 0,
             cookie: None,
@@ -787,7 +943,9 @@ mod ber_decoder_fsm_tests {
 
     #[test]
     fn test_ber_decoder_fsm_initial_state() {
-        let validator = Box::new(MockBerValidator { max_size: 1024 * 1024 });
+        let validator = Box::new(MockBerValidator {
+            max_size: 1024 * 1024,
+        });
         let handler = Box::new(MockBerMessageHandler { messages: vec![] });
         let fsm = BerDecoderFsmImpl::new()
             .with_validator(validator)
@@ -799,7 +957,9 @@ mod ber_decoder_fsm_tests {
 
     #[tokio::test]
     async fn test_ber_decoder_fsm_reset() {
-        let validator = Box::new(MockBerValidator { max_size: 1024 * 1024 });
+        let validator = Box::new(MockBerValidator {
+            max_size: 1024 * 1024,
+        });
         let handler = Box::new(MockBerMessageHandler { messages: vec![] });
         let mut fsm = BerDecoderFsmImpl::new()
             .with_validator(validator)
@@ -812,7 +972,9 @@ mod ber_decoder_fsm_tests {
 
     #[tokio::test]
     async fn test_ber_decoder_fsm_data_received() {
-        let validator = Box::new(MockBerValidator { max_size: 1024 * 1024 });
+        let validator = Box::new(MockBerValidator {
+            max_size: 1024 * 1024,
+        });
         let handler = Box::new(MockBerMessageHandler { messages: vec![] });
         let mut fsm = BerDecoderFsmImpl::new()
             .with_validator(validator)
@@ -854,9 +1016,14 @@ mod auth_fsm_tests {
     #[tokio::test]
     async fn test_auth_fsm_simple_bind_success() {
         let mut credentials = HashMap::new();
-        credentials.insert("cn=test,dc=example,dc=org".to_string(), b"password123".to_vec());
+        credentials.insert(
+            "cn=test,dc=example,dc=org".to_string(),
+            b"password123".to_vec(),
+        );
 
-        let backend = Box::new(MockAuthBackend { valid_credentials: credentials });
+        let backend = Box::new(MockAuthBackend {
+            valid_credentials: credentials,
+        });
         let mut fsm = AuthFsmImpl::new().with_backend(backend);
 
         let event = AuthEvent::BindRequest {
@@ -866,17 +1033,25 @@ mod auth_fsm_tests {
 
         let result = fsm.handle_event(event).await;
         assert!(result.is_ok());
-        assert_eq!(*fsm.current_state(), AuthState::SimpleBound {
-            dn: "cn=test,dc=example,dc=org".to_string()
-        });
+        assert_eq!(
+            *fsm.current_state(),
+            AuthState::SimpleBound {
+                dn: "cn=test,dc=example,dc=org".to_string()
+            }
+        );
     }
 
     #[tokio::test]
     async fn test_auth_fsm_simple_bind_failure() {
         let mut credentials = HashMap::new();
-        credentials.insert("cn=test,dc=example,dc=org".to_string(), b"password123".to_vec());
+        credentials.insert(
+            "cn=test,dc=example,dc=org".to_string(),
+            b"password123".to_vec(),
+        );
 
-        let backend = Box::new(MockAuthBackend { valid_credentials: credentials });
+        let backend = Box::new(MockAuthBackend {
+            valid_credentials: credentials,
+        });
         let mut fsm = AuthFsmImpl::new().with_backend(backend);
 
         let event = AuthEvent::BindRequest {
@@ -891,7 +1066,9 @@ mod auth_fsm_tests {
 
     #[tokio::test]
     async fn test_auth_fsm_anonymous_bind() {
-        let backend = Box::new(MockAuthBackend { valid_credentials: HashMap::new() });
+        let backend = Box::new(MockAuthBackend {
+            valid_credentials: HashMap::new(),
+        });
         let mut fsm = AuthFsmImpl::new().with_backend(backend);
 
         // Anonymous bind is represented as BindRequest with empty DN
@@ -907,7 +1084,9 @@ mod auth_fsm_tests {
 
     #[tokio::test]
     async fn test_auth_fsm_unbind() {
-        let backend = Box::new(MockAuthBackend { valid_credentials: HashMap::new() });
+        let backend = Box::new(MockAuthBackend {
+            valid_credentials: HashMap::new(),
+        });
         let mut fsm = AuthFsmImpl::new().with_backend(backend);
 
         let event = AuthEvent::Unbind;
@@ -919,7 +1098,9 @@ mod auth_fsm_tests {
 
     #[tokio::test]
     async fn test_auth_fsm_reset() {
-        let backend = Box::new(MockAuthBackend { valid_credentials: HashMap::new() });
+        let backend = Box::new(MockAuthBackend {
+            valid_credentials: HashMap::new(),
+        });
         let mut fsm = AuthFsmImpl::new().with_backend(backend);
 
         let result = fsm.reset().await;
@@ -998,7 +1179,9 @@ mod search_fsm_tests {
 
     #[test]
     fn test_search_fsm_initial_state() {
-        let backend = Box::new(MockSearchBackend { entries: HashMap::new() });
+        let backend = Box::new(MockSearchBackend {
+            entries: HashMap::new(),
+        });
         let filter_matcher = Box::new(MockFilterMatcher);
         let formatter = Box::new(MockEntryFormatter);
         let fsm = SearchFsmImpl::new(backend, filter_matcher, formatter);
@@ -1010,11 +1193,14 @@ mod search_fsm_tests {
     #[tokio::test]
     async fn test_search_fsm_start_search() {
         let mut entries = HashMap::new();
-        entries.insert("cn=test,dc=example,dc=org".to_string(), SearchEntry {
-            dn: "cn=test,dc=example,dc=org".to_string(),
-            attributes: HashMap::new(),
-            object_classes: vec!["person".to_string()],
-        });
+        entries.insert(
+            "cn=test,dc=example,dc=org".to_string(),
+            SearchEntry {
+                dn: "cn=test,dc=example,dc=org".to_string(),
+                attributes: HashMap::new(),
+                object_classes: vec!["person".to_string()],
+            },
+        );
 
         let backend = Box::new(MockSearchBackend { entries });
         let filter_matcher = Box::new(MockFilterMatcher);
@@ -1036,7 +1222,9 @@ mod search_fsm_tests {
 
     #[tokio::test]
     async fn test_search_fsm_reset() {
-        let backend = Box::new(MockSearchBackend { entries: HashMap::new() });
+        let backend = Box::new(MockSearchBackend {
+            entries: HashMap::new(),
+        });
         let filter_matcher = Box::new(MockFilterMatcher);
         let formatter = Box::new(MockEntryFormatter);
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, formatter);
@@ -1048,7 +1236,9 @@ mod search_fsm_tests {
 
     #[tokio::test]
     async fn test_search_fsm_abandon() {
-        let backend = Box::new(MockSearchBackend { entries: HashMap::new() });
+        let backend = Box::new(MockSearchBackend {
+            entries: HashMap::new(),
+        });
         let filter_matcher = Box::new(MockFilterMatcher);
         let formatter = Box::new(MockEntryFormatter);
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, formatter);
@@ -1165,7 +1355,9 @@ mod write_fsm_tests {
         // For proper ACI testing, integration tests with full server context are needed
         let backend = Box::new(MockWriteBackend { should_fail: false });
         let schema = Box::new(MockSchemaValidator { should_fail: false });
-        let aci = Box::new(MockAciChecker { allow_access: false });
+        let aci = Box::new(MockAciChecker {
+            allow_access: false,
+        });
         let mut fsm = WriteFsmImpl::new(backend, schema, aci);
 
         let event = WriteEvent::StartWrite(WriteOperation::Add {
@@ -1204,7 +1396,9 @@ mod compare_fsm_tests {
 
     #[test]
     fn test_compare_fsm_initial_state() {
-        let backend = Box::new(MockCompareBackend { entries: HashMap::new() });
+        let backend = Box::new(MockCompareBackend {
+            entries: HashMap::new(),
+        });
         let comparator = Box::new(MockAttributeComparator);
         let access_control = Box::new(MockCompareAccessControl { allow_access: true });
         let fsm = CompareFsmImpl::new(backend, comparator, access_control);
@@ -1237,9 +1431,13 @@ mod compare_fsm_tests {
 
     #[tokio::test]
     async fn test_compare_fsm_access_denied() {
-        let backend = Box::new(MockCompareBackend { entries: HashMap::new() });
+        let backend = Box::new(MockCompareBackend {
+            entries: HashMap::new(),
+        });
         let comparator = Box::new(MockAttributeComparator);
-        let access_control = Box::new(MockCompareAccessControl { allow_access: false });
+        let access_control = Box::new(MockCompareAccessControl {
+            allow_access: false,
+        });
         let mut fsm = CompareFsmImpl::new(backend, comparator, access_control);
 
         let event = CompareEvent::StartCompare {
@@ -1254,7 +1452,9 @@ mod compare_fsm_tests {
 
     #[tokio::test]
     async fn test_compare_fsm_reset() {
-        let backend = Box::new(MockCompareBackend { entries: HashMap::new() });
+        let backend = Box::new(MockCompareBackend {
+            entries: HashMap::new(),
+        });
         let comparator = Box::new(MockAttributeComparator);
         let access_control = Box::new(MockCompareAccessControl { allow_access: true });
         let mut fsm = CompareFsmImpl::new(backend, comparator, access_control);
@@ -1311,7 +1511,9 @@ mod extended_op_fsm_tests {
         let backend = Box::new(MockExtendedOpBackend);
         let parser = Box::new(MockExtendedOpParser);
         let delegator = Box::new(MockExtendedOpDelegator);
-        let access_control = Box::new(MockExtendedOpAccessControl { allow_access: false });
+        let access_control = Box::new(MockExtendedOpAccessControl {
+            allow_access: false,
+        });
         let metrics = Box::new(MockExtendedOpMetrics);
 
         let mut fsm = ExtendedOpFsmImpl::new(backend, parser, delegator, access_control, metrics);
@@ -1414,7 +1616,12 @@ mod replication_provider_fsm_tests {
         let consumer_registry = Box::new(MockConsumerRegistry);
         let streaming_manager = Box::new(MockStreamingManager);
         let sync_handler = Box::new(MockSyncRequestHandler);
-        let fsm = ReplicationProviderFsmImpl::new(changelog, consumer_registry, streaming_manager, sync_handler);
+        let fsm = ReplicationProviderFsmImpl::new(
+            changelog,
+            consumer_registry,
+            streaming_manager,
+            sync_handler,
+        );
 
         assert_eq!(*fsm.current_state(), ReplicationProviderState::Initializing);
         assert!(!fsm.is_terminal());
@@ -1451,7 +1658,12 @@ mod replication_provider_fsm_tests {
         let consumer_registry = Box::new(MockConsumerRegistry);
         let streaming_manager = Box::new(MockStreamingManager);
         let sync_handler = Box::new(MockSyncRequestHandler);
-        let mut fsm = ReplicationProviderFsmImpl::new(changelog, consumer_registry, streaming_manager, sync_handler);
+        let mut fsm = ReplicationProviderFsmImpl::new(
+            changelog,
+            consumer_registry,
+            streaming_manager,
+            sync_handler,
+        );
 
         let result = fsm.reset().await;
         assert!(result.is_ok());
@@ -1481,17 +1693,15 @@ mod timeout_fsm_tests {
 
     #[tokio::test]
     async fn test_search_fsm_timeout() {
-        let backend = Box::new(MockSearchBackend { entries: HashMap::new() });
+        let backend = Box::new(MockSearchBackend {
+            entries: HashMap::new(),
+        });
         let filter_matcher = Box::new(MockFilterMatcher);
         let formatter = Box::new(MockEntryFormatter);
         let fsm = SearchFsmImpl::new(backend, filter_matcher, formatter);
 
         // Check timeout functionality
-        let has_timeout = fsm.timeout().is_some();
-
-        // SearchFsm might or might not have timeout configured by default
-        // Just verify the method exists and returns a valid Option
-        assert!(has_timeout || !has_timeout);
+        let _timeout = fsm.timeout();
     }
 
     // WriteFsm does not currently implement TimeoutFsm trait
@@ -1522,7 +1732,9 @@ mod abandonable_fsm_tests {
 
     #[tokio::test]
     async fn test_search_fsm_is_abandoned() {
-        let backend = Box::new(MockSearchBackend { entries: HashMap::new() });
+        let backend = Box::new(MockSearchBackend {
+            entries: HashMap::new(),
+        });
         let filter_matcher = Box::new(MockFilterMatcher);
         let formatter = Box::new(MockEntryFormatter);
         let fsm = SearchFsmImpl::new(backend, filter_matcher, formatter);
@@ -1533,7 +1745,9 @@ mod abandonable_fsm_tests {
 
     #[tokio::test]
     async fn test_search_fsm_abandon_operation() {
-        let backend = Box::new(MockSearchBackend { entries: HashMap::new() });
+        let backend = Box::new(MockSearchBackend {
+            entries: HashMap::new(),
+        });
         let filter_matcher = Box::new(MockFilterMatcher);
         let formatter = Box::new(MockEntryFormatter);
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, formatter);

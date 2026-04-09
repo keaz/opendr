@@ -66,7 +66,7 @@ impl Default for ResourceLimits {
             max_connections_per_ip: 10,
             max_operations_per_connection: 100,
             max_memory_per_connection: 10 * 1024 * 1024, // 10 MB
-            max_total_memory: 1024 * 1024 * 1024,         // 1 GB
+            max_total_memory: 1024 * 1024 * 1024,        // 1 GB
             connection_idle_timeout: Duration::from_secs(600), // 10 minutes
         }
     }
@@ -80,9 +80,6 @@ struct ConnectionInfo {
 
     /// Client socket address
     addr: SocketAddr,
-
-    /// Connection creation time
-    created_at: Instant,
 
     /// Last activity time
     last_activity: Instant,
@@ -189,7 +186,6 @@ impl ConnectionPool {
         let conn_info = ConnectionInfo {
             id: conn_id,
             addr,
-            created_at: Instant::now(),
             last_activity: Instant::now(),
             operation_count: 0,
             memory_usage: 0,
@@ -229,8 +225,12 @@ impl ConnectionPool {
 
             // Update statistics
             stats.active_connections = connections.len();
-            stats.total_operations = stats.total_operations.saturating_sub(conn_info.operation_count);
-            stats.total_memory_usage = stats.total_memory_usage.saturating_sub(conn_info.memory_usage);
+            stats.total_operations = stats
+                .total_operations
+                .saturating_sub(conn_info.operation_count);
+            stats.total_memory_usage = stats
+                .total_memory_usage
+                .saturating_sub(conn_info.memory_usage);
 
             if let Some(count) = stats.connections_by_ip.get_mut(&ip_str) {
                 *count = count.saturating_sub(1);
@@ -289,7 +289,9 @@ impl ConnectionPool {
             let new_usage = if memory_delta >= 0 {
                 conn_info.memory_usage.saturating_add(memory_delta as usize)
             } else {
-                conn_info.memory_usage.saturating_sub((-memory_delta) as usize)
+                conn_info
+                    .memory_usage
+                    .saturating_sub((-memory_delta) as usize)
             };
 
             // Check per-connection limit
@@ -299,9 +301,13 @@ impl ConnectionPool {
 
             // Check total memory limit
             let new_total = if memory_delta >= 0 {
-                stats.total_memory_usage.saturating_add(memory_delta as usize)
+                stats
+                    .total_memory_usage
+                    .saturating_add(memory_delta as usize)
             } else {
-                stats.total_memory_usage.saturating_sub((-memory_delta) as usize)
+                stats
+                    .total_memory_usage
+                    .saturating_sub((-memory_delta) as usize)
             };
 
             if new_total > self.limits.max_total_memory {

@@ -3,8 +3,8 @@
 //! This module provides an adapter between the write FSM's SchemaValidator trait
 //! and the LdapSchema implementation. It handles LDIF parsing and validation.
 
-use crate::schema::{LdapSchema, SchemaError};
-use crate::write_fsm::{SchemaValidator, WriteEntry, Modification};
+use crate::schema::LdapSchema;
+use crate::write_fsm::{Modification, SchemaValidator, WriteEntry};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,9 +39,10 @@ impl LdapSchemaValidator {
     /// cn: John Doe
     /// sn: Doe
     /// ```
+    #[cfg(test)]
     fn parse_ldif_to_attributes(ldif_bytes: &[u8]) -> Result<HashMap<String, Vec<String>>, String> {
-        let ldif_str = std::str::from_utf8(ldif_bytes)
-            .map_err(|e| format!("Invalid UTF-8 in LDIF: {}", e))?;
+        let ldif_str =
+            std::str::from_utf8(ldif_bytes).map_err(|e| format!("Invalid UTF-8 in LDIF: {}", e))?;
 
         let mut attributes: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -63,10 +64,7 @@ impl LdapSchemaValidator {
                 let attr_name = line[..colon_pos].trim().to_string();
                 let attr_value = line[colon_pos + 1..].trim().to_string();
 
-                attributes
-                    .entry(attr_name)
-                    .or_insert_with(Vec::new)
-                    .push(attr_value);
+                attributes.entry(attr_name).or_default().push(attr_value);
             }
         }
 
@@ -123,10 +121,7 @@ impl SchemaValidator for LdapSchemaValidator {
                 Modification::Add { name, values } | Modification::Replace { name, values } => {
                     if let Some(attr_type) = self.schema.get_attribute_type(name) {
                         if attr_type.single_value && values.len() > 1 {
-                            return Err(format!(
-                                "Single-value violation for attribute: {}",
-                                name
-                            ));
+                            return Err(format!("Single-value violation for attribute: {}", name));
                         }
                     }
                 }
@@ -185,8 +180,14 @@ mail: john@example.com
         let attributes = LdapSchemaValidator::parse_ldif_to_attributes(ldif).unwrap();
 
         assert_eq!(attributes.get("objectClass").unwrap().len(), 2);
-        assert!(attributes.get("objectClass").unwrap().contains(&"top".to_string()));
-        assert!(attributes.get("objectClass").unwrap().contains(&"person".to_string()));
+        assert!(attributes
+            .get("objectClass")
+            .unwrap()
+            .contains(&"top".to_string()));
+        assert!(attributes
+            .get("objectClass")
+            .unwrap()
+            .contains(&"person".to_string()));
         assert_eq!(attributes.get("cn").unwrap()[0], "John Doe");
         assert_eq!(attributes.get("sn").unwrap()[0], "Doe");
         assert_eq!(attributes.get("mail").unwrap()[0], "john@example.com");

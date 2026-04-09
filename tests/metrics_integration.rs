@@ -199,11 +199,7 @@ fn test_latency_single_operation() {
     let metrics = MetricsCollector::new();
 
     metrics.record_operation_start(OperationType::Delete, "127.0.0.1:1234");
-    metrics.record_operation_complete(
-        OperationType::Delete,
-        Duration::from_millis(100),
-        true,
-    );
+    metrics.record_operation_complete(OperationType::Delete, Duration::from_millis(100), true);
 
     let stats = metrics.get_operation_stats(OperationType::Delete).unwrap();
     assert_eq!(

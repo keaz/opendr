@@ -2,7 +2,7 @@
 // First-time setup wizard
 
 use clap::{Parser, Subcommand};
-use opendr::setup::{BackendType, SetupConfig, SetupHandler};
+use opendr::setup::{SetupConfig, SetupHandler};
 use std::path::PathBuf;
 use std::process;
 
@@ -107,9 +107,15 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(|e| format!("Failed to write config file: {}", e))?;
 
-            println!("✓ Generated sample configuration file: {}", output.display());
+            println!(
+                "✓ Generated sample configuration file: {}",
+                output.display()
+            );
             println!("\nEdit this file and then run:");
-            println!("  opendr-setup non-interactive --config {}", output.display());
+            println!(
+                "  opendr-setup non-interactive --config {}",
+                output.display()
+            );
         }
 
         Commands::Status => {
@@ -163,9 +169,9 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
 
         Commands::HashPassword { password } => {
-            use sha2::{Digest, Sha512};
             use base64::Engine;
             use rand::Rng;
+            use sha2::{Digest, Sha512};
 
             // Generate 16-byte salt
             let salt: [u8; 16] = rand::thread_rng().gen();
@@ -173,7 +179,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             // Hash password + salt
             let mut hasher = Sha512::new();
             hasher.update(password.as_bytes());
-            hasher.update(&salt);
+            hasher.update(salt);
             let hash = hasher.finalize();
 
             // Combine hash + salt and encode in base64

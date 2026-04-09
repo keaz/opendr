@@ -26,10 +26,10 @@ pub struct AttributeType {
 pub struct ObjectClass {
     pub oid: String,
     pub names: Vec<String>,
-    pub sup: Vec<String>,          // Superior object classes
+    pub sup: Vec<String>, // Superior object classes
     pub kind: ObjectClassKind,
-    pub must: Vec<String>,         // Required attributes
-    pub may: Vec<String>,          // Optional attributes
+    pub must: Vec<String>, // Required attributes
+    pub may: Vec<String>,  // Optional attributes
 }
 
 /// Object class type
@@ -58,11 +58,21 @@ impl std::fmt::Display for SchemaError {
         match self {
             SchemaError::ObjectClassNotFound(name) => write!(f, "Object class not found: {}", name),
             SchemaError::AttributeNotFound(name) => write!(f, "Attribute type not found: {}", name),
-            SchemaError::MissingRequiredAttribute(name) => write!(f, "Missing required attribute: {}", name),
-            SchemaError::InvalidStructuralChain => write!(f, "Invalid structural object class chain"),
-            SchemaError::MultipleStructuralClasses => write!(f, "Multiple structural object classes"),
-            SchemaError::SingleValueViolation(name) => write!(f, "Single-value violation for attribute: {}", name),
-            SchemaError::InvalidSyntax(attr, reason) => write!(f, "Invalid syntax for {}: {}", attr, reason),
+            SchemaError::MissingRequiredAttribute(name) => {
+                write!(f, "Missing required attribute: {}", name)
+            }
+            SchemaError::InvalidStructuralChain => {
+                write!(f, "Invalid structural object class chain")
+            }
+            SchemaError::MultipleStructuralClasses => {
+                write!(f, "Multiple structural object classes")
+            }
+            SchemaError::SingleValueViolation(name) => {
+                write!(f, "Single-value violation for attribute: {}", name)
+            }
+            SchemaError::InvalidSyntax(attr, reason) => {
+                write!(f, "Invalid syntax for {}: {}", attr, reason)
+            }
             SchemaError::NoStructuralClass => write!(f, "No structural object class defined"),
         }
     }
@@ -174,7 +184,8 @@ impl LdapSchema {
 
         for attr in core_attributes {
             for name in &attr.names {
-                self.attribute_types.insert(name.to_lowercase(), attr.clone());
+                self.attribute_types
+                    .insert(name.to_lowercase(), attr.clone());
             }
         }
 
@@ -210,7 +221,11 @@ impl LdapSchema {
                 sup: vec!["organizationalPerson".to_string()],
                 kind: ObjectClassKind::Structural,
                 must: vec![],
-                may: vec!["uid".to_string(), "givenName".to_string(), "mail".to_string()],
+                may: vec![
+                    "uid".to_string(),
+                    "givenName".to_string(),
+                    "mail".to_string(),
+                ],
             },
             ObjectClass {
                 oid: "2.5.6.4".to_string(),
@@ -240,7 +255,8 @@ impl LdapSchema {
     /// Add an attribute type to the schema
     pub fn add_attribute_type(&mut self, attr: AttributeType) {
         for name in &attr.names {
-            self.attribute_types.insert(name.to_lowercase(), attr.clone());
+            self.attribute_types
+                .insert(name.to_lowercase(), attr.clone());
         }
     }
 
@@ -262,16 +278,23 @@ impl LdapSchema {
     }
 
     /// Validate an entry against the schema
-    pub fn validate_entry(&self, attributes: &HashMap<String, Vec<String>>) -> Result<(), SchemaError> {
+    pub fn validate_entry(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> Result<(), SchemaError> {
         // Get object classes
-        let object_classes = attributes.get("objectclass")
+        let object_classes = attributes
+            .get("objectclass")
             .or_else(|| attributes.get("objectClass"))
-            .ok_or(SchemaError::MissingRequiredAttribute("objectClass".to_string()))?;
+            .ok_or(SchemaError::MissingRequiredAttribute(
+                "objectClass".to_string(),
+            ))?;
 
         // Validate object classes exist
         let mut oc_definitions = Vec::new();
         for oc_name in object_classes {
-            let oc = self.get_object_class(oc_name)
+            let oc = self
+                .get_object_class(oc_name)
                 .ok_or_else(|| SchemaError::ObjectClassNotFound(oc_name.clone()))?;
             oc_definitions.push(oc);
         }
@@ -292,7 +315,8 @@ impl LdapSchema {
         }
 
         // Validate all attributes are allowed
-        let all_allowed: HashSet<String> = must_attrs.iter()
+        let all_allowed: HashSet<String> = must_attrs
+            .iter()
             .chain(may_attrs.iter())
             .map(|s| s.to_lowercase())
             .collect();
@@ -320,8 +344,12 @@ impl LdapSchema {
     }
 
     /// Validate structural object class rules
-    fn validate_structural_classes(&self, oc_definitions: &[&ObjectClass]) -> Result<(), SchemaError> {
-        let structural: Vec<_> = oc_definitions.iter()
+    fn validate_structural_classes(
+        &self,
+        oc_definitions: &[&ObjectClass],
+    ) -> Result<(), SchemaError> {
+        let structural: Vec<_> = oc_definitions
+            .iter()
             .filter(|oc| oc.kind == ObjectClassKind::Structural)
             .collect();
 
@@ -341,7 +369,8 @@ impl LdapSchema {
             // Each structural class (except one) must be a superior of another
             let mut has_root = false;
             for oc in &structural {
-                let is_sup_of_another = structural.iter()
+                let is_sup_of_another = structural
+                    .iter()
                     .any(|other| oc.names[0] != other.names[0] && all_sups.contains(&oc.names[0]));
 
                 if !is_sup_of_another && !has_root {
@@ -366,7 +395,10 @@ impl LdapSchema {
     }
 
     /// Collect all required and optional attributes from object classes
-    fn collect_attributes(&self, oc_definitions: &[&ObjectClass]) -> (HashSet<String>, HashSet<String>) {
+    fn collect_attributes(
+        &self,
+        oc_definitions: &[&ObjectClass],
+    ) -> (HashSet<String>, HashSet<String>) {
         let mut must = HashSet::new();
         let mut may = HashSet::new();
 
@@ -383,7 +415,12 @@ impl LdapSchema {
     }
 
     /// Recursively collect attributes from superior classes
-    fn collect_superior_attributes(&self, oc: &ObjectClass, must: &mut HashSet<String>, may: &mut HashSet<String>) {
+    fn collect_superior_attributes(
+        &self,
+        oc: &ObjectClass,
+        must: &mut HashSet<String>,
+        may: &mut HashSet<String>,
+    ) {
         for sup_name in &oc.sup {
             if let Some(sup) = self.get_object_class(sup_name) {
                 must.extend(sup.must.iter().cloned());
@@ -425,7 +462,10 @@ mod tests {
         let schema = LdapSchema::with_core_schema();
 
         let mut attributes = HashMap::new();
-        attributes.insert("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]);
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
         attributes.insert("cn".to_string(), vec!["John Doe".to_string()]);
         attributes.insert("sn".to_string(), vec!["Doe".to_string()]);
 
@@ -437,12 +477,18 @@ mod tests {
         let schema = LdapSchema::with_core_schema();
 
         let mut attributes = HashMap::new();
-        attributes.insert("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]);
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
         attributes.insert("cn".to_string(), vec!["John Doe".to_string()]);
         // Missing 'sn' which is required by person
 
         let result = schema.validate_entry(&attributes);
-        assert!(matches!(result, Err(SchemaError::MissingRequiredAttribute(_))));
+        assert!(matches!(
+            result,
+            Err(SchemaError::MissingRequiredAttribute(_))
+        ));
     }
 
     #[test]
@@ -452,7 +498,10 @@ mod tests {
         let attributes = HashMap::new();
 
         let result = schema.validate_entry(&attributes);
-        assert!(matches!(result, Err(SchemaError::MissingRequiredAttribute(_))));
+        assert!(matches!(
+            result,
+            Err(SchemaError::MissingRequiredAttribute(_))
+        ));
     }
 
     #[test]
@@ -471,8 +520,15 @@ mod tests {
         let schema = LdapSchema::with_core_schema();
 
         let mut attributes = HashMap::new();
-        attributes.insert("objectClass".to_string(),
-            vec!["top".to_string(), "person".to_string(), "organizationalPerson".to_string(), "inetOrgPerson".to_string()]);
+        attributes.insert(
+            "objectClass".to_string(),
+            vec![
+                "top".to_string(),
+                "person".to_string(),
+                "organizationalPerson".to_string(),
+                "inetOrgPerson".to_string(),
+            ],
+        );
         attributes.insert("cn".to_string(), vec!["Jane Smith".to_string()]);
         attributes.insert("sn".to_string(), vec!["Smith".to_string()]);
         attributes.insert("uid".to_string(), vec!["jsmith".to_string()]);
@@ -486,7 +542,10 @@ mod tests {
         let schema = LdapSchema::with_core_schema();
 
         let mut attributes = HashMap::new();
-        attributes.insert("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]);
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "organization".to_string()],
+        );
         attributes.insert("o".to_string(), vec!["Example Corp".to_string()]);
 
         assert!(schema.validate_entry(&attributes).is_ok());
@@ -497,7 +556,10 @@ mod tests {
         let schema = LdapSchema::with_core_schema();
 
         let mut attributes = HashMap::new();
-        attributes.insert("objectClass".to_string(), vec!["top".to_string(), "organizationalUnit".to_string()]);
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "organizationalUnit".to_string()],
+        );
         attributes.insert("ou".to_string(), vec!["Engineering".to_string()]);
 
         assert!(schema.validate_entry(&attributes).is_ok());
@@ -528,11 +590,21 @@ mod tests {
         });
 
         let mut attributes = HashMap::new();
-        attributes.insert("objectClass".to_string(),
-            vec!["top".to_string(), "person".to_string(), "inetOrgPerson".to_string(), "employee".to_string()]);
+        attributes.insert(
+            "objectClass".to_string(),
+            vec![
+                "top".to_string(),
+                "person".to_string(),
+                "inetOrgPerson".to_string(),
+                "employee".to_string(),
+            ],
+        );
         attributes.insert("cn".to_string(), vec!["John".to_string()]);
         attributes.insert("sn".to_string(), vec!["Doe".to_string()]);
-        attributes.insert("employeeNumber".to_string(), vec!["123".to_string(), "456".to_string()]);
+        attributes.insert(
+            "employeeNumber".to_string(),
+            vec!["123".to_string(), "456".to_string()],
+        );
 
         let result = schema.validate_entry(&attributes);
         assert!(matches!(result, Err(SchemaError::SingleValueViolation(_))));
@@ -556,7 +628,10 @@ mod tests {
 
         // Test with various case combinations for attribute names
         let mut attributes = HashMap::new();
-        attributes.insert("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]);
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
         attributes.insert("CN".to_string(), vec!["John Doe".to_string()]);
         attributes.insert("SN".to_string(), vec!["Doe".to_string()]);
 
@@ -570,11 +645,17 @@ mod tests {
         // inetOrgPerson inherits from organizationalPerson which inherits from person
         // So it should require cn and sn from person
         let mut attributes = HashMap::new();
-        attributes.insert("objectClass".to_string(), vec!["top".to_string(), "inetOrgPerson".to_string()]);
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "inetOrgPerson".to_string()],
+        );
         attributes.insert("cn".to_string(), vec!["Jane".to_string()]);
         // Missing sn - should fail
 
         let result = schema.validate_entry(&attributes);
-        assert!(matches!(result, Err(SchemaError::MissingRequiredAttribute(_))));
+        assert!(matches!(
+            result,
+            Err(SchemaError::MissingRequiredAttribute(_))
+        ));
     }
 }

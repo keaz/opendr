@@ -11,6 +11,9 @@
 //! - State persistence
 //! - Multi-consumer scenarios
 
+use ldap_parser::filter::{AttributeValueAssertion, Filter};
+use ldap_parser::ldap::{DerefAliases, LdapDN, LdapString, ProtocolOp, SearchRequest, SearchScope};
+use ldap_parser::parse_ldap_messages;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
 use opendr::config::ServerConfig;
@@ -19,9 +22,6 @@ use opendr::replication_provider_fsm::ChangeType;
 use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
-use ldap_parser::filter::{AttributeValueAssertion, Filter};
-use ldap_parser::ldap::{DerefAliases, LdapDN, LdapString, ProtocolOp, SearchRequest, SearchScope};
-use ldap_parser::parse_ldap_messages;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -308,8 +308,12 @@ async fn test_e2e_sequence_number_ordering() {
     assert_eq!(entries.len(), 5);
     // Verify CSNs are strictly increasing
     for idx in 1..entries.len() {
-        assert!(entries[idx].csn > entries[idx-1].csn,
-            "CSN at index {} should be greater than CSN at index {}", idx, idx-1);
+        assert!(
+            entries[idx].csn > entries[idx - 1].csn,
+            "CSN at index {} should be greater than CSN at index {}",
+            idx,
+            idx - 1
+        );
     }
 }
 
@@ -342,7 +346,7 @@ async fn test_e2e_changelog_capacity() {
     assert!(entries.len() <= 3);
     // Verify CSNs are ordered
     for idx in 1..entries.len() {
-        assert!(entries[idx].csn > entries[idx-1].csn);
+        assert!(entries[idx].csn > entries[idx - 1].csn);
     }
 }
 
@@ -503,7 +507,7 @@ async fn test_e2e_provider_serves_changes() {
     // Get all changes and verify count
     let all_changes = changelog.get_all();
     assert_eq!(all_changes.len(), 10); // All 10 entries
-    
+
     // Simulate consumer query from cookie (get changes since 5th CSN)
     let csn5 = &all_changes[4].csn; // 5th entry (index 4)
     let changes_since_5 = changelog.get_since_csn(csn5);
@@ -549,10 +553,13 @@ async fn test_e2e_concurrent_operations() {
     // Verify CSNs are unique and all entries recorded
     let mut csns: Vec<_> = entries.iter().map(|e| e.csn.clone()).collect();
     csns.sort();
-    
+
     // Verify all CSNs are unique (no duplicates after sorting)
     for idx in 1..csns.len() {
-        assert!(csns[idx] > csns[idx-1], "CSNs should be unique and ordered");
+        assert!(
+            csns[idx] > csns[idx - 1],
+            "CSNs should be unique and ordered"
+        );
     }
 }
 
@@ -592,8 +599,11 @@ async fn test_e2e_changelog_cookie() {
     let changelog = service.changelog().unwrap();
     let context_csn = changelog.get_context_csn();
 
-    assert!(context_csn.is_some(), "Context CSN should exist after changes");
-    
+    assert!(
+        context_csn.is_some(),
+        "Context CSN should exist after changes"
+    );
+
     // Verify we can generate and parse cookies
     let cookie = changelog.generate_context_cookie();
     let parsed_csn = changelog.parse_cookie(&cookie);
@@ -666,17 +676,20 @@ async fn test_e2e_listening_replication_stream_emits_live_change() {
             assert!(response
                 .attributes
                 .iter()
-                .any(|attr| attr.attr_type.0.as_ref() == opendr::replication::REPLICATION_CHANGE_TYPE_ATTRIBUTE
+                .any(|attr| attr.attr_type.0.as_ref()
+                    == opendr::replication::REPLICATION_CHANGE_TYPE_ATTRIBUTE
                     && std::str::from_utf8(attr.attr_vals[0].0.as_ref()).unwrap() == "add"));
             assert!(response
                 .attributes
                 .iter()
-                .any(|attr| attr.attr_type.0.as_ref() == opendr::replication::REPLICATION_CHANGE_DATA_ATTRIBUTE
+                .any(|attr| attr.attr_type.0.as_ref()
+                    == opendr::replication::REPLICATION_CHANGE_DATA_ATTRIBUTE
                     && !attr.attr_vals[0].0.as_ref().is_empty()));
             assert!(response
                 .attributes
                 .iter()
-                .any(|attr| attr.attr_type.0.as_ref() == opendr::replication::REPLICATION_CSN_ATTRIBUTE
+                .any(|attr| attr.attr_type.0.as_ref()
+                    == opendr::replication::REPLICATION_CSN_ATTRIBUTE
                     && !attr.attr_vals[0].0.as_ref().is_empty()));
         }
         other => panic!("unexpected replication response: {:?}", other),

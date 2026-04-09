@@ -611,13 +611,7 @@ impl AuditLogger {
     }
 
     /// Log modify operation
-    pub async fn log_modify(
-        &self,
-        dn: &str,
-        user_dn: &str,
-        client_ip: &str,
-        attributes: &[&str],
-    ) {
+    pub async fn log_modify(&self, dn: &str, user_dn: &str, client_ip: &str, attributes: &[&str]) {
         let event = AuditEvent::new(
             AuditLevel::Info,
             AuditEventType::DataModification,
@@ -654,13 +648,7 @@ impl AuditLogger {
     }
 
     /// Log modifydn operation
-    pub async fn log_modifydn(
-        &self,
-        old_dn: &str,
-        new_dn: &str,
-        user_dn: &str,
-        client_ip: &str,
-    ) {
+    pub async fn log_modifydn(&self, old_dn: &str, new_dn: &str, user_dn: &str, client_ip: &str) {
         let event = AuditEvent::new(
             AuditLevel::Info,
             AuditEventType::DataModification,

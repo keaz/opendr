@@ -28,11 +28,11 @@
 //! coordinator.shutdown().await;
 //! ```
 
+use log::{info, warn};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock, Notify};
+use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::time::timeout;
-use log::{info, warn, error};
 
 /// Shutdown configuration
 #[derive(Debug, Clone)]
@@ -113,10 +113,7 @@ impl ShutdownCoordinator {
         let state = self.state.clone();
         let shutdown_tx = self.shutdown_tx.clone();
 
-        ShutdownSignal {
-            state,
-            shutdown_tx,
-        }
+        ShutdownSignal { state, shutdown_tx }
     }
 
     /// Subscribe to shutdown notifications
@@ -231,7 +228,10 @@ impl ShutdownCoordinator {
                         break;
                     }
 
-                    info!("Waiting for {} operations and {} connections to complete", ops, conns);
+                    info!(
+                        "Waiting for {} operations and {} connections to complete",
+                        ops, conns
+                    );
 
                     // Wait for notification or check periodically
                     tokio::select! {
@@ -302,10 +302,10 @@ impl ShutdownSignal {
         {
             use tokio::signal::unix::{signal, SignalKind};
 
-            let mut sigterm = signal(SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler");
-            let mut sigint = signal(SignalKind::interrupt())
-                .expect("Failed to install SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
 
             tokio::select! {
                 _ = sigterm.recv() => {
@@ -321,7 +321,9 @@ impl ShutdownSignal {
         {
             use tokio::signal;
 
-            signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+            signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl+C handler");
             info!("Received Ctrl+C signal");
         }
 

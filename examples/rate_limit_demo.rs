@@ -17,7 +17,7 @@
 //! cargo run --example rate_limit_demo
 //! ```
 
-use opendr::rate_limit::{RateLimiter, RateLimitConfig, OperationType};
+use opendr::rate_limit::{OperationType, RateLimitConfig, RateLimiter};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -158,9 +158,7 @@ async fn demo_global_limiting() {
 
     // Simulate 5 clients making requests
     for client_num in 1..=5 {
-        let client_ip: IpAddr = format!("192.168.1.{}", 100 + client_num)
-            .parse()
-            .unwrap();
+        let client_ip: IpAddr = format!("192.168.1.{}", 100 + client_num).parse().unwrap();
 
         let mut client_allowed = 0;
         for _ in 0..8 {
@@ -178,7 +176,10 @@ async fn demo_global_limiting() {
         );
     }
 
-    println!("\nTotal: {} allowed, {} blocked", total_allowed, total_blocked);
+    println!(
+        "\nTotal: {} allowed, {} blocked",
+        total_allowed, total_blocked
+    );
     println!("Note: Global limit prevents excessive total load");
     println!("---------------------------------------\n");
 
@@ -278,7 +279,10 @@ async fn demo_auto_ban() {
             allowed_while_banned += 1;
         }
     }
-    println!("Requests allowed while banned: {} (should be 0)", allowed_while_banned);
+    println!(
+        "Requests allowed while banned: {} (should be 0)",
+        allowed_while_banned
+    );
 
     // Wait for ban to expire
     println!("\nWaiting for ban to expire (2 seconds)...");
@@ -309,7 +313,7 @@ async fn demo_adaptive_limiting() {
         global_requests_per_second: 50,
         per_client_requests_per_second: 20,
         adaptive_enabled: true,
-        adaptive_threshold: 0.6, // 60% of global limit
+        adaptive_threshold: 0.6,  // 60% of global limit
         adaptive_multiplier: 0.5, // Reduce to 50%
         ..Default::default()
     };
@@ -323,9 +327,7 @@ async fn demo_adaptive_limiting() {
     // Generate high load
     println!("Generating high load from multiple clients...");
     for i in 0..5 {
-        let client_ip: IpAddr = format!("192.168.1.{}", 100 + i)
-            .parse()
-            .unwrap();
+        let client_ip: IpAddr = format!("192.168.1.{}", 100 + i).parse().unwrap();
 
         for _ in 0..10 {
             limiter.check_rate_limit(client_ip, "search").await;
@@ -379,11 +381,20 @@ async fn demo_statistics() {
 
     let config = limiter.get_config().await;
     println!("\n=== Configuration ===");
-    println!("Global limit:       {} req/sec", config.global_requests_per_second);
-    println!("Per-client limit:   {} req/sec", config.per_client_requests_per_second);
+    println!(
+        "Global limit:       {} req/sec",
+        config.global_requests_per_second
+    );
+    println!(
+        "Per-client limit:   {} req/sec",
+        config.per_client_requests_per_second
+    );
     println!("Burst size:         {}", config.burst_size);
     println!("Adaptive enabled:   {}", config.adaptive_enabled);
-    println!("Auto-ban threshold: {} violations", config.auto_ban_threshold);
+    println!(
+        "Auto-ban threshold: {} violations",
+        config.auto_ban_threshold
+    );
     println!("Auto-ban duration:  {:?}", config.auto_ban_duration);
 
     println!("\n=== Operation Limits ===");

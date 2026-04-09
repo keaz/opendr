@@ -107,7 +107,7 @@ pub struct LmdbBackend {
     /// Lock for write operations (reads are lock-free in LMDB)
     write_lock: Arc<RwLock<()>>,
     /// Database directory path
-    db_path: PathBuf,
+    _db_path: PathBuf,
     /// Configured maximum reader slots
     max_readers: u32,
     /// CSN generator for operational attributes
@@ -218,7 +218,7 @@ impl LmdbBackend {
             attr_indexes: Arc::new(RwLock::new(attr_indexes)),
             index_config,
             write_lock: Arc::new(RwLock::new(())),
-            db_path,
+            _db_path: db_path,
             max_readers,
             csn_generator,
         })
@@ -471,7 +471,7 @@ impl LmdbBackend {
         // Hash password with salt
         let mut hasher = Sha512::new();
         hasher.update(password);
-        hasher.update(&salt);
+        hasher.update(salt);
         let hash = hasher.finalize();
 
         // Combine hash and salt
@@ -490,8 +490,8 @@ impl LmdbBackend {
     /// Format: {SSHA512}base64(SHA512(password + salt) + salt)
     fn verify_ssha512(password: &[u8], stored_hash: &str) -> bool {
         // Remove {SSHA512} prefix if present
-        let hash_b64 = if stored_hash.starts_with("{SSHA512}") {
-            &stored_hash[9..]
+        let hash_b64 = if let Some(stripped) = stored_hash.strip_prefix("{SSHA512}") {
+            stripped
         } else {
             stored_hash
         };
@@ -1317,7 +1317,7 @@ mod tests {
     async fn test_lmdb_backend_create() {
         let dir = tempdir().unwrap();
         let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
-        assert!(backend.db_path.exists());
+        assert!(backend._db_path.exists());
     }
 
     #[tokio::test]
@@ -1485,8 +1485,7 @@ mod tests {
             let mut attributes = HashMap::new();
             attributes.insert("cn".to_string(), vec![format!("User {}", i)]);
             attributes.insert("ou".to_string(), vec!["Engineering".to_string()]);
-            let entry =
-                DirectoryEntry::new(&format!("uid=user{},dc=example,dc=org", i), attributes);
+            let entry = DirectoryEntry::new(format!("uid=user{},dc=example,dc=org", i), attributes);
             backend.add_entry(entry, vec![]).await.unwrap();
         }
 

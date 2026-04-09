@@ -51,7 +51,7 @@ pub enum ConfigError {
 }
 
 /// Complete server configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
     /// Server settings
     #[serde(default)]
@@ -937,23 +937,6 @@ impl Default for PerformanceSettings {
     }
 }
 
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerSettings::default(),
-            backend: BackendSettings::default(),
-            tls: TlsSettings::default(),
-            resources: ResourceSettings::default(),
-            rate_limit: RateLimitSettings::default(),
-            replication: ReplicationSettings::default(),
-            monitoring: MonitoringSettings::default(),
-            audit: AuditSettings::default(),
-            access_control: AccessControlSettings::default(),
-            performance: PerformanceSettings::default(),
-        }
-    }
-}
-
 fn trim_secret_value(secret: String) -> String {
     secret.trim_end_matches(['\n', '\r']).to_string()
 }
@@ -1141,7 +1124,6 @@ impl ServerConfig {
     /// Convert ServerConfig to FsmServerConfig for FSM server usage
     pub fn to_fsm_server_config(&self) -> crate::fsm_server::FsmServerConfig {
         use crate::connection_pool::ResourceLimits;
-        use crate::rate_limit::RateLimitConfig as RlConfig;
 
         crate::fsm_server::FsmServerConfig {
             operation_timeout: self.operation_timeout(),

@@ -406,7 +406,7 @@ pub trait WriteBackend: Send + Sync {
     ///
     /// # Returns
     /// * (operations_performed, entries_affected)
-    async fn get_transaction_stats(&self, txn_id: &str) -> Result<(usize, usize), String> {
+    async fn get_transaction_stats(&self, _txn_id: &str) -> Result<(usize, usize), String> {
         // Default implementation returns zeros
         Ok((0, 0))
     }
@@ -455,9 +455,9 @@ pub trait SchemaValidator: Send + Sync {
     /// * `Err(String)` - Schema validation error
     async fn validate_dn_modification(
         &self,
-        dn: &str,
-        new_rdn: &str,
-        new_superior: Option<&str>,
+        _dn: &str,
+        _new_rdn: &str,
+        _new_superior: Option<&str>,
     ) -> Result<(), String> {
         // Default implementation accepts all modifications
         Ok(())
@@ -470,7 +470,7 @@ pub trait SchemaValidator: Send + Sync {
     ///
     /// # Returns
     /// * true if object class is defined in schema
-    fn is_object_class_defined(&self, object_class: &str) -> bool {
+    fn is_object_class_defined(&self, _object_class: &str) -> bool {
         // Default implementation assumes all object classes are valid
         true
     }
@@ -509,9 +509,9 @@ pub trait AciChecker: Send + Sync {
     /// * `Err(String)` - Access denied
     async fn check_add_permission(
         &self,
-        user_dn: Option<&str>,
-        entry_dn: &str,
-        entry: &WriteEntry,
+        _user_dn: Option<&str>,
+        _entry_dn: &str,
+        _entry: &WriteEntry,
     ) -> Result<(), String> {
         // Default implementation allows all operations
         Ok(())
@@ -529,9 +529,9 @@ pub trait AciChecker: Send + Sync {
     /// * `Err(String)` - Access denied
     async fn check_modify_permission(
         &self,
-        user_dn: Option<&str>,
-        entry_dn: &str,
-        modifications: &[Modification],
+        _user_dn: Option<&str>,
+        _entry_dn: &str,
+        _modifications: &[Modification],
     ) -> Result<(), String> {
         // Default implementation allows all operations
         Ok(())
@@ -548,8 +548,8 @@ pub trait AciChecker: Send + Sync {
     /// * `Err(String)` - Access denied
     async fn check_delete_permission(
         &self,
-        user_dn: Option<&str>,
-        entry_dn: &str,
+        _user_dn: Option<&str>,
+        _entry_dn: &str,
     ) -> Result<(), String> {
         // Default implementation allows all operations
         Ok(())
@@ -1439,7 +1439,7 @@ impl WriteFsmImpl {
 
                 attributes
                     .entry(attr_name.to_string())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(attr_value);
             }
         }
@@ -1674,6 +1674,7 @@ impl WriteFsm for WriteFsmImpl {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};

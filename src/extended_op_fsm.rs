@@ -294,12 +294,12 @@ impl ExtendedOpFsmImpl {
         let parsed = self
             .parser
             .parse_request(&oid, value.as_deref())
-            .map_err(|e| ExtendedOpError::from(e))?;
+            .map_err(ExtendedOpError::from)?;
 
         // Validate the parsed operation
         self.parser
             .validate_operation(&parsed)
-            .map_err(|e| ExtendedOpError::from(e))?;
+            .map_err(ExtendedOpError::from)?;
 
         // Check if backend supports this operation
         if !self.backend.is_operation_supported(&oid) {
@@ -325,7 +325,7 @@ impl ExtendedOpFsmImpl {
             .backend
             .execute_operation(&operation, self.operation_value.as_deref())
             .await
-            .map_err(|e| ExtendedOpError::from(e))?;
+            .map_err(ExtendedOpError::from)?;
 
         self.response_value = Some(response_data);
         Ok(())
@@ -351,7 +351,7 @@ impl ExtendedOpFsmImpl {
             .delegator
             .delegate_operation(parsed_op)
             .await
-            .map_err(|e| ExtendedOpError::from(e))?;
+            .map_err(ExtendedOpError::from)?;
 
         self.response_value = Some(response_data);
         Ok(())

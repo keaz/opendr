@@ -3,14 +3,11 @@
 //! These tests verify that the connection pool and resource limits work correctly
 //! in a realistic server scenario.
 
-use opendr::backend::MockBackend;
 use opendr::connection_pool::{ConnectionPool, ResourceLimits};
 use opendr::fsm_server::FsmServerConfig;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 /// Helper to create a test address
 fn test_addr(port: u16) -> SocketAddr {
@@ -50,8 +47,8 @@ async fn test_max_connections_enforcement() {
 
     // Acquire 3 connections
     let conn1 = pool.acquire_connection(test_addr(1234)).await.unwrap();
-    let conn2 = pool.acquire_connection(test_addr(1235)).await.unwrap();
-    let conn3 = pool.acquire_connection(test_addr(1236)).await.unwrap();
+    let _conn2 = pool.acquire_connection(test_addr(1235)).await.unwrap();
+    let _conn3 = pool.acquire_connection(test_addr(1236)).await.unwrap();
 
     // Fourth should be rejected
     let conn4 = pool.acquire_connection(test_addr(1237)).await;
@@ -83,8 +80,8 @@ async fn test_per_ip_connection_limits() {
     let ip2_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 1234);
 
     // Acquire 2 connections from IP1
-    let conn1 = pool.acquire_connection(ip1_addr).await.unwrap();
-    let conn2 = pool.acquire_connection(ip1_addr).await.unwrap();
+    let _conn1 = pool.acquire_connection(ip1_addr).await.unwrap();
+    let _conn2 = pool.acquire_connection(ip1_addr).await.unwrap();
 
     // Third from same IP should be rejected
     let conn3 = pool.acquire_connection(ip1_addr).await;

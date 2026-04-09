@@ -68,7 +68,9 @@ async fn test_indexed_search_single_entry() {
     assert_eq!(results.len(), 1);
 
     // Search by mail
-    let results = backend.search_by_index("mail", "alice@example.com").unwrap();
+    let results = backend
+        .search_by_index("mail", "alice@example.com")
+        .unwrap();
     assert_eq!(results.len(), 1);
 }
 
@@ -85,7 +87,7 @@ async fn test_indexed_search_multiple_entries() {
         attributes.insert("ou".to_string(), vec!["Engineering".to_string()]);
 
         let entry = DirectoryEntry::new(
-            &format!("uid=eng{},ou=People,dc=example,dc=org", i),
+            format!("uid=eng{},ou=People,dc=example,dc=org", i),
             attributes,
         );
         backend.add_entry(entry, vec![]).await.unwrap();
@@ -185,7 +187,9 @@ async fn test_index_maintenance_on_modify() {
     assert_eq!(results.len(), 1);
 
     // mail should still be indexed (unchanged)
-    let results = backend.search_by_index("mail", "original@example.com").unwrap();
+    let results = backend
+        .search_by_index("mail", "original@example.com")
+        .unwrap();
     assert_eq!(results.len(), 1);
 }
 
@@ -199,7 +203,7 @@ async fn test_index_maintenance_on_delete() {
         let mut attributes = HashMap::new();
         attributes.insert("cn".to_string(), vec![format!("User {}", i)]);
         attributes.insert("ou".to_string(), vec!["Sales".to_string()]);
-        let entry = DirectoryEntry::new(&format!("uid=user{},dc=example,dc=org", i), attributes);
+        let entry = DirectoryEntry::new(format!("uid=user{},dc=example,dc=org", i), attributes);
         backend.add_entry(entry, vec![]).await.unwrap();
     }
 
@@ -250,7 +254,9 @@ async fn test_index_with_add_operation() {
     let results = backend.search_by_index("mail", "test@example.com").unwrap();
     assert_eq!(results.len(), 1);
 
-    let results = backend.search_by_index("mail", "test2@example.com").unwrap();
+    let results = backend
+        .search_by_index("mail", "test2@example.com")
+        .unwrap();
     assert_eq!(results.len(), 1);
 }
 
@@ -284,11 +290,15 @@ async fn test_index_with_delete_operation() {
         .unwrap();
 
     // Deleted value should not be indexed
-    let results = backend.search_by_index("mail", "test1@example.com").unwrap();
+    let results = backend
+        .search_by_index("mail", "test1@example.com")
+        .unwrap();
     assert_eq!(results.len(), 0);
 
     // Remaining value should still be indexed
-    let results = backend.search_by_index("mail", "test2@example.com").unwrap();
+    let results = backend
+        .search_by_index("mail", "test2@example.com")
+        .unwrap();
     assert_eq!(results.len(), 1);
 }
 
@@ -328,7 +338,9 @@ async fn test_custom_index_configuration() {
     let results = backend.search_by_index("employeeNumber", "12345").unwrap();
     assert_eq!(results.len(), 1);
 
-    let results = backend.search_by_index("department", "Engineering").unwrap();
+    let results = backend
+        .search_by_index("department", "Engineering")
+        .unwrap();
     assert_eq!(results.len(), 1);
 
     let results = backend.search_by_index("title", "Senior Engineer").unwrap();
@@ -350,7 +362,7 @@ async fn test_indexed_search_performance() {
             vec![format!("Department{}", i % 10)], // 10 different departments
         );
 
-        let entry = DirectoryEntry::new(&format!("uid=user{},dc=example,dc=org", i), attributes);
+        let entry = DirectoryEntry::new(format!("uid=user{},dc=example,dc=org", i), attributes);
         backend.add_entry(entry, vec![]).await.unwrap();
     }
 
@@ -379,7 +391,7 @@ async fn test_indexed_search_no_results() {
     for i in 1..=5 {
         let mut attributes = HashMap::new();
         attributes.insert("cn".to_string(), vec![format!("User {}", i)]);
-        let entry = DirectoryEntry::new(&format!("uid=user{},dc=example,dc=org", i), attributes);
+        let entry = DirectoryEntry::new(format!("uid=user{},dc=example,dc=org", i), attributes);
         backend.add_entry(entry, vec![]).await.unwrap();
     }
 
@@ -394,7 +406,7 @@ async fn test_objectclass_indexing() {
     let backend = create_test_backend(&temp_dir);
 
     // Add entries with different objectClass values
-    let classes = vec![
+    let classes = [
         vec!["person".to_string(), "inetOrgPerson".to_string()],
         vec!["organizationalUnit".to_string()],
         vec!["person".to_string()],
@@ -405,7 +417,7 @@ async fn test_objectclass_indexing() {
         attributes.insert("objectclass".to_string(), obj_class.clone());
         attributes.insert("cn".to_string(), vec![format!("Entry {}", i)]);
 
-        let entry = DirectoryEntry::new(&format!("cn=entry{},dc=example,dc=org", i), attributes);
+        let entry = DirectoryEntry::new(format!("cn=entry{},dc=example,dc=org", i), attributes);
         backend.add_entry(entry, vec![]).await.unwrap();
     }
 

@@ -242,8 +242,7 @@ impl ChangelogTracker {
         }
 
         let temp_path = path.with_extension("tmp");
-        let payload = serde_json::to_vec_pretty(&snapshot)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        let payload = serde_json::to_vec_pretty(&snapshot).map_err(std::io::Error::other)?;
         std::fs::write(&temp_path, payload)?;
         std::fs::rename(&temp_path, &path)?;
         Ok(())
@@ -422,6 +421,12 @@ impl ChangelogTracker {
         }
 
         ChangelogCookieStatus::Valid(Some(csn))
+    }
+}
+
+impl Default for ChangelogTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -758,6 +763,12 @@ pub struct ConsumerRegistryImpl {
     consumers: Arc<Mutex<HashMap<String, ConsumerConnection>>>,
 }
 
+impl Default for ConsumerRegistryImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConsumerRegistryImpl {
     pub fn new() -> Self {
         Self {
@@ -829,6 +840,12 @@ pub struct StreamingManagerImpl {
     active_streams: Arc<Mutex<HashMap<String, StreamingStats>>>,
 }
 
+impl Default for StreamingManagerImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingManagerImpl {
     pub fn new() -> Self {
         Self {
@@ -885,6 +902,12 @@ impl StreamingManager for StreamingManagerImpl {
 
 /// Sync request handler
 pub struct SyncRequestHandlerImpl;
+
+impl Default for SyncRequestHandlerImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SyncRequestHandlerImpl {
     pub fn new() -> Self {
@@ -1154,11 +1177,9 @@ impl ProviderConnection for ProviderConnectionImpl {
         // Query remote provider via LDAP
         // Parse cookie to get CSN if provided
         let cookie_csn = if let Some(cookie_str) = cookie {
-            if let Some(csn_str) = cookie_str.strip_prefix("csn-") {
-                Some(csn_str.to_string())
-            } else {
-                None
-            }
+            cookie_str
+                .strip_prefix("csn-")
+                .map(|csn_str| csn_str.to_string())
         } else {
             None
         };
@@ -1762,6 +1783,12 @@ impl StateManager for StateManagerImpl {
 pub struct ChangeListenerImpl {
     listening: Arc<Mutex<bool>>,
     stats: Arc<Mutex<ListeningStats>>,
+}
+
+impl Default for ChangeListenerImpl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChangeListenerImpl {

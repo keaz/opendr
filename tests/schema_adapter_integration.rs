@@ -4,7 +4,7 @@
 //! proper validation of LDAP write operations.
 
 use opendr::schema_adapter::LdapSchemaValidator;
-use opendr::write_fsm::{WriteEntry, Modification, SchemaValidator};
+use opendr::write_fsm::{Modification, SchemaValidator, WriteEntry};
 use std::collections::HashMap;
 
 #[tokio::test]
@@ -42,7 +42,10 @@ async fn test_schema_validator_missing_required_attribute() {
     };
 
     let result = validator.validate_entry(&entry).await;
-    assert!(result.is_err(), "Entry missing required attribute should fail");
+    assert!(
+        result.is_err(),
+        "Entry missing required attribute should fail"
+    );
     assert!(result.unwrap_err().contains("Missing required attribute"));
 }
 
@@ -61,7 +64,10 @@ async fn test_schema_validator_unknown_object_class() {
     };
 
     let result = validator.validate_entry(&entry).await;
-    assert!(result.is_err(), "Unknown object class should fail validation");
+    assert!(
+        result.is_err(),
+        "Unknown object class should fail validation"
+    );
     assert!(result.unwrap_err().contains("Object class not found"));
 }
 
@@ -88,7 +94,10 @@ async fn test_schema_validator_inetorgperson_entry() {
     };
 
     let result = validator.validate_entry(&entry).await;
-    assert!(result.is_ok(), "Valid inetOrgPerson entry should pass validation");
+    assert!(
+        result.is_ok(),
+        "Valid inetOrgPerson entry should pass validation"
+    );
 }
 
 #[tokio::test]
@@ -126,7 +135,10 @@ async fn test_validate_modifications_unknown_attribute() {
         .validate_modifications("cn=John Doe,dc=example,dc=com", &modifications)
         .await;
 
-    assert!(result.is_err(), "Unknown attribute in modification should fail");
+    assert!(
+        result.is_err(),
+        "Unknown attribute in modification should fail"
+    );
     assert!(result.unwrap_err().contains("Unknown attribute type"));
 }
 
@@ -135,11 +147,7 @@ async fn test_validate_dn_modification_valid() {
     let validator = LdapSchemaValidator::new();
 
     let result = validator
-        .validate_dn_modification(
-            "cn=John Doe,dc=example,dc=com",
-            "cn=Jane Doe",
-            None,
-        )
+        .validate_dn_modification("cn=John Doe,dc=example,dc=com", "cn=Jane Doe", None)
         .await;
 
     assert!(result.is_ok(), "Valid DN modification should pass");
@@ -150,11 +158,7 @@ async fn test_validate_dn_modification_invalid_rdn() {
     let validator = LdapSchemaValidator::new();
 
     let result = validator
-        .validate_dn_modification(
-            "cn=John Doe,dc=example,dc=com",
-            "invalid_rdn",
-            None,
-        )
+        .validate_dn_modification("cn=John Doe,dc=example,dc=com", "invalid_rdn", None)
         .await;
 
     assert!(result.is_err(), "Invalid RDN format should fail");
@@ -166,11 +170,7 @@ async fn test_validate_dn_modification_unknown_attribute() {
     let validator = LdapSchemaValidator::new();
 
     let result = validator
-        .validate_dn_modification(
-            "cn=John Doe,dc=example,dc=com",
-            "unknownAttr=value",
-            None,
-        )
+        .validate_dn_modification("cn=John Doe,dc=example,dc=com", "unknownAttr=value", None)
         .await;
 
     assert!(result.is_err(), "Unknown attribute in RDN should fail");
@@ -193,7 +193,10 @@ async fn test_organizational_unit_entry() {
 
     let mut attributes = HashMap::new();
     attributes.insert("ou".to_string(), vec!["Engineering".to_string()]);
-    attributes.insert("description".to_string(), vec!["Engineering Department".to_string()]);
+    attributes.insert(
+        "description".to_string(),
+        vec!["Engineering Department".to_string()],
+    );
 
     let entry = WriteEntry {
         dn: "ou=Engineering,dc=example,dc=com".to_string(),
@@ -203,7 +206,10 @@ async fn test_organizational_unit_entry() {
     };
 
     let result = validator.validate_entry(&entry).await;
-    assert!(result.is_ok(), "Valid organizationalUnit entry should pass validation");
+    assert!(
+        result.is_ok(),
+        "Valid organizationalUnit entry should pass validation"
+    );
 }
 
 #[tokio::test]
@@ -212,7 +218,10 @@ async fn test_organization_entry() {
 
     let mut attributes = HashMap::new();
     attributes.insert("o".to_string(), vec!["Example Corp".to_string()]);
-    attributes.insert("description".to_string(), vec!["Example Corporation".to_string()]);
+    attributes.insert(
+        "description".to_string(),
+        vec!["Example Corporation".to_string()],
+    );
 
     let entry = WriteEntry {
         dn: "dc=example,dc=com".to_string(),
@@ -222,7 +231,10 @@ async fn test_organization_entry() {
     };
 
     let result = validator.validate_entry(&entry).await;
-    assert!(result.is_ok(), "Valid organization entry should pass validation");
+    assert!(
+        result.is_ok(),
+        "Valid organization entry should pass validation"
+    );
 }
 
 #[tokio::test]
@@ -239,7 +251,10 @@ async fn test_no_structural_class() {
     };
 
     let result = validator.validate_entry(&entry).await;
-    assert!(result.is_err(), "Entry with only abstract class should fail");
+    assert!(
+        result.is_err(),
+        "Entry with only abstract class should fail"
+    );
     assert!(result.unwrap_err().contains("No structural"));
 }
 
@@ -259,7 +274,10 @@ async fn test_case_insensitive_validation() {
     };
 
     let result = validator.validate_entry(&entry).await;
-    assert!(result.is_ok(), "Case-insensitive attribute names should work");
+    assert!(
+        result.is_ok(),
+        "Case-insensitive attribute names should work"
+    );
 }
 
 #[tokio::test]

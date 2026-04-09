@@ -438,6 +438,12 @@ impl ProcessingStats {
     }
 }
 
+impl Default for ProcessingStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Storage metadata information
 #[derive(Debug, Clone)]
 pub struct StorageMetadata {
@@ -525,6 +531,12 @@ impl ListeningStats {
     }
 }
 
+impl Default for ListeningStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Overall consumer statistics
 #[derive(Debug, Clone)]
 pub struct ConsumerStats {
@@ -580,6 +592,12 @@ impl ConsumerStats {
         } else {
             0.0
         }
+    }
+}
+
+impl Default for ConsumerStats {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1515,15 +1533,24 @@ pub mod tests {
     use std::sync::{Arc, Mutex};
     use tokio;
 
+    type BatchRequestCall = (Option<String>, usize, usize);
+    type BatchRequestLog = Arc<Mutex<Vec<BatchRequestCall>>>;
+
     // Mock implementations for testing
     pub struct MockProviderConnection {
         should_fail: bool,
         connected: Arc<Mutex<bool>>,
         entries: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
-        request_batch_calls: Arc<Mutex<Vec<(Option<String>, usize, usize)>>>,
+        request_batch_calls: BatchRequestLog,
         connection_info: ConnectionInfo,
         connect_delay: Option<Duration>,
         request_delay: Option<Duration>,
+    }
+
+    impl Default for MockProviderConnection {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockProviderConnection {
@@ -1671,6 +1698,12 @@ pub mod tests {
         stats: Arc<Mutex<ProcessingStats>>,
     }
 
+    impl Default for MockBatchProcessor {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockBatchProcessor {
         pub fn new() -> Self {
             Self {
@@ -1774,6 +1807,12 @@ pub mod tests {
         save_delay: Option<Duration>,
     }
 
+    impl Default for MockStateManager {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockStateManager {
         pub fn new() -> Self {
             Self {
@@ -1871,6 +1910,12 @@ pub mod tests {
         start_delay: Option<Duration>,
     }
 
+    impl Default for MockChangeListener {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockChangeListener {
         pub fn new() -> Self {
             Self {
@@ -1966,6 +2011,12 @@ pub mod tests {
     pub struct MockConsumerMetrics {
         stats: Arc<Mutex<ConsumerStats>>,
         recorded_events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Default for MockConsumerMetrics {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockConsumerMetrics {

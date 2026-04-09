@@ -15,12 +15,12 @@
 //! cargo run --example full_server_with_config
 //! ```
 
-use opendr::config::ServerConfig;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
-use opendr::shutdown::{ShutdownCoordinator, ShutdownConfig};
-use std::sync::Arc;
+use opendr::config::ServerConfig;
+use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,7 +99,10 @@ fn display_config_summary(config: &ServerConfig) {
     println!("  Base DN:         {}", config.server.base_dn);
     println!("  Root User:       {}", config.server.root_user_dn);
     println!("  Organization:    {}", config.server.organization_name);
-    println!("  Buffer Size:     {} bytes", config.server.read_buffer_size);
+    println!(
+        "  Buffer Size:     {} bytes",
+        config.server.read_buffer_size
+    );
     println!("  Op Timeout:      {:?}", config.operation_timeout());
     println!("  Cleanup:         {:?}", config.cleanup_interval());
 
@@ -107,42 +110,75 @@ fn display_config_summary(config: &ServerConfig) {
     println!("  Type:            {}", config.backend.backend_type);
     println!("  Data Directory:  {:?}", config.backend.data_directory);
     if config.backend.backend_type == "lmdb" {
-        println!("  Max Size:        {} MB", config.backend.lmdb_max_size / (1024 * 1024));
+        println!(
+            "  Max Size:        {} MB",
+            config.backend.lmdb_max_size / (1024 * 1024)
+        );
         println!("  Max Readers:     {}", config.backend.lmdb_max_readers);
     }
     println!("  Indexed Attrs:   {:?}", config.backend.indexed_attributes);
 
     println!("\n[Resource Management]");
-    println!("  Max Connections:     {}", config.resources.max_connections);
-    println!("  Per-IP Limit:        {}", config.resources.max_connections_per_ip);
-    println!("  Ops/Connection:      {}", config.resources.max_operations_per_connection);
-    println!("  Memory/Connection:   {} MB", config.resources.max_memory_per_connection / (1024 * 1024));
-    println!("  Total Memory:        {} MB", config.resources.max_total_memory / (1024 * 1024));
-    println!("  Idle Timeout:        {:?}", config.connection_idle_timeout());
+    println!(
+        "  Max Connections:     {}",
+        config.resources.max_connections
+    );
+    println!(
+        "  Per-IP Limit:        {}",
+        config.resources.max_connections_per_ip
+    );
+    println!(
+        "  Ops/Connection:      {}",
+        config.resources.max_operations_per_connection
+    );
+    println!(
+        "  Memory/Connection:   {} MB",
+        config.resources.max_memory_per_connection / (1024 * 1024)
+    );
+    println!(
+        "  Total Memory:        {} MB",
+        config.resources.max_total_memory / (1024 * 1024)
+    );
+    println!(
+        "  Idle Timeout:        {:?}",
+        config.connection_idle_timeout()
+    );
 
     println!("\n[Rate Limiting]");
     println!("  Enabled:         {}", config.rate_limit.enabled);
     if config.rate_limit.enabled {
-        println!("  Global Limit:    {} req/sec", config.rate_limit.global_requests_per_second);
-        println!("  Per-Client:      {} req/sec", config.rate_limit.per_client_requests_per_second);
+        println!(
+            "  Global Limit:    {} req/sec",
+            config.rate_limit.global_requests_per_second
+        );
+        println!(
+            "  Per-Client:      {} req/sec",
+            config.rate_limit.per_client_requests_per_second
+        );
         println!("  Burst Size:      {}", config.rate_limit.burst_size);
         println!("  Adaptive:        {}", config.rate_limit.adaptive_enabled);
-        println!("  Auto-Ban:        {} violations → {:?}",
-                 config.rate_limit.auto_ban_threshold,
-                 config.auto_ban_duration());
+        println!(
+            "  Auto-Ban:        {} violations → {:?}",
+            config.rate_limit.auto_ban_threshold,
+            config.auto_ban_duration()
+        );
     }
 
     println!("\n[Monitoring]");
     println!("  Enabled:         {}", config.monitoring.enabled);
     if config.monitoring.enabled {
-        println!("  Metrics:         {}:{}{}",
-                 config.monitoring.metrics_address,
-                 config.monitoring.metrics_port,
-                 config.monitoring.metrics_path);
-        println!("  Health Check:    {}:{}{}",
-                 config.monitoring.metrics_address,
-                 config.monitoring.metrics_port,
-                 config.monitoring.health_path);
+        println!(
+            "  Metrics:         {}:{}{}",
+            config.monitoring.metrics_address,
+            config.monitoring.metrics_port,
+            config.monitoring.metrics_path
+        );
+        println!(
+            "  Health Check:    {}:{}{}",
+            config.monitoring.metrics_address,
+            config.monitoring.metrics_port,
+            config.monitoring.health_path
+        );
     }
 
     println!("\n[Audit Logging]");
@@ -161,42 +197,78 @@ fn display_fsm_config(fsm_config: &opendr::fsm_server::FsmServerConfig) {
     println!("\n[FSM Server Configuration]");
     println!("  Operation Timeout:    {:?}", fsm_config.operation_timeout);
     println!("  Cleanup Interval:     {:?}", fsm_config.cleanup_interval);
-    println!("  Read Buffer Size:     {} bytes", fsm_config.read_buffer_size);
-    println!("  Max Concurrent Ops:   {}", fsm_config.max_concurrent_operations);
-    println!("  Rate Limiting:        {}", fsm_config.rate_limiting_enabled);
+    println!(
+        "  Read Buffer Size:     {} bytes",
+        fsm_config.read_buffer_size
+    );
+    println!(
+        "  Max Concurrent Ops:   {}",
+        fsm_config.max_concurrent_operations
+    );
+    println!(
+        "  Rate Limiting:        {}",
+        fsm_config.rate_limiting_enabled
+    );
 
     println!("\n  Resource Limits:");
-    println!("    Max Connections:        {}", fsm_config.resource_limits.max_connections);
-    println!("    Max Per-IP:             {}", fsm_config.resource_limits.max_connections_per_ip);
-    println!("    Max Ops/Connection:     {}", fsm_config.resource_limits.max_operations_per_connection);
-    println!("    Max Memory/Connection:  {} MB",
-             fsm_config.resource_limits.max_memory_per_connection / (1024 * 1024));
-    println!("    Max Total Memory:       {} MB",
-             fsm_config.resource_limits.max_total_memory / (1024 * 1024));
-    println!("    Idle Timeout:           {:?}", fsm_config.resource_limits.connection_idle_timeout);
+    println!(
+        "    Max Connections:        {}",
+        fsm_config.resource_limits.max_connections
+    );
+    println!(
+        "    Max Per-IP:             {}",
+        fsm_config.resource_limits.max_connections_per_ip
+    );
+    println!(
+        "    Max Ops/Connection:     {}",
+        fsm_config.resource_limits.max_operations_per_connection
+    );
+    println!(
+        "    Max Memory/Connection:  {} MB",
+        fsm_config.resource_limits.max_memory_per_connection / (1024 * 1024)
+    );
+    println!(
+        "    Max Total Memory:       {} MB",
+        fsm_config.resource_limits.max_total_memory / (1024 * 1024)
+    );
+    println!(
+        "    Idle Timeout:           {:?}",
+        fsm_config.resource_limits.connection_idle_timeout
+    );
 
     if fsm_config.rate_limiting_enabled {
         println!("\n  Rate Limit Config:");
-        println!("    Global Limit:           {} req/sec", fsm_config.rate_limit_config.global_requests_per_second);
-        println!("    Per-Client Limit:       {} req/sec", fsm_config.rate_limit_config.per_client_requests_per_second);
-        println!("    Adaptive Enabled:       {}", fsm_config.rate_limit_config.adaptive_enabled);
-        println!("    Window Duration:        {:?}", fsm_config.rate_limit_config.window_duration);
+        println!(
+            "    Global Limit:           {} req/sec",
+            fsm_config.rate_limit_config.global_requests_per_second
+        );
+        println!(
+            "    Per-Client Limit:       {} req/sec",
+            fsm_config.rate_limit_config.per_client_requests_per_second
+        );
+        println!(
+            "    Adaptive Enabled:       {}",
+            fsm_config.rate_limit_config.adaptive_enabled
+        );
+        println!(
+            "    Window Duration:        {:?}",
+            fsm_config.rate_limit_config.window_duration
+        );
     }
 }
 
 /// Create backend based on configuration
-async fn create_backend(config: &ServerConfig) -> Result<Arc<dyn DirectoryBackend>, Box<dyn std::error::Error>> {
+async fn create_backend(
+    config: &ServerConfig,
+) -> Result<Arc<dyn DirectoryBackend>, Box<dyn std::error::Error>> {
     match config.backend.backend_type.as_str() {
         "lmdb" => {
             println!("  Initializing LMDB backend...");
-            let max_size_mb = (config.backend.lmdb_max_size / (1024 * 1024)) as usize;
+            let max_size_mb = config.backend.lmdb_max_size / (1024 * 1024);
             let replica_id = 1;
 
-            let mut backend = LmdbBackend::new(
-                &config.backend.data_directory,
-                max_size_mb,
-                replica_id
-            )?;
+            let mut backend =
+                LmdbBackend::new(&config.backend.data_directory, max_size_mb, replica_id)?;
 
             // Initialize directory structure if needed
             if backend.get_entry(&config.server.base_dn).await?.is_none() {
@@ -208,7 +280,13 @@ async fn create_backend(config: &ServerConfig) -> Result<Arc<dyn DirectoryBacken
 
             Ok(Arc::new(backend))
         }
-        "memory" | _ => {
+        "memory" => {
+            println!("  Initializing in-memory backend...");
+            let mut backend = MockBackend::default();
+            initialize_directory(&mut backend, config).await?;
+            Ok(Arc::new(backend))
+        }
+        _ => {
             println!("  Initializing in-memory backend...");
             let mut backend = MockBackend::default();
             initialize_directory(&mut backend, config).await?;
@@ -220,22 +298,36 @@ async fn create_backend(config: &ServerConfig) -> Result<Arc<dyn DirectoryBacken
 /// Initialize base directory structure
 async fn initialize_directory(
     backend: &mut dyn DirectoryBackend,
-    config: &ServerConfig
+    config: &ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create base DN entry
     let base_entry = DirectoryEntry::new(
         &config.server.base_dn,
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]),
-            ("o".to_string(), vec![config.server.organization_name.clone()]),
-            ("description".to_string(), vec![format!("{} LDAP Directory", config.server.organization_name)]),
-        ])
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organization".to_string()],
+            ),
+            (
+                "o".to_string(),
+                vec![config.server.organization_name.clone()],
+            ),
+            (
+                "description".to_string(),
+                vec![format!(
+                    "{} LDAP Directory",
+                    config.server.organization_name
+                )],
+            ),
+        ]),
     );
     backend.add_entry(base_entry, vec![]).await?;
 
     // Create admin user
     let admin_dn = format!("{},{}", config.server.root_user_dn, config.server.base_dn);
-    let admin_cn = config.server.root_user_dn
+    let admin_cn = config
+        .server
+        .root_user_dn
         .split('=')
         .nth(1)
         .unwrap_or("admin")
@@ -244,32 +336,49 @@ async fn initialize_directory(
     let admin_entry = DirectoryEntry::new(
         &admin_dn,
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
             ("cn".to_string(), vec![admin_cn]),
             ("sn".to_string(), vec!["Administrator".to_string()]),
-            ("description".to_string(), vec!["Directory Administrator".to_string()]),
-        ])
+            (
+                "description".to_string(),
+                vec!["Directory Administrator".to_string()],
+            ),
+        ]),
     );
-    backend.add_entry(admin_entry, config.server.root_password.as_bytes().to_vec()).await?;
+    backend
+        .add_entry(admin_entry, config.server.root_password.as_bytes().to_vec())
+        .await?;
 
     // Create organizational units
     let people_ou = DirectoryEntry::new(
-        &format!("ou=People,{}", config.server.base_dn),
+        format!("ou=People,{}", config.server.base_dn),
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organizationalUnit".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
             ("ou".to_string(), vec!["People".to_string()]),
             ("description".to_string(), vec!["User Accounts".to_string()]),
-        ])
+        ]),
     );
     backend.add_entry(people_ou, vec![]).await?;
 
     let groups_ou = DirectoryEntry::new(
-        &format!("ou=Groups,{}", config.server.base_dn),
+        format!("ou=Groups,{}", config.server.base_dn),
         HashMap::from([
-            ("objectClass".to_string(), vec!["top".to_string(), "organizationalUnit".to_string()]),
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
             ("ou".to_string(), vec!["Groups".to_string()]),
-            ("description".to_string(), vec!["Group Definitions".to_string()]),
-        ])
+            (
+                "description".to_string(),
+                vec!["Group Definitions".to_string()],
+            ),
+        ]),
     );
     backend.add_entry(groups_ou, vec![]).await?;
 
@@ -304,11 +413,26 @@ fn demonstrate_conversion_internals() {
     let server_config = ServerConfig::default();
 
     println!("BEFORE CONVERSION (ServerConfig):");
-    println!("  server.operation_timeout_secs = {}", server_config.server.operation_timeout_secs);
-    println!("  server.cleanup_interval_secs = {}", server_config.server.cleanup_interval_secs);
-    println!("  server.read_buffer_size = {}", server_config.server.read_buffer_size);
-    println!("  resources.max_connections = {}", server_config.resources.max_connections);
-    println!("  rate_limit.enabled = {}", server_config.rate_limit.enabled);
+    println!(
+        "  server.operation_timeout_secs = {}",
+        server_config.server.operation_timeout_secs
+    );
+    println!(
+        "  server.cleanup_interval_secs = {}",
+        server_config.server.cleanup_interval_secs
+    );
+    println!(
+        "  server.read_buffer_size = {}",
+        server_config.server.read_buffer_size
+    );
+    println!(
+        "  resources.max_connections = {}",
+        server_config.resources.max_connections
+    );
+    println!(
+        "  rate_limit.enabled = {}",
+        server_config.rate_limit.enabled
+    );
 
     // This is what happens inside to_fsm_server_config():
     let fsm_config = server_config.to_fsm_server_config();
@@ -317,8 +441,14 @@ fn demonstrate_conversion_internals() {
     println!("  operation_timeout = {:?}", fsm_config.operation_timeout);
     println!("  cleanup_interval = {:?}", fsm_config.cleanup_interval);
     println!("  read_buffer_size = {}", fsm_config.read_buffer_size);
-    println!("  resource_limits.max_connections = {}", fsm_config.resource_limits.max_connections);
-    println!("  rate_limiting_enabled = {}", fsm_config.rate_limiting_enabled);
+    println!(
+        "  resource_limits.max_connections = {}",
+        fsm_config.resource_limits.max_connections
+    );
+    println!(
+        "  rate_limiting_enabled = {}",
+        fsm_config.rate_limiting_enabled
+    );
 
     println!("\nCONVERSIONS PERFORMED:");
     println!("  ✓ u64 seconds → Duration (operation_timeout, cleanup_interval)");

@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -62,20 +63,8 @@ pub enum OperationType {
 
 impl OperationType {
     /// Convert from string representation
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "bind" => Some(Self::Bind),
-            "search" => Some(Self::Search),
-            "modify" => Some(Self::Modify),
-            "add" => Some(Self::Add),
-            "delete" => Some(Self::Delete),
-            "modifydn" => Some(Self::ModifyDN),
-            "compare" => Some(Self::Compare),
-            "extended" => Some(Self::Extended),
-            "unbind" => Some(Self::Unbind),
-            "abandon" => Some(Self::Abandon),
-            _ => None,
-        }
+    pub fn parse_name(s: &str) -> Option<Self> {
+        s.parse().ok()
     }
 
     /// Get string representation
@@ -91,6 +80,26 @@ impl OperationType {
             Self::Extended => "extended",
             Self::Unbind => "unbind",
             Self::Abandon => "abandon",
+        }
+    }
+}
+
+impl FromStr for OperationType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "bind" => Ok(Self::Bind),
+            "search" => Ok(Self::Search),
+            "modify" => Ok(Self::Modify),
+            "add" => Ok(Self::Add),
+            "delete" => Ok(Self::Delete),
+            "modifydn" => Ok(Self::ModifyDN),
+            "compare" => Ok(Self::Compare),
+            "extended" => Ok(Self::Extended),
+            "unbind" => Ok(Self::Unbind),
+            "abandon" => Ok(Self::Abandon),
+            _ => Err(()),
         }
     }
 }
@@ -179,7 +188,7 @@ struct RequestTimestamp {
 #[derive(Debug)]
 struct ClientState {
     /// IP address
-    ip: IpAddr,
+    _ip: IpAddr,
 
     /// Recent requests (sliding window)
     requests: Vec<RequestTimestamp>,
@@ -197,7 +206,7 @@ struct ClientState {
 impl ClientState {
     fn new(ip: IpAddr) -> Self {
         Self {
-            ip,
+            _ip: ip,
             requests: Vec::new(),
             violations: 0,
             last_violation: None,
@@ -327,7 +336,7 @@ impl RateLimiter {
 
     /// Check if a request should be allowed
     pub async fn check_rate_limit(&self, client_ip: IpAddr, operation: &str) -> bool {
-        let op = match OperationType::from_str(operation) {
+        let op = match OperationType::parse_name(operation) {
             Some(o) => o,
             None => return true, // Unknown operation type - allow
         };
@@ -804,16 +813,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_operation_type_conversion() {
-        assert_eq!(OperationType::from_str("bind"), Some(OperationType::Bind));
+        assert_eq!(OperationType::parse_name("bind"), Some(OperationType::Bind));
         assert_eq!(
-            OperationType::from_str("SEARCH"),
+            OperationType::parse_name("SEARCH"),
             Some(OperationType::Search)
         );
         assert_eq!(
-            OperationType::from_str("ModifyDN"),
+            OperationType::parse_name("ModifyDN"),
             Some(OperationType::ModifyDN)
         );
-        assert_eq!(OperationType::from_str("invalid"), None);
+        assert_eq!(OperationType::parse_name("invalid"), None);
 
         assert_eq!(OperationType::Bind.as_str(), "bind");
         assert_eq!(OperationType::Search.as_str(), "search");

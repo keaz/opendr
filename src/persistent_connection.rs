@@ -56,7 +56,7 @@
 //! # }
 //! ```
 
-use ldap3::{Ldap, LdapConnAsync, LdapError, Scope, SearchEntry};
+use ldap3::{Ldap, LdapConnAsync};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -141,25 +141,13 @@ impl DirectoryEntry {
 }
 
 /// Connection statistics for monitoring
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectionStats {
     pub entries_sent: u64,
     pub sync_info_sent: u64,
     pub heartbeats_sent: u64,
     pub errors: u64,
     pub last_error: Option<String>,
-}
-
-impl Default for ConnectionStats {
-    fn default() -> Self {
-        Self {
-            entries_sent: 0,
-            sync_info_sent: 0,
-            heartbeats_sent: 0,
-            errors: 0,
-            last_error: None,
-        }
-    }
 }
 
 /// Maintains a persistent LDAP connection to a consumer
@@ -628,7 +616,6 @@ impl Drop for PersistentConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn test_sync_state_to_control_value() {
@@ -673,15 +660,15 @@ mod tests {
     #[test]
     fn test_sync_info_variants() {
         let info1 = SyncInfo::NewCookie("cookie123".to_string());
-        let info2 = SyncInfo::RefreshDelete {
+        let _info2 = SyncInfo::RefreshDelete {
             cookie: Some("cookie456".to_string()),
             refresh_done: true,
         };
-        let info3 = SyncInfo::RefreshPresent {
+        let _info3 = SyncInfo::RefreshPresent {
             cookie: None,
             refresh_done: false,
         };
-        let info4 = SyncInfo::SyncIdSet {
+        let _info4 = SyncInfo::SyncIdSet {
             cookie: Some("cookie789".to_string()),
             refresh_deletes: true,
             uuids: vec!["uuid1".to_string(), "uuid2".to_string()],

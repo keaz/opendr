@@ -8,12 +8,12 @@ use std::time::Duration;
 use ldap_parser::ldap::ProtocolOp;
 use ldap_parser::parse_ldap_messages;
 use opendr::extended_ops::oids;
-use rcgen::generate_simple_self_signed;
 use rasn::der;
 use rasn_ldap::{
     AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
     ExtendedRequest as RasnExtendedRequest,
 };
+use rcgen::generate_simple_self_signed;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use tempfile::TempDir;

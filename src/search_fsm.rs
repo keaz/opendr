@@ -265,7 +265,7 @@ pub trait SearchBackend: Send + Sync {
     ///
     /// # Returns
     /// * (estimated_entries, estimated_depth)
-    async fn get_search_stats(&self, base_dn: &str) -> Result<(usize, usize), String> {
+    async fn get_search_stats(&self, _base_dn: &str) -> Result<(usize, usize), String> {
         // Default implementation returns conservative estimates
         Ok((1000, 10))
     }
@@ -297,7 +297,7 @@ pub trait FilterMatcher: Send + Sync {
     /// # Returns
     /// * `Ok(())` - Filter is valid
     /// * `Err(String)` - Error message if filter is invalid
-    async fn validate_filter(&self, filter: &str) -> Result<(), String> {
+    async fn validate_filter(&self, _filter: &str) -> Result<(), String> {
         // Default implementation accepts all filters
         Ok(())
     }
@@ -1303,6 +1303,7 @@ impl SearchFsm for SearchFsmImpl {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;

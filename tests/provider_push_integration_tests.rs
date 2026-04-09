@@ -24,8 +24,10 @@ async fn create_test_coordinator() -> ProviderPushCoordinator {
     let observer = Arc::new(ChangeObserverImpl::new());
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer, push_config)));
-    let mut config = ProviderPushConfig::default();
-    config.connect_on_registration = false;
+    let config = ProviderPushConfig {
+        connect_on_registration: false,
+        ..ProviderPushConfig::default()
+    };
     ProviderPushCoordinator::new(push_manager, config)
 }
 
@@ -329,8 +331,10 @@ async fn test_unregister_nonexistent_consumer() {
 async fn test_max_persistent_consumers_limit() {
     println!("\n=== Test: Max Persistent Consumers Limit ===");
 
-    let mut config = ProviderPushConfig::default();
-    config.max_persistent_consumers = 3;
+    let config = ProviderPushConfig {
+        max_persistent_consumers: 3,
+        ..ProviderPushConfig::default()
+    };
 
     let coordinator = create_coordinator_with_config(config).await;
     let test_server = TestLdapServer::start().await;

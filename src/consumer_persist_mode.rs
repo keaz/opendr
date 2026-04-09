@@ -237,7 +237,7 @@ pub struct PersistModeManager {
     /// Change listener
     change_listener: Arc<dyn ChangeListener>,
     /// State manager
-    state_manager: Arc<dyn StateManager>,
+    _state_manager: Arc<dyn StateManager>,
     /// Change notification channel
     change_tx: mpsc::Sender<Vec<u8>>,
     change_rx: Arc<RwLock<mpsc::Receiver<Vec<u8>>>>,
@@ -267,7 +267,7 @@ impl PersistModeManager {
             stats: Arc::new(RwLock::new(PersistModeStats::new())),
             provider_connection,
             change_listener,
-            state_manager,
+            _state_manager: state_manager,
             change_tx,
             change_rx: Arc::new(RwLock::new(change_rx)),
         }
@@ -397,36 +397,6 @@ impl PersistModeManager {
                 Ok(None)
             }
         }
-    }
-
-    /// Send heartbeat to provider
-    ///
-    /// # Returns
-    /// * `Ok(())` - Heartbeat sent successfully
-    /// * `Err(ConsumerError)` - Failed to send heartbeat
-    async fn send_heartbeat(&self) -> Result<(), ConsumerError> {
-        debug!("Sending heartbeat to provider");
-
-        // Check if connection is active
-        let is_connected = self.provider_connection.is_connected().await?;
-
-        if !is_connected {
-            warn!("Provider connection lost, attempting reconnection");
-            return Err(ConsumerError::ConnectionError {
-                message: "Connection lost".to_string(),
-            });
-        }
-
-        // Update stats
-        {
-            let mut stats = self.stats.write().await;
-            stats.heartbeats_sent += 1;
-            stats.last_heartbeat = Some(Instant::now());
-        }
-
-        debug!("Heartbeat sent successfully");
-
-        Ok(())
     }
 
     /// Start background heartbeat task

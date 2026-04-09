@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Setup configuration for first-time server initialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -982,7 +982,7 @@ description: Root Administrator Account
 
         for (i, (attr, value)) in components.iter().enumerate() {
             if i > 0 {
-                current_dn = format!("{},{}", format!("{}={}", attr, value), current_dn);
+                current_dn = format!("{attr}={value},{current_dn}");
             } else {
                 current_dn = format!("{}={}", attr, value);
             }
@@ -1110,7 +1110,7 @@ description: Standard users group
         // Hash password + salt
         let mut hasher = Sha512::new();
         hasher.update(password.as_bytes());
-        hasher.update(&salt);
+        hasher.update(salt);
         let hash = hasher.finalize();
 
         // Combine hash + salt and encode in base64

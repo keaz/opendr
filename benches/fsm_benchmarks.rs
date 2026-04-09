@@ -4,9 +4,9 @@
 //! and memory allocations.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use opendr::connection_fsm::{ConnectionFsmImpl, NoOpTlsHandler};
 use opendr::auth_fsm::AuthFsmImpl;
 use opendr::ber_decoder_fsm::BerDecoderFsmImpl;
+use opendr::connection_fsm::{ConnectionFsmImpl, NoOpTlsHandler};
 
 /// Benchmark: FSM creation overhead
 fn bench_fsm_creation(c: &mut Criterion) {
@@ -16,25 +16,18 @@ fn bench_fsm_creation(c: &mut Criterion) {
     group.bench_function("connection_fsm", |b| {
         b.iter(|| {
             let tls_handler = Box::new(NoOpTlsHandler);
-            ConnectionFsmImpl::new(
-                black_box("test-connection"),
-                black_box(tls_handler),
-            )
+            ConnectionFsmImpl::new(black_box("test-connection"), black_box(tls_handler))
         });
     });
 
     // Benchmark: AuthFsm creation
     group.bench_function("auth_fsm", |b| {
-        b.iter(|| {
-            AuthFsmImpl::new()
-        });
+        b.iter(AuthFsmImpl::new);
     });
 
     // Benchmark: BerDecoderFsm creation
     group.bench_function("ber_decoder_fsm", |b| {
-        b.iter(|| {
-            BerDecoderFsmImpl::new()
-        });
+        b.iter(BerDecoderFsmImpl::new);
     });
 
     group.finish();
@@ -75,9 +68,5 @@ fn bench_fsm_batch_creation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_fsm_creation,
-    bench_fsm_batch_creation
-);
+criterion_group!(benches, bench_fsm_creation, bench_fsm_batch_creation);
 criterion_main!(benches);

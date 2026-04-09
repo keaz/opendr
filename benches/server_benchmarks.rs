@@ -3,7 +3,7 @@
 //! This benchmark suite measures end-to-end performance of LDAP operations
 //! through the full server request/response pipeline.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::schema::LdapSchema;
 use std::collections::HashMap;
@@ -19,7 +19,10 @@ fn setup_backend_with_data(num_entries: usize) -> Arc<MockBackend> {
         let base_entry = DirectoryEntry::new(
             "dc=example,dc=com",
             HashMap::from([
-                ("objectClass".to_string(), vec!["top".to_string(), "organization".to_string()]),
+                (
+                    "objectClass".to_string(),
+                    vec!["top".to_string(), "organization".to_string()],
+                ),
                 ("o".to_string(), vec!["Example Corp".to_string()]),
             ]),
         );
@@ -29,7 +32,10 @@ fn setup_backend_with_data(num_entries: usize) -> Arc<MockBackend> {
         let ou_entry = DirectoryEntry::new(
             "ou=people,dc=example,dc=com",
             HashMap::from([
-                ("objectClass".to_string(), vec!["top".to_string(), "organizationalUnit".to_string()]),
+                (
+                    "objectClass".to_string(),
+                    vec!["top".to_string(), "organizationalUnit".to_string()],
+                ),
                 ("ou".to_string(), vec!["people".to_string()]),
             ]),
         );
@@ -41,18 +47,24 @@ fn setup_backend_with_data(num_entries: usize) -> Arc<MockBackend> {
             let entry = DirectoryEntry::new(
                 dn,
                 HashMap::from([
-                    ("objectClass".to_string(), vec![
-                        "top".to_string(),
-                        "person".to_string(),
-                        "inetOrgPerson".to_string(),
-                    ]),
+                    (
+                        "objectClass".to_string(),
+                        vec![
+                            "top".to_string(),
+                            "person".to_string(),
+                            "inetOrgPerson".to_string(),
+                        ],
+                    ),
                     ("cn".to_string(), vec![format!("User {}", i)]),
                     ("sn".to_string(), vec![format!("Surname{}", i)]),
                     ("uid".to_string(), vec![format!("user{}", i)]),
                     ("mail".to_string(), vec![format!("user{}@example.com", i)]),
                 ]),
             );
-            backend.add_entry(entry, format!("password{}", i).as_bytes().to_vec()).await.unwrap();
+            backend
+                .add_entry(entry, format!("password{}", i).as_bytes().to_vec())
+                .await
+                .unwrap();
         }
     });
 
@@ -73,7 +85,10 @@ fn bench_backend_with_schema(c: &mut Criterion) {
             let backend = backend.clone();
             rt.block_on(async {
                 let entry_attrs = HashMap::from([
-                    ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "person".to_string()],
+                    ),
                     ("cn".to_string(), vec!["Test User".to_string()]),
                     ("sn".to_string(), vec!["User".to_string()]),
                 ]);
@@ -81,7 +96,10 @@ fn bench_backend_with_schema(c: &mut Criterion) {
                 // Validate first
                 if schema.validate_entry(black_box(&entry_attrs)).is_ok() {
                     let entry = DirectoryEntry::new(
-                        black_box(format!("cn=test{},dc=example,dc=com", rand::random::<u32>())),
+                        black_box(format!(
+                            "cn=test{},dc=example,dc=com",
+                            rand::random::<u32>()
+                        )),
                         entry_attrs,
                     );
                     let _ = backend.add_entry(entry, vec![]).await;
@@ -96,9 +114,15 @@ fn bench_backend_with_schema(c: &mut Criterion) {
             let backend = backend.clone();
             rt.block_on(async {
                 let entry = DirectoryEntry::new(
-                    black_box(format!("cn=test{},dc=example,dc=com", rand::random::<u32>())),
+                    black_box(format!(
+                        "cn=test{},dc=example,dc=com",
+                        rand::random::<u32>()
+                    )),
                     HashMap::from([
-                        ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+                        (
+                            "objectClass".to_string(),
+                            vec!["top".to_string(), "person".to_string()],
+                        ),
                         ("cn".to_string(), vec!["Test User".to_string()]),
                         ("sn".to_string(), vec!["User".to_string()]),
                     ]),
@@ -123,10 +147,12 @@ fn bench_authentication(c: &mut Criterion) {
         b.iter(|| {
             let backend = backend.clone();
             rt.block_on(async {
-                let result = backend.authenticate(
-                    black_box("uid=user50,ou=people,dc=example,dc=com"),
-                    black_box(b"password50"),
-                ).await;
+                let result = backend
+                    .authenticate(
+                        black_box("uid=user50,ou=people,dc=example,dc=com"),
+                        black_box(b"password50"),
+                    )
+                    .await;
                 assert!(result.unwrap());
             })
         });
@@ -137,10 +163,12 @@ fn bench_authentication(c: &mut Criterion) {
         b.iter(|| {
             let backend = backend.clone();
             rt.block_on(async {
-                let result = backend.authenticate(
-                    black_box("uid=user50,ou=people,dc=example,dc=com"),
-                    black_box(b"wrongpassword"),
-                ).await;
+                let result = backend
+                    .authenticate(
+                        black_box("uid=user50,ou=people,dc=example,dc=com"),
+                        black_box(b"wrongpassword"),
+                    )
+                    .await;
                 assert!(!result.unwrap());
             })
         });
@@ -151,10 +179,12 @@ fn bench_authentication(c: &mut Criterion) {
         b.iter(|| {
             let backend = backend.clone();
             rt.block_on(async {
-                let result = backend.authenticate(
-                    black_box("uid=nonexistent,ou=people,dc=example,dc=com"),
-                    black_box(b"password"),
-                ).await;
+                let _result = backend
+                    .authenticate(
+                        black_box("uid=nonexistent,ou=people,dc=example,dc=com"),
+                        black_box(b"password"),
+                    )
+                    .await;
                 // User not found
             })
         });
@@ -172,23 +202,22 @@ fn bench_search_operations(c: &mut Criterion) {
     for size in [10, 100, 1000].iter() {
         let backend = setup_backend_with_data(*size);
 
-        group.bench_with_input(
-            BenchmarkId::new("search_all_users", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    let backend = backend.clone();
-                    rt.block_on(async {
-                        use ldap_parser::ldap::SearchScope;
-                        let results = backend.search_entries(
+        group.bench_with_input(BenchmarkId::new("search_all_users", size), size, |b, _| {
+            b.iter(|| {
+                let backend = backend.clone();
+                rt.block_on(async {
+                    use ldap_parser::ldap::SearchScope;
+                    let results = backend
+                        .search_entries(
                             black_box("ou=people,dc=example,dc=com"),
                             black_box(SearchScope(2)), // Subtree
-                        ).await.unwrap();
-                        black_box(results);
-                    })
-                });
-            },
-        );
+                        )
+                        .await
+                        .unwrap();
+                    black_box(results);
+                })
+            });
+        });
 
         group.bench_with_input(
             BenchmarkId::new("search_single_entry", size),
@@ -197,9 +226,10 @@ fn bench_search_operations(c: &mut Criterion) {
                 b.iter(|| {
                     let backend = backend.clone();
                     rt.block_on(async {
-                        let result = backend.get_entry(
-                            black_box("uid=user50,ou=people,dc=example,dc=com"),
-                        ).await.unwrap();
+                        let result = backend
+                            .get_entry(black_box("uid=user50,ou=people,dc=example,dc=com"))
+                            .await
+                            .unwrap();
                         black_box(result);
                     })
                 });
@@ -224,18 +254,18 @@ fn bench_modify_operations(c: &mut Criterion) {
             rt.block_on(async {
                 use opendr::backend::{Modification, ModifyOperation};
 
-                let modifications = vec![
-                    Modification {
-                        operation: ModifyOperation::Replace,
-                        attribute: "mail".to_string(),
-                        values: vec![format!("newemail{}@example.com", rand::random::<u32>())],
-                    },
-                ];
+                let modifications = vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "mail".to_string(),
+                    values: vec![format!("newemail{}@example.com", rand::random::<u32>())],
+                }];
 
-                let _ = backend.modify_entry(
-                    black_box("uid=user50,ou=people,dc=example,dc=com"),
-                    black_box(modifications),
-                ).await;
+                let _ = backend
+                    .modify_entry(
+                        black_box("uid=user50,ou=people,dc=example,dc=com"),
+                        black_box(modifications),
+                    )
+                    .await;
             })
         });
     });
@@ -265,10 +295,12 @@ fn bench_modify_operations(c: &mut Criterion) {
                     },
                 ];
 
-                let _ = backend.modify_entry(
-                    black_box("uid=user50,ou=people,dc=example,dc=com"),
-                    black_box(modifications),
-                ).await;
+                let _ = backend
+                    .modify_entry(
+                        black_box("uid=user50,ou=people,dc=example,dc=com"),
+                        black_box(modifications),
+                    )
+                    .await;
             })
         });
     });
@@ -290,7 +322,10 @@ fn bench_delete_operations(c: &mut Criterion) {
                 let entry = DirectoryEntry::new(
                     "cn=temp,dc=example,dc=com",
                     HashMap::from([
-                        ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+                        (
+                            "objectClass".to_string(),
+                            vec!["top".to_string(), "person".to_string()],
+                        ),
                         ("cn".to_string(), vec!["Temp".to_string()]),
                         ("sn".to_string(), vec!["User".to_string()]),
                     ]),
@@ -298,7 +333,9 @@ fn bench_delete_operations(c: &mut Criterion) {
                 backend.add_entry(entry, vec![]).await.unwrap();
 
                 // Delete it
-                let _ = backend.delete_entry(black_box("cn=temp,dc=example,dc=com")).await;
+                let _ = backend
+                    .delete_entry(black_box("cn=temp,dc=example,dc=com"))
+                    .await;
             })
         });
     });
@@ -322,7 +359,9 @@ fn bench_concurrent_operations(c: &mut Criterion) {
                 for i in 0..10 {
                     let backend = backend.clone();
                     let handle = tokio::spawn(async move {
-                        backend.get_entry(&format!("uid=user{},ou=people,dc=example,dc=com", i * 10)).await
+                        backend
+                            .get_entry(&format!("uid=user{},ou=people,dc=example,dc=com", i * 10))
+                            .await
                     });
                     handles.push(handle);
                 }
@@ -343,10 +382,12 @@ fn bench_concurrent_operations(c: &mut Criterion) {
                 for i in 0..10 {
                     let backend = backend.clone();
                     let handle = tokio::spawn(async move {
-                        backend.authenticate(
-                            &format!("uid=user{},ou=people,dc=example,dc=com", i * 10),
-                            format!("password{}", i * 10).as_bytes(),
-                        ).await
+                        backend
+                            .authenticate(
+                                &format!("uid=user{},ou=people,dc=example,dc=com", i * 10),
+                                format!("password{}", i * 10).as_bytes(),
+                            )
+                            .await
                     });
                     handles.push(handle);
                 }
@@ -379,7 +420,10 @@ fn bench_memory_efficiency(c: &mut Criterion) {
             let entry = DirectoryEntry::new(
                 black_box("cn=test,dc=example,dc=com"),
                 HashMap::from([
-                    ("objectClass".to_string(), vec!["top".to_string(), "person".to_string()]),
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "person".to_string()],
+                    ),
                     ("cn".to_string(), vec!["Test".to_string()]),
                     ("sn".to_string(), vec!["User".to_string()]),
                 ]),

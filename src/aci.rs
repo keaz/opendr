@@ -3,7 +3,7 @@
 //! This module provides a comprehensive ACI system for fine-grained access control
 //! in LDAP operations, following LDAP ACI specifications.
 
-use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -30,18 +30,8 @@ pub enum Permission {
 
 impl Permission {
     /// Parse permission from string
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "read" => Some(Permission::Read),
-            "write" => Some(Permission::Write),
-            "search" => Some(Permission::Search),
-            "compare" => Some(Permission::Compare),
-            "add" => Some(Permission::Add),
-            "delete" => Some(Permission::Delete),
-            "modify" => Some(Permission::Modify),
-            "proxy" => Some(Permission::Proxy),
-            _ => None,
-        }
+    pub fn parse_name(s: &str) -> Option<Self> {
+        s.parse().ok()
     }
 
     /// Convert permission to string
@@ -55,6 +45,24 @@ impl Permission {
             Permission::Delete => "delete",
             Permission::Modify => "modify",
             Permission::Proxy => "proxy",
+        }
+    }
+}
+
+impl FromStr for Permission {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "read" => Ok(Permission::Read),
+            "write" => Ok(Permission::Write),
+            "search" => Ok(Permission::Search),
+            "compare" => Ok(Permission::Compare),
+            "add" => Ok(Permission::Add),
+            "delete" => Ok(Permission::Delete),
+            "modify" => Ok(Permission::Modify),
+            "proxy" => Ok(Permission::Proxy),
+            _ => Err(()),
         }
     }
 }
@@ -78,13 +86,13 @@ impl AciTarget {
         match self {
             AciTarget::Dn(target_dn) => dn.eq_ignore_ascii_case(target_dn),
             AciTarget::Subtree(base_dn) => {
-                dn.eq_ignore_ascii_case(base_dn) ||
-                dn.to_lowercase().ends_with(&format!(",{}", base_dn.to_lowercase()))
+                dn.eq_ignore_ascii_case(base_dn)
+                    || dn
+                        .to_lowercase()
+                        .ends_with(&format!(",{}", base_dn.to_lowercase()))
             }
             AciTarget::Attributes(_) => true, // DN matching for attributes is always true
-            AciTarget::Combined(left, right) => {
-                left.matches_dn(dn) && right.matches_dn(dn)
-            }
+            AciTarget::Combined(left, right) => left.matches_dn(dn) && right.matches_dn(dn),
         }
     }
 
@@ -92,9 +100,7 @@ impl AciTarget {
     pub fn matches_attribute(&self, attr: &str) -> bool {
         match self {
             AciTarget::Dn(_) | AciTarget::Subtree(_) => true,
-            AciTarget::Attributes(attrs) => {
-                attrs.iter().any(|a| a.eq_ignore_ascii_case(attr))
-            }
+            AciTarget::Attributes(attrs) => attrs.iter().any(|a| a.eq_ignore_ascii_case(attr)),
             AciTarget::Combined(left, right) => {
                 left.matches_attribute(attr) && right.matches_attribute(attr)
             }
@@ -121,9 +127,7 @@ impl AciSubject {
     /// Check if a user DN matches this subject
     pub fn matches_user(&self, user_dn: Option<&str>, target_dn: &str) -> bool {
         match self {
-            AciSubject::User(dn) => {
-                user_dn.map(|u| u.eq_ignore_ascii_case(dn)).unwrap_or(false)
-            }
+            AciSubject::User(dn) => user_dn.map(|u| u.eq_ignore_ascii_case(dn)).unwrap_or(false),
             AciSubject::Group(_group_dn) => {
                 // TODO: Implement group membership checking
                 // This would require a backend lookup
@@ -131,9 +135,9 @@ impl AciSubject {
             }
             AciSubject::AllAuthenticated => user_dn.is_some(),
             AciSubject::All => true,
-            AciSubject::SelfEntry => {
-                user_dn.map(|u| u.eq_ignore_ascii_case(target_dn)).unwrap_or(false)
-            }
+            AciSubject::SelfEntry => user_dn
+                .map(|u| u.eq_ignore_ascii_case(target_dn))
+                .unwrap_or(false),
         }
     }
 }
@@ -349,7 +353,8 @@ impl AciEngine {
         permissions: &[Permission],
     ) -> Result<(), String> {
         for permission in permissions {
-            self.check_permission(user_dn, target_dn, attribute, *permission).await?;
+            self.check_permission(user_dn, target_dn, attribute, *permission)
+                .await?;
         }
         Ok(())
     }
@@ -482,9 +487,9 @@ mod tests {
 
     #[test]
     fn test_permission_from_str() {
-        assert_eq!(Permission::from_str("read"), Some(Permission::Read));
-        assert_eq!(Permission::from_str("WRITE"), Some(Permission::Write));
-        assert_eq!(Permission::from_str("invalid"), None);
+        assert_eq!(Permission::parse_name("read"), Some(Permission::Read));
+        assert_eq!(Permission::parse_name("WRITE"), Some(Permission::Write));
+        assert_eq!(Permission::parse_name("invalid"), None);
     }
 
     #[test]
@@ -563,21 +568,25 @@ mod tests {
         engine.add_rule(rule).await;
 
         // Should allow admin to read
-        let result = engine.check_permission(
-            Some("cn=admin,dc=example,dc=org"),
-            "cn=user,dc=example,dc=org",
-            None,
-            Permission::Read,
-        ).await;
+        let result = engine
+            .check_permission(
+                Some("cn=admin,dc=example,dc=org"),
+                "cn=user,dc=example,dc=org",
+                None,
+                Permission::Read,
+            )
+            .await;
         assert!(result.is_ok());
 
         // Should deny other users
-        let result = engine.check_permission(
-            Some("cn=other,dc=example,dc=org"),
-            "cn=user,dc=example,dc=org",
-            None,
-            Permission::Read,
-        ).await;
+        let result = engine
+            .check_permission(
+                Some("cn=other,dc=example,dc=org"),
+                "cn=user,dc=example,dc=org",
+                None,
+                Permission::Read,
+            )
+            .await;
         assert!(result.is_err());
     }
 
@@ -595,21 +604,25 @@ mod tests {
         engine.add_rule(rule).await;
 
         // Should deny user write
-        let result = engine.check_permission(
-            Some("cn=user,dc=example,dc=org"),
-            "cn=other,dc=example,dc=org",
-            None,
-            Permission::Write,
-        ).await;
+        let result = engine
+            .check_permission(
+                Some("cn=user,dc=example,dc=org"),
+                "cn=other,dc=example,dc=org",
+                None,
+                Permission::Write,
+            )
+            .await;
         assert!(result.is_err());
 
         // Should allow other permissions
-        let result = engine.check_permission(
-            Some("cn=user,dc=example,dc=org"),
-            "cn=other,dc=example,dc=org",
-            None,
-            Permission::Read,
-        ).await;
+        let result = engine
+            .check_permission(
+                Some("cn=user,dc=example,dc=org"),
+                "cn=other,dc=example,dc=org",
+                None,
+                Permission::Read,
+            )
+            .await;
         assert!(result.is_ok());
     }
 
@@ -639,7 +652,8 @@ mod tests {
             AciTarget::Subtree("dc=example,dc=org".to_string()),
             vec![Permission::Write],
             AciSubject::AllAuthenticated,
-        ).with_priority(100);
+        )
+        .with_priority(100);
 
         // Low priority grant rule
         let grant_rule = AciRule::grant(
@@ -647,18 +661,21 @@ mod tests {
             AciTarget::Subtree("dc=example,dc=org".to_string()),
             vec![Permission::Write],
             AciSubject::AllAuthenticated,
-        ).with_priority(10);
+        )
+        .with_priority(10);
 
         engine.add_rule(grant_rule).await;
         engine.add_rule(deny_rule).await;
 
         // Deny should win due to higher priority
-        let result = engine.check_permission(
-            Some("cn=user,dc=example,dc=org"),
-            "cn=target,dc=example,dc=org",
-            None,
-            Permission::Write,
-        ).await;
+        let result = engine
+            .check_permission(
+                Some("cn=user,dc=example,dc=org"),
+                "cn=target,dc=example,dc=org",
+                None,
+                Permission::Write,
+            )
+            .await;
         assert!(result.is_err());
     }
 
@@ -694,20 +711,24 @@ mod tests {
 
         engine.add_rule(rule).await;
 
-        let result = engine.check_permissions(
-            Some("cn=user,dc=example,dc=org"),
-            "cn=target,dc=example,dc=org",
-            None,
-            &[Permission::Read, Permission::Search],
-        ).await;
+        let result = engine
+            .check_permissions(
+                Some("cn=user,dc=example,dc=org"),
+                "cn=target,dc=example,dc=org",
+                None,
+                &[Permission::Read, Permission::Search],
+            )
+            .await;
         assert!(result.is_ok());
 
-        let result = engine.check_permissions(
-            Some("cn=user,dc=example,dc=org"),
-            "cn=target,dc=example,dc=org",
-            None,
-            &[Permission::Read, Permission::Write],
-        ).await;
+        let result = engine
+            .check_permissions(
+                Some("cn=user,dc=example,dc=org"),
+                "cn=target,dc=example,dc=org",
+                None,
+                &[Permission::Read, Permission::Write],
+            )
+            .await;
         assert!(result.is_err());
     }
 }

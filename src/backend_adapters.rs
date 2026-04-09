@@ -7,16 +7,20 @@
 //! These adapters enable FSM implementations to work with any DirectoryBackend
 //! implementation without tight coupling.
 
-use std::sync::Arc;
-use std::collections::HashMap;
 use async_trait::async_trait;
 use ldap_parser::ldap::SearchScope;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::backend::{DirectoryBackend, DirectoryEntry, Modification as BackendMod, ModifyOperation};
-use crate::search_fsm::{SearchBackend, SearchEntry};
-use crate::write_fsm::{WriteBackend, Modification as WriteMod};
+use crate::backend::{
+    DirectoryBackend, DirectoryEntry, Modification as BackendMod, ModifyOperation,
+};
 use crate::compare_fsm::{CompareBackend, CompareEntry};
-use crate::operational_attrs::{filter_operational_attributes, filter_user_attributes, merge_attributes};
+use crate::operational_attrs::{
+    filter_operational_attributes, filter_user_attributes, merge_attributes,
+};
+use crate::search_fsm::{SearchBackend, SearchEntry};
+use crate::write_fsm::{Modification as WriteMod, WriteBackend};
 
 /// Adapter that implements SearchBackend using a DirectoryBackend
 pub struct SearchBackendAdapter {
@@ -31,19 +35,32 @@ impl SearchBackendAdapter {
 
 #[async_trait]
 impl SearchBackend for SearchBackendAdapter {
-    async fn find_candidates(&self, base_dn: &str, scope: i32, _filter: &str) -> Result<Vec<String>, String> {
+    async fn find_candidates(
+        &self,
+        base_dn: &str,
+        scope: i32,
+        _filter: &str,
+    ) -> Result<Vec<String>, String> {
         // Convert scope to SearchScope
         let search_scope = SearchScope(scope as u32);
 
-        let entries = self.backend.search_entries(base_dn, search_scope)
+        let entries = self
+            .backend
+            .search_entries(base_dn, search_scope)
             .await
             .map_err(|e| format!("Backend search error: {}", e))?;
 
         Ok(entries.into_iter().map(|e| e.dn).collect())
     }
 
-    async fn get_entry(&self, dn: &str, attributes: &[String]) -> Result<Option<SearchEntry>, String> {
-        let entry = self.backend.get_entry(dn)
+    async fn get_entry(
+        &self,
+        dn: &str,
+        attributes: &[String],
+    ) -> Result<Option<SearchEntry>, String> {
+        let entry = self
+            .backend
+            .get_entry(dn)
             .await
             .map_err(|e| format!("Backend get_entry error: {}", e))?;
 
@@ -56,15 +73,15 @@ impl SearchBackend for SearchBackendAdapter {
             SearchEntry {
                 dn: e.dn.clone(),
                 attributes: combined_attrs,
-                object_classes: e.attributes.get("objectclass")
-                    .cloned()
-                    .unwrap_or_default(),
+                object_classes: e.attributes.get("objectclass").cloned().unwrap_or_default(),
             }
         }))
     }
 
     async fn entry_exists(&self, dn: &str) -> Result<bool, String> {
-        let entry = self.backend.get_entry(dn)
+        let entry = self
+            .backend
+            .get_entry(dn)
             .await
             .map_err(|e| format!("Backend entry_exists error: {}", e))?;
         Ok(entry.is_some())
@@ -125,15 +142,22 @@ impl WriteBackend for WriteBackendAdapter {
 
         let dir_entry = DirectoryEntry::new(dn, attributes);
 
-        self.backend.add_entry(dir_entry, Vec::new())
+        self.backend
+            .add_entry(dir_entry, Vec::new())
             .await
             .map_err(|e| format!("Backend add_entry error: {}", e))
     }
 
-    async fn modify_entry(&self, _txn_id: &str, dn: &str, modifications: &[WriteMod]) -> Result<(), String> {
+    async fn modify_entry(
+        &self,
+        _txn_id: &str,
+        dn: &str,
+        modifications: &[WriteMod],
+    ) -> Result<(), String> {
         // Convert WriteMod enum to BackendMod struct
-        let mods: Vec<BackendMod> = modifications.iter().map(|m| {
-            match m {
+        let mods: Vec<BackendMod> = modifications
+            .iter()
+            .map(|m| match m {
                 WriteMod::Add { name, values } => BackendMod {
                     operation: ModifyOperation::Add,
                     attribute: name.clone(),
@@ -149,10 +173,11 @@ impl WriteBackend for WriteBackendAdapter {
                     attribute: name.clone(),
                     values: values.clone(),
                 },
-            }
-        }).collect();
+            })
+            .collect();
 
-        self.backend.modify_entry(dn, mods)
+        self.backend
+            .modify_entry(dn, mods)
             .await
             .map_err(|e| format!("Backend modify_entry error: {}", e))
     }
@@ -165,19 +190,23 @@ impl WriteBackend for WriteBackendAdapter {
         delete_old: bool,
         new_superior: Option<&str>,
     ) -> Result<(), String> {
-        self.backend.rename_entry(dn, new_rdn, delete_old, new_superior.map(String::from))
+        self.backend
+            .rename_entry(dn, new_rdn, delete_old, new_superior.map(String::from))
             .await
             .map_err(|e| format!("Backend rename_entry error: {}", e))
     }
 
     async fn delete_entry(&self, _txn_id: &str, dn: &str) -> Result<(), String> {
-        self.backend.delete_entry(dn)
+        self.backend
+            .delete_entry(dn)
             .await
             .map_err(|e| format!("Backend delete_entry error: {}", e))
     }
 
     async fn entry_exists(&self, dn: &str) -> Result<bool, String> {
-        let entry = self.backend.get_entry(dn)
+        let entry = self
+            .backend
+            .get_entry(dn)
             .await
             .map_err(|e| format!("Backend entry_exists error: {}", e))?;
         Ok(entry.is_some())
@@ -197,31 +226,37 @@ impl CompareBackendAdapter {
 
 #[async_trait]
 impl CompareBackend for CompareBackendAdapter {
-    async fn get_entry_attributes(&self, dn: &str, attributes: &[String]) -> Result<Option<CompareEntry>, String> {
-        let entry = self.backend.get_entry(dn)
+    async fn get_entry_attributes(
+        &self,
+        dn: &str,
+        _attributes: &[String],
+    ) -> Result<Option<CompareEntry>, String> {
+        let entry = self
+            .backend
+            .get_entry(dn)
             .await
             .map_err(|e| format!("Backend get_entry error: {}", e))?;
 
         Ok(entry.map(|e| {
             // Convert string attributes to binary format
-            let binary_attrs: HashMap<String, Vec<Vec<u8>>> = e.attributes.iter()
-                .map(|(k, v)| {
-                    (k.clone(), v.iter().map(|s| s.as_bytes().to_vec()).collect())
-                })
+            let binary_attrs: HashMap<String, Vec<Vec<u8>>> = e
+                .attributes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().map(|s| s.as_bytes().to_vec()).collect()))
                 .collect();
 
             CompareEntry {
                 dn: e.dn.clone(),
                 attributes: binary_attrs,
-                object_classes: e.attributes.get("objectclass")
-                    .cloned()
-                    .unwrap_or_default(),
+                object_classes: e.attributes.get("objectclass").cloned().unwrap_or_default(),
             }
         }))
     }
 
     async fn entry_exists(&self, dn: &str) -> Result<bool, String> {
-        let entry = self.backend.get_entry(dn)
+        let entry = self
+            .backend
+            .get_entry(dn)
             .await
             .map_err(|e| format!("Backend entry_exists error: {}", e))?;
         Ok(entry.is_some())

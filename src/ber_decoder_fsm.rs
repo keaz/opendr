@@ -346,7 +346,7 @@ impl BerDecoderFsmImpl {
             validator
                 .validate_tag(tag)
                 .await
-                .map_err(|msg| BerDecoderError::InvalidTag(msg))?;
+                .map_err(BerDecoderError::InvalidTag)?;
         }
 
         // Start new message
@@ -390,7 +390,7 @@ impl BerDecoderFsmImpl {
                     validator
                         .validate_length(length)
                         .await
-                        .map_err(|msg| BerDecoderError::InvalidLength(msg))?;
+                        .map_err(BerDecoderError::InvalidLength)?;
                 }
 
                 // Check message size limits
@@ -549,8 +549,8 @@ impl BerDecoderFsmImpl {
 
             // Parse length from following bytes
             let mut length = 0usize;
-            for i in 1..=length_bytes_count {
-                length = length << 8 | remaining[i] as usize;
+            for byte in remaining.iter().take(length_bytes_count + 1).skip(1) {
+                length = (length << 8) | *byte as usize;
             }
 
             let encoded_length = remaining[..=length_bytes_count].to_vec();
@@ -571,7 +571,7 @@ impl BerDecoderFsmImpl {
 
     /// Extract completed message and reset for next message
     fn extract_completed_message(&mut self) -> Option<Vec<u8>> {
-        if let Some(_) = &self.current_message {
+        if self.current_message.is_some() {
             let message = self.build_complete_message();
             self.current_message = None;
             Some(message)
@@ -607,6 +607,12 @@ pub struct BerDecoderStats {
     pub bytes_processed: u64,
     pub current_buffer_size: usize,
     pub uptime: Duration,
+}
+
+impl Default for BerDecoderFsmImpl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Implementation of StateMachine trait for BerDecoderFsmImpl
@@ -711,6 +717,7 @@ impl BerDecoderFsm for BerDecoderFsmImpl {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use crate::fsm::StateMachine;
@@ -960,7 +967,7 @@ mod tests {
         let payload = patterned_payload(300);
         let frame = build_frame(0x30, &[0x82, 0x01, 0x2C], &payload);
 
-        let chunks = vec![
+        let chunks = [
             frame[..2].to_vec(),
             frame[2..3].to_vec(),
             frame[3..4].to_vec(),
@@ -993,7 +1000,7 @@ mod tests {
         let payload = patterned_payload(300);
         let frame = build_frame(0x30, &[0x83, 0x00, 0x01, 0x2C], &payload);
 
-        let chunks = vec![
+        let chunks = [
             frame[..2].to_vec(),
             frame[2..4].to_vec(),
             frame[4..5].to_vec(),
@@ -1026,7 +1033,7 @@ mod tests {
         let payload = patterned_payload(300);
         let frame = build_frame(0x30, &[0x84, 0x00, 0x00, 0x01, 0x2C], &payload);
 
-        let chunks = vec![
+        let chunks = [
             frame[..2].to_vec(),
             frame[2..5].to_vec(),
             frame[5..6].to_vec(),

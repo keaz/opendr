@@ -271,7 +271,7 @@ async fn send_connection_rejected(mut socket: TcpStream) -> Result<(), std::io::
         "",
         "Server resource limits exceeded",
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+    .map_err(|e| std::io::Error::other(format!("{:?}", e)))?;
 
     socket.write_all(&response).await?;
     socket.shutdown().await?;
@@ -291,7 +291,7 @@ async fn send_shutdown_in_progress(mut socket: TcpStream) -> Result<(), std::io:
         "",
         "Server is shutting down",
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+    .map_err(|e| std::io::Error::other(format!("{:?}", e)))?;
 
     socket.write_all(&response).await?;
     socket.shutdown().await?;
@@ -305,7 +305,7 @@ async fn handle_connection(
     config: FsmServerConfig,
     pool: Arc<ConnectionPool>,
     conn_id: u64,
-    shutdown: Option<Arc<ShutdownCoordinator>>,
+    _shutdown: Option<Arc<ShutdownCoordinator>>,
     rate_limiter: Option<Arc<RateLimiter>>,
 ) -> Result<(), ServerError> {
     // Get client IP for rate limiting
@@ -447,7 +447,7 @@ async fn decode_ready_messages(
 async fn process_ldap_message(
     fsm_set: &mut ConnectionFsmSet,
     message: LdapMessage<'_>,
-    config: &FsmServerConfig,
+    _config: &FsmServerConfig,
     pool: &Arc<ConnectionPool>,
     conn_id: u64,
     rate_limiter: &Option<Arc<RateLimiter>>,

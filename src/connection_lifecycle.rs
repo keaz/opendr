@@ -63,9 +63,8 @@
 //! # }
 //! ```
 
-use crate::consumer_persist_mode::{PersistConnectionState, PersistModeManager, PersistModeStats};
+use crate::consumer_persist_mode::PersistModeManager;
 use crate::replication_consumer_fsm::ConsumerError;
-use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -458,35 +457,6 @@ impl ConnectionLifecycleManager {
         Ok(())
     }
 
-    /// Calculate reconnection delay with exponential backoff
-    fn calculate_backoff_delay(&self, attempt: u32) -> Duration {
-        if !self.config.enable_exponential_backoff {
-            return self.config.reconnect_base_delay;
-        }
-
-        // Calculate exponential delay
-        let multiplier = self.config.backoff_multiplier.powi(attempt as i32 - 1);
-        let delay_secs = self.config.reconnect_base_delay.as_secs_f64() * multiplier;
-        let mut delay =
-            Duration::from_secs_f64(delay_secs.min(self.config.reconnect_max_delay.as_secs_f64()));
-
-        // Add jitter if enabled
-        if self.config.enable_jitter {
-            let jitter_percent = self.get_random_jitter();
-            let jitter = Duration::from_secs_f64(delay.as_secs_f64() * jitter_percent);
-            delay += jitter;
-        }
-
-        delay
-    }
-
-    /// Get random jitter value
-    fn get_random_jitter(&self) -> f64 {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        rng.gen_range(0.0..self.config.max_jitter_percent)
-    }
-
     /// Start monitoring task for connection health
     async fn start_monitoring_task(&self) {
         let persist_manager = Arc::clone(&self.persist_manager);
@@ -535,7 +505,7 @@ impl ConnectionLifecycleManager {
         let provider_url = Arc::clone(&self.provider_url);
         let last_cookie = Arc::clone(&self.last_cookie);
         let shutdown = Arc::clone(&self.shutdown);
-        let lifecycle_manager = self;
+        let _lifecycle_manager = self;
 
         // Clone the manager for spawning (we need to avoid moving self)
         let self_stats = Arc::clone(&self.stats);

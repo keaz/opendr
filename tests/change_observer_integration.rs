@@ -5,16 +5,18 @@
 //! - Backend Changelog Wrapper integrates with observer
 //! - Notifications happen asynchronously without blocking operations
 
-use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend, Modification, ModifyOperation};
+use async_trait::async_trait;
+use opendr::backend::{
+    DirectoryBackend, DirectoryEntry, MockBackend, Modification, ModifyOperation,
+};
 use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
 use opendr::change_observer::{ChangeCallback, ChangeObserver, ChangeObserverImpl};
 use opendr::replication::ChangelogTracker;
-use opendr::replication_provider_fsm::{ChangelogEntry, ChangeType};
+use opendr::replication_provider_fsm::{ChangeType, ChangelogEntry};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use async_trait::async_trait;
 
 /// Test callback that counts notifications and records change details
 struct TestNotificationCallback {
@@ -98,7 +100,7 @@ async fn test_observer_notified_on_add() {
     let changelog = Arc::new(ChangelogTracker::new());
     let observer = Arc::new(ChangeObserverImpl::new());
     let callback = Arc::new(TestNotificationCallback::new());
-    
+
     observer.register_callback(callback.clone());
 
     let mut wrapper = ChangelogBackendWrapper::new(backend, Some(changelog));
@@ -133,7 +135,7 @@ async fn test_observer_notified_on_modify() {
     let changelog = Arc::new(ChangelogTracker::new());
     let observer = Arc::new(ChangeObserverImpl::new());
     let callback = Arc::new(TestNotificationCallback::new());
-    
+
     observer.register_callback(callback.clone());
 
     let mut wrapper = ChangelogBackendWrapper::new(backend, Some(changelog));
@@ -170,7 +172,7 @@ async fn test_observer_notified_on_delete() {
     let changelog = Arc::new(ChangelogTracker::new());
     let observer = Arc::new(ChangeObserverImpl::new());
     let callback = Arc::new(TestNotificationCallback::new());
-    
+
     observer.register_callback(callback.clone());
 
     let mut wrapper = ChangelogBackendWrapper::new(backend, Some(changelog));
@@ -202,7 +204,7 @@ async fn test_observer_notified_on_rename() {
     let changelog = Arc::new(ChangelogTracker::new());
     let observer = Arc::new(ChangeObserverImpl::new());
     let callback = Arc::new(TestNotificationCallback::new());
-    
+
     observer.register_callback(callback.clone());
 
     let mut wrapper = ChangelogBackendWrapper::new(backend, Some(changelog));
@@ -230,11 +232,11 @@ async fn test_multiple_callbacks_all_notified() {
     let backend = Arc::new(MockBackend::new());
     let changelog = Arc::new(ChangelogTracker::new());
     let observer = Arc::new(ChangeObserverImpl::new());
-    
+
     let callback1 = Arc::new(TestNotificationCallback::new());
     let callback2 = Arc::new(TestNotificationCallback::new());
     let callback3 = Arc::new(TestNotificationCallback::new());
-    
+
     observer.register_callback(callback1.clone());
     observer.register_callback(callback2.clone());
     observer.register_callback(callback3.clone());
@@ -262,7 +264,7 @@ async fn test_observer_handles_rapid_changes() {
     let changelog = Arc::new(ChangelogTracker::new());
     let observer = Arc::new(ChangeObserverImpl::new());
     let callback = Arc::new(TestNotificationCallback::new());
-    
+
     observer.register_callback(callback.clone());
 
     let mut wrapper = ChangelogBackendWrapper::new(backend, Some(changelog));
@@ -293,7 +295,7 @@ async fn test_observer_handles_rapid_changes() {
 
     // Verify all changes were notified
     assert_eq!(callback.get_add_count().await, 10);
-    
+
     let changes = callback.get_changes().await;
     assert_eq!(changes.len(), 10);
 }

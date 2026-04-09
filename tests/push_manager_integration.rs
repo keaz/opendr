@@ -5,13 +5,12 @@
 
 use opendr::change_observer::{ChangeCallback, ChangeObserver, ChangeObserverImpl};
 use opendr::csn::Csn;
-use opendr::persistent_connection::{DirectoryEntry, PersistentConsumer, SyncState, SyncInfo};
 use opendr::push_manager::{PushManager, PushManagerConfig};
 use opendr::replication_provider_fsm::{ChangeType, ChangelogEntry};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 // ================================================================================================
 // Test Helpers
@@ -25,7 +24,7 @@ fn create_test_change(dn: &str, change_type: ChangeType, csn: u64) -> ChangelogE
         Csn::new(csn as u16),
         change_type,
         dn.to_string(),
-        vec![] /* change_data */
+        vec![], /* change_data */
     )
 }
 
@@ -46,7 +45,10 @@ async fn test_push_manager_lifecycle() {
     // Start manager
     let result = manager.start().await;
     assert!(result.is_ok(), "Manager should start successfully");
-    assert!(manager.is_running().await, "Manager should be running after start");
+    assert!(
+        manager.is_running().await,
+        "Manager should be running after start"
+    );
 
     // Observer should have callback registered
     assert_eq!(
@@ -58,7 +60,10 @@ async fn test_push_manager_lifecycle() {
     // Stop manager
     let result = manager.stop().await;
     assert!(result.is_ok(), "Manager should stop successfully");
-    assert!(!manager.is_running().await, "Manager should not be running after stop");
+    assert!(
+        !manager.is_running().await,
+        "Manager should not be running after stop"
+    );
 }
 
 #[tokio::test]
@@ -96,7 +101,7 @@ async fn test_stop_without_start_fails() {
 async fn test_register_consumers() {
     let observer = Arc::new(ChangeObserverImpl::new());
     let config = PushManagerConfig::default();
-    let mut manager = PushManager::new(observer, config);
+    let manager = PushManager::new(observer, config);
 
     assert_eq!(manager.consumer_count().await, 0);
 
@@ -112,7 +117,10 @@ async fn test_unregister_consumer_not_found() {
 
     let result = manager.unregister_consumer("nonexistent").await;
     assert!(result.is_ok());
-    assert!(!result.unwrap(), "Should return false for nonexistent consumer");
+    assert!(
+        !result.unwrap(),
+        "Should return false for nonexistent consumer"
+    );
 }
 
 #[tokio::test]
@@ -165,7 +173,10 @@ async fn test_consumer_stats_not_found() {
     let manager = PushManager::new(observer, config);
 
     let stats = manager.get_consumer_stats("nonexistent").await;
-    assert!(stats.is_none(), "Stats should be None for nonexistent consumer");
+    assert!(
+        stats.is_none(),
+        "Stats should be None for nonexistent consumer"
+    );
 }
 
 // ================================================================================================
@@ -217,7 +228,10 @@ async fn test_change_notification_without_consumers() {
 
     // Should not fail even with no consumers
     let result = observer.notify_change(&change).await;
-    assert!(result.is_ok(), "Notification should succeed with no consumers");
+    assert!(
+        result.is_ok(),
+        "Notification should succeed with no consumers"
+    );
 }
 
 #[tokio::test]

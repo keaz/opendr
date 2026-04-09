@@ -228,7 +228,7 @@ fn resolve_route(request: &str, settings: &MonitoringSettings) -> Route {
 fn http_response(status: &str, content_type: &str, body: String) -> String {
     format!(
         "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        body.as_bytes().len(),
+        body.len(),
         body
     )
 }

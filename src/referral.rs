@@ -56,10 +56,7 @@ impl LdapReferralResolver {
         }
 
         let use_tls = scheme == "ldaps";
-        let host = url
-            .host_str()
-            .ok_or("Missing host in URL")?
-            .to_string();
+        let host = url.host_str().ok_or("Missing host in URL")?.to_string();
 
         let port = url.port().unwrap_or(if use_tls {
             self.default_tls_port
@@ -117,7 +114,7 @@ pub struct LdapChainHandler {
     /// Maximum hop depth allowed
     max_depth: u32,
     /// Connection timeout in milliseconds
-    timeout_ms: u64,
+    _timeout_ms: u64,
 }
 
 impl LdapChainHandler {
@@ -125,7 +122,7 @@ impl LdapChainHandler {
     pub fn new() -> Self {
         Self {
             max_depth: 10,
-            timeout_ms: 30000,
+            _timeout_ms: 30000,
         }
     }
 
@@ -133,7 +130,7 @@ impl LdapChainHandler {
     pub fn with_config(max_depth: u32, timeout_ms: u64) -> Self {
         Self {
             max_depth,
-            timeout_ms,
+            _timeout_ms: timeout_ms,
         }
     }
 
@@ -141,7 +138,7 @@ impl LdapChainHandler {
     ///
     /// This modifies the request to include hop count information
     /// to prevent infinite referral loops
-    fn add_hop_count_to_request(&self, request: &[u8], hop_count: u32) -> Vec<u8> {
+    fn add_hop_count_to_request(&self, request: &[u8], _hop_count: u32) -> Vec<u8> {
         // In a real implementation, this would modify the LDAP message
         // to include a control indicating the hop count.
         // For now, we just pass through the request as-is.
@@ -176,7 +173,7 @@ impl ChainHandler for LdapChainHandler {
         }
 
         // Add hop count to request
-        let modified_request = self.add_hop_count_to_request(request, hop_count);
+        let _modified_request = self.add_hop_count_to_request(request, hop_count);
 
         // Forward request to target DSA
         // In production, this would use the NetworkClient
@@ -234,7 +231,7 @@ impl Default for LdapProxyHandler {
 
 #[async_trait]
 impl ProxyHandler for LdapProxyHandler {
-    async fn proxy_request(&self, target: &str, request: &[u8]) -> Result<Vec<u8>, String> {
+    async fn proxy_request(&self, target: &str, _request: &[u8]) -> Result<Vec<u8>, String> {
         // Forward request to target DSA transparently
         // In production, this would:
         // 1. Establish connection to target (or reuse from pool)
@@ -490,14 +487,14 @@ mod tests {
     fn test_ldap_chain_handler_new() {
         let handler = LdapChainHandler::new();
         assert_eq!(handler.max_chain_depth(), 10);
-        assert_eq!(handler.timeout_ms, 30000);
+        assert_eq!(handler._timeout_ms, 30000);
     }
 
     #[test]
     fn test_ldap_chain_handler_custom_config() {
         let handler = LdapChainHandler::with_config(5, 15000);
         assert_eq!(handler.max_chain_depth(), 5);
-        assert_eq!(handler.timeout_ms, 15000);
+        assert_eq!(handler._timeout_ms, 15000);
     }
 
     #[tokio::test]
@@ -507,14 +504,20 @@ mod tests {
         let request = b"test request";
 
         // First hop should be allowed
-        let result = handler.chain_request("server1.example.com", request, 0).await;
+        let result = handler
+            .chain_request("server1.example.com", request, 0)
+            .await;
         assert!(result.is_err()); // Will fail due to network layer not implemented, but not due to hop limit
 
-        let result = handler.chain_request("server1.example.com", request, 1).await;
+        let result = handler
+            .chain_request("server1.example.com", request, 1)
+            .await;
         assert!(result.is_err());
 
         // Hop at limit should fail
-        let result = handler.chain_request("server1.example.com", request, 2).await;
+        let result = handler
+            .chain_request("server1.example.com", request, 2)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Hop limit exceeded"));
     }

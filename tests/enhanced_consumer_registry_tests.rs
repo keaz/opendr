@@ -17,32 +17,27 @@ async fn test_consumer_connection_defaults() {
 
     assert_eq!(conn.address, "consumer1");
     assert_eq!(conn.sync_mode, SyncMode::RefreshOnly);
-    assert_eq!(conn.is_persistent, false);
+    assert!(!conn.is_persistent);
     assert_eq!(conn.last_cookie, None);
     assert!(!conn.consumer_id.is_empty());
 }
 
 #[tokio::test]
 async fn test_consumer_connection_with_sync_mode_refresh_only() {
-    let conn = ConsumerConnection::with_sync_mode(
-        "consumer1".to_string(),
-        SyncMode::RefreshOnly,
-    );
+    let conn = ConsumerConnection::with_sync_mode("consumer1".to_string(), SyncMode::RefreshOnly);
 
     assert_eq!(conn.sync_mode, SyncMode::RefreshOnly);
-    assert_eq!(conn.is_persistent, false);
+    assert!(!conn.is_persistent);
     assert!(!conn.is_persistent_mode());
 }
 
 #[tokio::test]
 async fn test_consumer_connection_with_sync_mode_refresh_and_persist() {
-    let conn = ConsumerConnection::with_sync_mode(
-        "consumer1".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let conn =
+        ConsumerConnection::with_sync_mode("consumer1".to_string(), SyncMode::RefreshAndPersist);
 
     assert_eq!(conn.sync_mode, SyncMode::RefreshAndPersist);
-    assert_eq!(conn.is_persistent, true);
+    assert!(conn.is_persistent);
     assert!(conn.is_persistent_mode());
 }
 
@@ -107,25 +102,27 @@ async fn test_registry_get_persistent_consumers_with_mixed_consumers() {
     let mut registry = ConsumerRegistryImpl::new();
 
     // Add refresh-only consumer
-    let conn1 = ConsumerConnection::with_sync_mode(
-        "consumer1".to_string(),
-        SyncMode::RefreshOnly,
-    );
-    registry.register_consumer("consumer1", conn1).await.unwrap();
+    let conn1 = ConsumerConnection::with_sync_mode("consumer1".to_string(), SyncMode::RefreshOnly);
+    registry
+        .register_consumer("consumer1", conn1)
+        .await
+        .unwrap();
 
     // Add persistent consumer
-    let conn2 = ConsumerConnection::with_sync_mode(
-        "consumer2".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
-    registry.register_consumer("consumer2", conn2).await.unwrap();
+    let conn2 =
+        ConsumerConnection::with_sync_mode("consumer2".to_string(), SyncMode::RefreshAndPersist);
+    registry
+        .register_consumer("consumer2", conn2)
+        .await
+        .unwrap();
 
     // Add another persistent consumer
-    let conn3 = ConsumerConnection::with_sync_mode(
-        "consumer3".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
-    registry.register_consumer("consumer3", conn3).await.unwrap();
+    let conn3 =
+        ConsumerConnection::with_sync_mode("consumer3".to_string(), SyncMode::RefreshAndPersist);
+    registry
+        .register_consumer("consumer3", conn3)
+        .await
+        .unwrap();
 
     // Get all active consumers
     let active = registry.get_active_consumers().await.unwrap();
@@ -155,7 +152,10 @@ async fn test_registry_get_consumer_found() {
         "test-consumer".to_string(),
         SyncMode::RefreshAndPersist,
     );
-    registry.register_consumer("consumer1", conn.clone()).await.unwrap();
+    registry
+        .register_consumer("consumer1", conn.clone())
+        .await
+        .unwrap();
 
     let result = registry.get_consumer("consumer1").await.unwrap();
     assert!(result.is_some());
@@ -174,7 +174,8 @@ async fn test_registry_update_consumer_cookie() {
     registry.register_consumer("consumer1", conn).await.unwrap();
 
     // Update cookie
-    registry.update_consumer_cookie("consumer1", "seq-100".to_string())
+    registry
+        .update_consumer_cookie("consumer1", "seq-100".to_string())
         .await
         .unwrap();
 
@@ -183,7 +184,8 @@ async fn test_registry_update_consumer_cookie() {
     assert_eq!(retrieved.last_cookie, Some("seq-100".to_string()));
 
     // Update again
-    registry.update_consumer_cookie("consumer1", "seq-200".to_string())
+    registry
+        .update_consumer_cookie("consumer1", "seq-200".to_string())
         .await
         .unwrap();
 
@@ -196,7 +198,9 @@ async fn test_registry_update_cookie_for_nonexistent_consumer() {
     let mut registry = ConsumerRegistryImpl::new();
 
     // Should not error, just silently do nothing
-    let result = registry.update_consumer_cookie("nonexistent", "cookie".to_string()).await;
+    let result = registry
+        .update_consumer_cookie("nonexistent", "cookie".to_string())
+        .await;
     assert!(result.is_ok());
 }
 
@@ -220,7 +224,8 @@ async fn test_consumer_lifecycle_with_persistent_mode() {
     assert!(persistent.contains(&"consumer1".to_string()));
 
     // Update cookie
-    registry.update_consumer_cookie("consumer1", "seq-50".to_string())
+    registry
+        .update_consumer_cookie("consumer1", "seq-50".to_string())
         .await
         .unwrap();
 
@@ -247,7 +252,8 @@ async fn test_multiple_persistent_consumers_with_different_cookies() {
             format!("consumer{}", i),
             SyncMode::RefreshAndPersist,
         );
-        registry.register_consumer(&format!("consumer{}", i), conn)
+        registry
+            .register_consumer(&format!("consumer{}", i), conn)
             .await
             .unwrap();
     }
@@ -258,17 +264,16 @@ async fn test_multiple_persistent_consumers_with_different_cookies() {
 
     // Update different cookies for each
     for i in 1..=3 {
-        registry.update_consumer_cookie(
-            &format!("consumer{}", i),
-            format!("seq-{}", i * 100),
-        )
-        .await
-        .unwrap();
+        registry
+            .update_consumer_cookie(&format!("consumer{}", i), format!("seq-{}", i * 100))
+            .await
+            .unwrap();
     }
 
     // Verify each has correct cookie
     for i in 1..=3 {
-        let conn = registry.get_consumer(&format!("consumer{}", i))
+        let conn = registry
+            .get_consumer(&format!("consumer{}", i))
             .await
             .unwrap()
             .unwrap();
@@ -290,11 +295,12 @@ async fn test_persistent_mode_change_lifecycle() {
     let mut registry = ConsumerRegistryImpl::new();
 
     // Start with refresh-only
-    let mut conn = ConsumerConnection::with_sync_mode(
-        "consumer1".to_string(),
-        SyncMode::RefreshOnly,
-    );
-    registry.register_consumer("consumer1", conn.clone()).await.unwrap();
+    let mut conn =
+        ConsumerConnection::with_sync_mode("consumer1".to_string(), SyncMode::RefreshOnly);
+    registry
+        .register_consumer("consumer1", conn.clone())
+        .await
+        .unwrap();
 
     // Verify not in persistent list
     let persistent = registry.get_persistent_consumers().await.unwrap();
@@ -325,9 +331,15 @@ async fn test_registry_thread_safety() {
             let mut reg = registry.write().await;
             let conn = ConsumerConnection::with_sync_mode(
                 format!("consumer{}", i),
-                if i % 2 == 0 { SyncMode::RefreshAndPersist } else { SyncMode::RefreshOnly },
+                if i % 2 == 0 {
+                    SyncMode::RefreshAndPersist
+                } else {
+                    SyncMode::RefreshOnly
+                },
             );
-            reg.register_consumer(&format!("consumer{}", i), conn).await.unwrap();
+            reg.register_consumer(&format!("consumer{}", i), conn)
+                .await
+                .unwrap();
         });
         handles.push(handle);
     }
@@ -359,10 +371,8 @@ async fn test_connection_duration_tracking() {
 
 #[tokio::test]
 async fn test_consumer_capabilities_preserved() {
-    let mut conn = ConsumerConnection::with_sync_mode(
-        "consumer1".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let mut conn =
+        ConsumerConnection::with_sync_mode("consumer1".to_string(), SyncMode::RefreshAndPersist);
 
     conn.add_capability("ldap_v3".to_string());
     conn.add_capability("tls".to_string());

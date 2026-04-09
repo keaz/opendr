@@ -7,7 +7,6 @@ use opendr::fsm::{
     ExtendedOpEvent, ExtendedOpFsm, ExtendedOpResultCode, ExtendedOpState, StateMachine,
 };
 use std::collections::HashMap;
-use tokio;
 
 /// Mock backend for testing
 pub struct MockBackend;

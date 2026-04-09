@@ -3,17 +3,11 @@
 //! This module provides concrete implementations of various SASL mechanisms
 //! for LDAP authentication, including PLAIN, DIGEST-MD5, and others.
 
-use crate::sasl_fsm::{SaslMechanismHandler, SaslChallengeResult, CredentialVerifier};
+use crate::sasl_fsm::{CredentialVerifier, SaslChallengeResult, SaslMechanismHandler};
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose};
-use hmac::{Hmac, Mac};
-use md5::{Md5, Digest};
-use sha2::Sha256;
+use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-type HmacMd5 = Hmac<Md5>;
-type HmacSha256 = Hmac<Sha256>;
 
 /// Combined SASL mechanism handler supporting multiple mechanisms
 pub struct MultiMechanismHandler {
@@ -26,6 +20,7 @@ pub struct MultiMechanismHandler {
 }
 
 /// Session data for multi-step SASL authentication
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SaslSessionData {
     mechanism: String,
@@ -96,16 +91,20 @@ impl MultiMechanismHandler {
         let (_authzid, authcid, _passwd) = Self::parse_plain_credentials(data)?;
 
         // Verify credentials through the credential verifier
-        let is_valid = self.credential_verifier
+        let is_valid = self
+            .credential_verifier
             .verify_credentials("PLAIN", &authcid)
             .await?;
 
         if !is_valid {
-            return Ok(SaslChallengeResult::Failure("Invalid credentials".to_string()));
+            return Ok(SaslChallengeResult::Failure(
+                "Invalid credentials".to_string(),
+            ));
         }
 
         // Get user DN
-        let dn = self.credential_verifier
+        let dn = self
+            .credential_verifier
             .get_user_dn(&authcid)
             .await?
             .ok_or_else(|| "User not found".to_string())?;
@@ -166,10 +165,7 @@ impl MultiMechanismHandler {
             let trimmed = part.trim();
             if let Some(eq_pos) = trimmed.find('=') {
                 let key = trimmed[..eq_pos].trim().to_string();
-                let value = trimmed[eq_pos + 1..]
-                    .trim()
-                    .trim_matches('"')
-                    .to_string();
+                let value = trimmed[eq_pos + 1..].trim().trim_matches('"').to_string();
                 params.insert(key, value);
             }
         }
@@ -184,24 +180,29 @@ impl MultiMechanismHandler {
     ) -> Result<SaslChallengeResult, String> {
         let params = Self::parse_digest_md5_response(response_data)?;
 
-        let username = params.get("username")
+        let username = params
+            .get("username")
             .ok_or("Missing username in response")?;
-        let nonce = params.get("nonce")
-            .ok_or("Missing nonce in response")?;
-        let response = params.get("response")
+        let nonce = params.get("nonce").ok_or("Missing nonce in response")?;
+        let _response = params
+            .get("response")
             .ok_or("Missing response in response")?;
 
         // Verify credentials
-        let is_valid = self.credential_verifier
+        let is_valid = self
+            .credential_verifier
             .verify_credentials("DIGEST-MD5", username)
             .await?;
 
         if !is_valid {
-            return Ok(SaslChallengeResult::Failure("Invalid credentials".to_string()));
+            return Ok(SaslChallengeResult::Failure(
+                "Invalid credentials".to_string(),
+            ));
         }
 
         // Get user DN
-        let dn = self.credential_verifier
+        let dn = self
+            .credential_verifier
             .get_user_dn(username)
             .await?
             .ok_or_else(|| "User not found".to_string())?;
@@ -228,23 +229,29 @@ impl MultiMechanismHandler {
 
         let parts: Vec<&str> = response_str.split_whitespace().collect();
         if parts.len() != 2 {
-            return Ok(SaslChallengeResult::Failure("Invalid CRAM-MD5 response".to_string()));
+            return Ok(SaslChallengeResult::Failure(
+                "Invalid CRAM-MD5 response".to_string(),
+            ));
         }
 
         let username = parts[0];
         let _provided_hash = parts[1];
 
         // Verify credentials
-        let is_valid = self.credential_verifier
+        let is_valid = self
+            .credential_verifier
             .verify_credentials("CRAM-MD5", username)
             .await?;
 
         if !is_valid {
-            return Ok(SaslChallengeResult::Failure("Invalid credentials".to_string()));
+            return Ok(SaslChallengeResult::Failure(
+                "Invalid credentials".to_string(),
+            ));
         }
 
         // Get user DN
-        let dn = self.credential_verifier
+        let dn = self
+            .credential_verifier
             .get_user_dn(username)
             .await?
             .ok_or_else(|| "User not found".to_string())?;
@@ -281,7 +288,10 @@ impl SaslMechanismHandler for MultiMechanismHandler {
         match mechanism {
             "DIGEST-MD5" => self.handle_digest_md5_response(response).await,
             "CRAM-MD5" => self.handle_cram_md5_response(response).await,
-            _ => Err(format!("Mechanism {} does not support multi-step", mechanism)),
+            _ => Err(format!(
+                "Mechanism {} does not support multi-step",
+                mechanism
+            )),
         }
     }
 
@@ -316,7 +326,11 @@ mod tests {
 
     #[async_trait]
     impl CredentialVerifier for MockCredentialVerifier {
-        async fn verify_credentials(&self, _mechanism: &str, identity: &str) -> Result<bool, String> {
+        async fn verify_credentials(
+            &self,
+            _mechanism: &str,
+            identity: &str,
+        ) -> Result<bool, String> {
             Ok(identity == "testuser")
         }
 
