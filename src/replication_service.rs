@@ -46,9 +46,8 @@ use crate::backend::DirectoryBackend;
 use crate::backend_changelog_wrapper::ChangelogBackendWrapper;
 use crate::config::ServerConfig;
 use crate::replication::{
-    BroadcastChangeListener, ChangeListenerImpl, ChangelogProviderImpl, ChangelogTracker,
-    ConsumerRegistryImpl, LdapChangeListener, ProviderConnectionImpl, StreamingManagerImpl,
-    SyncRequestHandlerImpl,
+    ChangeListenerImpl, ChangelogProviderImpl, ChangelogTracker, ConsumerRegistryImpl,
+    LdapChangeListener, ProviderConnectionImpl, StreamingManagerImpl, SyncRequestHandlerImpl,
 };
 use crate::replication_provider_fsm::{ReplicationProviderConfig, ReplicationProviderFsmImpl};
 use crate::shutdown::ShutdownCoordinator;
@@ -149,6 +148,10 @@ impl fmt::Debug for ConsumerServiceConfig {
 }
 
 impl ReplicationService {
+    fn uses_local_provider_runtime(provider_url: &str) -> bool {
+        provider_url.starts_with("local://") || provider_url.starts_with("in-memory://")
+    }
+
     /// Create a new replication service from configuration
     ///
     /// # Arguments
@@ -405,15 +408,19 @@ impl ReplicationService {
             .as_ref()
             .ok_or_else(|| "Consumer config not available".to_string())?;
 
+        if consumer_config.enable_change_listening
+            && Self::uses_local_provider_runtime(&consumer_config.provider_url)
+        {
+            return Err(
+                "listening mode requires ldap:// or ldaps:// provider_url; local:// and in-memory:// remain polling-only compatibility URLs".to_string()
+            );
+        }
+
         info!("Starting replication consumer service");
 
         // Create consumer dependencies
         use crate::replication::{BatchProcessorImpl, StateManagerImpl};
         use crate::replication_consumer_fsm::{ConsumerConfig, ReplicationConsumerFsmImpl};
-
-        let has_local_provider = self.changelog.is_some()
-            && (consumer_config.provider_url.starts_with("local://")
-                || consumer_config.provider_url.starts_with("in-memory://"));
 
         let changelog_provider = if let Some(ref changelog) = self.changelog {
             Arc::new(ChangelogProviderImpl::new(
@@ -442,21 +449,13 @@ impl ReplicationService {
 
         let change_listener: Box<dyn crate::replication_consumer_fsm::ChangeListener> =
             if consumer_config.enable_change_listening {
-                if has_local_provider {
-                    if let Some(receiver) = self.backend.subscribe_to_replication_changes() {
-                        Box::new(BroadcastChangeListener::new(receiver))
-                    } else {
-                        Box::new(ChangeListenerImpl::new())
-                    }
-                } else {
-                    Box::new(LdapChangeListener::new(
-                        consumer_config.provider_url.clone(),
-                        consumer_config.base_dn.clone(),
-                        consumer_config.provider_bind_dn.clone(),
-                        consumer_config.provider_bind_password.clone(),
-                        consumer_config.change_buffer_size,
-                    ))
-                }
+                Box::new(LdapChangeListener::new(
+                    consumer_config.provider_url.clone(),
+                    consumer_config.base_dn.clone(),
+                    consumer_config.provider_bind_dn.clone(),
+                    consumer_config.provider_bind_password.clone(),
+                    consumer_config.change_buffer_size,
+                ))
             } else {
                 Box::new(ChangeListenerImpl::new())
             };
@@ -890,6 +889,48 @@ mod tests {
             let _ = h.await;
         }
         if let Some(h) = consumer_handle {
+            let _ = h.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consumer_service_rejects_local_provider_url_when_listening_enabled() {
+        use crate::shutdown::{ShutdownConfig, ShutdownCoordinator};
+
+        let mut config = create_test_config();
+        config.replication.mode = "consumer".to_string();
+        config.replication.provider_url = Some("local://provider".to_string());
+        config.replication.enable_change_listening = true;
+        let backend = Arc::new(MockBackend::new());
+
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig::default()));
+
+        let err = service.start_consumer(shutdown).await.unwrap_err();
+
+        assert!(err.contains("listening mode requires ldap:// or ldaps:// provider_url"));
+    }
+
+    #[tokio::test]
+    async fn test_consumer_service_allows_local_provider_url_when_listening_disabled() {
+        use crate::shutdown::{ShutdownConfig, ShutdownCoordinator};
+
+        let mut config = create_test_config();
+        config.replication.mode = "consumer".to_string();
+        config.replication.provider_url = Some("in-memory://provider".to_string());
+        config.replication.enable_change_listening = false;
+        config.replication.sync_interval_secs = 30;
+        let backend = Arc::new(MockBackend::new());
+
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig::default()));
+
+        let handle = service.start_consumer(shutdown.clone()).await.unwrap();
+
+        assert!(handle.is_some());
+
+        shutdown.initiate_shutdown().await;
+        if let Some(h) = handle {
             let _ = h.await;
         }
     }
