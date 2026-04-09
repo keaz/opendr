@@ -48,8 +48,10 @@ use crate::replication::{
 };
 use crate::schema::LdapSchema;
 use crate::search_controls::{
-    decode_paged_results_control, encode_paged_results_control, PagedResultsControl,
-    PAGED_RESULTS_OID,
+    decode_paged_results_control, decode_server_side_sort_request_control,
+    encode_paged_results_control, encode_server_side_sort_response_control, PagedResultsControl,
+    ServerSideSortResultCode, SortKey, PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID,
+    SERVER_SIDE_SORT_RESPONSE_OID,
 };
 use crate::tls::RustlsTlsHandler;
 
@@ -156,6 +158,7 @@ struct SearchRequestSignature {
     types_only: bool,
     filter_repr: String,
     attributes: Vec<String>,
+    sort_keys: Option<Vec<SortKey>>,
 }
 
 impl SearchRequestSignature {
@@ -163,6 +166,7 @@ impl SearchRequestSignature {
         base_dn: &str,
         request: &SearchRequest<'_>,
         attribute_selection: &[String],
+        sort_keys: Option<&[SortKey]>,
     ) -> Self {
         let mut attributes = attribute_selection
             .iter()
@@ -180,6 +184,7 @@ impl SearchRequestSignature {
             types_only: request.types_only,
             filter_repr: format!("{:?}", request.filter),
             attributes,
+            sort_keys: sort_keys.map(|keys| keys.to_vec()),
         }
     }
 }
@@ -1594,7 +1599,9 @@ fn active_runtime_control_registry() -> ControlRegistry {
     let mut registry = ControlRegistry::default();
     registry
         .register_request_control(PAGED_RESULTS_OID)
-        .register_response_control(PAGED_RESULTS_OID);
+        .register_response_control(PAGED_RESULTS_OID)
+        .register_request_control(SERVER_SIDE_SORT_REQUEST_OID)
+        .register_response_control(SERVER_SIDE_SORT_RESPONSE_OID);
     registry
 }
 
@@ -1788,6 +1795,23 @@ enum PagedSearchRequestError {
     UnsupportedCombination(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestedServerSideSort {
+    keys: Vec<SortKey>,
+    critical: bool,
+}
+
+#[derive(Debug)]
+enum ServerSideSortRequestError {
+    ProtocolError(String),
+    Unsupported {
+        result: ServerSideSortResultCode,
+        attribute_type: Option<String>,
+        diagnostic: String,
+        critical: bool,
+    },
+}
+
 impl PagedSearchRequestError {
     fn result_code(&self) -> ResultCode {
         match self {
@@ -1816,6 +1840,19 @@ fn paged_results_response_control(
     Ok(LdapControl::new(PAGED_RESULTS_OID, false, Some(value)))
 }
 
+fn server_side_sort_response_control(
+    result: ServerSideSortResultCode,
+    attribute_type: Option<&str>,
+) -> Result<LdapControl, ServerError> {
+    let value = encode_server_side_sort_response_control(result, attribute_type)
+        .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?;
+    Ok(LdapControl::new(
+        SERVER_SIDE_SORT_RESPONSE_OID,
+        false,
+        Some(value),
+    ))
+}
+
 fn parse_paged_results_request(
     request_controls: &RequestControls,
 ) -> Result<Option<PagedResultsControl>, PagedSearchRequestError> {
@@ -1837,6 +1874,97 @@ fn parse_paged_results_request(
 
 fn record_paged_search_invalid_cookie(request_context: &RequestContext) {
     increment_control_counter(request_context, "ldap_paged_search_invalid_cookie_total", 1);
+}
+
+fn parse_server_side_sort_request(
+    request_controls: &RequestControls,
+) -> Result<Option<RequestedServerSideSort>, ServerSideSortRequestError> {
+    let control = request_controls
+        .singleton(SERVER_SIDE_SORT_REQUEST_OID)
+        .map_err(|err| ServerSideSortRequestError::ProtocolError(err.to_string()))?;
+    let Some(control) = control else {
+        return Ok(None);
+    };
+
+    let decoded = decode_server_side_sort_request_control(control.value()).map_err(|err| {
+        ServerSideSortRequestError::ProtocolError(format!(
+            "malformed server-side sort control: {err}"
+        ))
+    })?;
+
+    Ok(Some(RequestedServerSideSort {
+        keys: decoded.keys,
+        critical: control.criticality(),
+    }))
+}
+
+fn validate_server_side_sort_request(
+    requested_sort: &RequestedServerSideSort,
+) -> Result<(), ServerSideSortRequestError> {
+    let mut seen_attributes = HashSet::new();
+    for key in &requested_sort.keys {
+        let normalized_attribute = key.attribute_type.to_ascii_lowercase();
+        if !seen_attributes.insert(normalized_attribute) {
+            return Err(ServerSideSortRequestError::Unsupported {
+                result: ServerSideSortResultCode::UnwillingToPerform,
+                attribute_type: Some(key.attribute_type.clone()),
+                diagnostic: format!(
+                    "server-side sort attribute {} appears more than once",
+                    key.attribute_type
+                ),
+                critical: requested_sort.critical,
+            });
+        }
+
+        if key.ordering_rule.is_some() {
+            return Err(ServerSideSortRequestError::Unsupported {
+                result: ServerSideSortResultCode::InappropriateMatching,
+                attribute_type: Some(key.attribute_type.clone()),
+                diagnostic: format!(
+                    "explicit ordering rule is not supported for {}",
+                    key.attribute_type
+                ),
+                critical: requested_sort.critical,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn sort_value_for_key(entry: &DirectoryEntry, key: &SortKey) -> Option<String> {
+    let attribute_name = key.attribute_type.to_ascii_lowercase();
+    entry
+        .attributes
+        .get(&attribute_name)
+        .and_then(|values| values.iter().map(|value| value.to_ascii_lowercase()).min())
+}
+
+fn sort_search_entries(entries: &mut [DirectoryEntry], requested_sort: &RequestedServerSideSort) {
+    entries.sort_by(|left, right| {
+        for key in &requested_sort.keys {
+            let left_value = sort_value_for_key(left, key);
+            let right_value = sort_value_for_key(right, key);
+            let ordering = match (&left_value, &right_value) {
+                (Some(left_value), Some(right_value)) => left_value.cmp(right_value),
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+
+            let ordering = if key.reverse_order {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+
+        normalize_search_dn(&left.dn).cmp(&normalize_search_dn(&right.dn))
+    });
 }
 
 async fn reject_paged_search_request(
@@ -1879,6 +2007,88 @@ async fn reject_paged_search_request(
         error.diagnostic(),
     )
     .await
+}
+
+async fn reject_server_side_sort_request(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    base_dn: &str,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+    error: &ServerSideSortRequestError,
+) -> Result<(), ServerError> {
+    match error {
+        ServerSideSortRequestError::ProtocolError(diagnostic) => {
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "server_side_sort",
+                false,
+                Some(base_dn),
+                Some(diagnostic.as_str()),
+                vec![("error_kind".to_string(), "protocol_error".to_string())],
+            )
+            .await;
+
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                ResultCode::ProtocolError,
+                base_dn,
+                diagnostic.as_str(),
+            )
+            .await
+        }
+        ServerSideSortRequestError::Unsupported {
+            result,
+            attribute_type,
+            diagnostic,
+            critical,
+        } => {
+            increment_control_counter(request_context, "ldap_sort_failures_total", 1);
+            if *result == ServerSideSortResultCode::InappropriateMatching {
+                increment_control_counter(
+                    request_context,
+                    "ldap_sort_unsupported_ordering_rule_total",
+                    1,
+                );
+            }
+
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "server_side_sort",
+                false,
+                Some(base_dn),
+                Some(diagnostic.as_str()),
+                vec![("error_kind".to_string(), "sort_failure".to_string())],
+            )
+            .await;
+
+            let sort_response =
+                server_side_sort_response_control(*result, attribute_type.as_deref())?;
+            let result_code = if *critical {
+                ResultCode::UnavailableCriticalExtension
+            } else {
+                ResultCode::Success
+            };
+            send_result_with_controls(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                result_code,
+                base_dn,
+                diagnostic.as_str(),
+                &[sort_response],
+            )
+            .await
+        }
+    }
 }
 
 pub async fn handle_bind_request(
@@ -2940,6 +3150,41 @@ async fn handle_search_request_with_context_and_registry(
         increment_control_counter(request_context, "ldap_paged_search_requests_total", 1);
     }
 
+    let requested_sort = match parse_server_side_sort_request(request_controls) {
+        Ok(sort) => sort,
+        Err(err) => {
+            reject_server_side_sort_request(
+                socket,
+                message_id,
+                &base_dn,
+                session,
+                request_context,
+                &err,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if requested_sort.is_some() {
+        increment_control_counter(request_context, "ldap_sort_requests_total", 1);
+    }
+
+    if let Some(requested_sort) = requested_sort.as_ref() {
+        if let Err(err) = validate_server_side_sort_request(requested_sort) {
+            reject_server_side_sort_request(
+                socket,
+                message_id,
+                &base_dn,
+                session,
+                request_context,
+                &err,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     if let Some(control) = paged_results.as_ref() {
         if control.size == 0 && control.cookie.is_empty() {
             let err = PagedSearchRequestError::ProtocolError(
@@ -2961,7 +3206,14 @@ async fn handle_search_request_with_context_and_registry(
 
     let is_virtual_base =
         base_dn.is_empty() || base_dn.eq_ignore_ascii_case(&runtime_config.subschema_dn);
-    let virtual_result_controls = if let Some(control) = paged_results.as_ref() {
+    let mut virtual_result_controls = Vec::new();
+    if requested_sort.is_some() && is_virtual_base {
+        virtual_result_controls.push(server_side_sort_response_control(
+            ServerSideSortResultCode::Success,
+            None,
+        )?);
+    }
+    if let Some(control) = paged_results.as_ref() {
         if !control.cookie.is_empty() && is_virtual_base {
             let err = PagedSearchRequestError::InvalidCookie(
                 "paged results cookie is not valid for this search sequence".to_string(),
@@ -2979,13 +3231,9 @@ async fn handle_search_request_with_context_and_registry(
         }
 
         if is_virtual_base {
-            vec![paged_results_response_control(1, &[])?]
-        } else {
-            Vec::new()
+            virtual_result_controls.push(paged_results_response_control(1, &[])?);
         }
-    } else {
-        Vec::new()
-    };
+    }
 
     if try_handle_virtual_search_request(
         socket,
@@ -3061,6 +3309,29 @@ async fn handle_search_request_with_context_and_registry(
         .iter()
         .any(|attribute| attribute.eq_ignore_ascii_case(REPLICATION_STREAM_ATTRIBUTE))
     {
+        if let Some(_sort) = requested_sort.as_ref() {
+            let err = ServerSideSortRequestError::Unsupported {
+                result: ServerSideSortResultCode::UnwillingToPerform,
+                attribute_type: None,
+                diagnostic: "server-side sort is not supported for replication stream searches"
+                    .to_string(),
+                critical: requested_sort
+                    .as_ref()
+                    .map(|sort| sort.critical)
+                    .unwrap_or(false),
+            };
+            reject_server_side_sort_request(
+                socket,
+                message_id,
+                &base_dn,
+                session,
+                request_context,
+                &err,
+            )
+            .await?;
+            return Ok(());
+        }
+
         if let Some(_control) = paged_results.as_ref() {
             let err = PagedSearchRequestError::UnsupportedCombination(
                 "paged results are not supported for replication stream searches".to_string(),
@@ -3092,9 +3363,14 @@ async fn handle_search_request_with_context_and_registry(
 
     operation_registry.register(message_id, ConnectionOperationKind::Search, true);
 
-    let search_signature = paged_results
-        .as_ref()
-        .map(|_| SearchRequestSignature::from_request(&base_dn, &request, &attribute_selection));
+    let search_signature = paged_results.as_ref().map(|_| {
+        SearchRequestSignature::from_request(
+            &base_dn,
+            &request,
+            &attribute_selection,
+            requested_sort.as_ref().map(|sort| sort.keys.as_slice()),
+        )
+    });
 
     if let Some(control) = paged_results
         .as_ref()
@@ -3190,6 +3466,17 @@ async fn handle_search_request_with_context_and_registry(
         } else {
             (result_code, diagnostic)
         };
+        let mut response_controls = vec![response_control];
+        if requested_sort.is_some() {
+            response_controls.push(server_side_sort_response_control(
+                if time_limit_hit {
+                    ServerSideSortResultCode::TimeLimitExceeded
+                } else {
+                    ServerSideSortResultCode::Success
+                },
+                None,
+            )?);
+        }
         send_result_with_controls(
             socket,
             message_id,
@@ -3197,7 +3484,7 @@ async fn handle_search_request_with_context_and_registry(
             result_code,
             &base_dn,
             diagnostic,
-            &[response_control],
+            &response_controls,
         )
         .await?;
         if result_code == ResultCode::TimeLimitExceeded {
@@ -3219,7 +3506,7 @@ async fn handle_search_request_with_context_and_registry(
         return Ok(());
     }
 
-    let search_result_set = match collect_search_result_set(
+    let mut search_result_set = match collect_search_result_set(
         backend,
         &effective_base_dn,
         &request,
@@ -3268,6 +3555,10 @@ async fn handle_search_request_with_context_and_registry(
             return Ok(());
         }
     };
+
+    if let Some(requested_sort) = requested_sort.as_ref() {
+        sort_search_entries(&mut search_result_set.entries, requested_sort);
+    }
 
     if let Some(control) = paged_results.as_ref() {
         let page_size = control.size as usize;
@@ -3339,6 +3630,17 @@ async fn handle_search_request_with_context_and_registry(
         } else {
             (result_code, diagnostic)
         };
+        let mut response_controls = vec![response_control];
+        if requested_sort.is_some() {
+            response_controls.push(server_side_sort_response_control(
+                if time_limit_hit {
+                    ServerSideSortResultCode::TimeLimitExceeded
+                } else {
+                    ServerSideSortResultCode::Success
+                },
+                None,
+            )?);
+        }
         send_result_with_controls(
             socket,
             message_id,
@@ -3346,7 +3648,7 @@ async fn handle_search_request_with_context_and_registry(
             result_code,
             &base_dn,
             diagnostic,
-            &[response_control],
+            &response_controls,
         )
         .await?;
         if result_code == ResultCode::TimeLimitExceeded {
@@ -3395,15 +3697,36 @@ async fn handle_search_request_with_context_and_registry(
             (ResultCode::Success, "")
         };
 
-        send_result(
-            socket,
-            message_id,
-            ResponseOp::SearchDone,
-            result_code,
-            &base_dn,
-            diagnostic,
-        )
-        .await?;
+        if requested_sort.is_some() {
+            let sort_response = server_side_sort_response_control(
+                if search_result_set.time_limit_hit || emit_time_limit_hit {
+                    ServerSideSortResultCode::TimeLimitExceeded
+                } else {
+                    ServerSideSortResultCode::Success
+                },
+                None,
+            )?;
+            send_result_with_controls(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                result_code,
+                &base_dn,
+                diagnostic,
+                &[sort_response],
+            )
+            .await?;
+        } else {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                result_code,
+                &base_dn,
+                diagnostic,
+            )
+            .await?;
+        }
     }
 
     operation_registry.finish(message_id, FinishedOperationState::Completed);
@@ -5621,8 +5944,10 @@ mod tests {
     use crate::replication_service::ReplicationService;
     use crate::schema::LdapSchema;
     use crate::search_controls::{
-        decode_paged_results_control, encode_paged_results_control, PagedResultsControl,
-        PAGED_RESULTS_OID,
+        decode_paged_results_control, decode_server_side_sort_response_control,
+        encode_paged_results_control, encode_server_side_sort_request_control, PagedResultsControl,
+        ServerSideSortResponseControl, ServerSideSortResultCode, SortKey, PAGED_RESULTS_OID,
+        SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
     };
     use ldap_parser::filter::{
         Attribute as FilterAttribute, AttributeValue, AttributeValueAssertion, Filter,
@@ -5921,6 +6246,57 @@ mod tests {
             .find(|control| control.control_type.0.as_ref() == PAGED_RESULTS_OID)
             .expect("paged results response control");
         decode_paged_results_control(control.control_value.as_deref()).unwrap()
+    }
+
+    fn server_side_sort_request_controls(keys: &[SortKey], critical: bool) -> RequestControls {
+        RequestControls::new(vec![LdapControl::new(
+            SERVER_SIDE_SORT_REQUEST_OID,
+            critical,
+            Some(encode_server_side_sort_request_control(keys).unwrap()),
+        )])
+    }
+
+    fn paged_and_sort_request_controls(
+        size: u32,
+        cookie: &[u8],
+        keys: &[SortKey],
+        critical: bool,
+    ) -> RequestControls {
+        RequestControls::new(vec![
+            LdapControl::new(
+                PAGED_RESULTS_OID,
+                false,
+                Some(encode_paged_results_control(size, cookie).unwrap()),
+            ),
+            LdapControl::new(
+                SERVER_SIDE_SORT_REQUEST_OID,
+                critical,
+                Some(encode_server_side_sort_request_control(keys).unwrap()),
+            ),
+        ])
+    }
+
+    fn server_side_sort_response(
+        message: &ldap_parser::ldap::LdapMessage<'_>,
+    ) -> ServerSideSortResponseControl {
+        let controls = message.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == SERVER_SIDE_SORT_RESPONSE_OID)
+            .expect("server-side sort response control");
+        decode_server_side_sort_response_control(control.control_value.as_deref()).unwrap()
+    }
+
+    fn search_result_dns(messages: &[ldap_parser::ldap::LdapMessage<'_>]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match &message.protocol_op {
+                ProtocolOp::SearchResultEntry(entry) => {
+                    Some(entry.object_name.0.as_ref().to_string())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -6352,6 +6728,7 @@ mod tests {
             types_only: false,
             filter_repr: "present".to_string(),
             attributes: vec!["cn".to_string()],
+            sort_keys: None,
         };
 
         let cancel_cookie = registry.remember_paged_search(PagedSearchCursor {
@@ -6916,10 +7293,15 @@ mod tests {
         ];
         expected_extensions.sort();
         assert_eq!(supported_extensions, expected_extensions);
-        assert_eq!(
-            attributes.get("supportedControl").unwrap(),
-            &vec![PAGED_RESULTS_OID.to_string()]
-        );
+        let mut supported_controls = attributes.get("supportedControl").unwrap().clone();
+        supported_controls.sort();
+        let mut expected_controls = vec![
+            PAGED_RESULTS_OID.to_string(),
+            SERVER_SIDE_SORT_REQUEST_OID.to_string(),
+            SERVER_SIDE_SORT_RESPONSE_OID.to_string(),
+        ];
+        expected_controls.sort();
+        assert_eq!(supported_controls, expected_controls);
 
         match &messages[1].protocol_op {
             ProtocolOp::SearchResultDone(done) => {
@@ -7191,6 +7573,380 @@ mod tests {
             }
             other => panic!("unexpected response: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn server_side_sort_orders_results_by_requested_attribute() {
+        let backend = MockBackend::new();
+        for (dn, cn) in [
+            ("cn=zeta,dc=example,dc=org", "Zulu"),
+            ("cn=alpha,dc=example,dc=org", "alpha"),
+            ("cn=beta,dc=example,dc=org", "Beta"),
+        ] {
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        dn,
+                        HashMap::from([
+                            ("cn".to_string(), vec![cn.to_string()]),
+                            ("objectclass".to_string(), vec!["person".to_string()]),
+                        ]),
+                    ),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig::default();
+        let request_context = RequestContext::default();
+        let session = ConnectionSession::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let request_controls = server_side_sort_request_controls(
+            &[SortKey {
+                attribute_type: "cn".to_string(),
+                ordering_rule: None,
+                reverse_order: false,
+            }],
+            false,
+        );
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            37,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec![
+                "cn=alpha,dc=example,dc=org".to_string(),
+                "cn=beta,dc=example,dc=org".to_string(),
+                "cn=zeta,dc=example,dc=org".to_string(),
+            ]
+        );
+        let sort_response = server_side_sort_response(messages.last().unwrap());
+        assert_eq!(sort_response.result, ServerSideSortResultCode::Success);
+        assert_eq!(sort_response.attribute_type, None);
+    }
+
+    #[tokio::test]
+    async fn server_side_sort_supports_multi_key_ordering_and_missing_values() {
+        let backend = MockBackend::new();
+        for (dn, attrs) in [
+            (
+                "cn=one,dc=example,dc=org",
+                HashMap::from([
+                    ("sn".to_string(), vec!["Jones".to_string()]),
+                    ("givenname".to_string(), vec!["Zara".to_string()]),
+                    ("objectclass".to_string(), vec!["person".to_string()]),
+                ]),
+            ),
+            (
+                "cn=two,dc=example,dc=org",
+                HashMap::from([
+                    ("sn".to_string(), vec!["Jones".to_string()]),
+                    ("givenname".to_string(), vec!["Adam".to_string()]),
+                    ("objectclass".to_string(), vec!["person".to_string()]),
+                ]),
+            ),
+            (
+                "cn=three,dc=example,dc=org",
+                HashMap::from([
+                    ("sn".to_string(), vec!["Jones".to_string()]),
+                    ("objectclass".to_string(), vec!["person".to_string()]),
+                ]),
+            ),
+            (
+                "cn=four,dc=example,dc=org",
+                HashMap::from([
+                    ("sn".to_string(), vec!["Smith".to_string()]),
+                    ("givenname".to_string(), vec!["Ava".to_string()]),
+                    ("objectclass".to_string(), vec!["person".to_string()]),
+                ]),
+            ),
+        ] {
+            backend
+                .add_entry(DirectoryEntry::new(dn, attrs), Vec::new())
+                .await
+                .unwrap();
+        }
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig::default();
+        let request_context = RequestContext::default();
+        let session = ConnectionSession::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let request_controls = server_side_sort_request_controls(
+            &[
+                SortKey {
+                    attribute_type: "sn".to_string(),
+                    ordering_rule: None,
+                    reverse_order: false,
+                },
+                SortKey {
+                    attribute_type: "givenName".to_string(),
+                    ordering_rule: None,
+                    reverse_order: false,
+                },
+            ],
+            false,
+        );
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            38,
+            subtree_search_request("dc=example,dc=org", &["sn", "givenName"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec![
+                "cn=two,dc=example,dc=org".to_string(),
+                "cn=one,dc=example,dc=org".to_string(),
+                "cn=three,dc=example,dc=org".to_string(),
+                "cn=four,dc=example,dc=org".to_string(),
+            ]
+        );
+        let sort_response = server_side_sort_response(messages.last().unwrap());
+        assert_eq!(sort_response.result, ServerSideSortResultCode::Success);
+    }
+
+    #[tokio::test]
+    async fn server_side_sort_rejects_unsupported_ordering_rule_with_control() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=user,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig::default();
+        let request_context = RequestContext::default();
+        let session = ConnectionSession::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let request_controls = server_side_sort_request_controls(
+            &[SortKey {
+                attribute_type: "cn".to_string(),
+                ordering_rule: Some("caseIgnoreOrderingMatch".to_string()),
+                reverse_order: false,
+            }],
+            false,
+        );
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            39,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        let sort_response = server_side_sort_response(&messages[0]);
+        assert_eq!(
+            sort_response.result,
+            ServerSideSortResultCode::InappropriateMatching
+        );
+        assert_eq!(sort_response.attribute_type.as_deref(), Some("cn"));
+    }
+
+    #[tokio::test]
+    async fn paged_server_side_sort_preserves_sorted_sequence_across_pages() {
+        let backend = MockBackend::new();
+        for (dn, cn) in [
+            ("cn=zeta,dc=example,dc=org", "Zulu"),
+            ("cn=alpha,dc=example,dc=org", "alpha"),
+            ("cn=gamma,dc=example,dc=org", "Gamma"),
+            ("cn=beta,dc=example,dc=org", "Beta"),
+            ("cn=delta,dc=example,dc=org", "delta"),
+        ] {
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        dn,
+                        HashMap::from([
+                            ("cn".to_string(), vec![cn.to_string()]),
+                            ("objectclass".to_string(), vec!["person".to_string()]),
+                        ]),
+                    ),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig::default();
+        let request_context = RequestContext::default();
+        let session = ConnectionSession::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let sort_keys = [SortKey {
+            attribute_type: "cn".to_string(),
+            ordering_rule: None,
+            reverse_order: false,
+        }];
+
+        let request_controls = paged_and_sort_request_controls(2, &[], &sort_keys, false);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            40,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, first_page) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(
+            search_result_dns(&first_page),
+            vec![
+                "cn=alpha,dc=example,dc=org".to_string(),
+                "cn=beta,dc=example,dc=org".to_string(),
+            ]
+        );
+        assert_eq!(
+            server_side_sort_response(first_page.last().unwrap()).result,
+            ServerSideSortResultCode::Success
+        );
+        let first_cookie = paged_results_response(first_page.last().unwrap());
+        assert!(!first_cookie.cookie.is_empty());
+
+        let request_controls =
+            paged_and_sort_request_controls(2, &first_cookie.cookie, &sort_keys, false);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            41,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, second_page) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(
+            search_result_dns(&second_page),
+            vec![
+                "cn=delta,dc=example,dc=org".to_string(),
+                "cn=gamma,dc=example,dc=org".to_string(),
+            ]
+        );
+        assert_eq!(
+            server_side_sort_response(second_page.last().unwrap()).result,
+            ServerSideSortResultCode::Success
+        );
+        let second_cookie = paged_results_response(second_page.last().unwrap());
+        assert_eq!(second_cookie.cookie, first_cookie.cookie);
+
+        let request_controls =
+            paged_and_sort_request_controls(2, &second_cookie.cookie, &sort_keys, false);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            42,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, third_page) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(
+            search_result_dns(&third_page),
+            vec!["cn=zeta,dc=example,dc=org".to_string()]
+        );
+        let final_cookie = paged_results_response(third_page.last().unwrap());
+        assert!(final_cookie.cookie.is_empty());
+        assert_eq!(
+            server_side_sort_response(third_page.last().unwrap()).result,
+            ServerSideSortResultCode::Success
+        );
     }
 
     #[tokio::test]
