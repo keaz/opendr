@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use ldap3::{LdapConnAsync, LdapConnSettings};
 use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -214,6 +215,41 @@ pub const REPLICATION_CHANGE_TYPE_ATTRIBUTE: &str = "opendrChangeType";
 pub const REPLICATION_CHANGE_DATA_ATTRIBUTE: &str = "opendrChangeData";
 pub const REPLICATION_CSN_ATTRIBUTE: &str = "opendrChangeCsn";
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RenameChange {
+    pub new_rdn: String,
+    pub delete_old: bool,
+    pub new_superior: Option<String>,
+}
+
+pub(crate) fn encode_rename_change(
+    new_rdn: &str,
+    delete_old: bool,
+    new_superior: Option<&str>,
+) -> Vec<u8> {
+    serde_json::to_vec(&RenameChange {
+        new_rdn: new_rdn.to_string(),
+        delete_old,
+        new_superior: new_superior.map(str::to_string),
+    })
+    .unwrap_or_default()
+}
+
+fn decode_rename_change(change_data: &[u8]) -> Result<RenameChange, ConsumerError> {
+    serde_json::from_slice(change_data).map_err(|e| ConsumerError::ProcessingError {
+        message: format!("Invalid rename change payload: {}", e),
+    })
+}
+
+fn replicated_password(entry: &crate::backend::DirectoryEntry) -> Vec<u8> {
+    entry
+        .attributes
+        .get("userpassword")
+        .and_then(|values| values.first())
+        .map(|value| value.as_bytes().to_vec())
+        .unwrap_or_default()
+}
+
 fn encode_change_bytes(change_type: &ChangeType, dn: &str, change_data: &[u8]) -> Vec<u8> {
     let change_type_str = match change_type {
         ChangeType::Add => "add",
@@ -242,9 +278,7 @@ fn encode_directory_entry_as_change(entry: crate::backend::DirectoryEntry) -> Op
     }
 }
 
-pub fn changelog_entry_to_replication_attrs(
-    entry: &ChangelogEntry,
-) -> Vec<(String, Vec<String>)> {
+pub fn changelog_entry_to_replication_attrs(entry: &ChangelogEntry) -> Vec<(String, Vec<String>)> {
     let encoded_data = base64::engine::general_purpose::STANDARD.encode(&entry.change_data);
     vec![
         (
@@ -272,7 +306,9 @@ pub fn changelog_entry_to_replication_attrs(
     ]
 }
 
-pub fn parse_replication_stream_entry(entry: &ldap3::SearchEntry) -> Result<Vec<u8>, ConsumerError> {
+pub fn parse_replication_stream_entry(
+    entry: &ldap3::SearchEntry,
+) -> Result<Vec<u8>, ConsumerError> {
     let find_attr = |name: &str| {
         entry.attrs.iter().find_map(|(key, values)| {
             if key.eq_ignore_ascii_case(name) {
@@ -283,15 +319,17 @@ pub fn parse_replication_stream_entry(entry: &ldap3::SearchEntry) -> Result<Vec<
         })
     };
 
-    let change_type = find_attr(REPLICATION_CHANGE_TYPE_ATTRIBUTE)
-        .ok_or_else(|| ConsumerError::ListeningError {
+    let change_type = find_attr(REPLICATION_CHANGE_TYPE_ATTRIBUTE).ok_or_else(|| {
+        ConsumerError::ListeningError {
             message: "Replication stream entry missing change type".to_string(),
-        })?;
+        }
+    })?;
 
-    let encoded_change = find_attr(REPLICATION_CHANGE_DATA_ATTRIBUTE)
-        .ok_or_else(|| ConsumerError::ListeningError {
+    let encoded_change = find_attr(REPLICATION_CHANGE_DATA_ATTRIBUTE).ok_or_else(|| {
+        ConsumerError::ListeningError {
             message: "Replication stream entry missing change payload".to_string(),
-        })?;
+        }
+    })?;
 
     let change_data = base64::engine::general_purpose::STANDARD
         .decode(encoded_change)
@@ -837,7 +875,11 @@ impl ProviderConnection for ProviderConnectionImpl {
                 // Filter by entryCSN if we have a cookie
                 if let Some(ref cookie_csn_str) = cookie_csn {
                     // Get entryCSN from the entry
-                    if let Some(entry_csn_values) = search_entry.attrs.get("entryCSN").or_else(|| search_entry.attrs.get("entrycsn")) {
+                    if let Some(entry_csn_values) = search_entry
+                        .attrs
+                        .get("entryCSN")
+                        .or_else(|| search_entry.attrs.get("entrycsn"))
+                    {
                         if let Some(entry_csn_str) = entry_csn_values.first() {
                             // Compare CSNs as strings (they are formatted to be sortable)
                             // Cookie CSN format: timestamp#replica_id#seq#mod
@@ -1003,9 +1045,8 @@ impl BatchProcessor for BatchProcessorImpl {
                     if let Ok(dir_entry) =
                         serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json)
                     {
-                        // Use empty password for replicated entries
-                        // TODO: Proper password handling in replication
-                        match self.backend.add_entry(dir_entry, vec![]).await {
+                        let password = replicated_password(&dir_entry);
+                        match self.backend.add_entry(dir_entry, password).await {
                             Ok(_) => {
                                 info!("Replicated ADD: {}", dn);
                             }
@@ -1058,9 +1099,19 @@ impl BatchProcessor for BatchProcessorImpl {
                 }
             },
             "rename" => {
-                // Rename / ModifyDN operation
-                warn!("Rename operation not yet fully implemented for: {}", dn);
-                // TODO: Implement proper rename/modifyDN handling
+                let rename = decode_rename_change(change_data)?;
+                match self
+                    .backend
+                    .rename_entry(dn, &rename.new_rdn, rename.delete_old, rename.new_superior)
+                    .await
+                {
+                    Ok(_) => {
+                        info!("Replicated RENAME: {}", dn);
+                    }
+                    Err(e) => {
+                        warn!("Failed to replicate RENAME for {}: {:?}", dn, e);
+                    }
+                }
             }
             unknown => {
                 return Err(ConsumerError::ProcessingError {
@@ -1317,7 +1368,8 @@ impl ChangeListener for BroadcastChangeListener {
         let mut receiver = self.receiver.lock().await;
         match tokio::time::timeout(std::time::Duration::from_millis(250), receiver.recv()).await {
             Ok(Ok(change)) => {
-                let encoded = encode_change_bytes(&change.change_type, &change.dn, &change.change_data);
+                let encoded =
+                    encode_change_bytes(&change.change_type, &change.dn, &change.change_data);
                 self.stats.lock().unwrap().record_change(encoded.len());
                 Ok(Some(encoded))
             }
@@ -1475,17 +1527,20 @@ impl ChangeListener for LdapChangeListener {
                 }
 
                 match search.next().await {
-                    Ok(Some(entry)) => match parse_replication_stream_entry(&ldap3::SearchEntry::construct(entry)) {
-                        Ok(change) => {
-                            if change_tx.send(change).await.is_err() {
-                                break;
+                    Ok(Some(entry)) => {
+                        match parse_replication_stream_entry(&ldap3::SearchEntry::construct(entry))
+                        {
+                            Ok(change) => {
+                                if change_tx.send(change).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                stats.lock().unwrap().record_error();
+                                warn!("Skipping invalid replication stream entry: {}", e);
                             }
                         }
-                        Err(e) => {
-                            stats.lock().unwrap().record_error();
-                            warn!("Skipping invalid replication stream entry: {}", e);
-                        }
-                    },
+                    }
                     Ok(None) => break,
                     Err(e) => {
                         stats.lock().unwrap().record_error();

@@ -1,3 +1,4 @@
+use base64::Engine;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -5,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ldap_parser::ldap::SearchScope;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
 use tokio::sync::RwLock;
 
 use crate::csn::Csn;
@@ -351,7 +353,7 @@ impl DirectoryBackend for MockBackend {
         let entries = self.entries.read().await;
         Ok(entries
             .get(dn)
-            .map(|entry| entry.password.as_slice() == password)
+            .map(|entry| password_matches(entry.password.as_slice(), password))
             .unwrap_or(false))
     }
 
@@ -572,6 +574,37 @@ fn apply_modification(
             password.clear();
         }
     }
+}
+
+fn password_matches(stored_password: &[u8], candidate: &[u8]) -> bool {
+    if stored_password == candidate {
+        return true;
+    }
+
+    let Ok(stored_password) = std::str::from_utf8(stored_password) else {
+        return false;
+    };
+
+    stored_password.starts_with("{SSHA512}") && verify_ssha512(candidate, stored_password)
+}
+
+fn verify_ssha512(password: &[u8], stored_hash: &str) -> bool {
+    let hash_b64 = stored_hash.strip_prefix("{SSHA512}").unwrap_or(stored_hash);
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(hash_b64) {
+        Ok(decoded) => decoded,
+        Err(_) => return false,
+    };
+
+    if decoded.len() < 64 {
+        return false;
+    }
+
+    let (stored_hash, salt) = decoded.split_at(64);
+    let mut hasher = Sha512::new();
+    hasher.update(password);
+    hasher.update(salt);
+
+    hasher.finalize().as_slice() == stored_hash
 }
 
 fn compute_new_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {

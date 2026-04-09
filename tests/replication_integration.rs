@@ -4,6 +4,7 @@
 //! between provider and consumer servers.
 
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
+use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
 use opendr::fsm::{
     ReplicationConsumerEvent, ReplicationConsumerFsm, ReplicationConsumerState, ReplicationPhase,
     ReplicationProviderEvent, ReplicationProviderFsm, ReplicationProviderState, StateMachine,
@@ -119,6 +120,21 @@ fn encode_replication_change(change_type: ChangeType, dn: &str, change_data: &[u
     let mut encoded = header.into_bytes();
     encoded.extend_from_slice(change_data);
     encoded
+}
+
+fn create_entry_with_password(dn: &str, cn: &str, password: &str) -> DirectoryEntry {
+    DirectoryEntry::new(
+        dn,
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            ("cn".to_string(), vec![cn.to_string()]),
+            ("sn".to_string(), vec!["Replication".to_string()]),
+            ("userPassword".to_string(), vec![password.to_string()]),
+        ]),
+    )
 }
 
 #[tokio::test]
@@ -546,6 +562,129 @@ async fn test_consumer_fsm_receive_real_time_changes() {
     // Entries applied count should increment
     assert_eq!(fsm.entries_applied(), 1);
     assert!(fsm.current_cookie().is_some());
+}
+
+#[tokio::test]
+async fn test_batch_processor_replays_password_and_rename_semantics() {
+    let provider_backend = Arc::new(MockBackend::new());
+    let changelog = Arc::new(ChangelogTracker::new());
+    let provider = ChangelogBackendWrapper::new(provider_backend, Some(changelog.clone()));
+    let consumer_backend = Arc::new(MockBackend::new());
+    let batch_processor = BatchProcessorImpl::new(consumer_backend.clone());
+
+    let original_dn = "cn=replicated,dc=example,dc=org";
+    let renamed_dn = "cn=replicated-renamed,dc=example,dc=org";
+    let entry = create_entry_with_password(original_dn, "replicated", "initial-secret");
+    provider
+        .add_entry(entry, b"initial-secret".to_vec())
+        .await
+        .unwrap();
+
+    let mut changes = changelog.get_all();
+    let add_change = changes.remove(0);
+    batch_processor
+        .apply_entry(&encode_replication_change(
+            add_change.change_type.clone(),
+            &add_change.dn,
+            &add_change.change_data,
+        ))
+        .await
+        .unwrap();
+
+    assert!(consumer_backend
+        .authenticate(original_dn, b"initial-secret")
+        .await
+        .unwrap());
+
+    provider
+        .modify_entry(
+            original_dn,
+            vec![
+                opendr::backend::Modification {
+                    operation: opendr::backend::ModifyOperation::Replace,
+                    attribute: "description".to_string(),
+                    values: vec!["updated".to_string()],
+                },
+                opendr::backend::Modification {
+                    operation: opendr::backend::ModifyOperation::Replace,
+                    attribute: "userPassword".to_string(),
+                    values: vec!["rotated-secret".to_string()],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let modify_change = changelog.get_all().pop().unwrap();
+    batch_processor
+        .apply_entry(&encode_replication_change(
+            modify_change.change_type.clone(),
+            &modify_change.dn,
+            &modify_change.change_data,
+        ))
+        .await
+        .unwrap();
+
+    assert!(!consumer_backend
+        .authenticate(original_dn, b"initial-secret")
+        .await
+        .unwrap());
+    assert!(consumer_backend
+        .authenticate(original_dn, b"rotated-secret")
+        .await
+        .unwrap());
+
+    provider
+        .rename_entry(original_dn, "cn=replicated-renamed", true, None)
+        .await
+        .unwrap();
+
+    let rename_change = changelog.get_all().pop().unwrap();
+    batch_processor
+        .apply_entry(&encode_replication_change(
+            rename_change.change_type.clone(),
+            &rename_change.dn,
+            &rename_change.change_data,
+        ))
+        .await
+        .unwrap();
+
+    assert!(consumer_backend
+        .get_entry(original_dn)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(consumer_backend
+        .get_entry(renamed_dn)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(consumer_backend
+        .authenticate(renamed_dn, b"rotated-secret")
+        .await
+        .unwrap());
+
+    provider.delete_entry(renamed_dn).await.unwrap();
+
+    let delete_change = changelog.get_all().pop().unwrap();
+    batch_processor
+        .apply_entry(&encode_replication_change(
+            delete_change.change_type.clone(),
+            &delete_change.dn,
+            &delete_change.change_data,
+        ))
+        .await
+        .unwrap();
+
+    assert!(consumer_backend
+        .get_entry(renamed_dn)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!consumer_backend
+        .authenticate(renamed_dn, b"rotated-secret")
+        .await
+        .unwrap());
 }
 
 #[tokio::test]

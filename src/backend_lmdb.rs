@@ -125,7 +125,11 @@ impl LmdbBackend {
     ///
     /// # Returns
     /// * `Result<Self, BackendError>` - New backend instance or error
-    pub fn new<P: AsRef<Path>>(path: P, max_size_mb: usize, replica_id: u16) -> Result<Self, BackendError> {
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        max_size_mb: usize,
+        replica_id: u16,
+    ) -> Result<Self, BackendError> {
         Self::new_with_config(path, max_size_mb, replica_id, IndexConfig::default())
     }
 
@@ -430,6 +434,28 @@ impl LmdbBackend {
         computed_hash.as_slice() == stored_hash
     }
 
+    fn password_hash_from_bytes(password: &[u8]) -> Option<String> {
+        if password.is_empty() {
+            return None;
+        }
+
+        Some(
+            std::str::from_utf8(password)
+                .ok()
+                .filter(|password| password.starts_with("{SSHA512}"))
+                .map(str::to_string)
+                .unwrap_or_else(|| Self::create_ssha512(password)),
+        )
+    }
+
+    fn password_hash_from_value(password: &str) -> String {
+        if password.starts_with("{SSHA512}") {
+            password.to_string()
+        } else {
+            Self::create_ssha512(password.as_bytes())
+        }
+    }
+
     /// Update attribute indexes for an entry
     ///
     /// This method updates the attribute indexes when an entry is added or modified.
@@ -644,7 +670,7 @@ impl DirectoryBackend for LmdbBackend {
 
         // Generate CSN for this entry
         let csn = self.csn_generator.generate();
-        
+
         // Set operational attributes (entryCSN, createTimestamp, modifyTimestamp, creatorsName)
         // TODO: Get creator DN from authentication context (for now, use None)
         entry.operational_attributes = crate::backend::OperationalAttributes::for_new_entry(
@@ -679,8 +705,7 @@ impl DirectoryBackend for LmdbBackend {
         .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
 
         // Hash and write password (if provided)
-        if !password.is_empty() {
-            let password_hash = Self::create_ssha512(&password);
+        if let Some(password_hash) = Self::password_hash_from_bytes(&password) {
             txn.put(
                 self.passwords_db,
                 &entry.dn.as_bytes(),
@@ -835,6 +860,29 @@ impl DirectoryBackend for LmdbBackend {
         )
         .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
 
+        if let Some(password_value) = entry
+            .attributes
+            .get("userpassword")
+            .and_then(|values| values.first())
+        {
+            let password_hash = Self::password_hash_from_value(password_value);
+            txn.put(
+                self.passwords_db,
+                &entry.dn.as_bytes(),
+                &password_hash.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+        } else {
+            txn.del(self.passwords_db, &entry.dn.as_bytes(), None)
+                .or_else(|e| match e {
+                    lmdb::Error::NotFound => Ok(()),
+                    _ => Err(BackendError::Storage(
+                        "Failed to delete password".to_string(),
+                    )),
+                })?;
+        }
+
         // Update attribute indexes
         // Remove old indexed values and add new ones
         self.remove_attribute_indexes(&mut txn, &entry.dn, &old_attributes)?;
@@ -870,48 +918,60 @@ impl DirectoryBackend for LmdbBackend {
         new_superior: Option<String>,
     ) -> Result<(), BackendError> {
         let _lock = self.write_lock.write().await;
-
-        // This is a simplified implementation
-        // Full implementation would handle subtree renames
-        let entry = self.get_entry_internal(dn)?.ok_or(BackendError::NotFound)?;
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+        let normalized_dn = Self::normalize_dn(dn);
+        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
+            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        };
+        let entry_bytes = txn
+            .get(self.entries_db, &actual_dn.as_bytes())
+            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
+        let entry: StoredEntry = bincode::deserialize(entry_bytes)
+            .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
 
         // Compute new DN
         let new_dn = if let Some(superior) = new_superior {
             format!("{},{}", new_rdn, superior)
-        } else if let Some((_, rest)) = dn.split_once(',') {
+        } else if let Some((_, rest)) = actual_dn.split_once(',') {
             format!("{},{}", new_rdn, rest)
         } else {
             new_rdn.to_string()
         };
+        let normalized_new_dn = Self::normalize_dn(&new_dn);
 
         // Check if new DN already exists
-        if self.get_entry_internal(&new_dn)?.is_some() {
+        if txn
+            .get(self.dn_index_db, &normalized_new_dn.as_bytes())
+            .is_ok()
+        {
             return Err(BackendError::AlreadyExists);
         }
 
-        // Get password (in separate scope to drop txn)
-        let password = {
-            let txn = self
-                .env
-                .begin_ro_txn()
-                .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let password_hash = txn
+            .get(self.passwords_db, &actual_dn.as_bytes())
+            .map(|password| String::from_utf8_lossy(password).to_string())
+            .ok();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let csn = self.csn_generator.generate();
 
-            let pw = txn
-                .get(self.passwords_db, &entry.dn.as_bytes())
-                .map(|p| p.to_vec())
-                .unwrap_or_default();
-
-            // txn is dropped here
-            pw
-        };
-
-        // Create new entry
-        let mut new_entry = DirectoryEntry::new(new_dn.clone(), entry.attributes.clone());
+        let mut new_entry = entry.to_directory_entry();
+        new_entry.dn = new_dn.clone();
+        new_entry
+            .operational_attributes
+            .for_modified_entry(csn.clone(), None);
 
         // Handle RDN attribute updates
         if delete_old {
             // Remove old RDN attributes (simplified)
-            if let Some((attr, _)) = dn.split_once('=') {
+            if let Some((attr, _)) = actual_dn.split_once('=') {
                 new_entry.attributes.remove(&attr.trim().to_lowercase());
             }
         }
@@ -926,12 +986,64 @@ impl DirectoryBackend for LmdbBackend {
                 .or_default()
                 .push(val_str);
         }
+        let new_stored_entry = StoredEntry {
+            dn: new_dn.clone(),
+            attributes: new_entry.attributes.clone(),
+            created_at: entry.created_at,
+            modified_at: now,
+            operational_attributes: new_entry.operational_attributes,
+        };
+        let new_entry_bytes = bincode::serialize(&new_stored_entry)
+            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
 
-        // Add new entry
-        self.add_entry(new_entry, password).await?;
+        self.remove_attribute_indexes(&mut txn, &actual_dn, &entry.attributes)?;
+        txn.del(self.entries_db, &actual_dn.as_bytes(), None)
+            .map_err(|e| BackendError::Storage(format!("Failed to delete entry: {}", e)))?;
+        txn.del(self.dn_index_db, &normalized_dn.as_bytes(), None)
+            .map_err(|e| BackendError::Storage(format!("Failed to delete DN index: {}", e)))?;
+        txn.del(self.passwords_db, &actual_dn.as_bytes(), None)
+            .or_else(|e| match e {
+                lmdb::Error::NotFound => Ok(()),
+                _ => Err(BackendError::Storage(
+                    "Failed to delete password".to_string(),
+                )),
+            })?;
 
-        // Delete old entry
-        self.delete_entry(dn).await?;
+        txn.put(
+            self.entries_db,
+            &new_dn.as_bytes(),
+            &new_entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+        txn.put(
+            self.dn_index_db,
+            &normalized_new_dn.as_bytes(),
+            &new_dn.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
+        if let Some(password_hash) = password_hash {
+            txn.put(
+                self.passwords_db,
+                &new_dn.as_bytes(),
+                &password_hash.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+        }
+        self.update_attribute_indexes(&mut txn, &new_dn, &new_stored_entry.attributes)?;
+        let csn_string = csn.to_ldap_string();
+        txn.put(
+            self.metadata_db,
+            &b"context_csn",
+            &csn_string.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
         Ok(())
     }
@@ -949,18 +1061,19 @@ impl DirectoryBackend for LmdbBackend {
     }
 
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
-        let txn = self
-            .env
-            .begin_ro_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin read transaction: {}", e)))?;
+        let txn = self.env.begin_ro_txn().map_err(|e| {
+            BackendError::Storage(format!("Failed to begin read transaction: {}", e))
+        })?;
 
         match txn.get(self.metadata_db, &b"context_csn") {
             Ok(bytes) => {
                 // Deserialize CSN from stored bytes
-                let csn_string = std::str::from_utf8(bytes)
-                    .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in contextCSN: {}", e)))?;
-                let csn = crate::csn::Csn::parse(csn_string)
-                    .map_err(|e| BackendError::Storage(format!("Failed to parse contextCSN: {}", e)))?;
+                let csn_string = std::str::from_utf8(bytes).map_err(|e| {
+                    BackendError::Storage(format!("Invalid UTF-8 in contextCSN: {}", e))
+                })?;
+                let csn = crate::csn::Csn::parse(csn_string).map_err(|e| {
+                    BackendError::Storage(format!("Failed to parse contextCSN: {}", e))
+                })?;
                 Ok(Some(csn))
             }
             Err(lmdb::Error::NotFound) => Ok(None),
@@ -973,15 +1086,14 @@ impl DirectoryBackend for LmdbBackend {
 
     async fn set_context_csn(&self, csn: crate::csn::Csn) -> Result<(), BackendError> {
         let _lock = self.write_lock.write().await;
-        
-        let mut txn = self
-            .env
-            .begin_rw_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin write transaction: {}", e)))?;
+
+        let mut txn = self.env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!("Failed to begin write transaction: {}", e))
+        })?;
 
         // Serialize CSN to LDAP string format
         let csn_string = csn.to_ldap_string();
-        
+
         txn.put(
             self.metadata_db,
             &b"context_csn",

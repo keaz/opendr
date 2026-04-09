@@ -33,8 +33,11 @@ use tokio::sync::broadcast;
 
 use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, Modification};
 use crate::change_observer::ChangeObserver;
-use crate::replication::ChangelogTracker;
+use crate::replication::{encode_rename_change, ChangelogTracker};
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
+
+#[cfg(test)]
+use crate::replication::RenameChange;
 
 /// Wrapper around DirectoryBackend that records changes to a changelog
 ///
@@ -246,7 +249,9 @@ impl DirectoryBackend for ChangelogBackendWrapper {
     }
 
     fn subscribe_to_replication_changes(&self) -> Option<broadcast::Receiver<ChangelogEntry>> {
-        self.replication_sender.as_ref().map(|sender| sender.subscribe())
+        self.replication_sender
+            .as_ref()
+            .map(|sender| sender.subscribe())
     }
 
     async fn rename_entry(
@@ -256,20 +261,17 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         delete_old: bool,
         new_superior: Option<String>,
     ) -> Result<(), BackendError> {
-        // Get entry before rename for changelog
-        let entry_data = if let Ok(Some(entry)) = self.backend.get_entry(dn).await {
-            Self::serialize_entry(&entry)
-        } else {
-            Vec::new()
-        };
-
         // Perform the rename operation
         self.backend
-            .rename_entry(dn, new_rdn, delete_old, new_superior)
+            .rename_entry(dn, new_rdn, delete_old, new_superior.clone())
             .await?;
 
         // Record to changelog after successful rename
-        self.record_change(ChangeType::Rename, dn.to_string(), entry_data);
+        self.record_change(
+            ChangeType::Rename,
+            dn.to_string(),
+            encode_rename_change(new_rdn, delete_old, new_superior.as_deref()),
+        );
 
         Ok(())
     }
@@ -385,6 +387,15 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
         assert!(matches!(entries[0].change_type, ChangeType::Rename));
+        let payload: RenameChange = serde_json::from_slice(&entries[0].change_data).unwrap();
+        assert_eq!(
+            payload,
+            RenameChange {
+                new_rdn: "cn=renamed".to_string(),
+                delete_old: true,
+                new_superior: None,
+            }
+        );
     }
 
     #[tokio::test]
