@@ -18,6 +18,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Validate configuration
     config.validate()?;
+    config.validate_for_shipped_binary()?;
     let root_password = config.resolved_root_password()?;
 
     // Create shutdown coordinator
@@ -124,8 +125,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let shutdown_rx = shutdown_clone.subscribe();
 
     // Run server with shutdown support
+    let selected_runtime = config.server.runtime.clone();
     let server_task = tokio::spawn(async move {
-        if let Err(e) = server::run(&bind_addr, backend, shutdown_rx).await {
+        let result = match selected_runtime.as_str() {
+            "legacy" => server::run(&bind_addr, backend, shutdown_rx).await,
+            unsupported => Err(std::io::Error::other(format!(
+                "server.runtime = {:?} is not supported by the shipped opendr binary",
+                unsupported
+            ))
+            .into()),
+        };
+
+        if let Err(e) = result {
             eprintln!("Server error: {}", e);
         }
     });

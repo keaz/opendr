@@ -2,6 +2,8 @@
 
 This guide shows how to integrate the `ServerConfig` into your OpenDR LDAP server application.
 
+> Note: the shipped `opendr` binary currently supports the legacy runtime in `src/server.rs`. The FSM server examples below are library-level integration examples, not the default production executable path yet.
+
 ## Quick Start
 
 ### 1. Basic Usage
@@ -24,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 2. Using with FSM Server
+### 2. Using with FSM Server (Experimental / Library Path)
 
 ```rust
 use opendr::config::ServerConfig;

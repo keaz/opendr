@@ -85,6 +85,7 @@ bind_address = "127.0.0.1"          # Address to bind to
 ldap_port = 1389                     # LDAP port (non-TLS)
 ldaps_port = 1636                    # LDAPS port (TLS/SSL)
 hostname = "localhost"               # Server hostname
+runtime = "legacy"                  # Supported runtime for the shipped `opendr` binary
 replica_id = 1                       # Unique CSN replica ID for this server
 base_dn = "dc=example,dc=com"        # Base DN for directory
 root_user_dn = "cn=admin"            # Admin user DN
@@ -98,6 +99,7 @@ max_concurrent_operations = 100     # Max operations per connection
 
 **Key Settings:**
 - `ldap_port` and `ldaps_port` must be different
+- `runtime = "legacy"` is the only supported setting for the shipped `opendr` binary today
 - `replica_id` must be non-zero, and must be unique per replicated node
 - `base_dn` cannot be empty
 - `root_password_env` and `root_password_file` let you inject the admin secret without storing it inline

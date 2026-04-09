@@ -113,6 +113,10 @@ pub struct ServerSettings {
     #[serde(default = "default_hostname")]
     pub hostname: String,
 
+    /// Runtime used by the shipped executable
+    #[serde(default = "default_server_runtime")]
+    pub runtime: String,
+
     /// Replica ID used in generated CSNs
     #[serde(default = "default_replica_id")]
     pub replica_id: u16,
@@ -518,6 +522,9 @@ fn default_ldaps_port() -> u16 {
 fn default_hostname() -> String {
     "localhost".to_string()
 }
+fn default_server_runtime() -> String {
+    "legacy".to_string()
+}
 fn default_replica_id() -> u16 {
     1
 }
@@ -723,6 +730,7 @@ impl Default for ServerSettings {
             ldap_port: default_ldap_port(),
             ldaps_port: default_ldaps_port(),
             hostname: default_hostname(),
+            runtime: default_server_runtime(),
             replica_id: default_replica_id(),
             base_dn: default_base_dn(),
             root_user_dn: default_root_user_dn(),
@@ -967,6 +975,7 @@ impl fmt::Debug for ServerSettings {
             .field("ldap_port", &self.ldap_port)
             .field("ldaps_port", &self.ldaps_port)
             .field("hostname", &self.hostname)
+            .field("runtime", &self.runtime)
             .field("replica_id", &self.replica_id)
             .field("base_dn", &self.base_dn)
             .field("root_user_dn", &self.root_user_dn)
@@ -1201,6 +1210,12 @@ impl ServerConfig {
                 "Base DN cannot be empty".to_string(),
             ));
         }
+        if !["legacy", "fsm"].contains(&self.server.runtime.as_str()) {
+            return Err(ConfigError::ValidationError(format!(
+                "server.runtime must be one of: legacy, fsm (got {})",
+                self.server.runtime
+            )));
+        }
         let _ = self.resolved_root_password()?;
         if self.server.replica_id == 0 {
             return Err(ConfigError::ValidationError(
@@ -1354,6 +1369,21 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// Validate that the selected runtime is supported by the shipped `opendr` binary.
+    pub fn validate_for_shipped_binary(&self) -> Result<(), ConfigError> {
+        match self.server.runtime.as_str() {
+            "legacy" => Ok(()),
+            "fsm" => Err(ConfigError::ValidationError(
+                "server.runtime = \"fsm\" is not supported by the shipped opendr binary yet; use \"legacy\""
+                    .to_string(),
+            )),
+            other => Err(ConfigError::ValidationError(format!(
+                "server.runtime must be one of: legacy, fsm (got {})",
+                other
+            ))),
+        }
+    }
+
     /// Get operation timeout as Duration
     pub fn operation_timeout(&self) -> Duration {
         Duration::from_secs(self.server.operation_timeout_secs)
@@ -1415,6 +1445,7 @@ mod tests {
         assert_eq!(config.server.ldap_port, 1389);
         assert_eq!(config.server.ldaps_port, 1636);
         assert_eq!(config.server.bind_address, "127.0.0.1");
+        assert_eq!(config.server.runtime, "legacy");
         assert_eq!(config.server.replica_id, 1);
         assert!(config.rate_limit.enabled);
         assert!(config.monitoring.enabled);
@@ -1493,6 +1524,7 @@ mod tests {
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 389
+runtime = "fsm"
 replica_id = 7
 base_dn = "dc=test,dc=org"
 
@@ -1503,6 +1535,7 @@ backend_type = "memory"
         let config = ServerConfig::from_toml_str(toml).unwrap();
         assert_eq!(config.server.bind_address, "0.0.0.0");
         assert_eq!(config.server.ldap_port, 389);
+        assert_eq!(config.server.runtime, "fsm");
         assert_eq!(config.server.replica_id, 7);
         assert_eq!(config.server.base_dn, "dc=test,dc=org");
         assert_eq!(config.backend.backend_type, "memory");
@@ -1607,6 +1640,24 @@ root_password_env = "OPENDR_TEST_ROOT_PASSWORD"
         config.replication.enabled = true;
         config.replication.mode = "invalid".to_string();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_invalid_server_runtime() {
+        let mut config = ServerConfig::default();
+        config.server.runtime = "unsupported".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_shipped_binary_rejects_fsm_runtime() {
+        let mut config = ServerConfig::default();
+        config.server.runtime = "fsm".to_string();
+        let error = config
+            .validate_for_shipped_binary()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported by the shipped opendr binary"));
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 This document explains how `ServerConfig.to_fsm_server_config()` works and how configuration flows through the system.
 
+> Note: this flow documents the experimental FSM runtime configuration path. The shipped `opendr` binary currently validates and runs the legacy runtime instead.
+
 ## Overview
 
 The `to_fsm_server_config()` method converts the comprehensive `ServerConfig` into the FSM-specific `FsmServerConfig` that the server uses at runtime.

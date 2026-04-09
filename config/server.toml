@@ -4,6 +4,7 @@
 [server]
 bind_address = "localhost"
 ldap_port = 1388
+runtime = "legacy"
 # Must be unique per replicated node when replication is enabled
 replica_id = 1
 base_dn = "dc=example,dc=com"
