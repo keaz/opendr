@@ -23,6 +23,7 @@ pub mod extended_ops;
 pub mod fsm;
 pub mod fsm_runtime;
 pub mod fsm_server;
+pub mod ldap_controls;
 mod ldap_filter_eval;
 pub mod metrics;
 pub mod monitoring_runtime;

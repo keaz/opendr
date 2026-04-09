@@ -28,10 +28,11 @@ use crate::backend::{
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
 use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
+use crate::ldap_controls::{ControlRegistry, ControlValidationError, LdapControl, RequestControls};
 use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
-    encode_bind_response, encode_extended_response, encode_result_response, encode_search_entry,
-    ResponseOp,
+    encode_bind_response, encode_extended_response_with_controls,
+    encode_result_response_with_controls, encode_search_entry_with_controls, ResponseOp,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::real_time_propagation::is_dn_in_scope;
@@ -169,6 +170,7 @@ struct RequestContext {
     client_ip: Option<IpAddr>,
     session_id: Option<ConnectionId>,
     security: Option<Arc<LegacySecurityConfig>>,
+    metrics: Option<Arc<MetricsCollector>>,
 }
 
 #[derive(Clone, Copy)]
@@ -475,6 +477,7 @@ async fn run_plain_listener(
                         client_ip: Some(addr.ip()),
                         session_id: Some(conn_id),
                         security: security.clone(),
+                        metrics: metrics.clone(),
                     };
                     handle_client_with_metrics_and_tls(
                         ConnectionStream::plain(socket),
@@ -632,6 +635,7 @@ pub async fn run_tls_with_metrics_and_config_and_security(
                         client_ip: Some(addr.ip()),
                         session_id: Some(conn_id),
                         security: security.clone(),
+                        metrics: metrics.clone(),
                     };
                     handle_client_with_metrics_and_tls(
                         ConnectionStream::tls(tls_stream),
@@ -1148,6 +1152,20 @@ async fn process_message_with_session(
     request_context: &RequestContext,
 ) -> Result<(), ServerError> {
     let message_id = message.message_id.0;
+    let response_kind = rejection_response_for_protocol(&message.protocol_op);
+    let request_controls = match validate_message_controls(
+        socket,
+        message_id,
+        response_kind,
+        &message,
+        session,
+        request_context,
+    )
+    .await?
+    {
+        Some(controls) => controls,
+        None => return Ok(()),
+    };
 
     match message.protocol_op {
         ProtocolOp::BindRequest(bind_request) => {
@@ -1159,6 +1177,7 @@ async fn process_message_with_session(
                 session,
                 request_context,
                 socket.is_secure(),
+                &request_controls,
             )
             .await?;
         }
@@ -1170,6 +1189,7 @@ async fn process_message_with_session(
                 search_request,
                 session,
                 request_context,
+                &request_controls,
             )
             .await?;
         }
@@ -1193,6 +1213,7 @@ async fn process_message_with_session(
                 modify_request,
                 session,
                 request_context,
+                &request_controls,
             )
             .await?;
         }
@@ -1211,6 +1232,7 @@ async fn process_message_with_session(
                 add_request,
                 session,
                 request_context,
+                &request_controls,
             )
             .await?;
         }
@@ -1234,6 +1256,7 @@ async fn process_message_with_session(
                 delete_request,
                 session,
                 request_context,
+                &request_controls,
             )
             .await?;
         }
@@ -1257,6 +1280,7 @@ async fn process_message_with_session(
                 rename_request,
                 session,
                 request_context,
+                &request_controls,
             )
             .await?;
         }
@@ -1268,6 +1292,7 @@ async fn process_message_with_session(
                 compare_request,
                 session,
                 request_context,
+                &request_controls,
             )
             .await?;
         }
@@ -1287,6 +1312,7 @@ async fn process_message_with_session(
                 session,
                 tls_handler,
                 request_context,
+                &request_controls,
             )
             .await?;
         }
@@ -1298,6 +1324,178 @@ async fn process_message_with_session(
     Ok(())
 }
 
+fn active_runtime_control_registry() -> ControlRegistry {
+    ControlRegistry::default()
+}
+
+fn control_metric_fragment(oid: &str) -> String {
+    oid.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn increment_control_counter(request_context: &RequestContext, counter: &str, value: u64) {
+    if let Some(metrics) = request_context.metrics.as_ref() {
+        metrics.increment_counter(counter, value);
+    }
+}
+
+fn record_control_metrics(
+    request_context: &RequestContext,
+    controls: &[LdapControl],
+    ignored_controls: &[LdapControl],
+) {
+    for control in controls {
+        increment_control_counter(request_context, "ldap_controls_seen_total", 1);
+        increment_control_counter(
+            request_context,
+            &format!(
+                "ldap_controls_seen_{}",
+                control_metric_fragment(control.oid())
+            ),
+            1,
+        );
+    }
+
+    for control in ignored_controls {
+        increment_control_counter(request_context, "ldap_controls_ignored_total", 1);
+        increment_control_counter(
+            request_context,
+            &format!(
+                "ldap_controls_ignored_{}",
+                control_metric_fragment(control.oid())
+            ),
+            1,
+        );
+    }
+}
+
+fn record_rejected_control_metric(request_context: &RequestContext, oid: &str) {
+    increment_control_counter(request_context, "ldap_controls_rejected_total", 1);
+    increment_control_counter(
+        request_context,
+        &format!("ldap_controls_rejected_{}", control_metric_fragment(oid)),
+        1,
+    );
+}
+
+fn describe_controls(controls: &[LdapControl]) -> String {
+    controls
+        .iter()
+        .map(|control| {
+            let value_len = control.value().map(|value| value.len()).unwrap_or_default();
+            format!(
+                "{}(critical={},value_len={})",
+                control.oid(),
+                control.criticality(),
+                value_len
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+async fn log_control_processing(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    accepted_controls: &[LdapControl],
+    ignored_controls: &[LdapControl],
+    rejected_control_oid: Option<&str>,
+) {
+    if accepted_controls.is_empty() && ignored_controls.is_empty() && rejected_control_oid.is_none()
+    {
+        return;
+    }
+
+    let mut details = Vec::new();
+    if !accepted_controls.is_empty() {
+        details.push((
+            "accepted_controls".to_string(),
+            describe_controls(accepted_controls),
+        ));
+    }
+    if !ignored_controls.is_empty() {
+        details.push((
+            "ignored_controls".to_string(),
+            describe_controls(ignored_controls),
+        ));
+    }
+    if let Some(rejected_control_oid) = rejected_control_oid {
+        details.push((
+            "rejected_control".to_string(),
+            rejected_control_oid.to_string(),
+        ));
+    }
+
+    let (level, success, error_message) = if let Some(rejected_control_oid) = rejected_control_oid {
+        (
+            AuditLevel::Warning,
+            false,
+            Some(format!(
+                "unsupported critical control {}",
+                rejected_control_oid
+            )),
+        )
+    } else {
+        (AuditLevel::Info, true, None)
+    };
+
+    log_generic_audit_event(
+        request_context,
+        session,
+        level,
+        AuditEventType::System,
+        "ldap_controls",
+        success,
+        session.bound_dn(),
+        error_message.as_deref(),
+        details,
+    )
+    .await;
+}
+
+async fn validate_message_controls(
+    socket: &mut ConnectionStream,
+    message_id: u32,
+    response_kind: Option<RejectionResponse>,
+    message: &ldap_parser::ldap::LdapMessage<'_>,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> Result<Option<RequestControls>, ServerError> {
+    let registry = active_runtime_control_registry();
+    match registry.validate_request_controls(message.controls.as_deref()) {
+        Ok(validated_controls) => {
+            record_control_metrics(
+                request_context,
+                validated_controls.accepted().as_slice(),
+                validated_controls.ignored(),
+            );
+            log_control_processing(
+                request_context,
+                session,
+                validated_controls.accepted().as_slice(),
+                validated_controls.ignored(),
+                None,
+            )
+            .await;
+            Ok(Some(validated_controls.into_accepted()))
+        }
+        Err(ControlValidationError::UnknownCritical { oid }) => {
+            record_rejected_control_metric(request_context, &oid);
+            log_control_processing(request_context, session, &[], &[], Some(&oid)).await;
+            send_rejection_response(
+                socket,
+                message_id,
+                response_kind,
+                ResultCode::UnavailableCriticalExtension,
+                &format!("unsupported critical control {}", oid),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
 pub async fn handle_bind_request(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
@@ -1305,6 +1503,7 @@ pub async fn handle_bind_request(
     request: BindRequest<'_>,
 ) -> Result<(), ServerError> {
     let mut session = ConnectionSession::default();
+    let request_controls = RequestControls::default();
     handle_bind_request_with_session_and_context(
         socket,
         backend,
@@ -1313,6 +1512,7 @@ pub async fn handle_bind_request(
         &mut session,
         &RequestContext::default(),
         false,
+        &request_controls,
     )
     .await
 }
@@ -1603,6 +1803,7 @@ async fn handle_bind_request_with_session_and_context(
     session: &mut ConnectionSession,
     request_context: &RequestContext,
     connection_is_secure: bool,
+    _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     if request.version != 3 {
         session.clear();
@@ -1869,8 +2070,35 @@ async fn send_result(
     matched_dn: impl Into<String>,
     diagnostic_message: impl Into<String>,
 ) -> Result<(), ServerError> {
-    let encoded =
-        encode_result_response(message_id, op, result_code, matched_dn, diagnostic_message)?;
+    send_result_with_controls(
+        socket,
+        message_id,
+        op,
+        result_code,
+        matched_dn,
+        diagnostic_message,
+        &[],
+    )
+    .await
+}
+
+async fn send_result_with_controls(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    op: ResponseOp,
+    result_code: ResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+    controls: &[LdapControl],
+) -> Result<(), ServerError> {
+    let encoded = encode_result_response_with_controls(
+        message_id,
+        op,
+        result_code,
+        matched_dn,
+        diagnostic_message,
+        controls,
+    )?;
     socket.write_all(&encoded).await?;
     Ok(())
 }
@@ -1884,14 +2112,52 @@ async fn send_extended_response(
     response_name: Option<String>,
     response_value: Option<Vec<u8>>,
 ) -> Result<(), ServerError> {
-    let encoded = encode_extended_response(
+    send_extended_response_with_controls(
+        socket,
         message_id,
         result_code,
         matched_dn,
         diagnostic_message,
         response_name,
         response_value,
+        &[],
+    )
+    .await
+}
+
+async fn send_extended_response_with_controls(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    result_code: ResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+    response_name: Option<String>,
+    response_value: Option<Vec<u8>>,
+    controls: &[LdapControl],
+) -> Result<(), ServerError> {
+    let encoded = encode_extended_response_with_controls(
+        message_id,
+        result_code,
+        matched_dn,
+        diagnostic_message,
+        response_name,
+        response_value,
+        controls,
     )?;
+    socket.write_all(&encoded).await?;
+    Ok(())
+}
+
+async fn send_search_entry_with_controls(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    entry: &DirectoryEntry,
+    attributes: &[(String, Vec<String>)],
+    types_only: bool,
+    controls: &[LdapControl],
+) -> Result<(), ServerError> {
+    let encoded =
+        encode_search_entry_with_controls(message_id, entry, attributes, types_only, controls)?;
     socket.write_all(&encoded).await?;
     Ok(())
 }
@@ -1933,6 +2199,7 @@ pub async fn handle_search_request(
     request: SearchRequest<'_>,
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
+    let request_controls = RequestControls::default();
     handle_search_request_with_context(
         socket,
         backend,
@@ -1940,6 +2207,7 @@ pub async fn handle_search_request(
         request,
         &session,
         &RequestContext::default(),
+        &request_controls,
     )
     .await
 }
@@ -1951,6 +2219,7 @@ async fn handle_search_request_with_context(
     request: SearchRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
+    _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let base_dn = request.base_object.0.as_ref().trim().to_owned();
     let attribute_selection: Vec<String> = request
@@ -2025,8 +2294,15 @@ async fn handle_search_request_with_context(
         }
 
         let attributes = select_attributes(&entry, &attribute_selection);
-        let encoded = encode_search_entry(message_id, &entry, &attributes, request.types_only)?;
-        socket.write_all(&encoded).await?;
+        send_search_entry_with_controls(
+            socket,
+            message_id,
+            &entry,
+            &attributes,
+            request.types_only,
+            &[],
+        )
+        .await?;
         returned += 1;
     }
 
@@ -2207,8 +2483,15 @@ impl<'a, S: AsyncWrite + Unpin> ProviderOwnedReplicationSession<'a, S> {
     ) -> Result<(), ServerError> {
         let synthetic_entry = DirectoryEntry::new(entry.dn.clone(), HashMap::new());
         let attributes = changelog_entry_to_replication_attrs(entry);
-        let encoded = encode_search_entry(self.message_id, &synthetic_entry, &attributes, false)?;
-        self.socket.write_all(&encoded).await?;
+        send_search_entry_with_controls(
+            self.socket,
+            self.message_id,
+            &synthetic_entry,
+            &attributes,
+            false,
+            &[],
+        )
+        .await?;
         Ok(())
     }
 
@@ -2323,6 +2606,7 @@ pub async fn handle_modify_request(
     request: ModifyRequest<'_>,
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
+    let request_controls = RequestControls::default();
     handle_modify_request_with_context(
         socket,
         backend,
@@ -2330,6 +2614,7 @@ pub async fn handle_modify_request(
         request,
         &session,
         &RequestContext::default(),
+        &request_controls,
     )
     .await
 }
@@ -2341,6 +2626,7 @@ async fn handle_modify_request_with_context(
     request: ModifyRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
+    _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.object.0.as_ref().trim().to_owned();
     let modifications = convert_modifications(request.changes);
@@ -2424,6 +2710,7 @@ pub async fn handle_add_request(
     request: AddRequest<'_>,
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
+    let request_controls = RequestControls::default();
     handle_add_request_with_context(
         socket,
         backend,
@@ -2432,6 +2719,7 @@ pub async fn handle_add_request(
         request,
         &session,
         &RequestContext::default(),
+        &request_controls,
     )
     .await
 }
@@ -2444,6 +2732,7 @@ async fn handle_add_request_with_context(
     request: AddRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
+    _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let (entry, password) = build_entry_from_add_request(&dn, request.attributes);
@@ -2559,6 +2848,7 @@ pub async fn handle_delete_request(
     dn: ldap_parser::ldap::LdapDN<'_>,
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
+    let request_controls = RequestControls::default();
     handle_delete_request_with_context(
         socket,
         backend,
@@ -2566,6 +2856,7 @@ pub async fn handle_delete_request(
         dn,
         &session,
         &RequestContext::default(),
+        &request_controls,
     )
     .await
 }
@@ -2577,6 +2868,7 @@ async fn handle_delete_request_with_context(
     dn: ldap_parser::ldap::LdapDN<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
+    _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = dn.0.as_ref().trim().to_owned();
 
@@ -2661,6 +2953,7 @@ pub async fn handle_moddn_request(
     request: ModDnRequest<'_>,
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
+    let request_controls = RequestControls::default();
     handle_moddn_request_with_context(
         socket,
         backend,
@@ -2668,6 +2961,7 @@ pub async fn handle_moddn_request(
         request,
         &session,
         &RequestContext::default(),
+        &request_controls,
     )
     .await
 }
@@ -2679,6 +2973,7 @@ async fn handle_moddn_request_with_context(
     request: ModDnRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
+    _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let new_rdn = request.newrdn.0.as_ref().trim().to_owned();
@@ -2778,6 +3073,7 @@ pub async fn handle_compare_request(
     request: CompareRequest<'_>,
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
+    let request_controls = RequestControls::default();
     handle_compare_request_with_context(
         socket,
         backend,
@@ -2785,6 +3081,7 @@ pub async fn handle_compare_request(
         request,
         &session,
         &RequestContext::default(),
+        &request_controls,
     )
     .await
 }
@@ -2796,6 +3093,7 @@ async fn handle_compare_request_with_context(
     request: CompareRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
+    _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let attribute = request.ava.attribute_desc.0.as_ref().trim().to_owned();
@@ -2898,6 +3196,7 @@ pub async fn handle_extended_request(
     request: ExtendedRequest<'_>,
 ) -> Result<(), ServerError> {
     let mut session = ConnectionSession::default();
+    let request_controls = RequestControls::default();
     handle_extended_request_with_session(
         socket,
         message_id,
@@ -2905,6 +3204,7 @@ pub async fn handle_extended_request(
         &mut session,
         None,
         &RequestContext::default(),
+        &request_controls,
     )
     .await
 }
@@ -2916,6 +3216,7 @@ async fn handle_extended_request_with_session(
     session: &mut ConnectionSession,
     tls_handler: Option<&RustlsTlsHandler>,
     request_context: &RequestContext,
+    _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
     const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
@@ -3248,6 +3549,7 @@ mod tests {
     use crate::aci::AciEngine;
     use crate::backend::MockBackend;
     use crate::config::ServerConfig;
+    use crate::ldap_controls::LdapControl;
     use crate::replication::REPLICATION_STREAM_ATTRIBUTE;
     use crate::replication_service::ReplicationService;
     use crate::schema::LdapSchema;
@@ -3263,7 +3565,10 @@ mod tests {
     };
     use ldap_parser::ldap::{Change, Operation};
     use rasn::der;
-    use rasn_ldap::{AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest};
+    use rasn_ldap::{
+        AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
+        Control as RasnControl, LdapMessage as RasnLdapMessage, ProtocolOp as RasnProtocolOp,
+    };
     use std::borrow::Cow;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
@@ -3290,6 +3595,28 @@ mod tests {
             .expect("failed to read response");
         buf.truncate(len);
         buf
+    }
+
+    fn rasn_control(oid: &str, criticality: bool, value: Option<&[u8]>) -> RasnControl {
+        RasnControl::new(
+            oid.as_bytes().to_vec().into(),
+            criticality,
+            value.map(|value| value.to_vec().into()),
+        )
+    }
+
+    fn bind_request_with_controls(message_id: u32, controls: Vec<RasnControl>) -> Vec<u8> {
+        let bind_request = RasnBindRequest::new(
+            3,
+            b"cn=admin,dc=example,dc=org".to_vec().into(),
+            RasnAuthChoice::Simple(b"secret".to_vec().into()),
+        );
+        let mut message =
+            RasnLdapMessage::new(message_id, RasnProtocolOp::BindRequest(bind_request));
+        if !controls.is_empty() {
+            message.controls = Some(controls.into_iter().collect());
+        }
+        der::encode(&message).unwrap()
     }
 
     fn replication_stream_request() -> SearchRequest<'static> {
@@ -3445,6 +3772,7 @@ mod tests {
         };
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::default();
 
         handle_bind_request_with_session_and_context(
             &mut server_stream,
@@ -3454,6 +3782,7 @@ mod tests {
             &mut session,
             &RequestContext::default(),
             false,
+            &request_controls,
         )
         .await
         .unwrap();
@@ -3488,6 +3817,7 @@ mod tests {
         };
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::default();
 
         handle_bind_request_with_session_and_context(
             &mut server_stream,
@@ -3497,6 +3827,7 @@ mod tests {
             &mut session,
             &RequestContext::default(),
             false,
+            &request_controls,
         )
         .await
         .unwrap();
@@ -3534,6 +3865,7 @@ mod tests {
                 access_control: None,
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
             })),
+            metrics: None,
         };
 
         let mut session = ConnectionSession::default();
@@ -3547,6 +3879,7 @@ mod tests {
         };
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::default();
         handle_bind_request_with_session_and_context(
             &mut server_stream,
             &backend,
@@ -3555,6 +3888,7 @@ mod tests {
             &mut session,
             &request_context,
             true,
+            &request_controls,
         )
         .await
         .unwrap();
@@ -3589,9 +3923,11 @@ mod tests {
                 access_control: Some(Arc::new(AciEngine::restrictive())),
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
             })),
+            metrics: None,
         };
         let mut session = ConnectionSession::default();
         session.bind("cn=user,dc=example,dc=org".to_string());
+        let request_controls = RequestControls::default();
 
         let request = CompareRequest {
             entry: LdapDN(Cow::Owned("cn=target,dc=example,dc=org".to_string())),
@@ -3609,6 +3945,7 @@ mod tests {
             request,
             &session,
             &request_context,
+            &request_controls,
         )
         .await
         .unwrap();
@@ -3640,6 +3977,7 @@ mod tests {
         let mut server_stream = ConnectionStream::Plain(server_stream);
         let mut session = ConnectionSession::default();
         session.bind("cn=admin,dc=example,dc=org".to_string());
+        let request_controls = RequestControls::default();
 
         handle_extended_request_with_session(
             &mut server_stream,
@@ -3648,6 +3986,7 @@ mod tests {
             &mut session,
             None,
             &RequestContext::default(),
+            &request_controls,
         )
         .await
         .unwrap();
@@ -3736,6 +4075,7 @@ mod tests {
         };
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::default();
         handle_add_request_with_context(
             &mut server_stream,
             &backend,
@@ -3744,6 +4084,7 @@ mod tests {
             request,
             &session,
             &RequestContext::default(),
+            &request_controls,
         )
         .await
         .unwrap();
@@ -3805,6 +4146,7 @@ mod tests {
         };
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::default();
         handle_modify_request_with_context(
             &mut server_stream,
             &backend,
@@ -3812,6 +4154,7 @@ mod tests {
             request,
             &session,
             &RequestContext::default(),
+            &request_controls,
         )
         .await
         .unwrap();
@@ -3872,6 +4215,7 @@ mod tests {
         };
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::default();
         handle_moddn_request_with_context(
             &mut server_stream,
             &backend,
@@ -3879,6 +4223,7 @@ mod tests {
             request,
             &session,
             &RequestContext::default(),
+            &request_controls,
         )
         .await
         .unwrap();
@@ -3946,6 +4291,106 @@ mod tests {
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_client_rejects_unknown_critical_control() {
+        let backend = Arc::new(MockBackend::from_credentials([(
+            String::from("cn=admin,dc=example,dc=org"),
+            b"secret".to_vec(),
+        )]));
+        let schema = Arc::new(LdapSchema::with_core_schema());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let server_task = tokio::spawn(async move {
+            handle_client(server_stream, backend, schema).await;
+        });
+
+        let encoded = bind_request_with_controls(11, vec![rasn_control("1.2.3.4", true, None)]);
+        client_stream.write_all(&encoded).await.unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(
+                    bind_response.result.result_code,
+                    ParserResultCode::UnavailableCriticalExtension
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_client_ignores_unknown_non_critical_control() {
+        let backend = Arc::new(MockBackend::from_credentials([(
+            String::from("cn=admin,dc=example,dc=org"),
+            b"secret".to_vec(),
+        )]));
+        let schema = Arc::new(LdapSchema::with_core_schema());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let server_task = tokio::spawn(async move {
+            handle_client(server_stream, backend, schema).await;
+        });
+
+        let encoded =
+            bind_request_with_controls(12, vec![rasn_control("1.2.3.4", false, Some(b"ignored"))]);
+        client_stream.write_all(&encoded).await.unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_result_with_controls_emits_response_controls() {
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        send_result_with_controls(
+            &mut server_stream,
+            13,
+            ResponseOp::SearchDone,
+            ResultCode::Success,
+            "",
+            "",
+            &[LdapControl::new(
+                "1.2.840.113556.1.4.319",
+                false,
+                Some(vec![1, 2, 3]),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].controls.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            messages[0].controls.as_ref().unwrap()[0]
+                .control_type
+                .0
+                .as_ref(),
+            "1.2.840.113556.1.4.319"
+        );
     }
 
     #[tokio::test]

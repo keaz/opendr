@@ -4,6 +4,7 @@ use rasn::types::SetOf;
 use rasn_ldap::{ResultCode, SearchResultEntry};
 
 use crate::backend::DirectoryEntry;
+use crate::ldap_controls::LdapControl;
 
 pub enum ResponseOp {
     SearchDone,
@@ -29,12 +30,11 @@ pub fn encode_bind_response(
         None,
     );
 
-    let message = rasn_ldap::LdapMessage::new(
+    encode_message(
         message_id,
         rasn_ldap::ProtocolOp::BindResponse(bind_response),
-    );
-
-    der::encode(&message)
+        &[],
+    )
 }
 
 pub fn encode_result_response(
@@ -43,6 +43,24 @@ pub fn encode_result_response(
     result_code: ResultCode,
     matched_dn: impl Into<String>,
     diagnostic_message: impl Into<String>,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_result_response_with_controls(
+        message_id,
+        op,
+        result_code,
+        matched_dn,
+        diagnostic_message,
+        &[],
+    )
+}
+
+pub fn encode_result_response_with_controls(
+    message_id: u32,
+    op: ResponseOp,
+    result_code: ResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+    controls: &[LdapControl],
 ) -> Result<Vec<u8>, EncodeError> {
     let matched_dn = matched_dn.into();
     let diagnostic = diagnostic_message.into();
@@ -82,8 +100,7 @@ pub fn encode_result_response(
         }
     };
 
-    let message = rasn_ldap::LdapMessage::new(message_id, protocol_op);
-    der::encode(&message)
+    encode_message(message_id, protocol_op, controls)
 }
 
 pub fn encode_extended_response(
@@ -93,6 +110,26 @@ pub fn encode_extended_response(
     diagnostic_message: impl Into<String>,
     response_name: Option<String>,
     response_value: Option<Vec<u8>>,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_extended_response_with_controls(
+        message_id,
+        result_code,
+        matched_dn,
+        diagnostic_message,
+        response_name,
+        response_value,
+        &[],
+    )
+}
+
+pub fn encode_extended_response_with_controls(
+    message_id: u32,
+    result_code: ResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+    response_name: Option<String>,
+    response_value: Option<Vec<u8>>,
+    controls: &[LdapControl],
 ) -> Result<Vec<u8>, EncodeError> {
     let matched_dn = matched_dn.into();
     let diagnostic = diagnostic_message.into();
@@ -105,9 +142,11 @@ pub fn encode_extended_response(
         response_value: response_value.map(|value| value.into()),
     };
 
-    let message =
-        rasn_ldap::LdapMessage::new(message_id, rasn_ldap::ProtocolOp::ExtendedResp(response));
-    der::encode(&message)
+    encode_message(
+        message_id,
+        rasn_ldap::ProtocolOp::ExtendedResp(response),
+        controls,
+    )
 }
 
 pub fn encode_search_entry(
@@ -115,6 +154,16 @@ pub fn encode_search_entry(
     entry: &DirectoryEntry,
     attributes: &[(String, Vec<String>)],
     types_only: bool,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_search_entry_with_controls(message_id, entry, attributes, types_only, &[])
+}
+
+pub fn encode_search_entry_with_controls(
+    message_id: u32,
+    entry: &DirectoryEntry,
+    attributes: &[(String, Vec<String>)],
+    types_only: bool,
+    controls: &[LdapControl],
 ) -> Result<Vec<u8>, EncodeError> {
     let partial_attributes: Vec<rasn_ldap::PartialAttribute> = attributes
         .iter()
@@ -135,10 +184,152 @@ pub fn encode_search_entry(
 
     let search_entry = SearchResultEntry::new(entry.dn.as_bytes().to_vec().into(), attributes);
 
-    let message = rasn_ldap::LdapMessage::new(
+    encode_message(
         message_id,
         rasn_ldap::ProtocolOp::SearchResEntry(search_entry),
-    );
+        controls,
+    )
+}
 
+pub fn encode_search_reference_with_controls(
+    message_id: u32,
+    uris: &[String],
+    controls: &[LdapControl],
+) -> Result<Vec<u8>, EncodeError> {
+    let references = uris
+        .iter()
+        .map(|uri| uri.as_bytes().to_vec().into())
+        .collect();
+
+    encode_message(
+        message_id,
+        rasn_ldap::ProtocolOp::SearchResRef(rasn_ldap::SearchResultReference(references)),
+        controls,
+    )
+}
+
+pub fn encode_intermediate_response(
+    message_id: u32,
+    response_name: Option<String>,
+    response_value: Option<Vec<u8>>,
+    controls: &[LdapControl],
+) -> Result<Vec<u8>, EncodeError> {
+    let response = rasn_ldap::IntermediateResponse {
+        response_name: response_name.map(|name| name.into_bytes().into()),
+        response_value: response_value.map(Into::into),
+    };
+
+    encode_message(
+        message_id,
+        rasn_ldap::ProtocolOp::IntermediateResponse(response),
+        controls,
+    )
+}
+
+fn encode_message(
+    message_id: u32,
+    protocol_op: rasn_ldap::ProtocolOp,
+    controls: &[LdapControl],
+) -> Result<Vec<u8>, EncodeError> {
+    let mut message = rasn_ldap::LdapMessage::new(message_id, protocol_op);
+    if !controls.is_empty() {
+        message.controls = Some(
+            controls
+                .iter()
+                .cloned()
+                .map(rasn_ldap::Control::from)
+                .collect(),
+        );
+    }
     der::encode(&message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ldap_controls::LdapControl;
+    use ldap_parser::ldap::ProtocolOp as ParserProtocolOp;
+    use ldap_parser::parse_ldap_messages;
+    use std::collections::HashMap;
+
+    #[test]
+    fn encode_result_response_round_trips_response_controls() {
+        let control = LdapControl::new("1.2.3", false, Some(b"ok".to_vec()));
+
+        let encoded = encode_result_response_with_controls(
+            7,
+            ResponseOp::SearchDone,
+            ResultCode::Success,
+            "",
+            "",
+            &[control],
+        )
+        .unwrap();
+
+        let (_, messages) = parse_ldap_messages(&encoded).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].controls.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            messages[0].controls.as_ref().unwrap()[0]
+                .control_type
+                .0
+                .as_ref(),
+            "1.2.3"
+        );
+        assert_eq!(
+            messages[0].controls.as_ref().unwrap()[0]
+                .control_value
+                .as_ref()
+                .unwrap()
+                .as_ref(),
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn encode_search_entry_round_trips_response_controls() {
+        let entry = DirectoryEntry::new(
+            "cn=alice,dc=example,dc=org",
+            HashMap::from([("cn".to_string(), vec!["alice".to_string()])]),
+        );
+        let control = LdapControl::new("1.2.840.113556.1.4.319", false, Some(vec![1, 2, 3]));
+
+        let encoded = encode_search_entry_with_controls(
+            8,
+            &entry,
+            &[("cn".to_string(), vec!["alice".to_string()])],
+            false,
+            &[control],
+        )
+        .unwrap();
+
+        let (_, messages) = parse_ldap_messages(&encoded).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages[0].protocol_op,
+            ParserProtocolOp::SearchResultEntry(_)
+        ));
+        assert_eq!(messages[0].controls.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn encode_intermediate_response_round_trips_response_controls() {
+        let control = LdapControl::new("1.2.3.4", true, None);
+
+        let encoded = encode_intermediate_response(
+            9,
+            Some("1.3.6.1.4.1.example".to_string()),
+            Some(b"payload".to_vec()),
+            &[control],
+        )
+        .unwrap();
+
+        let (_, messages) = parse_ldap_messages(&encoded).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].controls.as_ref().unwrap().len(), 1);
+        assert!(matches!(
+            messages[0].protocol_op,
+            ParserProtocolOp::IntermediateResponse(_)
+        ));
+    }
 }
