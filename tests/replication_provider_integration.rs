@@ -13,6 +13,7 @@ use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{sleep, timeout, Duration};
 
 fn create_test_entry(dn: &str, cn: &str) -> DirectoryEntry {
     let mut attributes = HashMap::new();
@@ -223,4 +224,88 @@ async fn test_replication_service_both_mode() {
     let handle = service.start_provider(shutdown).await;
     assert!(handle.is_ok());
     assert!(handle.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_replication_service_provider_shutdown_waits_for_active_sessions_to_drain() {
+    let config = create_provider_config();
+
+    let backend = Arc::new(MockBackend::new());
+    let service = ReplicationService::from_config(&config, backend).unwrap();
+    let provider_backend = service.backend();
+    let lifecycle = provider_backend
+        .replication_provider_lifecycle()
+        .expect("provider lifecycle should be available");
+    let session_guard = lifecycle
+        .register_session()
+        .expect("session registration should succeed before shutdown");
+
+    let shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig {
+        shutdown_timeout: Duration::from_secs(2),
+        drain_timeout: Duration::from_millis(500),
+        graceful_drain: true,
+    }));
+
+    let handle = service
+        .start_provider(shutdown.clone())
+        .await
+        .unwrap()
+        .expect("provider task should start");
+
+    shutdown.initiate_shutdown().await;
+    sleep(Duration::from_millis(50)).await;
+
+    assert!(lifecycle.is_draining());
+    assert!(!handle.is_finished());
+
+    drop(session_guard);
+
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("provider task should finish after drain")
+        .unwrap();
+    assert_eq!(lifecycle.active_session_count(), 0);
+}
+
+#[tokio::test]
+async fn test_replication_service_provider_shutdown_rejects_new_sessions_without_graceful_drain() {
+    let config = create_provider_config();
+
+    let backend = Arc::new(MockBackend::new());
+    let service = ReplicationService::from_config(&config, backend).unwrap();
+    let provider_backend = service.backend();
+    let lifecycle = provider_backend
+        .replication_provider_lifecycle()
+        .expect("provider lifecycle should be available");
+    let session_guard = lifecycle
+        .register_session()
+        .expect("session registration should succeed before shutdown");
+
+    let shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig {
+        shutdown_timeout: Duration::from_secs(2),
+        drain_timeout: Duration::from_secs(5),
+        graceful_drain: false,
+    }));
+
+    let handle = service
+        .start_provider(shutdown.clone())
+        .await
+        .unwrap()
+        .expect("provider task should start");
+
+    shutdown.initiate_shutdown().await;
+
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("provider task should stop immediately when graceful drain is disabled")
+        .unwrap();
+
+    assert!(lifecycle.is_draining());
+    assert!(
+        lifecycle.register_session().is_none(),
+        "new replication sessions must be rejected after shutdown begins"
+    );
+
+    drop(session_guard);
+    assert_eq!(lifecycle.active_session_count(), 0);
 }

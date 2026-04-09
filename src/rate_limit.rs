@@ -13,10 +13,11 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust
 //! use opendr::rate_limit::{RateLimiter, RateLimitConfig};
 //! use std::net::IpAddr;
 //!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! let config = RateLimitConfig::default();
 //! let limiter = RateLimiter::new(config);
 //!
@@ -27,6 +28,7 @@
 //! } else {
 //!     // Reject request - rate limit exceeded
 //! }
+//! # });
 //! ```
 
 use std::collections::HashMap;

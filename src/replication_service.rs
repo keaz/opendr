@@ -18,8 +18,8 @@
 //! ## Usage
 //!
 //! ```rust,ignore
-//! use opendr::replication_service::ReplicationService;
 //! use opendr::config::ServerConfig;
+//! use opendr::replication_service::ReplicationService;
 //!
 //! // Initialize replication service from configuration
 //! let service = ReplicationService::from_config(&config, backend.clone())?;
@@ -35,12 +35,15 @@
 //! }
 //! ```
 
-use log::{error, info};
+use log::{error, info, warn};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::backend::DirectoryBackend;
 use crate::backend_changelog_wrapper::ChangelogBackendWrapper;
@@ -64,6 +67,9 @@ pub struct ReplicationService {
 
     /// Replication configuration
     config: ReplicationConfig,
+
+    /// Provider lifecycle state shared with inbound replication stream handlers.
+    provider_lifecycle: Option<Arc<ReplicationProviderLifecycle>>,
 }
 
 /// Replication configuration extracted from ServerConfig
@@ -169,6 +175,11 @@ impl ReplicationService {
             .as_ref()
             .map(|provider| provider.changelog_enabled)
             .unwrap_or(false);
+        let provider_lifecycle = if should_track_changelog {
+            Some(Arc::new(ReplicationProviderLifecycle::new()))
+        } else {
+            None
+        };
 
         // Create changelog if replication enabled
         let changelog = if should_track_changelog {
@@ -193,6 +204,7 @@ impl ReplicationService {
             let mut wrapper = ChangelogBackendWrapper::new(backend.clone(), changelog.clone());
             let (replication_sender, _) = broadcast::channel(1024);
             wrapper.set_replication_sender(replication_sender);
+            wrapper.set_provider_lifecycle(provider_lifecycle.clone());
             Arc::new(wrapper) as Arc<dyn DirectoryBackend>
         } else {
             backend.clone()
@@ -203,6 +215,7 @@ impl ReplicationService {
             backend: wrapped_backend,
             original_backend: backend,
             config: repl_config,
+            provider_lifecycle,
         })
     }
 
@@ -320,6 +333,10 @@ impl ReplicationService {
             .provider_config
             .as_ref()
             .ok_or_else(|| "Provider config not available".to_string())?;
+        let provider_lifecycle = self
+            .provider_lifecycle
+            .clone()
+            .ok_or_else(|| "Provider lifecycle not initialized".to_string())?;
 
         self.changelog
             .as_ref()
@@ -333,6 +350,8 @@ impl ReplicationService {
 
         // Get shutdown receiver
         let mut shutdown_rx = shutdown.subscribe();
+        let graceful_drain = shutdown.graceful_drain_enabled();
+        let drain_timeout = shutdown.drain_timeout();
 
         // Spawn provider service task
         let handle = tokio::spawn(async move {
@@ -344,11 +363,29 @@ impl ReplicationService {
             let _ = shutdown_rx.recv().await;
 
             info!("Replication provider service shutting down");
+            provider_lifecycle.begin_shutdown();
 
-            // TODO: Add graceful provider shutdown
-            // - Stop accepting new consumers
-            // - Complete active sync operations
-            // - Cleanup resources
+            if !graceful_drain {
+                info!("Replication provider service shutdown will not wait for session drain");
+                return;
+            }
+
+            match timeout(
+                drain_timeout,
+                provider_lifecycle.wait_for_sessions_to_drain(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    info!("Replication provider sessions drained cleanly");
+                }
+                Err(_) => {
+                    warn!(
+                        "Replication provider drain timeout exceeded with {} active session(s) remaining",
+                        provider_lifecycle.active_session_count()
+                    );
+                }
+            }
         });
 
         Ok(Some(handle))
@@ -628,6 +665,108 @@ impl ReplicationService {
     /// Get provider configuration
     pub fn provider_config(&self) -> Option<&ProviderServiceConfig> {
         self.config.provider_config.as_ref()
+    }
+}
+
+/// Shared provider lifecycle used to reject new sessions and drain active ones.
+pub struct ReplicationProviderLifecycle {
+    draining: AtomicBool,
+    active_sessions: AtomicUsize,
+    shutdown_notifier: Notify,
+    drained_notifier: Notify,
+}
+
+impl ReplicationProviderLifecycle {
+    pub fn new() -> Self {
+        Self {
+            draining: AtomicBool::new(false),
+            active_sessions: AtomicUsize::new(0),
+            shutdown_notifier: Notify::new(),
+            drained_notifier: Notify::new(),
+        }
+    }
+
+    pub fn begin_shutdown(&self) {
+        if !self.draining.swap(true, Ordering::SeqCst) {
+            self.shutdown_notifier.notify_waiters();
+            if self.active_sessions.load(Ordering::SeqCst) == 0 {
+                self.drained_notifier.notify_waiters();
+            }
+        }
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    pub fn active_session_count(&self) -> usize {
+        self.active_sessions.load(Ordering::SeqCst)
+    }
+
+    pub fn register_session(self: &Arc<Self>) -> Option<ReplicationProviderSessionGuard> {
+        if self.is_draining() {
+            return None;
+        }
+
+        self.active_sessions.fetch_add(1, Ordering::SeqCst);
+
+        if self.is_draining() {
+            if self.active_sessions.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.drained_notifier.notify_waiters();
+            }
+            return None;
+        }
+
+        Some(ReplicationProviderSessionGuard {
+            lifecycle: self.clone(),
+        })
+    }
+
+    pub async fn wait_for_shutdown(&self) {
+        loop {
+            if self.is_draining() {
+                return;
+            }
+
+            let notified = self.shutdown_notifier.notified();
+            if self.is_draining() {
+                return;
+            }
+
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_sessions_to_drain(&self) {
+        loop {
+            if self.active_session_count() == 0 {
+                return;
+            }
+
+            let notified = self.drained_notifier.notified();
+            if self.active_session_count() == 0 {
+                return;
+            }
+
+            notified.await;
+        }
+    }
+}
+
+pub struct ReplicationProviderSessionGuard {
+    lifecycle: Arc<ReplicationProviderLifecycle>,
+}
+
+impl Drop for ReplicationProviderSessionGuard {
+    fn drop(&mut self) {
+        if self
+            .lifecycle
+            .active_sessions
+            .fetch_sub(1, Ordering::SeqCst)
+            == 1
+        {
+            self.lifecycle.drained_notifier.notify_waiters();
+        }
     }
 }
 

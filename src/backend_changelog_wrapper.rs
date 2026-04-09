@@ -37,6 +37,7 @@ use crate::backend::{
 use crate::change_observer::ChangeObserver;
 use crate::replication::{encode_rename_change_with_actor, ChangelogTracker};
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
+use crate::replication_service::ReplicationProviderLifecycle;
 
 #[cfg(test)]
 use crate::replication::RenameChange;
@@ -57,6 +58,9 @@ pub struct ChangelogBackendWrapper {
 
     /// Optional broadcast channel for live replication stream subscribers
     replication_sender: Option<broadcast::Sender<ChangelogEntry>>,
+
+    /// Optional provider lifecycle shared with inbound replication stream sessions.
+    provider_lifecycle: Option<Arc<ReplicationProviderLifecycle>>,
 }
 
 impl ChangelogBackendWrapper {
@@ -77,6 +81,7 @@ impl ChangelogBackendWrapper {
             changelog,
             observer: None,
             replication_sender: None,
+            provider_lifecycle: None,
         }
     }
 
@@ -91,6 +96,11 @@ impl ChangelogBackendWrapper {
     /// Set the broadcast sender for live replication stream subscribers.
     pub fn set_replication_sender(&mut self, sender: broadcast::Sender<ChangelogEntry>) {
         self.replication_sender = Some(sender);
+    }
+
+    /// Set the provider lifecycle for inbound replication stream shutdown coordination.
+    pub fn set_provider_lifecycle(&mut self, lifecycle: Option<Arc<ReplicationProviderLifecycle>>) {
+        self.provider_lifecycle = lifecycle;
     }
 
     /// Record a change to the changelog
@@ -299,6 +309,10 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         self.replication_sender
             .as_ref()
             .map(|sender| sender.subscribe())
+    }
+
+    fn replication_provider_lifecycle(&self) -> Option<Arc<ReplicationProviderLifecycle>> {
+        self.provider_lifecycle.clone()
     }
 
     async fn rename_entry(

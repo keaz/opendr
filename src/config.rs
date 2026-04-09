@@ -14,17 +14,21 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use opendr::config::ServerConfig;
 //!
+//! # fn main() -> Result<(), opendr::config::ConfigError> {
 //! // Load from file with environment overrides
-//! let config = ServerConfig::from_file("config/server.toml")?;
+//! let file_config = ServerConfig::from_file("config/server.toml")?;
 //!
 //! // Or use defaults
-//! let config = ServerConfig::default();
+//! let default_config = ServerConfig::default();
 //!
 //! // Validate configuration
-//! config.validate()?;
+//! file_config.validate()?;
+//! default_config.validate()?;
+//! # Ok(())
+//! # }
 //! ```
 
 use serde::{Deserialize, Serialize};

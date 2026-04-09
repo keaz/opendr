@@ -127,6 +127,16 @@ impl ShutdownCoordinator {
         *state != ShutdownState::Running
     }
 
+    /// Get the configured drain timeout.
+    pub fn drain_timeout(&self) -> Duration {
+        self.config.drain_timeout
+    }
+
+    /// Return whether graceful draining is enabled.
+    pub fn graceful_drain_enabled(&self) -> bool {
+        self.config.graceful_drain
+    }
+
     /// Get current shutdown state
     pub async fn get_state(&self) -> ShutdownState {
         *self.state.read().await

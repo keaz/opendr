@@ -12,11 +12,14 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust
 //! use opendr::connection_pool::{ConnectionPool, ResourceLimits};
+//! use std::net::SocketAddr;
 //!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! let limits = ResourceLimits::default();
 //! let pool = ConnectionPool::new(limits);
+//! let client_addr: SocketAddr = "127.0.0.1:1389".parse().unwrap();
 //!
 //! // Try to acquire a connection slot
 //! if let Some(conn_id) = pool.acquire_connection(client_addr).await {
@@ -26,6 +29,7 @@
 //! } else {
 //!     // Connection rejected due to limits
 //! }
+//! # });
 //! ```
 
 use std::collections::HashMap;

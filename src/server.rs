@@ -2071,6 +2071,21 @@ async fn handle_replication_stream_request(
     attribute_selection: &[String],
 ) -> Result<(), ServerError> {
     let mut session = ProviderOwnedReplicationSession::new(socket, message_id, base_dn);
+    let provider_lifecycle = backend.replication_provider_lifecycle();
+    let _session_guard = if let Some(lifecycle) = provider_lifecycle.as_ref() {
+        match lifecycle.register_session() {
+            Some(guard) => Some(guard),
+            None => {
+                return finish_replication_stream_unavailable(
+                    &mut session,
+                    "replication provider shutting down",
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
 
     let mut receiver = if let Some(receiver) = backend.subscribe_to_replication_changes() {
         receiver
@@ -2097,6 +2112,16 @@ async fn handle_replication_stream_request(
         };
 
         for entry in replay_entries {
+            if provider_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.is_draining())
+            {
+                return finish_replication_stream_unavailable(
+                    &mut session,
+                    "replication provider shutting down",
+                )
+                .await;
+            }
             if !is_dn_in_scope(&entry.dn, base_dn) {
                 continue;
             }
@@ -2105,8 +2130,32 @@ async fn handle_replication_stream_request(
     }
 
     loop {
-        match receiver.recv().await {
+        let recv_result = if let Some(lifecycle) = provider_lifecycle.as_ref() {
+            tokio::select! {
+                _ = lifecycle.wait_for_shutdown() => {
+                    return finish_replication_stream_unavailable(
+                        &mut session,
+                        "replication provider shutting down",
+                    ).await;
+                }
+                recv_result = receiver.recv() => recv_result,
+            }
+        } else {
+            receiver.recv().await
+        };
+
+        match recv_result {
             Ok(entry) => {
+                if provider_lifecycle
+                    .as_ref()
+                    .is_some_and(|lifecycle| lifecycle.is_draining())
+                {
+                    return finish_replication_stream_unavailable(
+                        &mut session,
+                        "replication provider shutting down",
+                    )
+                    .await;
+                }
                 if !is_dn_in_scope(&entry.dn, base_dn) {
                     continue;
                 }
@@ -2124,6 +2173,16 @@ async fn handle_replication_stream_request(
 
     let _ = session.finish().await;
 
+    Ok(())
+}
+
+async fn finish_replication_stream_unavailable<S: AsyncWrite + Unpin>(
+    session: &mut ProviderOwnedReplicationSession<'_, S>,
+    message: &str,
+) -> Result<(), ServerError> {
+    if let Err(err) = session.send_unavailable(message).await {
+        warn!("Replication stream shutdown response failed: {}", err);
+    }
     Ok(())
 }
 
@@ -3961,5 +4020,88 @@ mod tests {
 
         handler.abort();
         let _ = handler.await;
+    }
+
+    #[tokio::test]
+    async fn replication_stream_request_rejects_new_consumer_while_provider_is_draining() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+        let lifecycle = provider_backend
+            .replication_provider_lifecycle()
+            .expect("provider lifecycle should be available");
+        lifecycle.begin_shutdown();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_search_request(
+            &mut server_stream,
+            provider_backend.as_ref(),
+            12,
+            replication_stream_request(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Unavailable);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_stream_request_drains_active_session_on_provider_shutdown() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+        let lifecycle = provider_backend
+            .replication_provider_lifecycle()
+            .expect("provider lifecycle should be available");
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request = replication_stream_request();
+        let stream_backend = provider_backend.clone();
+
+        let handler = tokio::spawn(async move {
+            handle_search_request(&mut server_stream, stream_backend.as_ref(), 13, request)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lifecycle.begin_shutdown();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Unavailable);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        timeout(Duration::from_secs(1), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifecycle.active_session_count(), 0);
     }
 }

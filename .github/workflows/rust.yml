@@ -23,5 +23,7 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: cargo test --workspace --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --quiet
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings

@@ -329,6 +329,13 @@ pub trait DirectoryBackend: Send + Sync {
     {
         None
     }
+
+    /// Return provider lifecycle state for inbound replication streams, if available.
+    fn replication_provider_lifecycle(
+        &self,
+    ) -> Option<Arc<crate::replication_service::ReplicationProviderLifecycle>> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
