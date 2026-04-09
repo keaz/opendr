@@ -113,6 +113,8 @@ async fn test_consumer_configuration_values() {
     assert_eq!(consumer_cfg.sync_interval_secs, 30);
     assert_eq!(consumer_cfg.max_retry_attempts, 3);
     assert_eq!(consumer_cfg.retry_delay_secs, 5);
+    assert_eq!(consumer_cfg.heartbeat_interval_secs, 30);
+    assert_eq!(consumer_cfg.state_storage_path, "./data/replication_state");
 }
 
 #[tokio::test]
@@ -223,4 +225,26 @@ async fn test_consumer_change_listening_enabled() {
 
     let consumer_cfg = service.consumer_config().unwrap();
     assert!(consumer_cfg.enable_change_listening);
+}
+
+#[tokio::test]
+async fn test_consumer_custom_listening_config_propagates() {
+    let mut config = create_consumer_config();
+    config.replication.sync_interval_secs = 20;
+    config.replication.max_retry_attempts = 7;
+    config.replication.retry_delay_secs = 13;
+    config.replication.enable_change_listening = false;
+    config.replication.heartbeat_interval_secs = 47;
+    config.replication.state_storage_path = std::path::PathBuf::from("/tmp/opendr/repl_state");
+
+    let backend = Arc::new(MockBackend::new());
+    let service = ReplicationService::from_config(&config, backend).unwrap();
+
+    let consumer_cfg = service.consumer_config().unwrap();
+    assert_eq!(consumer_cfg.sync_interval_secs, 20);
+    assert_eq!(consumer_cfg.max_retry_attempts, 7);
+    assert_eq!(consumer_cfg.retry_delay_secs, 13);
+    assert!(!consumer_cfg.enable_change_listening);
+    assert_eq!(consumer_cfg.heartbeat_interval_secs, 47);
+    assert_eq!(consumer_cfg.state_storage_path, "/tmp/opendr/repl_state");
 }

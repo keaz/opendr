@@ -20,6 +20,11 @@ use crate::backend::{
 use crate::parser::{
     encode_bind_response, encode_result_response, encode_search_entry, ResponseOp,
 };
+use crate::real_time_propagation::is_dn_in_scope;
+use crate::replication::{
+    changelog_entry_to_replication_attrs, REPLICATION_COOKIE_ATTRIBUTE_PREFIX,
+    REPLICATION_STREAM_ATTRIBUTE,
+};
 use crate::schema::LdapSchema;
 
 #[derive(Debug)]
@@ -302,6 +307,20 @@ pub async fn handle_search_request(
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
 
+    if attribute_selection
+        .iter()
+        .any(|attribute| attribute.eq_ignore_ascii_case(REPLICATION_STREAM_ATTRIBUTE))
+    {
+        return handle_replication_stream_request(
+            socket,
+            backend,
+            message_id,
+            &base_dn,
+            &attribute_selection,
+        )
+        .await;
+    }
+
     let entries = match backend.search_entries(&base_dn, request.scope).await {
         Ok(entries) => entries,
         Err(err) => {
@@ -354,6 +373,94 @@ pub async fn handle_search_request(
     )
     .await?;
 
+    Ok(())
+}
+
+async fn handle_replication_stream_request(
+    socket: &mut TcpStream,
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    base_dn: &str,
+    attribute_selection: &[String],
+) -> Result<(), ServerError> {
+    let mut receiver = if let Some(receiver) = backend.subscribe_to_replication_changes() {
+        receiver
+    } else {
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::SearchDone,
+            ResultCode::Unavailable,
+            base_dn,
+            "replication stream not available",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let start_cookie = attribute_selection.iter().find_map(|attribute| {
+        attribute
+            .strip_prefix(REPLICATION_COOKIE_ATTRIBUTE_PREFIX)
+            .map(|cookie| cookie.to_string())
+    });
+
+    if let Some(changelog) = backend.replication_changelog() {
+        let replay_entries = match start_cookie.as_deref() {
+            Some("csn-empty") | None => Vec::new(),
+            Some(cookie) => changelog
+                .parse_cookie(cookie)
+                .map(|csn| changelog.get_since_csn(&csn))
+                .unwrap_or_default(),
+        };
+
+        for entry in replay_entries {
+            if !is_dn_in_scope(&entry.dn, base_dn) {
+                continue;
+            }
+            send_replication_stream_entry(socket, message_id, &entry).await?;
+        }
+    }
+
+    loop {
+        match receiver.recv().await {
+            Ok(entry) => {
+                if !is_dn_in_scope(&entry.dn, base_dn) {
+                    continue;
+                }
+                if let Err(err) = send_replication_stream_entry(socket, message_id, &entry).await {
+                    warn!("Replication stream send failed: {}", err);
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!("Replication stream lagged by {} messages", skipped);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+
+    let _ = send_result(
+        socket,
+        message_id,
+        ResponseOp::SearchDone,
+        ResultCode::Success,
+        base_dn,
+        "",
+    )
+    .await;
+
+    Ok(())
+}
+
+async fn send_replication_stream_entry(
+    socket: &mut TcpStream,
+    message_id: u32,
+    entry: &crate::replication_provider_fsm::ChangelogEntry,
+) -> Result<(), ServerError> {
+    let synthetic_entry = DirectoryEntry::new(entry.dn.clone(), HashMap::new());
+    let attributes = changelog_entry_to_replication_attrs(entry);
+    let encoded = encode_search_entry(message_id, &synthetic_entry, &attributes, false)?;
+    socket.write_all(&encoded).await?;
     Ok(())
 }
 

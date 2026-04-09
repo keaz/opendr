@@ -3,7 +3,7 @@
 //! These tests verify that the configuration system works correctly
 //! with file loading, environment variables, and validation.
 
-use opendr::config::{ServerConfig, ConfigError};
+use opendr::config::ServerConfig;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -15,6 +15,14 @@ fn test_load_default_config() {
     assert_eq!(config.server.ldap_port, 1389);
     assert_eq!(config.server.base_dn, "dc=example,dc=com");
     assert!(config.rate_limit.enabled);
+    assert!(config.replication.enable_change_listening);
+    assert_eq!(config.replication.max_retry_attempts, 3);
+    assert_eq!(config.replication.retry_delay_secs, 5);
+    assert_eq!(config.replication.heartbeat_interval_secs, 30);
+    assert_eq!(
+        config.replication.state_storage_path,
+        PathBuf::from("./data/replication_state")
+    );
 }
 
 #[test]
@@ -230,12 +238,99 @@ mode = "consumer"
 provider_url = "ldap://provider.example.com:389"
 bind_dn = "cn=replicator,dc=example,dc=com"
 bind_password = "secret"
+max_retry_attempts = 9
+retry_delay_secs = 12
+enable_change_listening = true
+heartbeat_interval_secs = 45
+state_storage_path = "/var/lib/opendr/repl_state"
     "#;
 
     let config = ServerConfig::from_toml_str(toml).unwrap();
     assert!(config.validate().is_ok());
     assert_eq!(config.replication.mode, "consumer");
     assert_eq!(config.replication.provider_url.unwrap(), "ldap://provider.example.com:389");
+    assert_eq!(config.replication.max_retry_attempts, 9);
+    assert_eq!(config.replication.retry_delay_secs, 12);
+    assert!(config.replication.enable_change_listening);
+    assert_eq!(config.replication.heartbeat_interval_secs, 45);
+    assert_eq!(
+        config.replication.state_storage_path,
+        PathBuf::from("/var/lib/opendr/repl_state")
+    );
+}
+
+#[test]
+fn test_validation_invalid_replication_listening_settings() {
+    let toml = r#"
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:389"
+max_retry_attempts = 0
+retry_delay_secs = 0
+heartbeat_interval_secs = 0
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    let result = config.validate();
+
+    assert!(result.is_err());
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("max_retry_attempts")
+            || message.contains("retry_delay_secs")
+            || message.contains("heartbeat_interval_secs")
+    );
+}
+
+#[test]
+fn test_validation_custom_replication_listening_config() {
+    let toml = r#"
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:389"
+bind_dn = "cn=replicator,dc=example,dc=com"
+bind_password = "secret"
+sync_interval_secs = 15
+max_retry_attempts = 9
+retry_delay_secs = 11
+enable_change_listening = false
+heartbeat_interval_secs = 45
+state_storage_path = "/var/lib/opendr/replication_state"
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    assert!(config.validate().is_ok());
+    assert_eq!(config.replication.sync_interval_secs, 15);
+    assert_eq!(config.replication.max_retry_attempts, 9);
+    assert_eq!(config.replication.retry_delay_secs, 11);
+    assert!(!config.replication.enable_change_listening);
+    assert_eq!(config.replication.heartbeat_interval_secs, 45);
+    assert_eq!(
+        config.replication.state_storage_path,
+        PathBuf::from("/var/lib/opendr/replication_state")
+    );
+}
+
+#[test]
+fn test_validation_replication_zero_retry_attempts() {
+    let toml = r#"
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:389"
+max_retry_attempts = 0
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    let result = config.validate();
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("max_retry_attempts must be > 0"));
 }
 
 #[test]

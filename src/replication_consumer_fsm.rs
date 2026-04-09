@@ -206,10 +206,13 @@ pub trait StateManager: Send + Sync {
 pub trait ChangeListener: Send + Sync {
     /// Start listening for real-time changes
     ///
+    /// # Arguments
+    /// * `cookie` - Last persisted replication cookie to resume from
+    ///
     /// # Returns
     /// * `Ok(())` - Listening started successfully
     /// * `Err(ConsumerError)` - Failed to start listening
-    async fn start_listening(&self) -> Result<(), ConsumerError>;
+    async fn start_listening(&self, cookie: Option<&str>) -> Result<(), ConsumerError>;
 
     /// Receive the next change notification (non-blocking)
     ///
@@ -813,6 +816,21 @@ impl ReplicationConsumerFsmImpl {
         )
     }
 
+    /// Receive the next live change notification from the configured listener.
+    pub async fn next_live_change(&self) -> Result<Option<Vec<u8>>, ConsumerError> {
+        self.change_listener.receive_change().await
+    }
+
+    /// Stop the live change listener if it is active.
+    pub async fn stop_live_listening(&self) -> Result<(), ConsumerError> {
+        self.change_listener.stop_listening().await
+    }
+
+    /// Return true when the FSM is currently waiting for live changes.
+    pub fn is_listening_state(&self) -> bool {
+        matches!(self.state, ReplicationConsumerState::Listening)
+    }
+
     /// Get pending batch count
     ///
     /// # Returns
@@ -974,8 +992,6 @@ impl ReplicationConsumerFsmImpl {
                 }
             }
 
-            // Transition to listening state
-            self.state = ReplicationConsumerState::Listening;
         } else {
             // No entries means we're already up to date
             // If we have a cookie, just keep using it
@@ -984,9 +1000,28 @@ impl ReplicationConsumerFsmImpl {
             } else {
                 log::info!("No entries available on provider");
             }
+        }
 
-            // Go straight to listening
+        if let Err(e) = self.provider_connection.disconnect().await {
+            log::warn!(
+                "Failed to disconnect provider connection after initial sync: {}",
+                e
+            );
+        }
+
+        if self.config.enable_change_listening {
+            let current_cookie = self.current_cookie.clone();
+            self.change_listener
+                .start_listening(current_cookie.as_deref())
+                .await
+                .map_err(|e| ConsumerError::ListeningError {
+                    message: format!("Failed to start listening: {}", e),
+                })?;
+
             self.state = ReplicationConsumerState::Listening;
+        } else {
+            self.state = ReplicationConsumerState::Completed;
+            self.successful_sessions += 1;
         }
 
         Ok(Some(entry_count))
@@ -1136,11 +1171,13 @@ impl ReplicationConsumerFsmImpl {
 
         // Transition to listening state if configured
         if self.config.enable_change_listening {
-            self.change_listener.start_listening().await.map_err(|e| {
-                ConsumerError::ListeningError {
+            let current_cookie = self.current_cookie.clone();
+            self.change_listener
+                .start_listening(current_cookie.as_deref())
+                .await
+                .map_err(|e| ConsumerError::ListeningError {
                     message: format!("Failed to start listening: {}", e),
-                }
-            })?;
+                })?;
 
             self.state = ReplicationConsumerState::Listening;
         } else {
@@ -1188,6 +1225,22 @@ impl ReplicationConsumerFsmImpl {
         // Record metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_entry_applied(Duration::from_millis(1)); // Placeholder timing
+        }
+
+        // Persist the latest contextCSN so reconnects resume from the live stream.
+        if let Some(context_csn) = self.batch_processor.get_context_csn().await.map_err(|e| {
+            ConsumerError::StateError {
+                message: format!("Failed to retrieve contextCSN after live change: {}", e),
+            }
+        })? {
+            let cookie = format!("csn-{}", context_csn);
+            self.state_manager
+                .save_cookie(&cookie)
+                .await
+                .map_err(|e| ConsumerError::StateError {
+                    message: format!("Failed to persist live change cookie: {}", e),
+                })?;
+            self.current_cookie = Some(cookie);
         }
 
         Ok(Some(1))
@@ -1656,7 +1709,7 @@ pub mod tests {
 
     #[async_trait]
     impl ChangeListener for MockChangeListener {
-        async fn start_listening(&self) -> Result<(), ConsumerError> {
+        async fn start_listening(&self, _cookie: Option<&str>) -> Result<(), ConsumerError> {
             if self.should_fail {
                 Err(ConsumerError::ListeningError {
                     message: "Mock listening failure".to_string(),
@@ -1880,6 +1933,107 @@ pub mod tests {
 
         let (total, _, _, _, _) = fsm.get_stats();
         assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_start_consumption_starts_live_listener() {
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager = Box::new(MockStateManager::new());
+        let mock_listener = MockChangeListener::new();
+        let listening = mock_listener.listening.clone();
+        let change_listener = Box::new(mock_listener);
+
+        let mut fsm = ReplicationConsumerFsmImpl::new(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: None,
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert!(matches!(
+            fsm.current_state(),
+            ReplicationConsumerState::Listening
+        ));
+        assert!(
+            *listening.lock().unwrap(),
+            "change listener should be active after StartConsumption"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_consumption_listening_failure_surfaces() {
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager = Box::new(MockStateManager::new());
+        let change_listener = Box::new(MockChangeListener::new().with_failure());
+
+        let mut fsm = ReplicationConsumerFsmImpl::new(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ConsumerError::ListeningError { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_start_consumption_without_live_listener_completes() {
+        let config = ConsumerConfig {
+            enable_change_listening: false,
+            ..Default::default()
+        };
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager = Box::new(MockStateManager::new());
+        let mock_listener = MockChangeListener::new();
+        let listening = mock_listener.listening.clone();
+        let change_listener = Box::new(mock_listener);
+
+        let mut fsm = ReplicationConsumerFsmImpl::with_config(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+            config,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: None,
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert!(matches!(
+            fsm.current_state(),
+            ReplicationConsumerState::Completed
+        ));
+        assert!(
+            !*listening.lock().unwrap(),
+            "change listener should stay inactive when listening is disabled"
+        );
     }
 
     #[tokio::test]
@@ -2459,7 +2613,7 @@ pub mod tests {
         assert!(!mock.is_listening().await.unwrap());
 
         // Test start listening
-        assert!(mock.start_listening().await.is_ok());
+        assert!(mock.start_listening(None).await.is_ok());
         assert!(mock.is_listening().await.unwrap());
 
         // Test receiving changes
@@ -2486,7 +2640,7 @@ pub mod tests {
 
         // Test with failure mode
         let mock_fail = MockChangeListener::new().with_failure();
-        assert!(mock_fail.start_listening().await.is_err());
+        assert!(mock_fail.start_listening(None).await.is_err());
     }
 
     #[tokio::test]

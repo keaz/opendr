@@ -42,12 +42,12 @@ global_requests_per_second = 1000
 
 ### File Locations
 
-The server looks for configuration files in the following order:
+The server looks for configuration in the following order:
 
-1. Path specified via `--config` command-line argument
-2. `./config/server.toml` (current directory)
-3. `/etc/opendr/server.toml` (system-wide, Linux/Unix)
-4. Built-in defaults
+1. `./config/server.toml` (current working directory)
+2. Built-in defaults
+
+The binary also expects `config/log4rs.yml` in the same working directory tree.
 
 ## Environment Variables
 
@@ -209,11 +209,16 @@ Configure multi-server replication for high availability.
 [replication]
 enabled = false                                 # Enable replication
 mode = "provider"                               # Mode: "provider", "consumer", "both"
-provider_url = "ldap://provider.example.com"   # Provider URL (consumer mode)
-bind_dn = "cn=replicator,dc=example,dc=com"   # Bind DN for authentication
-bind_password = "secret"                        # Bind password
-changelog_capacity = 10000                      # Changelog size
-sync_interval_secs = 60                         # Sync interval (consumer mode)
+provider_url = "ldap://provider.example.com"    # Provider URL (consumer mode)
+bind_dn = "cn=replicator,dc=example,dc=com"     # Canonical consumer bind key
+bind_password = "secret"                        # Canonical consumer bind secret
+changelog_capacity = 10000                      # Provider changelog size
+sync_interval_secs = 3600                       # Refresh/reconnect cadence (consumer mode)
+max_retry_attempts = 3                          # Consumer retry attempts
+retry_delay_secs = 5                            # Consumer retry delay
+enable_change_listening = true                  # Keep a live LDAP stream open
+heartbeat_interval_secs = 60                    # Provider/consumer keepalive interval
+state_storage_path = "./data/replication_state" # Consumer cookie/state storage
 ```
 
 **Replication Modes:**
@@ -222,8 +227,17 @@ sync_interval_secs = 60                         # Sync interval (consumer mode)
 - `both`: Acts as both provider and consumer (multi-master)
 
 **Consumer Configuration:**
-- Requires `provider_url`, `bind_dn`, and `bind_password`
-- `sync_interval_secs` controls how often to sync with provider
+- Requires `provider_url`; `bind_dn` and `bind_password` are optional
+- `bind_dn` / `bind_password` are the canonical keys; `provider_bind_dn` / `provider_bind_password` are accepted as aliases
+- `sync_interval_secs` controls refresh and reconnect cadence; it is not the steady-state live update latency when listening is enabled
+- `enable_change_listening` keeps a long-lived LDAP search open for live updates after refresh
+- `state_storage_path` stores the replication cookie between restarts
+- When running multiple instances on the same host, use distinct `ldap_port` and `data_directory` values
+
+**Provider Behavior:**
+- The provider exposes live replication data through the normal LDAP server path
+- Internally, the server intercepts replication stream searches and forwards changelog changes as streaming search results
+- This keeps the replication path inside the LDAP protocol instead of requiring a separate transport
 
 ### 7. Monitoring and Metrics Settings
 
@@ -340,7 +354,7 @@ Error: Invalid blacklist IP: not-an-ip
 ```
 Error: provider_url required for consumer mode
 ```
-**Solution:** Set `provider_url` when using consumer mode
+**Solution:** Set `provider_url` when using consumer mode. Enable `enable_change_listening` if you want the consumer to keep a live stream open after the initial refresh. If the provider requires authentication, configure `bind_dn` and `bind_password` as well.
 
 ## Examples
 
@@ -435,6 +449,7 @@ base_dn = "dc=example,dc=com"
 enabled = true
 mode = "provider"
 changelog_capacity = 50000
+heartbeat_interval_secs = 60
 ```
 
 **Consumer Server:**
@@ -450,6 +465,10 @@ provider_url = "ldap://provider.example.com:389"
 bind_dn = "cn=replicator,dc=example,dc=com"
 bind_password = "ReplicationSecret"
 sync_interval_secs = 30
+enable_change_listening = true
+max_retry_attempts = 3
+retry_delay_secs = 5
+state_storage_path = "/var/lib/opendr/replication_state"
 ```
 
 ## Best Practices
@@ -507,14 +526,20 @@ Create separate configuration files for each environment:
 - `config/server.staging.toml` - Staging settings
 - `config/server.production.toml` - Production settings
 
-Use environment variables or command-line arguments to select the appropriate file:
+Use environment variables or per-environment working directories to select the appropriate file:
 
 ```bash
 # Development
-opendr --config config/server.development.toml
+mkdir -p /srv/opendr-dev/config
+cp config/server.development.toml /srv/opendr-dev/config/server.toml
+cp config/log4rs.yml /srv/opendr-dev/config/log4rs.yml
+cd /srv/opendr-dev && opendr
 
 # Production
-opendr --config config/server.production.toml
+mkdir -p /srv/opendr-prod/config
+cp config/server.production.toml /srv/opendr-prod/config/server.toml
+cp config/log4rs.yml /srv/opendr-prod/config/log4rs.yml
+cd /srv/opendr-prod && opendr
 ```
 
 ## Troubleshooting

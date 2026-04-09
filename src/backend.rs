@@ -243,6 +243,19 @@ pub trait DirectoryBackend: Send + Sync {
     /// * `Ok(())` - contextCSN updated successfully
     /// * `Err(BackendError)` - Error updating contextCSN
     async fn set_context_csn(&self, csn: crate::csn::Csn) -> Result<(), BackendError>;
+
+    /// Return the changelog backing replication, if this backend exposes one.
+    fn replication_changelog(&self) -> Option<Arc<crate::replication::ChangelogTracker>> {
+        None
+    }
+
+    /// Subscribe to live replication changes, if this backend exposes them.
+    fn subscribe_to_replication_changes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::replication_provider_fsm::ChangelogEntry>>
+    {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

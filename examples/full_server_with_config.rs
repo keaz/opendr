@@ -18,7 +18,6 @@
 use opendr::config::ServerConfig;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
-use opendr::fsm_server;
 use opendr::shutdown::{ShutdownCoordinator, ShutdownConfig};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -48,12 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 5: Create Backend
     println!("\nStep 5: Creating backend...");
-    let backend = create_backend(&config).await?;
+    let _backend = create_backend(&config).await?;
     println!("✓ Backend created: {}\n", config.backend.backend_type);
 
     // Step 6: Setup Shutdown Handling
     println!("Step 6: Setting up graceful shutdown...");
-    let shutdown = setup_shutdown_handling();
+    let _shutdown = setup_shutdown_handling();
     println!("✓ Shutdown coordinator ready\n");
 
     // Step 7: Run Server
@@ -191,9 +190,7 @@ async fn create_backend(config: &ServerConfig) -> Result<Arc<dyn DirectoryBacken
         "lmdb" => {
             println!("  Initializing LMDB backend...");
             let max_size_mb = (config.backend.lmdb_max_size / (1024 * 1024)) as usize;
-            let replica_id = config.replication.as_ref()
-                .and_then(|r| r.replica_id)
-                .unwrap_or(1);
+            let replica_id = 1;
 
             let mut backend = LmdbBackend::new(
                 &config.backend.data_directory,
@@ -290,8 +287,6 @@ fn setup_shutdown_handling() -> Arc<ShutdownCoordinator> {
 
     // Install signal handlers
     let shutdown_signal = shutdown.install_signal_handlers();
-    let shutdown_clone = shutdown.clone();
-
     tokio::spawn(async move {
         shutdown_signal.wait().await;
         println!("\n🛑 Shutdown signal received!");

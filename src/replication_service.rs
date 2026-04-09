@@ -35,17 +35,18 @@
 //! }
 //! ```
 
-use async_trait::async_trait;
 use log::{error, info};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio::sync::broadcast;
 
 use crate::backend::DirectoryBackend;
 use crate::backend_changelog_wrapper::ChangelogBackendWrapper;
 use crate::config::ServerConfig;
 use crate::replication::{
-    ChangelogProviderImpl, ChangelogTracker, ConsumerRegistryImpl, StreamingManagerImpl,
+    BroadcastChangeListener, ChangeListenerImpl, ChangelogProviderImpl, ChangelogTracker,
+    ConsumerRegistryImpl, LdapChangeListener, ProviderConnectionImpl, StreamingManagerImpl,
     SyncRequestHandlerImpl,
 };
 use crate::replication_provider_fsm::{ReplicationProviderConfig, ReplicationProviderFsmImpl};
@@ -98,12 +99,14 @@ pub struct ProviderServiceConfig {
 #[derive(Debug, Clone)]
 pub struct ConsumerServiceConfig {
     pub provider_url: String,
+    pub base_dn: String,
     pub provider_bind_dn: Option<String>,
     pub provider_bind_password: Option<String>,
     pub sync_interval_secs: u64,
     pub max_retry_attempts: u32,
     pub retry_delay_secs: u64,
     pub enable_change_listening: bool,
+    pub heartbeat_interval_secs: u64,
     pub state_storage_path: String,
 }
 
@@ -139,10 +142,10 @@ impl ReplicationService {
             && (repl_config.mode == ReplicationMode::Provider
                 || repl_config.mode == ReplicationMode::Both)
         {
-            Arc::new(ChangelogBackendWrapper::new(
-                backend.clone(),
-                changelog.clone(),
-            )) as Arc<dyn DirectoryBackend>
+            let mut wrapper = ChangelogBackendWrapper::new(backend.clone(), changelog.clone());
+            let (replication_sender, _) = broadcast::channel(1024);
+            wrapper.set_replication_sender(replication_sender);
+            Arc::new(wrapper) as Arc<dyn DirectoryBackend>
         } else {
             backend.clone()
         };
@@ -202,13 +205,15 @@ impl ReplicationService {
 
             Some(ConsumerServiceConfig {
                 provider_url: provider_url.clone(),
+                base_dn: config.server.base_dn.clone(),
                 provider_bind_dn: config.replication.bind_dn.clone(),
                 provider_bind_password: config.replication.bind_password.clone(),
                 sync_interval_secs: config.replication.sync_interval_secs,
-                max_retry_attempts: 3,
-                retry_delay_secs: 5,
-                enable_change_listening: true,
-                state_storage_path: "./data/replication_state".to_string(),
+                max_retry_attempts: config.replication.max_retry_attempts,
+                retry_delay_secs: config.replication.retry_delay_secs,
+                enable_change_listening: config.replication.enable_change_listening,
+                heartbeat_interval_secs: config.replication.heartbeat_interval_secs,
+                state_storage_path: config.replication.state_storage_path.display().to_string(),
             })
         } else {
             None
@@ -348,24 +353,30 @@ impl ReplicationService {
         info!("Starting replication consumer service");
 
         // Create consumer dependencies
-        use crate::replication::{
-            BatchProcessorImpl, ChangeListenerImpl, ChangelogProviderImpl, ProviderConnectionImpl,
-            StateManagerImpl,
-        };
+        use crate::replication::{BatchProcessorImpl, StateManagerImpl};
         use crate::replication_consumer_fsm::{ConsumerConfig, ReplicationConsumerFsmImpl};
 
-        // Create a changelog provider for the consumer to query the remote provider
-        // In a real implementation, this would be a remote connection
-        // For now, we use a local one that can be replaced with network implementation
-        let remote_changelog_provider = Arc::new(ChangelogProviderImpl::new(
-            ChangelogTracker::new(),
-            self.original_backend.clone(),
-        ));
+        let has_local_provider = self.changelog.is_some()
+            && (consumer_config.provider_url.starts_with("local://")
+                || consumer_config.provider_url.starts_with("in-memory://"));
 
-        let provider_connection = Box::new(ProviderConnectionImpl::with_credentials(
-            remote_changelog_provider,
+        let changelog_provider = if let Some(ref changelog) = self.changelog {
+            Arc::new(ChangelogProviderImpl::new(
+                changelog.as_ref().clone(),
+                self.original_backend.clone(),
+            ))
+        } else {
+            Arc::new(ChangelogProviderImpl::new(
+                ChangelogTracker::new(),
+                self.original_backend.clone(),
+            ))
+        };
+
+        let provider_connection = Box::new(ProviderConnectionImpl::with_credentials_and_base(
+            changelog_provider,
             consumer_config.provider_bind_dn.clone(),
             consumer_config.provider_bind_password.clone(),
+            consumer_config.base_dn.clone(),
         ));
 
         let batch_processor = Box::new(BatchProcessorImpl::new(self.original_backend.clone()));
@@ -374,7 +385,26 @@ impl ReplicationService {
             consumer_config.state_storage_path.clone(),
         ));
 
-        let change_listener = Box::new(ChangeListenerImpl::new());
+        let change_listener: Box<dyn crate::replication_consumer_fsm::ChangeListener> =
+            if consumer_config.enable_change_listening {
+                if has_local_provider {
+                    if let Some(receiver) = self.backend.subscribe_to_replication_changes() {
+                        Box::new(BroadcastChangeListener::new(receiver))
+                    } else {
+                        Box::new(ChangeListenerImpl::new())
+                    }
+                } else {
+                    Box::new(LdapChangeListener::new(
+                        consumer_config.provider_url.clone(),
+                        consumer_config.base_dn.clone(),
+                        consumer_config.provider_bind_dn.clone(),
+                        consumer_config.provider_bind_password.clone(),
+                        1000,
+                    ))
+                }
+            } else {
+                Box::new(ChangeListenerImpl::new())
+            };
 
         // Create consumer FSM configuration
         let fsm_config = ConsumerConfig {
@@ -383,7 +413,7 @@ impl ReplicationService {
             max_retry_attempts: consumer_config.max_retry_attempts,
             retry_delay: Duration::from_secs(consumer_config.retry_delay_secs),
             enable_change_listening: consumer_config.enable_change_listening,
-            heartbeat_interval: Duration::from_secs(60),
+            heartbeat_interval: Duration::from_secs(consumer_config.heartbeat_interval_secs),
             change_buffer_size: 1000,
             state_persistence_timeout: Duration::from_secs(10),
         };
@@ -400,6 +430,8 @@ impl ReplicationService {
         // Get shutdown receiver
         let mut shutdown_rx = shutdown.subscribe();
         let sync_interval = Duration::from_secs(consumer_config.sync_interval_secs);
+        let retry_delay = Duration::from_secs(consumer_config.retry_delay_secs);
+        let enable_change_listening = consumer_config.enable_change_listening;
 
         let provider_url = consumer_config.provider_url.clone();
 
@@ -410,43 +442,131 @@ impl ReplicationService {
             use crate::fsm::{ReplicationConsumerEvent, StateMachine};
             use tokio::time::interval;
 
-            let mut sync_timer = interval(sync_interval);
+            if enable_change_listening {
+                loop {
+                    if let Err(e) = consumer_fsm.reset().await {
+                        error!("Failed to reset consumer FSM: {:?}", e);
+                        tokio::select! {
+                            _ = tokio::time::sleep(retry_delay) => {}
+                            _ = shutdown_rx.recv() => {
+                                info!("Replication consumer service shutting down");
+                                let _ = consumer_fsm.stop_live_listening().await;
+                                info!("Replication consumer service stopped");
+                                return;
+                            }
+                        }
+                        continue;
+                    }
 
-            loop {
-                tokio::select! {
-                    _ = sync_timer.tick() => {
-                        info!("Starting replication sync cycle");
+                    let event = ReplicationConsumerEvent::StartConsumption {
+                        provider_url: provider_url.clone(),
+                        cookie: None,
+                    };
 
-                        // Reset FSM to initial state before each sync cycle
-                        if let Err(e) = consumer_fsm.reset().await {
-                            error!("Failed to reset consumer FSM: {:?}", e);
+                    match consumer_fsm.handle_event(event).await {
+                        Ok(_) if consumer_fsm.is_listening_state() => {
+                            info!("Replication consumer entered listening mode");
+                        }
+                        Ok(_) => {
+                            info!("Replication consumer completed without entering listening mode");
+                            tokio::select! {
+                                _ = tokio::time::sleep(retry_delay) => {}
+                                _ = shutdown_rx.recv() => {
+                                    info!("Replication consumer service shutting down");
+                                    let _ = consumer_fsm.stop_live_listening().await;
+                                    info!("Replication consumer service stopped");
+                                    return;
+                                }
+                            }
                             continue;
                         }
-
-                        // Start sync by sending StartConsumption event
-                        let event = ReplicationConsumerEvent::StartConsumption {
-                            provider_url: provider_url.clone(),
-                            cookie: None, // Will be loaded from state by FSM
-                        };
-
-                        match consumer_fsm.handle_event(event).await {
-                            Ok(_) => {
-                                info!("Replication sync cycle completed successfully");
+                        Err(e) => {
+                            error!("Initial listening sync failed: {:?}", e);
+                            tokio::select! {
+                                _ = tokio::time::sleep(retry_delay) => {}
+                                _ = shutdown_rx.recv() => {
+                                    info!("Replication consumer service shutting down");
+                                    let _ = consumer_fsm.stop_live_listening().await;
+                                    info!("Replication consumer service stopped");
+                                    return;
+                                }
                             }
-                            Err(e) => {
-                                error!("Replication sync cycle failed: {:?}", e);
+                            continue;
+                        }
+                    }
+
+                    loop {
+                        tokio::select! {
+                            _ = shutdown_rx.recv() => {
+                                info!("Replication consumer service shutting down");
+                                let _ = consumer_fsm.stop_live_listening().await;
+                                info!("Replication consumer service stopped");
+                                return;
+                            }
+                            change = consumer_fsm.next_live_change() => {
+                                match change {
+                                    Ok(Some(change)) => {
+                                        if let Err(e) = consumer_fsm.handle_event(ReplicationConsumerEvent::ChangeReceived(change)).await {
+                                            error!("Failed to process live replication change: {:?}", e);
+                                            let _ = consumer_fsm.stop_live_listening().await;
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                    Err(e) => {
+                                        error!("Listening channel failed: {:?}", e);
+                                        let _ = consumer_fsm.stop_live_listening().await;
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
-                    _ = shutdown_rx.recv() => {
-                        info!("Replication consumer service shutting down");
-                        break;
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry_delay) => {}
+                        _ = shutdown_rx.recv() => {
+                            info!("Replication consumer service shutting down");
+                            let _ = consumer_fsm.stop_live_listening().await;
+                            info!("Replication consumer service stopped");
+                            return;
+                        }
                     }
                 }
-            }
+            } else {
+                let mut sync_timer = interval(sync_interval);
 
-            // Cleanup
-            info!("Replication consumer service stopped");
+                loop {
+                    tokio::select! {
+                        _ = sync_timer.tick() => {
+                            info!("Starting replication sync cycle");
+
+                            if let Err(e) = consumer_fsm.reset().await {
+                                error!("Failed to reset consumer FSM: {:?}", e);
+                                continue;
+                            }
+
+                            let event = ReplicationConsumerEvent::StartConsumption {
+                                provider_url: provider_url.clone(),
+                                cookie: None,
+                            };
+
+                            match consumer_fsm.handle_event(event).await {
+                                Ok(_) => info!("Replication sync cycle completed successfully"),
+                                Err(e) => error!("Replication sync cycle failed: {:?}", e),
+                            }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            info!("Replication consumer service shutting down");
+                            break;
+                        }
+                    }
+                }
+
+                info!("Replication consumer service stopped");
+            }
         });
 
         Ok(Some(handle))
@@ -705,6 +825,34 @@ mod tests {
         assert_eq!(
             consumer_cfg.provider_bind_dn,
             Some("cn=admin,dc=example,dc=com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_consumer_config_parses_listening_settings() {
+        let mut config = create_test_config();
+        config.server.base_dn = "dc=test,dc=org".to_string();
+        config.replication.mode = "consumer".to_string();
+        config.replication.provider_url = Some("ldap://provider:389".to_string());
+        config.replication.max_retry_attempts = 7;
+        config.replication.retry_delay_secs = 11;
+        config.replication.enable_change_listening = false;
+        config.replication.heartbeat_interval_secs = 45;
+        config.replication.state_storage_path =
+            std::path::PathBuf::from("/tmp/opendr-replication-state");
+        let backend = Arc::new(MockBackend::new());
+
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let consumer_cfg = service.consumer_config().unwrap();
+
+        assert_eq!(consumer_cfg.base_dn, "dc=test,dc=org");
+        assert_eq!(consumer_cfg.max_retry_attempts, 7);
+        assert_eq!(consumer_cfg.retry_delay_secs, 11);
+        assert!(!consumer_cfg.enable_change_listening);
+        assert_eq!(consumer_cfg.heartbeat_interval_secs, 45);
+        assert_eq!(
+            consumer_cfg.state_storage_path,
+            "/tmp/opendr-replication-state"
         );
     }
 }

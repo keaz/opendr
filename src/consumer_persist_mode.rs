@@ -316,7 +316,10 @@ impl PersistModeManager {
         }
 
         // Start change listener
-        self.change_listener.start_listening().await.map_err(|e| {
+        self.change_listener
+            .start_listening(cookie.as_deref())
+            .await
+            .map_err(|e| {
             error!("Failed to start change listener: {}", e);
             e
         })?;

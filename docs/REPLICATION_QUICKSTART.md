@@ -1,200 +1,179 @@
 # OpenDR Replication Quick Start
 
-A quick reference guide for setting up LDAP replication with OpenDR.
+This guide shows the shortest working path for provider-consumer replication with listener-based updates.
 
-## 5-Minute Setup
+## Before You Start
 
-### 1. Provider Configuration
+- Run each instance from its own working directory.
+- The `opendr` binary loads `config/server.toml` and `config/log4rs.yml` from the current working directory.
+- If you run provider and consumer on the same host, give them different `ldap_port` and `data_directory` values.
+- For LMDB-backed servers, `root_password` must be the generated `{SSHA512}` hash from `opendr-setup` or another existing OpenDR config.
 
-Create `/etc/opendr/provider.toml`:
+Example layout:
 
-```toml
-[server]
-bind_address = "0.0.0.0:389"
-base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "change_me"
+```text
+/srv/opendr-provider/
+  config/server.toml
+  config/log4rs.yml
+  data/
+  log/
 
-[backend]
-backend_type = "Lmdb"
-lmdb_path = "/var/lib/opendr/provider/data"
-lmdb_map_size = 10737418240
-
-[replication]
-role = "provider"
-changelog_enabled = true
-changelog_max_entries = 100000
+/srv/opendr-consumer/
+  config/server.toml
+  config/log4rs.yml
+  data/
+  log/
 ```
 
-### 2. Consumer Configuration
+## 1. Provider Configuration
 
-Create `/etc/opendr/consumer.toml`:
+Create `/srv/opendr-provider/config/server.toml`:
 
 ```toml
 [server]
-bind_address = "0.0.0.0:389"
+bind_address = "0.0.0.0"
+ldap_port = 1389
 base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "change_me"
+root_user_dn = "cn=manager"
+root_password = "{SSHA512}<generated-hash>"
+organization_name = "Example Org"
 
 [backend]
-backend_type = "Lmdb"
-lmdb_path = "/var/lib/opendr/consumer/data"
-lmdb_map_size = 10737418240
+backend_type = "lmdb"
+data_directory = "./data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 126
 
 [replication]
-role = "consumer"
-provider_url = "ldap://provider.example.com:389"
-sync_interval_secs = 30
+enabled = true
+mode = "provider"
+changelog_capacity = 100000
+heartbeat_interval_secs = 60
+```
+
+## 2. Consumer Configuration
+
+Create `/srv/opendr-consumer/config/server.toml`:
+
+```toml
+[server]
+bind_address = "0.0.0.0"
+ldap_port = 2389
+base_dn = "dc=example,dc=com"
+root_user_dn = "cn=manager"
+root_password = "{SSHA512}<generated-hash>"
+organization_name = "Example Org Replica"
+
+[backend]
+backend_type = "lmdb"
+data_directory = "./data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 126
+
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:1389"
+bind_dn = "cn=manager,dc=example,dc=com"
+bind_password = "replication_password"
+sync_interval_secs = 3600
+max_retry_attempts = 5
+retry_delay_secs = 1
 enable_change_listening = true
-state_storage_path = "/var/lib/opendr/consumer/state"
+heartbeat_interval_secs = 60
+state_storage_path = "./data/replication_state"
 ```
 
-### 3. Start Servers
+`bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` remain supported as aliases. In production, use a dedicated read-only replication account on the provider.
+
+## 3. Start Both Servers
+
+Copy the logging config into each runtime directory, then start each process from that directory:
 
 ```bash
-# On provider machine
-opendr --config /etc/opendr/provider.toml
+cp config/log4rs.yml /srv/opendr-provider/config/log4rs.yml
+cp config/log4rs.yml /srv/opendr-consumer/config/log4rs.yml
 
-# On consumer machine
-opendr --config /etc/opendr/consumer.toml
+cd /srv/opendr-provider && opendr
+cd /srv/opendr-consumer && opendr
 ```
 
-### 4. Verify Replication
+## 4. Verify Listener-Based Replication
+
+Add an entry on the provider:
 
 ```bash
-# Add entry to provider
-ldapadd -x -H ldap://provider.example.com:389 \
-    -D "cn=admin,dc=example,dc=com" -w change_me <<EOF
-dn: cn=Test User,dc=example,dc=com
+ldapadd -x -H ldap://provider.example.com:1389 \
+  -D "cn=manager,dc=example,dc=com" -w '<provider-root-password>' <<EOF
+dn: uid=replication-test,ou=People,dc=example,dc=com
+objectClass: top
 objectClass: person
-cn: Test User
-sn: User
+objectClass: organizationalPerson
+objectClass: inetOrgPerson
+cn: replication-test
+sn: Test
+uid: replication-test
 EOF
-
-# Check on consumer (wait ~30 seconds)
-ldapsearch -x -H ldap://consumer.example.com:389 \
-    -b "dc=example,dc=com" "(cn=Test User)"
 ```
 
-## Quick Test
-
-Run the automated test script:
+Query the consumer:
 
 ```bash
-./scripts/test_replication.sh
+ldapsearch -x -H ldap://consumer.example.com:2389 \
+  -D "cn=manager,dc=example,dc=com" -w '<consumer-root-password>' \
+  -b "ou=People,dc=example,dc=com" "(uid=replication-test)"
 ```
 
-This will:
-- Build OpenDR
-- Start provider on port 3890
-- Start consumer on port 3891
-- Add test data
-- Verify replication
-- Display logs
+The consumer is in listener mode when its log contains:
 
-## Common Configuration Options
+- `Replication consumer entered listening mode`
+- `Replicated ADD: ...` or `Replicated MODIFY: ...`
 
-### Provider Settings
+With `enable_change_listening = true`, those updates arrive over the live LDAP stream instead of waiting for `sync_interval_secs`.
+
+## 5. Polling-Only Mode
+
+If you want periodic refreshes instead of the live stream:
 
 ```toml
 [replication]
-role = "provider"
-changelog_enabled = true           # Enable change tracking
-changelog_max_entries = 100000     # Max entries in memory
-max_batch_size = 100               # Entries per batch
-consumer_timeout_secs = 30         # Consumer operation timeout
-enable_streaming = true            # Real-time updates
-heartbeat_interval_secs = 60       # Connection keepalive
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:1389"
+sync_interval_secs = 30
+enable_change_listening = false
 ```
 
-### Consumer Settings
+In that mode, the consumer uses scheduled refresh cycles and does not hold the long-lived replication search open.
 
-```toml
-[replication]
-role = "consumer"
-provider_url = "ldap://provider:389"         # Provider URL
-provider_bind_dn = "cn=repl,dc=example,dc=com"  # Optional auth
-provider_bind_password = "secret"            # Optional auth
-sync_interval_secs = 30                      # Sync frequency
-max_retry_attempts = 3                       # Retry on failure
-retry_delay_secs = 5                         # Delay between retries
-enable_change_listening = true               # Real-time listening
-state_storage_path = "/var/lib/opendr/state" # State file location
-```
+## Common Settings
 
-## Monitoring Commands
+- `enabled`: turns replication on
+- `mode`: `provider`, `consumer`, or `both`
+- `changelog_capacity`: provider-side number of retained change records
+- `provider_url`: consumer-side LDAP endpoint of the provider
+- `sync_interval_secs`: refresh and reconnect cadence
+- `enable_change_listening`: enables the long-lived listener after refresh
+- `state_storage_path`: filesystem path for the persisted replication cookie
+- `heartbeat_interval_secs`: keepalive interval for replication sessions
+
+## Quick Validation
+
+Run the focused live-stream integration test:
 
 ```bash
-# Check provider entry count
-ldapsearch -x -H ldap://provider:389 -b "dc=example,dc=com" \
-    "(objectClass=*)" | grep -c "^dn:"
-
-# Check consumer entry count
-ldapsearch -x -H ldap://consumer:389 -b "dc=example,dc=com" \
-    "(objectClass=*)" | grep -c "^dn:"
-
-# Test connectivity
-nc -zv provider.example.com 389
-
-# View consumer replication state
-cat /var/lib/opendr/consumer/state/cookie
+cargo test --test replication_e2e test_e2e_listening_replication_stream_emits_live_change -- --nocapture
 ```
 
 ## Troubleshooting
 
-### Consumer not syncing?
-
-1. **Check connectivity**: `nc -zv provider.example.com 389`
-2. **Verify credentials**: Test LDAP bind manually
-3. **Check logs**: Look for errors in consumer logs
-4. **Reset state**: Delete `/var/lib/opendr/consumer/state/*` and restart
-
-### Replication lag?
-
-1. **Reduce sync interval**: Set `sync_interval_secs = 10`
-2. **Increase batch size**: Set `max_batch_size = 500`
-3. **Check network**: `ping provider.example.com`
-
-### Changelog growing too large?
-
-1. **Increase capacity**: `changelog_max_entries = 500000`
-2. **More frequent syncs**: Reduce consumer `sync_interval_secs`
-
-## Architecture
-
-```
-┌──────────────┐                  ┌──────────────┐
-│   Provider   │                  │   Consumer   │
-│   (Master)   │                  │  (Replica)   │
-│              │                  │              │
-│  Directory   │                  │  Directory   │
-│     +        │  ──Replication──>│              │
-│  Changelog   │                  │              │
-└──────────────┘                  └──────────────┘
-```
-
-**Replication Flow:**
-1. **Refresh Phase**: Consumer requests all entries
-2. **Present Phase**: Provider sends changelog entries
-3. **Persist Phase**: Consumer persists state
-4. **Listen Phase**: Consumer listens for real-time changes
+- If the consumer never enters listener mode, verify `enable_change_listening = true`.
+- If the consumer cannot connect, verify `provider_url`, `bind_dn`, and `bind_password`.
+- If provider and consumer run on the same machine, verify the two instances do not share the same `ldap_port` or `data_directory`.
+- If you need a fresh refresh, stop the consumer and remove the contents of `state_storage_path`.
 
 ## Next Steps
 
 - Read the full [Replication Guide](REPLICATION_GUIDE.md)
-- Configure [TLS encryption](REPLICATION_GUIDE.md#security-considerations)
-- Set up [monitoring](REPLICATION_GUIDE.md#monitoring)
-- Review [performance tuning](REPLICATION_GUIDE.md#performance-tuning)
-
-## Key Files
-
-- Provider FSM: `src/replication_provider_fsm.rs`
-- Consumer FSM: `src/replication_consumer_fsm.rs`
-- Implementation: `src/replication.rs`
-- Tests: `tests/replication_integration.rs`
-- Test Script: `scripts/test_replication.sh`
-
-## RFC Reference
-
-OpenDR implements [RFC 4533: LDAP Content Synchronization Operation](https://datatracker.ietf.org/doc/html/rfc4533)
+- Review the replication configuration section in [Configuration](CONFIGURATION.md)
+- Use the setup flow in [Setup Wizard Guide](SETUP_WIZARD_GUIDE.md)

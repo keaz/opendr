@@ -322,11 +322,15 @@ pub struct ReplicationSettings {
     pub provider_url: Option<String>,
 
     /// Replication bind DN
-    #[serde(default)]
+    #[serde(default, alias = "provider_bind_dn", alias = "replication_bind_dn")]
     pub bind_dn: Option<String>,
 
     /// Replication bind password
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "provider_bind_password",
+        alias = "replication_bind_password"
+    )]
     pub bind_password: Option<String>,
 
     /// Changelog capacity
@@ -336,6 +340,30 @@ pub struct ReplicationSettings {
     /// Sync interval (seconds)
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
+
+    /// Maximum retry attempts for listening/polling reconnects
+    #[serde(default = "default_max_retry_attempts")]
+    pub max_retry_attempts: u32,
+
+    /// Delay between retry attempts (seconds)
+    #[serde(default = "default_retry_delay_secs")]
+    pub retry_delay_secs: u64,
+
+    /// Keep a long-lived listener open for post-refresh changes
+    #[serde(default = "default_true", alias = "listen_for_changes")]
+    pub enable_change_listening: bool,
+
+    /// Heartbeat interval for listening-based replication (seconds)
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+
+    /// Path for persisted replication state
+    #[serde(default = "default_replication_state_storage_path")]
+    pub state_storage_path: PathBuf,
+
+    /// TCP port used for the live replication stream (0 = derive from LDAP port)
+    #[serde(default, alias = "replication_stream_port", alias = "change_listener_port")]
+    pub stream_port: u16,
 }
 
 /// Monitoring settings
@@ -601,6 +629,18 @@ fn default_changelog_capacity() -> usize {
 fn default_sync_interval_secs() -> u64 {
     60
 }
+fn default_max_retry_attempts() -> u32 {
+    3
+}
+fn default_retry_delay_secs() -> u64 {
+    5
+}
+fn default_heartbeat_interval_secs() -> u64 {
+    30
+}
+fn default_replication_state_storage_path() -> PathBuf {
+    PathBuf::from("./data/replication_state")
+}
 
 fn default_metrics_address() -> String {
     "127.0.0.1".to_string()
@@ -722,6 +762,12 @@ impl Default for ReplicationSettings {
             bind_password: None,
             changelog_capacity: default_changelog_capacity(),
             sync_interval_secs: default_sync_interval_secs(),
+            max_retry_attempts: default_max_retry_attempts(),
+            retry_delay_secs: default_retry_delay_secs(),
+            enable_change_listening: true,
+            heartbeat_interval_secs: default_heartbeat_interval_secs(),
+            state_storage_path: default_replication_state_storage_path(),
+            stream_port: 0,
         }
     }
 }
@@ -1022,6 +1068,34 @@ impl ServerConfig {
                         "provider_url required for consumer mode".to_string(),
                     ));
                 }
+            }
+            if self.replication.sync_interval_secs == 0 {
+                return Err(ConfigError::ValidationError(
+                    "sync_interval_secs must be > 0".to_string(),
+                ));
+            }
+            if self.replication.max_retry_attempts == 0 {
+                return Err(ConfigError::ValidationError(
+                    "max_retry_attempts must be > 0".to_string(),
+                ));
+            }
+            if self.replication.retry_delay_secs == 0 {
+                return Err(ConfigError::ValidationError(
+                    "retry_delay_secs must be > 0".to_string(),
+                ));
+            }
+            if self.replication.heartbeat_interval_secs == 0 {
+                return Err(ConfigError::ValidationError(
+                    "heartbeat_interval_secs must be > 0".to_string(),
+                ));
+            }
+            if self.replication.stream_port != 0
+                && (self.replication.stream_port == self.server.ldap_port
+                    || self.replication.stream_port == self.server.ldaps_port)
+            {
+                return Err(ConfigError::ValidationError(
+                    "replication stream_port must differ from LDAP and LDAPS ports".to_string(),
+                ));
             }
         }
 

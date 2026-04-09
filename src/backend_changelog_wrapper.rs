@@ -29,11 +29,12 @@
 use async_trait::async_trait;
 use ldap_parser::ldap::SearchScope as Scope;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, Modification};
 use crate::change_observer::ChangeObserver;
 use crate::replication::ChangelogTracker;
-use crate::replication_provider_fsm::ChangeType;
+use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 
 /// Wrapper around DirectoryBackend that records changes to a changelog
 ///
@@ -48,6 +49,9 @@ pub struct ChangelogBackendWrapper {
 
     /// Optional change observer for push-based replication notifications
     observer: Option<Arc<dyn ChangeObserver>>,
+
+    /// Optional broadcast channel for live replication stream subscribers
+    replication_sender: Option<broadcast::Sender<ChangelogEntry>>,
 }
 
 impl ChangelogBackendWrapper {
@@ -67,6 +71,7 @@ impl ChangelogBackendWrapper {
             backend,
             changelog,
             observer: None,
+            replication_sender: None,
         }
     }
 
@@ -76,6 +81,11 @@ impl ChangelogBackendWrapper {
     /// * `observer` - Change observer to notify on directory changes
     pub fn set_observer(&mut self, observer: Arc<dyn ChangeObserver>) {
         self.observer = Some(observer);
+    }
+
+    /// Set the broadcast sender for live replication stream subscribers.
+    pub fn set_replication_sender(&mut self, sender: broadcast::Sender<ChangelogEntry>) {
+        self.replication_sender = Some(sender);
     }
 
     /// Record a change to the changelog
@@ -104,15 +114,27 @@ impl ChangelogBackendWrapper {
                     dn,
                     change_data,
                 );
+                let observer_entry = changelog_entry.clone();
 
                 // Spawn async task to notify observer without blocking
                 let observer = observer.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = observer.notify_change(&changelog_entry).await {
+                    if let Err(e) = observer.notify_change(&observer_entry).await {
                         use log::error;
                         error!("Failed to notify change observer: {}", e);
                     }
                 });
+                if let Some(ref sender) = self.replication_sender {
+                    let _ = sender.send(changelog_entry);
+                }
+            } else if let Some(ref sender) = self.replication_sender {
+                let changelog_entry = crate::replication_provider_fsm::ChangelogEntry::new(
+                    csn.clone(),
+                    change_type,
+                    dn,
+                    change_data,
+                );
+                let _ = sender.send(changelog_entry);
             }
 
             Some(csn)
@@ -217,6 +239,14 @@ impl DirectoryBackend for ChangelogBackendWrapper {
     async fn set_context_csn(&self, csn: crate::csn::Csn) -> Result<(), BackendError> {
         // Delegate to underlying backend
         self.backend.set_context_csn(csn).await
+    }
+
+    fn replication_changelog(&self) -> Option<Arc<ChangelogTracker>> {
+        self.changelog.clone()
+    }
+
+    fn subscribe_to_replication_changes(&self) -> Option<broadcast::Receiver<ChangelogEntry>> {
+        self.replication_sender.as_ref().map(|sender| sender.subscribe())
     }
 
     async fn rename_entry(

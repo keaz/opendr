@@ -104,7 +104,7 @@ impl MockChangeListener {
 
 #[async_trait]
 impl ChangeListener for MockChangeListener {
-    async fn start_listening(&self) -> Result<(), ConsumerError> {
+    async fn start_listening(&self, _cookie: Option<&str>) -> Result<(), ConsumerError> {
         let mut listening = self.listening.write().await;
         *listening = true;
         Ok(())

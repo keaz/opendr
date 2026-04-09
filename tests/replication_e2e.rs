@@ -11,15 +11,25 @@
 //! - State persistence
 //! - Multi-consumer scenarios
 
-use opendr::backend::{DirectoryEntry, MockBackend, Modification, ModifyOperation};
+use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
+use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
 use opendr::config::ServerConfig;
+use opendr::replication::ChangelogTracker;
 use opendr::replication_provider_fsm::ChangeType;
 use opendr::replication_service::ReplicationService;
+use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
+use ldap_parser::filter::{AttributeValueAssertion, Filter};
+use ldap_parser::ldap::{DerefAliases, LdapDN, LdapString, ProtocolOp, SearchRequest, SearchScope};
+use ldap_parser::parse_ldap_messages;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+use tokio::time::{sleep, timeout};
 
 /// Helper function to create a test provider configuration
 fn create_provider_config() -> ServerConfig {
@@ -55,6 +65,64 @@ fn create_test_entry(dn: &str, cn: &str, sn: &str) -> DirectoryEntry {
             ("sn".to_string(), vec![sn.to_string()]),
         ]),
     )
+}
+
+fn create_listening_provider_backend() -> Arc<dyn DirectoryBackend> {
+    let backend = Arc::new(MockBackend::default());
+    let changelog = Arc::new(ChangelogTracker::new());
+    let mut wrapper = ChangelogBackendWrapper::new(backend, Some(changelog));
+    let (replication_sender, _) = broadcast::channel(32);
+    wrapper.set_replication_sender(replication_sender);
+    Arc::new(wrapper)
+}
+
+async fn connected_stream_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+    let (server_stream, _) = listener.accept().await.unwrap();
+    let client_stream = client.await.unwrap();
+
+    (server_stream, client_stream)
+}
+
+async fn read_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    let len = timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("response timeout")
+        .expect("failed to read response");
+    buf.truncate(len);
+    buf
+}
+
+fn create_replication_search_request(cookie: Option<&str>) -> SearchRequest<'static> {
+    let mut attributes = vec![LdapString(Cow::Owned(
+        opendr::replication::REPLICATION_STREAM_ATTRIBUTE.to_string(),
+    ))];
+
+    if let Some(cookie) = cookie {
+        attributes.push(LdapString(Cow::Owned(format!(
+            "{}{}",
+            opendr::replication::REPLICATION_COOKIE_ATTRIBUTE_PREFIX,
+            cookie
+        ))));
+    }
+
+    SearchRequest {
+        base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
+        scope: SearchScope(2),
+        deref_aliases: DerefAliases(0),
+        size_limit: 0,
+        time_limit: 0,
+        types_only: false,
+        filter: Filter::EqualityMatch(AttributeValueAssertion {
+            attribute_desc: LdapString(Cow::Owned("objectClass".to_string())),
+            assertion_value: b"top",
+        }),
+        attributes,
+    }
 }
 
 /// Test basic provider-consumer setup
@@ -548,4 +616,124 @@ async fn test_e2e_reads_dont_replicate() {
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].change_type, ChangeType::Add);
+}
+
+#[tokio::test]
+async fn test_e2e_listening_replication_stream_emits_live_change() {
+    let provider_backend = create_listening_provider_backend();
+    let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+    let request = create_replication_search_request(None);
+    let server_backend = provider_backend.clone();
+
+    let handler = tokio::spawn(async move {
+        server::handle_search_request(&mut server_stream, server_backend.as_ref(), 1, request)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    let entry = create_test_entry(
+        "cn=listener-user,dc=example,dc=org",
+        "listener-user",
+        "Listener User",
+    );
+    provider_backend
+        .add_entry(entry.clone(), vec![])
+        .await
+        .unwrap();
+
+    let data = read_response(&mut client_stream).await;
+    let (_, messages) = parse_ldap_messages(&data).unwrap();
+    assert!(!messages.is_empty(), "expected a replication stream entry");
+
+    match &messages[0].protocol_op {
+        ProtocolOp::SearchResultEntry(response) => {
+            assert_eq!(response.object_name.0.as_ref(), entry.dn);
+            assert!(response
+                .attributes
+                .iter()
+                .any(|attr| attr.attr_type.0.as_ref() == opendr::replication::REPLICATION_CHANGE_TYPE_ATTRIBUTE
+                    && std::str::from_utf8(attr.attr_vals[0].0.as_ref()).unwrap() == "add"));
+            assert!(response
+                .attributes
+                .iter()
+                .any(|attr| attr.attr_type.0.as_ref() == opendr::replication::REPLICATION_CHANGE_DATA_ATTRIBUTE
+                    && !attr.attr_vals[0].0.as_ref().is_empty()));
+            assert!(response
+                .attributes
+                .iter()
+                .any(|attr| attr.attr_type.0.as_ref() == opendr::replication::REPLICATION_CSN_ATTRIBUTE
+                    && !attr.attr_vals[0].0.as_ref().is_empty()));
+        }
+        other => panic!("unexpected replication response: {:?}", other),
+    }
+
+    handler.abort();
+    let _ = handler.await;
+}
+
+#[tokio::test]
+async fn test_e2e_listening_replication_stream_respects_cookie_resume() {
+    let provider_backend = create_listening_provider_backend();
+    let first_entry = create_test_entry(
+        "cn=preexisting-user,dc=example,dc=org",
+        "preexisting-user",
+        "Preexisting User",
+    );
+    provider_backend
+        .add_entry(first_entry.clone(), vec![])
+        .await
+        .unwrap();
+
+    let cookie = provider_backend
+        .replication_changelog()
+        .unwrap()
+        .generate_context_cookie();
+
+    let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+    let request = create_replication_search_request(Some(&cookie));
+    let server_backend = provider_backend.clone();
+
+    let handler = tokio::spawn(async move {
+        server::handle_search_request(&mut server_stream, server_backend.as_ref(), 1, request)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    let second_entry = create_test_entry(
+        "cn=fresh-user,dc=example,dc=org",
+        "fresh-user",
+        "Fresh User",
+    );
+    provider_backend
+        .add_entry(second_entry.clone(), vec![])
+        .await
+        .unwrap();
+
+    let data = read_response(&mut client_stream).await;
+    let (_, messages) = parse_ldap_messages(&data).unwrap();
+    assert!(!messages.is_empty(), "expected a replicated change");
+
+    let stream_entries: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match &message.protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => Some(entry.object_name.0.as_ref().to_string()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        stream_entries.iter().all(|dn| dn != &first_entry.dn),
+        "cookie should skip the already-replicated entry"
+    );
+    assert!(
+        stream_entries.iter().any(|dn| dn == &second_entry.dn),
+        "cookie should still deliver the new change"
+    );
+
+    handler.abort();
+    let _ = handler.await;
 }

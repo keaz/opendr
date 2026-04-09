@@ -1,10 +1,12 @@
 # Replication Consumer FSM Architecture
 
-This document provides comprehensive documentation for the LDAP Content Synchronization Consumer Finite State Machine implementation, following RFC 4533 specifications.
+This document provides documentation for the LDAP Content Synchronization Consumer Finite State Machine implementation, following RFC 4533 semantics for refresh-and-persist replication.
 
 ## Overview
 
 The Replication Consumer FSM implements the consumer side of LDAP Content Synchronization as defined in RFC 4533. It manages the complete lifecycle of replication consumption: requesting data from a provider, applying batches of entries, persisting state, and listening for real-time changes.
+
+When `enable_change_listening` is enabled, the FSM transitions from refresh into a long-lived listening phase. The listener is started from the freshly persisted cookie so the handoff from refresh to live streaming does not skip changes. If listening is disabled or unavailable, the implementation falls back to periodic refresh cycles.
 
 ### Purpose
 
@@ -109,6 +111,8 @@ The FSM follows a linear progression through well-defined states:
 
 **Error Handling**: Storage failures, permission errors, disk space issues
 
+In the listener-based path, the FSM persists the refreshed cookie before starting the long-lived listener. That lets a reconnect resume from the latest applied point instead of replaying the entire refresh.
+
 ### Listening
 
 **Purpose**: Maintains connection with provider to receive real-time change notifications.
@@ -122,6 +126,8 @@ The FSM follows a linear progression through well-defined states:
 **Typical Duration**: Long-running (hours to days) - persistent connection maintenance
 
 **Error Handling**: Connection drops, notification processing errors, change application failures
+
+The listening state is entered only after the listener has actually been started against the provider. The implementation does not treat a state transition alone as proof that the live stream is active.
 
 ### Completed
 
@@ -347,6 +353,7 @@ impl BatchProcessor for DirectoryBatchProcessor {
 | `heartbeat_interval` | `Duration` | 60s | Interval for provider connection heartbeats |
 | `change_buffer_size` | `usize` | 1000 | Buffer size for change notifications |
 | `state_persistence_timeout` | `Duration` | 10s | Timeout for state persistence operations |
+| `state_storage_path` | `PathBuf` | `./data/replication_state` | Filesystem location used to persist replication cookies |
 
 ### Performance Tuning
 

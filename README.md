@@ -24,11 +24,11 @@ A high-performance, production-ready LDAP v3 server implementation in Rust, feat
 - ✅ **Audit Logging**: Comprehensive security event logging (JSON, syslog, text)
 
 ### Replication ⭐ NEW
-- ✅ **RFC 4533 Compliance**: LDAP Content Synchronization Operation
+- ✅ **RFC 4533 Alignment**: LDAP Content Synchronization semantics for refresh and persist phases
 - ✅ **Provider-Consumer**: Master-slave replication with automatic changelog tracking
 - ✅ **Multi-Master**: Bidirectional replication (both mode)
 - ✅ **Cookie-Based Resume**: Consumers can resume from last known state
-- ✅ **Real-Time Updates**: Continuous synchronization with configurable intervals
+- ✅ **Real-Time Updates**: Listening-based change delivery after the initial refresh
 - ✅ **State Persistence**: Automatic state saving for reliable recovery
 
 ### Enterprise Features
@@ -74,11 +74,8 @@ cargo build --release
 ### Basic Server
 
 ```bash
-# Start with default configuration
+# Start from a working directory that contains config/server.toml and config/log4rs.yml
 ./target/release/opendr
-
-# Or with custom config
-./target/release/opendr --config config/server.toml
 ```
 
 ### Test Operations
@@ -111,80 +108,127 @@ ldapdelete -x -H ldap://localhost:389 -D "cn=admin,dc=example,dc=com" -w passwor
 ## Replication Quick Start
 
 OpenDR supports provider-consumer replication for high availability and load distribution.
+After the initial refresh, consumers keep a live LDAP search open for change delivery when `enable_change_listening = true`; polling remains available as a fallback.
 
-### 1. Set Up Provider (Master)
+### 1. Create Per-Instance Runtime Directories
 
-Create `provider.toml`:
+The `opendr` binary loads `config/server.toml` and `config/log4rs.yml` from its current working directory.
+Run each instance from its own directory so the provider and consumer do not share ports, logs, or data files.
+
+```
+/srv/opendr-provider/
+  config/server.toml
+  config/log4rs.yml
+  data/
+  log/
+
+/srv/opendr-consumer/
+  config/server.toml
+  config/log4rs.yml
+  data/
+  log/
+```
+
+### 2. Configure the Provider
+
+Place this in `/srv/opendr-provider/config/server.toml`:
 
 ```toml
 [server]
-bind_address = "0.0.0.0:389"
+bind_address = "0.0.0.0"
+ldap_port = 1389
 base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "provider_password"
+root_user_dn = "cn=manager"
+root_password = "{SSHA512}<generated-hash>"
+organization_name = "Example Org"
 
 [backend]
-backend_type = "Lmdb"
-lmdb_path = "/var/lib/opendr/provider/data"
+backend_type = "lmdb"
+data_directory = "./data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 126
 
 [replication]
 enabled = true
 mode = "provider"
 changelog_capacity = 100000
+heartbeat_interval_secs = 60
 ```
 
-Start provider:
+### 3. Configure the Consumer
 
-```bash
-./target/release/opendr --config provider.toml
-```
-
-### 2. Set Up Consumer (Replica)
-
-Create `consumer.toml`:
+Place this in `/srv/opendr-consumer/config/server.toml`:
 
 ```toml
 [server]
-bind_address = "0.0.0.0:389"
+bind_address = "0.0.0.0"
+ldap_port = 2389
 base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "consumer_password"
+root_user_dn = "cn=manager"
+root_password = "{SSHA512}<generated-hash>"
+organization_name = "Example Org Replica"
 
 [backend]
-backend_type = "Lmdb"
-lmdb_path = "/var/lib/opendr/consumer/data"
+backend_type = "lmdb"
+data_directory = "./data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 126
 
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider-server:389"
-sync_interval_secs = 30
+provider_url = "ldap://provider-server:1389"
+bind_dn = "cn=manager,dc=example,dc=com"
+bind_password = "replication_password"
+sync_interval_secs = 3600
+max_retry_attempts = 3
+retry_delay_secs = 5
+enable_change_listening = true
+heartbeat_interval_secs = 60
+state_storage_path = "./data/replication_state"
 ```
 
-Start consumer:
+`bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` are still accepted as aliases. In production, point them at a dedicated read-only replication account on the provider.
+
+### 4. Start Both Servers
 
 ```bash
-./target/release/opendr --config consumer.toml
+cp config/log4rs.yml /srv/opendr-provider/config/log4rs.yml
+cp config/log4rs.yml /srv/opendr-consumer/config/log4rs.yml
+
+cd /srv/opendr-provider && opendr
+cd /srv/opendr-consumer && opendr
 ```
 
-### 3. Verify Replication
+For LMDB-backed instances, generate the `{SSHA512}` root password with `opendr-setup` or reuse the generated hash from an existing server config.
 
-Add data to provider:
+### 5. Verify Listener-Based Replication
+
+Add data to the provider:
 
 ```bash
-ldapadd -x -H ldap://provider-server:389 -D "cn=admin,dc=example,dc=com" -w provider_password <<EOF
-dn: cn=Test User,dc=example,dc=com
+ldapadd -x -H ldap://provider-server:1389 \
+  -D "cn=manager,dc=example,dc=com" -w '<provider-root-password>' <<EOF
+dn: uid=replication-test,ou=People,dc=example,dc=com
+objectClass: top
 objectClass: person
-cn: Test User
-sn: User
+objectClass: organizationalPerson
+objectClass: inetOrgPerson
+cn: replication-test
+sn: Test
+uid: replication-test
 EOF
 ```
 
-Verify on consumer (wait ~30 seconds):
+Verify on the consumer:
 
 ```bash
-ldapsearch -x -H ldap://consumer-server:389 -b "dc=example,dc=com" "(cn=Test User)"
+ldapsearch -x -H ldap://consumer-server:2389 \
+  -D "cn=manager,dc=example,dc=com" -w '<consumer-root-password>' \
+  -b "ou=People,dc=example,dc=com" "(uid=replication-test)"
 ```
+
+Listener mode is active when the consumer logs `Replication consumer entered listening mode` and subsequent writes produce `Replicated ADD:` / `Replicated MODIFY:` without waiting for `sync_interval_secs`.
 
 ### Run Demo Script
 
@@ -226,15 +270,18 @@ ldapsearch -x -H ldap://consumer-server:389 -b "dc=example,dc=com" "(cn=Test Use
 
 ```toml
 [server]
-bind_address = "0.0.0.0:389"
+bind_address = "0.0.0.0"
+ldap_port = 389
 base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "secure_password"
+root_user_dn = "cn=manager"
+root_password = "{SSHA512}<generated-hash>"
+organization_name = "Example Org"
 
 [backend]
-backend_type = "Lmdb"
-lmdb_path = "/var/lib/opendr/data"
-lmdb_map_size = 10737418240  # 10GB
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/data"
+lmdb_max_size = 10737418240  # 10GB
+lmdb_max_readers = 126
 
 [tls]
 enabled = true
@@ -294,12 +341,15 @@ entry_cache_size_mb = 512    # Increase for large directories
 schema_cache_size_mb = 100
 
 [backend]
-lmdb_map_size = 21474836480  # 20GB for large directories
-max_readers = 256            # Increase for high concurrency
+lmdb_max_size = 21474836480  # 20GB for large directories
+lmdb_max_readers = 256       # Increase for high concurrency
 
 [replication]
-max_batch_size = 500         # Larger batches for fast networks
-sync_interval_secs = 10      # More frequent updates
+sync_interval_secs = 10      # More frequent refreshes
+enable_change_listening = true
+max_retry_attempts = 3
+retry_delay_secs = 5
+state_storage_path = "/var/lib/opendr/consumer/state"
 ```
 
 See [Performance Optimization Guide](docs/PERFORMANCE_OPTIMIZATION.md) for details.
@@ -356,7 +406,8 @@ After=network.target
 Type=simple
 User=opendr
 Group=opendr
-ExecStart=/usr/local/bin/opendr --config /etc/opendr/server.toml
+WorkingDirectory=/etc/opendr
+ExecStart=/usr/local/bin/opendr
 Restart=always
 RestartSec=10
 KillMode=mixed

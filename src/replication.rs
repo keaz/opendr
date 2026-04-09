@@ -45,11 +45,14 @@
 //! ```
 
 use async_trait::async_trait;
+use base64::Engine;
 use ldap3::{LdapConnAsync, LdapConnSettings};
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::task::JoinHandle;
 
 use crate::backend::DirectoryBackend;
 use crate::csn::{Csn, CsnGenerator};
@@ -192,6 +195,113 @@ impl ChangelogTracker {
             "csn-empty".to_string()
         }
     }
+}
+
+pub const REPLICATION_STREAM_ATTRIBUTE: &str = "opendrReplicationStream";
+pub const REPLICATION_COOKIE_ATTRIBUTE_PREFIX: &str = "opendrReplicationCookie=";
+pub const REPLICATION_EVENT_OBJECT_CLASS: &str = "opendrReplicationEvent";
+pub const REPLICATION_CHANGE_TYPE_ATTRIBUTE: &str = "opendrChangeType";
+pub const REPLICATION_CHANGE_DATA_ATTRIBUTE: &str = "opendrChangeData";
+pub const REPLICATION_CSN_ATTRIBUTE: &str = "opendrChangeCsn";
+
+fn encode_change_bytes(change_type: &ChangeType, dn: &str, change_data: &[u8]) -> Vec<u8> {
+    let change_type_str = match change_type {
+        ChangeType::Add => "add",
+        ChangeType::Modify => "modify",
+        ChangeType::Delete => "delete",
+        ChangeType::Rename => "rename",
+    };
+
+    let header = format!("0|{}|{}|{}|", change_type_str, dn, change_data.len());
+    let mut result = header.into_bytes();
+    result.extend_from_slice(change_data);
+    result
+}
+
+fn encode_directory_entry_as_change(entry: crate::backend::DirectoryEntry) -> Option<Vec<u8>> {
+    match serde_json::to_vec(&entry) {
+        Ok(change_data) => Some(encode_change_bytes(
+            &ChangeType::Add,
+            &entry.dn,
+            &change_data,
+        )),
+        Err(e) => {
+            error!("Failed to serialize replication entry {}: {}", entry.dn, e);
+            None
+        }
+    }
+}
+
+pub fn changelog_entry_to_replication_attrs(
+    entry: &ChangelogEntry,
+) -> Vec<(String, Vec<String>)> {
+    let encoded_data = base64::engine::general_purpose::STANDARD.encode(&entry.change_data);
+    vec![
+        (
+            "objectClass".to_string(),
+            vec![REPLICATION_EVENT_OBJECT_CLASS.to_string()],
+        ),
+        (
+            REPLICATION_CHANGE_TYPE_ATTRIBUTE.to_string(),
+            vec![match entry.change_type {
+                ChangeType::Add => "add",
+                ChangeType::Modify => "modify",
+                ChangeType::Delete => "delete",
+                ChangeType::Rename => "rename",
+            }
+            .to_string()],
+        ),
+        (
+            REPLICATION_CHANGE_DATA_ATTRIBUTE.to_string(),
+            vec![encoded_data],
+        ),
+        (
+            REPLICATION_CSN_ATTRIBUTE.to_string(),
+            vec![entry.csn.to_string()],
+        ),
+    ]
+}
+
+pub fn parse_replication_stream_entry(entry: &ldap3::SearchEntry) -> Result<Vec<u8>, ConsumerError> {
+    let find_attr = |name: &str| {
+        entry.attrs.iter().find_map(|(key, values)| {
+            if key.eq_ignore_ascii_case(name) {
+                values.first()
+            } else {
+                None
+            }
+        })
+    };
+
+    let change_type = find_attr(REPLICATION_CHANGE_TYPE_ATTRIBUTE)
+        .ok_or_else(|| ConsumerError::ListeningError {
+            message: "Replication stream entry missing change type".to_string(),
+        })?;
+
+    let encoded_change = find_attr(REPLICATION_CHANGE_DATA_ATTRIBUTE)
+        .ok_or_else(|| ConsumerError::ListeningError {
+            message: "Replication stream entry missing change payload".to_string(),
+        })?;
+
+    let change_data = base64::engine::general_purpose::STANDARD
+        .decode(encoded_change)
+        .map_err(|e| ConsumerError::ListeningError {
+            message: format!("Failed to decode replication payload: {}", e),
+        })?;
+
+    let change_type = match change_type.to_lowercase().as_str() {
+        "add" => ChangeType::Add,
+        "modify" => ChangeType::Modify,
+        "delete" => ChangeType::Delete,
+        "rename" => ChangeType::Rename,
+        other => {
+            return Err(ConsumerError::ListeningError {
+                message: format!("Unknown replication change type: {}", other),
+            })
+        }
+    };
+
+    Ok(encode_change_bytes(&change_type, &entry.dn, &change_data))
 }
 
 // ================================================================================================
@@ -455,17 +565,37 @@ pub struct ProviderConnectionImpl {
     ldap_connection: Arc<Mutex<Option<ldap3::Ldap>>>,
     bind_dn: Option<String>,
     bind_password: Option<String>,
+    base_dn: String,
 }
 
 impl ProviderConnectionImpl {
     pub fn new(changelog_provider: Arc<dyn ChangelogProvider>) -> Self {
-        Self::with_credentials(changelog_provider, None, None)
+        Self::with_credentials_and_base(
+            changelog_provider,
+            None,
+            None,
+            "dc=example,dc=com".to_string(),
+        )
     }
 
     pub fn with_credentials(
         changelog_provider: Arc<dyn ChangelogProvider>,
         bind_dn: Option<String>,
         bind_password: Option<String>,
+    ) -> Self {
+        Self::with_credentials_and_base(
+            changelog_provider,
+            bind_dn,
+            bind_password,
+            "dc=example,dc=com".to_string(),
+        )
+    }
+
+    pub fn with_credentials_and_base(
+        changelog_provider: Arc<dyn ChangelogProvider>,
+        bind_dn: Option<String>,
+        bind_password: Option<String>,
+        base_dn: String,
     ) -> Self {
         Self {
             provider_url: Arc::new(Mutex::new(None)),
@@ -474,6 +604,7 @@ impl ProviderConnectionImpl {
             ldap_connection: Arc::new(Mutex::new(None)),
             bind_dn,
             bind_password,
+            base_dn,
         }
     }
 }
@@ -481,6 +612,12 @@ impl ProviderConnectionImpl {
 #[async_trait]
 impl ProviderConnection for ProviderConnectionImpl {
     async fn connect(&self, url: &str) -> Result<(), ConsumerError> {
+        if url.starts_with("local://") || url.starts_with("in-memory://") {
+            *self.provider_url.lock().unwrap() = Some(url.to_string());
+            *self.connected.lock().unwrap() = true;
+            return Ok(());
+        }
+
         // Parse URL to ensure it's valid
         if !url.starts_with("ldap://") && !url.starts_with("ldaps://") {
             return Err(ConsumerError::ConnectionError {
@@ -555,8 +692,27 @@ impl ProviderConnection for ProviderConnectionImpl {
         let has_ldap = self.ldap_connection.lock().unwrap().is_some();
 
         if !has_ldap {
-            warn!("No LDAP connection available, using local changelog provider (may be empty)");
-            // Fallback to local changelog if no LDAP connection (for testing)
+            if cookie.is_none() || matches!(cookie, Some("csn-empty")) {
+                let entries = self
+                    .changelog_provider
+                    .get_all_entries(&self.base_dn, None)
+                    .await
+                    .map_err(|e| ConsumerError::ConnectionError { message: e })?;
+
+                return Ok(entries
+                    .into_iter()
+                    .filter(|entry| entry.dn != self.base_dn && !entry.dn.starts_with("ou="))
+                    .filter_map(|entry| {
+                        let backend_entry = crate::backend::DirectoryEntry {
+                            dn: entry.dn,
+                            attributes: entry.attributes,
+                            operational_attributes: crate::backend::OperationalAttributes::new(),
+                        };
+                        encode_directory_entry_as_change(backend_entry)
+                    })
+                    .collect());
+            }
+
             let entries = self
                 .changelog_provider
                 .get_changelog_since(cookie, 100)
@@ -565,26 +721,7 @@ impl ProviderConnection for ProviderConnectionImpl {
 
             return Ok(entries
                 .iter()
-                .map(|e| {
-                    let change_type_str = match e.change_type {
-                        ChangeType::Add => "add",
-                        ChangeType::Modify => "modify",
-                        ChangeType::Delete => "delete",
-                        ChangeType::Rename => "rename",
-                    };
-
-                    let header = format!(
-                        "{}|{}|{}|{}|",
-                        e.csn,
-                        change_type_str,
-                        e.dn,
-                        e.change_data.len()
-                    );
-
-                    let mut result = header.into_bytes();
-                    result.extend_from_slice(&e.change_data);
-                    result
-                })
+                .map(|entry| encode_change_bytes(&entry.change_type, &entry.dn, &entry.change_data))
                 .collect());
         }
 
@@ -619,12 +756,11 @@ impl ProviderConnection for ProviderConnectionImpl {
         // Build search filter
         // NOTE: entryCSN comparison via LDAP filter is complex and not well-supported
         // We fetch all entries and filter on the consumer side based on entryCSN
-        let base_dn = "dc=example,dc=com"; // TODO: Get from config
         let filter = "(objectClass=*)";
 
         let (rs, _res) = ldap
             .search(
-                base_dn,
+                &self.base_dn,
                 Scope::Subtree,
                 filter,
                 vec!["*", "entryCSN"], // Request all attributes including entryCSN
@@ -645,7 +781,6 @@ impl ProviderConnection for ProviderConnectionImpl {
 
         // Convert LDAP search results to changelog format
         use ldap3::SearchEntry;
-        use serde_json;
 
         let result: Vec<Vec<u8>> = rs
             .into_iter()
@@ -663,14 +798,14 @@ impl ProviderConnection for ProviderConnectionImpl {
                 }
 
                 // Skip base DN and organizational units (they should already exist)
-                if dn == base_dn || dn.starts_with("ou=") {
+                if dn == self.base_dn || dn.starts_with("ou=") {
                     return None;
                 }
 
                 // Filter by entryCSN if we have a cookie
                 if let Some(ref cookie_csn_str) = cookie_csn {
                     // Get entryCSN from the entry
-                    if let Some(entry_csn_values) = search_entry.attrs.get("entryCSN") {
+                    if let Some(entry_csn_values) = search_entry.attrs.get("entryCSN").or_else(|| search_entry.attrs.get("entrycsn")) {
                         if let Some(entry_csn_str) = entry_csn_values.first() {
                             // Compare CSNs as strings (they are formatted to be sortable)
                             // Cookie CSN format: timestamp#replica_id#seq#mod
@@ -705,21 +840,7 @@ impl ProviderConnection for ProviderConnectionImpl {
                     operational_attributes: crate::backend::OperationalAttributes::new(),
                 };
 
-                // Serialize to JSON
-                let change_data = match serde_json::to_vec(&dir_entry) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        error!("Failed to serialize entry {}: {}", dn, e);
-                        return None;
-                    }
-                };
-
-                // Format: sequence|change_type|dn|len|data
-                let header = format!("0|add|{}|{}|", dn, change_data.len());
-                let mut result = header.into_bytes();
-                result.extend_from_slice(&change_data);
-
-                Some(result)
+                encode_directory_entry_as_change(dir_entry)
             })
             .collect();
 
@@ -1107,7 +1228,7 @@ impl ChangeListenerImpl {
 
 #[async_trait]
 impl ChangeListener for ChangeListenerImpl {
-    async fn start_listening(&self) -> Result<(), ConsumerError> {
+    async fn start_listening(&self, _cookie: Option<&str>) -> Result<(), ConsumerError> {
         *self.listening.lock().unwrap() = true;
         Ok(())
     }
@@ -1132,9 +1253,291 @@ impl ChangeListener for ChangeListenerImpl {
     }
 }
 
+/// Change listener backed by an in-process broadcast stream.
+pub struct BroadcastChangeListener {
+    listening: Arc<Mutex<bool>>,
+    stats: Arc<Mutex<ListeningStats>>,
+    receiver: Arc<AsyncMutex<broadcast::Receiver<ChangelogEntry>>>,
+}
+
+impl BroadcastChangeListener {
+    pub fn new(receiver: broadcast::Receiver<ChangelogEntry>) -> Self {
+        Self {
+            listening: Arc::new(Mutex::new(false)),
+            stats: Arc::new(Mutex::new(ListeningStats::new())),
+            receiver: Arc::new(AsyncMutex::new(receiver)),
+        }
+    }
+}
+
+#[async_trait]
+impl ChangeListener for BroadcastChangeListener {
+    async fn start_listening(&self, _cookie: Option<&str>) -> Result<(), ConsumerError> {
+        *self.listening.lock().unwrap() = true;
+        Ok(())
+    }
+
+    async fn receive_change(&self) -> Result<Option<Vec<u8>>, ConsumerError> {
+        if !*self.listening.lock().unwrap() {
+            return Ok(None);
+        }
+
+        let mut receiver = self.receiver.lock().await;
+        match tokio::time::timeout(std::time::Duration::from_millis(250), receiver.recv()).await {
+            Ok(Ok(change)) => {
+                let encoded = encode_change_bytes(&change.change_type, &change.dn, &change.change_data);
+                self.stats.lock().unwrap().record_change(encoded.len());
+                Ok(Some(encoded))
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                self.stats.lock().unwrap().record_error();
+                Ok(None)
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) => Ok(None),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn stop_listening(&self) -> Result<(), ConsumerError> {
+        *self.listening.lock().unwrap() = false;
+        Ok(())
+    }
+
+    async fn is_listening(&self) -> Result<bool, ConsumerError> {
+        Ok(*self.listening.lock().unwrap())
+    }
+
+    async fn get_listening_stats(&self) -> Result<ListeningStats, ConsumerError> {
+        Ok(self.stats.lock().unwrap().clone())
+    }
+}
+
+/// Change listener backed by a long-lived LDAP search stream.
+pub struct LdapChangeListener {
+    provider_url: String,
+    base_dn: String,
+    bind_dn: Option<String>,
+    bind_password: Option<String>,
+    listening: Arc<Mutex<bool>>,
+    stats: Arc<Mutex<ListeningStats>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    change_rx: Arc<AsyncMutex<mpsc::Receiver<Vec<u8>>>>,
+    change_tx: mpsc::Sender<Vec<u8>>,
+    task_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl LdapChangeListener {
+    pub fn new(
+        provider_url: String,
+        base_dn: String,
+        bind_dn: Option<String>,
+        bind_password: Option<String>,
+        buffer_size: usize,
+    ) -> Self {
+        let (change_tx, change_rx) = mpsc::channel(buffer_size);
+        Self {
+            provider_url,
+            base_dn,
+            bind_dn,
+            bind_password,
+            listening: Arc::new(Mutex::new(false)),
+            stats: Arc::new(Mutex::new(ListeningStats::new())),
+            last_error: Arc::new(Mutex::new(None)),
+            change_rx: Arc::new(AsyncMutex::new(change_rx)),
+            change_tx,
+            task_handle: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait]
+impl ChangeListener for LdapChangeListener {
+    async fn start_listening(&self, cookie: Option<&str>) -> Result<(), ConsumerError> {
+        if *self.listening.lock().unwrap() {
+            return Ok(());
+        }
+
+        *self.last_error.lock().unwrap() = None;
+
+        let provider_url = self.provider_url.clone();
+        let base_dn = self.base_dn.clone();
+        let bind_dn = self.bind_dn.clone();
+        let bind_password = self.bind_password.clone();
+        let listening = self.listening.clone();
+        let stats = self.stats.clone();
+        let last_error = self.last_error.clone();
+        let change_tx = self.change_tx.clone();
+        let cookie = cookie.map(str::to_string);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+
+        let handle = tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+            let settings =
+                LdapConnSettings::new().set_conn_timeout(std::time::Duration::from_secs(5));
+            let (conn, mut ldap) = match LdapConnAsync::with_settings(settings, &provider_url).await
+            {
+                Ok(connection) => connection,
+                Err(e) => {
+                    let message =
+                        format!("Failed to create LDAP change listener connection: {}", e);
+                    *last_error.lock().unwrap() = Some(message.clone());
+                    error!("{}", message);
+                    if let Some(sender) = ready_tx.take() {
+                        let _ = sender.send(Err(message));
+                    }
+                    return;
+                }
+            };
+
+            tokio::spawn(async move {
+                if let Err(e) = conn.drive().await {
+                    error!("LDAP change listener driver error: {}", e);
+                }
+            });
+
+            let bind_dn = bind_dn.as_deref().unwrap_or("");
+            let bind_password = bind_password.as_deref().unwrap_or("");
+            if let Err(e) = ldap
+                .simple_bind(bind_dn, bind_password)
+                .await
+                .and_then(|result| result.success())
+            {
+                let message = format!("Failed to bind LDAP change listener: {}", e);
+                *last_error.lock().unwrap() = Some(message.clone());
+                error!("{}", message);
+                if let Some(sender) = ready_tx.take() {
+                    let _ = sender.send(Err(message));
+                }
+                return;
+            }
+
+            let mut attrs = vec![REPLICATION_STREAM_ATTRIBUTE.to_string()];
+            if let Some(cookie) = cookie {
+                attrs.push(format!("{}{}", REPLICATION_COOKIE_ATTRIBUTE_PREFIX, cookie));
+            }
+
+            let mut search = match ldap
+                .streaming_search(&base_dn, ldap3::Scope::Base, "(objectClass=*)", attrs)
+                .await
+            {
+                Ok(search) => search,
+                Err(e) => {
+                    let message = format!("Failed to start LDAP replication stream: {}", e);
+                    *last_error.lock().unwrap() = Some(message.clone());
+                    error!("{}", message);
+                    if let Some(sender) = ready_tx.take() {
+                        let _ = sender.send(Err(message));
+                    }
+                    return;
+                }
+            };
+
+            *listening.lock().unwrap() = true;
+            if let Some(sender) = ready_tx.take() {
+                let _ = sender.send(Ok(()));
+            }
+
+            loop {
+                if !*listening.lock().unwrap() {
+                    break;
+                }
+
+                match search.next().await {
+                    Ok(Some(entry)) => match parse_replication_stream_entry(&ldap3::SearchEntry::construct(entry)) {
+                        Ok(change) => {
+                            if change_tx.send(change).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            stats.lock().unwrap().record_error();
+                            warn!("Skipping invalid replication stream entry: {}", e);
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        stats.lock().unwrap().record_error();
+                        let message = format!("LDAP replication stream ended with error: {}", e);
+                        *last_error.lock().unwrap() = Some(message.clone());
+                        warn!("{}", message);
+                        break;
+                    }
+                }
+            }
+
+            *listening.lock().unwrap() = false;
+            if last_error.lock().unwrap().is_none() {
+                *last_error.lock().unwrap() = Some("LDAP replication stream ended".to_string());
+            }
+            let _ = search.finish().await;
+            let _ = ldap.unbind().await;
+        });
+
+        *self.task_handle.lock().unwrap() = Some(handle);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(message))) => Err(ConsumerError::ListeningError { message }),
+            Ok(Err(_)) => Err(ConsumerError::ListeningError {
+                message: "LDAP change listener startup channel closed".to_string(),
+            }),
+            Err(_) => Err(ConsumerError::ListeningError {
+                message: "Timed out waiting for LDAP change listener startup".to_string(),
+            }),
+        }
+    }
+
+    async fn receive_change(&self) -> Result<Option<Vec<u8>>, ConsumerError> {
+        if let Some(message) = self.last_error.lock().unwrap().take() {
+            return Err(ConsumerError::ListeningError { message });
+        }
+
+        if !*self.listening.lock().unwrap() {
+            return Ok(None);
+        }
+
+        let mut receiver = self.change_rx.lock().await;
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(250), receiver.recv()).await;
+
+        if let Some(message) = self.last_error.lock().unwrap().take() {
+            return Err(ConsumerError::ListeningError { message });
+        }
+
+        match received {
+            Ok(Some(change)) => {
+                self.stats.lock().unwrap().record_change(change.len());
+                Ok(Some(change))
+            }
+            Ok(None) => Err(ConsumerError::ListeningError {
+                message: "LDAP replication stream closed".to_string(),
+            }),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn stop_listening(&self) -> Result<(), ConsumerError> {
+        *self.listening.lock().unwrap() = false;
+        *self.last_error.lock().unwrap() = None;
+        if let Some(handle) = self.task_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    async fn is_listening(&self) -> Result<bool, ConsumerError> {
+        Ok(*self.listening.lock().unwrap())
+    }
+
+    async fn get_listening_stats(&self) -> Result<ListeningStats, ConsumerError> {
+        Ok(self.stats.lock().unwrap().clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::broadcast;
 
     #[test]
     fn test_changelog_tracker_basic() {
@@ -1206,5 +1609,86 @@ mod tests {
 
         // Latest entry should still be there (check contextCSN exists)
         assert!(tracker.get_context_csn().is_some());
+    }
+
+    #[test]
+    fn test_parse_replication_stream_entry_round_trip() {
+        let change = ChangelogEntry::new(
+            crate::csn::CsnGenerator::new(7).generate(),
+            ChangeType::Modify,
+            "cn=stream-user,dc=example,dc=org".to_string(),
+            br#"{"op":"modify"}"#.to_vec(),
+        );
+
+        let attrs = changelog_entry_to_replication_attrs(&change)
+            .into_iter()
+            .map(|(name, values)| (name.to_lowercase(), values))
+            .collect::<HashMap<_, _>>();
+        let entry = ldap3::SearchEntry {
+            dn: change.dn.clone(),
+            attrs,
+            bin_attrs: HashMap::new(),
+        };
+
+        let encoded = parse_replication_stream_entry(&entry).unwrap();
+
+        assert_eq!(
+            encoded,
+            encode_change_bytes(&change.change_type, &change.dn, &change.change_data)
+        );
+    }
+
+    #[test]
+    fn test_parse_replication_stream_entry_preserves_mixed_case_attrs() {
+        let change = ChangelogEntry::new(
+            crate::csn::CsnGenerator::new(9).generate(),
+            ChangeType::Add,
+            "cn=case-user,dc=example,dc=org".to_string(),
+            br#"{"op":"add"}"#.to_vec(),
+        );
+
+        let attrs = changelog_entry_to_replication_attrs(&change)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let entry = ldap3::SearchEntry {
+            dn: change.dn.clone(),
+            attrs,
+            bin_attrs: HashMap::new(),
+        };
+
+        let encoded = parse_replication_stream_entry(&entry).unwrap();
+
+        assert_eq!(
+            encoded,
+            encode_change_bytes(&change.change_type, &change.dn, &change.change_data)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_change_listener_yields_encoded_changes() {
+        let (sender, receiver) = broadcast::channel(8);
+        let listener = BroadcastChangeListener::new(receiver);
+        let change = ChangelogEntry::new(
+            crate::csn::CsnGenerator::new(3).generate(),
+            ChangeType::Add,
+            "cn=live-user,dc=example,dc=org".to_string(),
+            br#"{"dn":"cn=live-user,dc=example,dc=org"}"#.to_vec(),
+        );
+
+        listener
+            .start_listening(Some("csn-previous-cookie"))
+            .await
+            .unwrap();
+        sender.send(change.clone()).unwrap();
+
+        let encoded = listener.receive_change().await.unwrap().unwrap();
+        let stats = listener.get_listening_stats().await.unwrap();
+
+        assert_eq!(
+            encoded,
+            encode_change_bytes(&change.change_type, &change.dn, &change.change_data)
+        );
+        assert_eq!(stats.changes_received, 1);
+        assert!(stats.bytes_received >= change.change_data.len());
     }
 }
