@@ -941,65 +941,58 @@ impl ReplicationConsumerFsmImpl {
 
         let entry_count = entries.len();
 
-        // If we received entries, process them immediately
-        if !entries.is_empty() {
-            // Transition to applying changes state
-            self.state = ReplicationConsumerState::ApplyingChanges { entries_applied: 0 };
+        let initial_sync_result: Result<(), ConsumerError> = async {
+            if !entries.is_empty() {
+                self.state = ReplicationConsumerState::ApplyingChanges { entries_applied: 0 };
 
-            log::info!("Processing batch of {} entries", entry_count);
+                log::info!("Processing batch of {} entries", entry_count);
 
-            // Process the batch
-            self.batch_processor
-                .process_batch(entries)
-                .await
-                .map_err(|e| ConsumerError::ProcessingError {
-                    message: format!("Failed to process batch: {}", e),
-                })?;
+                self.batch_processor
+                    .process_batch(entries)
+                    .await
+                    .map_err(|e| ConsumerError::ProcessingError {
+                        message: format!("Failed to process batch: {}", e),
+                    })?;
 
-            // After successfully processing entries, get the new contextCSN from backend
-            // and persist it as our replication cookie
-            match self.batch_processor.get_context_csn().await {
-                Ok(Some(csn)) => {
-                    // Generate cookie from contextCSN
-                    let new_cookie = format!("csn-{}", csn);
-                    log::info!(
-                        "Generated new replication cookie from contextCSN: {}",
-                        new_cookie
-                    );
+                let csn = self
+                    .batch_processor
+                    .get_context_csn()
+                    .await
+                    .map_err(|e| ConsumerError::StateError {
+                        message: format!("Failed to get contextCSN from backend: {}", e),
+                    })?
+                    .ok_or_else(|| ConsumerError::StateError {
+                        message: "No contextCSN available from backend after processing entries"
+                            .to_string(),
+                    })?;
 
-                    // Transition to persisting state
-                    self.state = ReplicationConsumerState::PersistingState {
-                        new_cookie: new_cookie.clone(),
-                    };
+                let new_cookie = format!("csn-{}", csn);
+                log::info!(
+                    "Generated new replication cookie from contextCSN: {}",
+                    new_cookie
+                );
 
-                    // Persist the cookie
-                    match self.state_manager.save_cookie(&new_cookie).await {
-                        Ok(()) => {
-                            log::info!("Successfully persisted replication cookie");
-                            self.current_cookie = Some(new_cookie.clone());
-                        }
-                        Err(e) => {
-                            log::error!("Failed to persist replication cookie: {}", e);
-                            // Don't fail the whole sync, but log the error
-                        }
-                    }
-                }
-                Ok(None) => {
-                    log::warn!("No contextCSN available from backend after processing entries");
-                }
-                Err(e) => {
-                    log::error!("Failed to get contextCSN from backend: {}", e);
-                }
-            }
-        } else {
-            // No entries means we're already up to date
-            // If we have a cookie, just keep using it
-            if let Some(ref cookie) = cookie {
+                self.state = ReplicationConsumerState::PersistingState {
+                    new_cookie: new_cookie.clone(),
+                };
+
+                self.state_manager
+                    .save_cookie(&new_cookie)
+                    .await
+                    .map_err(|e| ConsumerError::StateError {
+                        message: format!("Failed to persist replication cookie: {}", e),
+                    })?;
+                log::info!("Successfully persisted replication cookie");
+                self.current_cookie = Some(new_cookie);
+            } else if let Some(ref cookie) = cookie {
                 log::info!("No new entries, already synchronized (cookie: {})", cookie);
             } else {
                 log::info!("No entries available on provider");
             }
+
+            Ok(())
         }
+        .await;
 
         if let Err(e) = self.provider_connection.disconnect().await {
             log::warn!(
@@ -1007,6 +1000,8 @@ impl ReplicationConsumerFsmImpl {
                 e
             );
         }
+
+        initial_sync_result?;
 
         if self.config.enable_change_listening {
             let current_cookie = self.current_cookie.clone();
@@ -1124,7 +1119,6 @@ impl ReplicationConsumerFsmImpl {
 
         // If no more batches, transition to persisting state
         let new_cookie = format!("consumer-cookie-{}", self.entries_applied);
-        self.current_cookie = Some(new_cookie.clone());
         self.state = ReplicationConsumerState::PersistingState { new_cookie };
 
         Ok(Some(1))
@@ -2092,6 +2086,58 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_consumption_batch_failure_keeps_existing_cookie() {
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new().with_failure());
+        let state_manager = Box::new(MockStateManager::new());
+        let change_listener = Box::new(MockChangeListener::new());
+
+        let mut fsm = ReplicationConsumerFsmImpl::new(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: Some("resume-cookie".to_string()),
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
+        assert!(!fsm.is_listening());
+    }
+
+    #[tokio::test]
+    async fn test_start_consumption_save_failure_is_fatal_and_cookie_unchanged() {
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager = Box::new(MockStateManager::new().with_failure());
+        let change_listener = Box::new(MockChangeListener::new());
+
+        let mut fsm = ReplicationConsumerFsmImpl::new(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: Some("resume-cookie".to_string()),
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
+        assert!(!fsm.is_listening());
+    }
+
+    #[tokio::test]
     async fn test_batch_received_success() {
         let mut fsm = create_test_fsm();
 
@@ -2152,6 +2198,23 @@ pub mod tests {
             ReplicationConsumerState::PersistingState { .. }
         ));
         assert_eq!(fsm.entries_applied(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_entry_applied_does_not_advance_cookie_before_persist() {
+        let mut fsm = create_test_fsm();
+        fsm.state = ReplicationConsumerState::ApplyingChanges { entries_applied: 0 };
+        fsm.current_cookie = Some("resume-cookie".to_string());
+
+        fsm.handle_event(ReplicationConsumerEvent::EntryApplied)
+            .await
+            .unwrap();
+
+        assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
+        assert!(matches!(
+            fsm.current_state(),
+            ReplicationConsumerState::PersistingState { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2243,6 +2306,34 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_state_persisted_save_failure_does_not_change_cookie() {
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager = Box::new(MockStateManager::new().with_failure());
+        let change_listener = Box::new(MockChangeListener::new());
+
+        let mut fsm = ReplicationConsumerFsmImpl::new(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+        );
+        fsm.state = ReplicationConsumerState::PersistingState {
+            new_cookie: "new-cookie-456".to_string(),
+        };
+        fsm.current_cookie = Some("resume-cookie".to_string());
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StatePersisted {
+                cookie: "new-cookie-456".to_string(),
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
+    }
+
+    #[tokio::test]
     async fn test_change_received_success() {
         let mut fsm = create_test_fsm();
 
@@ -2264,6 +2355,34 @@ pub mod tests {
             ReplicationConsumerState::Listening
         ));
         assert_eq!(fsm.entries_applied(), 2); // 1 from batch + 1 from change
+    }
+
+    #[tokio::test]
+    async fn test_change_received_apply_failure_is_fatal_and_cookie_unchanged() {
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new().with_failure());
+        let state_manager = Box::new(MockStateManager::new());
+        let change_listener = Box::new(MockChangeListener::new());
+
+        let mut fsm = ReplicationConsumerFsmImpl::new(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+        );
+        fsm.state = ReplicationConsumerState::Listening;
+        fsm.entries_applied = 3;
+        fsm.current_cookie = Some("resume-cookie".to_string());
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::ChangeReceived(
+                b"change data".to_vec(),
+            ))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
+        assert_eq!(fsm.entries_applied(), 3);
     }
 
     #[tokio::test]

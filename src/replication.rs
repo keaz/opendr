@@ -250,6 +250,23 @@ fn replicated_password(entry: &crate::backend::DirectoryEntry) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+fn replication_entries_match(
+    existing: &crate::backend::DirectoryEntry,
+    desired: &crate::backend::DirectoryEntry,
+) -> bool {
+    existing.dn == desired.dn && existing.attributes == desired.attributes
+}
+
+fn replication_target_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {
+    if let Some(superior) = new_superior {
+        format!("{new_rdn},{superior}")
+    } else if let Some((_, rest)) = dn.split_once(',') {
+        format!("{new_rdn},{rest}")
+    } else {
+        new_rdn.to_string()
+    }
+}
+
 fn encode_change_bytes(change_type: &ChangeType, dn: &str, change_data: &[u8]) -> Vec<u8> {
     let change_type_str = match change_type {
         ChangeType::Add => "add",
@@ -1036,57 +1053,90 @@ impl BatchProcessor for BatchProcessorImpl {
         };
 
         // Apply the change to backend based on change type
-        use log::{info, warn};
+        use log::info;
 
         match change_type_str {
             "add" => {
-                // Deserialize entry data and add to backend
-                if let Ok(entry_json) = std::str::from_utf8(change_data) {
-                    if let Ok(dir_entry) =
-                        serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json)
-                    {
-                        let password = replicated_password(&dir_entry);
-                        match self.backend.add_entry(dir_entry, password).await {
-                            Ok(_) => {
-                                info!("Replicated ADD: {}", dn);
+                let entry_json = std::str::from_utf8(change_data).map_err(|e| {
+                    ConsumerError::ProcessingError {
+                        message: format!("Invalid UTF-8 in entry data for {dn}: {e}"),
+                    }
+                })?;
+                let dir_entry = serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json)
+                    .map_err(|e| ConsumerError::ProcessingError {
+                        message: format!("Failed to deserialize entry data for {dn}: {e}"),
+                    })?;
+                let password = replicated_password(&dir_entry);
+                match self.backend.add_entry(dir_entry.clone(), password).await {
+                    Ok(_) => {
+                        info!("Replicated ADD: {}", dn);
+                    }
+                    Err(crate::backend::BackendError::AlreadyExists) => {
+                        let existing = self.backend.get_entry(dn).await.map_err(|e| {
+                            ConsumerError::ProcessingError {
+                                message: format!(
+                                    "Failed to verify existing ADD target for {dn}: {e}"
+                                ),
                             }
-                            Err(e) => {
-                                warn!("Failed to replicate ADD for {}: {:?}", dn, e);
+                        })?;
+                        match existing {
+                            Some(existing_entry)
+                                if replication_entries_match(&existing_entry, &dir_entry) =>
+                            {
+                                info!("Replicated ADD already applied: {}", dn);
+                            }
+                            Some(_) => {
+                                return Err(ConsumerError::ProcessingError {
+                                    message: format!(
+                                        "Conflicting entry already exists while replaying ADD for {dn}"
+                                    ),
+                                });
+                            }
+                            None => {
+                                return Err(ConsumerError::ProcessingError {
+                                    message: format!(
+                                        "Backend reported existing ADD target for {dn}, but no entry was found"
+                                    ),
+                                });
                             }
                         }
-                    } else {
-                        warn!("Failed to deserialize entry data for: {}", dn);
                     }
-                } else {
-                    warn!("Invalid UTF-8 in entry data for: {}", dn);
+                    Err(e) => {
+                        return Err(ConsumerError::ProcessingError {
+                            message: format!("Failed to replicate ADD for {dn}: {e}"),
+                        });
+                    }
                 }
             }
             "modify" => {
-                // For modify, we need to apply modifications
-                if let Ok(entry_json) = std::str::from_utf8(change_data) {
-                    if let Ok(dir_entry) =
-                        serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json)
-                    {
-                        // Convert attributes to Modification format
-                        use crate::backend::{Modification, ModifyOperation};
-                        let modifications: Vec<Modification> = dir_entry
-                            .attributes
-                            .iter()
-                            .map(|(attr, values)| Modification {
-                                operation: ModifyOperation::Replace,
-                                attribute: attr.clone(),
-                                values: values.clone(),
-                            })
-                            .collect();
+                let entry_json = std::str::from_utf8(change_data).map_err(|e| {
+                    ConsumerError::ProcessingError {
+                        message: format!("Invalid UTF-8 in modify data for {dn}: {e}"),
+                    }
+                })?;
+                let dir_entry = serde_json::from_str::<crate::backend::DirectoryEntry>(entry_json)
+                    .map_err(|e| ConsumerError::ProcessingError {
+                        message: format!("Failed to deserialize modify data for {dn}: {e}"),
+                    })?;
+                use crate::backend::{Modification, ModifyOperation};
+                let modifications: Vec<Modification> = dir_entry
+                    .attributes
+                    .iter()
+                    .map(|(attr, values)| Modification {
+                        operation: ModifyOperation::Replace,
+                        attribute: attr.clone(),
+                        values: values.clone(),
+                    })
+                    .collect();
 
-                        match self.backend.modify_entry(dn, modifications).await {
-                            Ok(_) => {
-                                info!("Replicated MODIFY: {}", dn);
-                            }
-                            Err(e) => {
-                                warn!("Failed to replicate MODIFY for {}: {:?}", dn, e);
-                            }
-                        }
+                match self.backend.modify_entry(dn, modifications).await {
+                    Ok(_) => {
+                        info!("Replicated MODIFY: {}", dn);
+                    }
+                    Err(e) => {
+                        return Err(ConsumerError::ProcessingError {
+                            message: format!("Failed to replicate MODIFY for {dn}: {e}"),
+                        });
                     }
                 }
             }
@@ -1094,22 +1144,62 @@ impl BatchProcessor for BatchProcessorImpl {
                 Ok(_) => {
                     info!("Replicated DELETE: {}", dn);
                 }
+                Err(crate::backend::BackendError::NotFound) => {
+                    info!("Replicated DELETE already applied: {}", dn);
+                }
                 Err(e) => {
-                    warn!("Failed to replicate DELETE for {}: {:?}", dn, e);
+                    return Err(ConsumerError::ProcessingError {
+                        message: format!("Failed to replicate DELETE for {dn}: {e}"),
+                    });
                 }
             },
             "rename" => {
                 let rename = decode_rename_change(change_data)?;
+                let target_dn =
+                    replication_target_dn(dn, &rename.new_rdn, rename.new_superior.as_deref());
                 match self
                     .backend
-                    .rename_entry(dn, &rename.new_rdn, rename.delete_old, rename.new_superior)
+                    .rename_entry(
+                        dn,
+                        &rename.new_rdn,
+                        rename.delete_old,
+                        rename.new_superior.clone(),
+                    )
                     .await
                 {
                     Ok(_) => {
                         info!("Replicated RENAME: {}", dn);
                     }
+                    Err(crate::backend::BackendError::NotFound)
+                    | Err(crate::backend::BackendError::AlreadyExists) => {
+                        let old_entry = self.backend.get_entry(dn).await.map_err(|e| {
+                            ConsumerError::ProcessingError {
+                                message: format!(
+                                    "Failed to verify replayed RENAME source for {dn}: {e}"
+                                ),
+                            }
+                        })?;
+                        let new_entry = self.backend.get_entry(&target_dn).await.map_err(|e| {
+                            ConsumerError::ProcessingError {
+                                message: format!(
+                                    "Failed to verify replayed RENAME target for {target_dn}: {e}"
+                                ),
+                            }
+                        })?;
+                        if old_entry.is_none() && new_entry.is_some() {
+                            info!("Replicated RENAME already applied: {} -> {}", dn, target_dn);
+                        } else {
+                            return Err(ConsumerError::ProcessingError {
+                                message: format!(
+                                    "Failed to replicate RENAME for {dn}: target state does not match replay expectations"
+                                ),
+                            });
+                        }
+                    }
                     Err(e) => {
-                        warn!("Failed to replicate RENAME for {}: {:?}", dn, e);
+                        return Err(ConsumerError::ProcessingError {
+                            message: format!("Failed to replicate RENAME for {dn}: {e}"),
+                        });
                     }
                 }
             }
@@ -1183,9 +1273,6 @@ impl StateManagerImpl {
 #[async_trait]
 impl StateManager for StateManagerImpl {
     async fn save_cookie(&self, cookie: &str) -> Result<(), ConsumerError> {
-        // Update in-memory cache
-        *self.cookie.lock().unwrap() = Some(cookie.to_string());
-
         // Ensure storage directory exists
         self.ensure_storage_dir()?;
 
@@ -1207,6 +1294,7 @@ impl StateManager for StateManagerImpl {
                 message: format!("Failed to rename cookie file: {}", e),
             })?;
 
+        *self.cookie.lock().unwrap() = Some(cookie.to_string());
         log::info!("Saved replication cookie to {}", cookie_path.display());
         Ok(())
     }
@@ -1623,8 +1711,87 @@ impl ChangeListener for LdapChangeListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, MockBackend};
+    use ldap_parser::ldap::SearchScope;
     use std::collections::HashMap;
     use tokio::sync::broadcast;
+
+    struct DeleteFailingBackend {
+        inner: MockBackend,
+        fail_dn: String,
+    }
+
+    #[async_trait]
+    impl DirectoryBackend for DeleteFailingBackend {
+        async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError> {
+            self.inner.authenticate(dn, password).await
+        }
+
+        async fn get_entry(&self, dn: &str) -> Result<Option<DirectoryEntry>, BackendError> {
+            self.inner.get_entry(dn).await
+        }
+
+        async fn add_entry(
+            &self,
+            entry: DirectoryEntry,
+            password: Vec<u8>,
+        ) -> Result<(), BackendError> {
+            self.inner.add_entry(entry, password).await
+        }
+
+        async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
+            if dn == self.fail_dn {
+                Err(BackendError::Storage("forced delete failure".to_string()))
+            } else {
+                self.inner.delete_entry(dn).await
+            }
+        }
+
+        async fn modify_entry(
+            &self,
+            dn: &str,
+            modifications: Vec<crate::backend::Modification>,
+        ) -> Result<(), BackendError> {
+            self.inner.modify_entry(dn, modifications).await
+        }
+
+        async fn compare_attribute(
+            &self,
+            dn: &str,
+            attribute: &str,
+            value: &str,
+        ) -> Result<bool, BackendError> {
+            self.inner.compare_attribute(dn, attribute, value).await
+        }
+
+        async fn rename_entry(
+            &self,
+            dn: &str,
+            new_rdn: &str,
+            delete_old: bool,
+            new_superior: Option<String>,
+        ) -> Result<(), BackendError> {
+            self.inner
+                .rename_entry(dn, new_rdn, delete_old, new_superior)
+                .await
+        }
+
+        async fn search_entries(
+            &self,
+            base_dn: &str,
+            scope: SearchScope,
+        ) -> Result<Vec<DirectoryEntry>, BackendError> {
+            self.inner.search_entries(base_dn, scope).await
+        }
+
+        async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
+            self.inner.get_context_csn().await
+        }
+
+        async fn set_context_csn(&self, csn: crate::csn::Csn) -> Result<(), BackendError> {
+            self.inner.set_context_csn(csn).await
+        }
+    }
 
     #[test]
     fn test_changelog_tracker_basic() {
@@ -1777,5 +1944,132 @@ mod tests {
         );
         assert_eq!(stats.changes_received, 1);
         assert!(stats.bytes_received >= change.change_data.len());
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_add_already_applied_is_idempotent() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = BatchProcessorImpl::new(backend.clone());
+        let entry = DirectoryEntry::new(
+            "cn=user1,dc=example,dc=org",
+            HashMap::from([
+                ("cn".to_string(), vec!["user1".to_string()]),
+                ("sn".to_string(), vec!["User".to_string()]),
+            ]),
+        );
+        backend
+            .add_entry(entry.clone(), b"secret".to_vec())
+            .await
+            .unwrap();
+
+        let encoded = encode_change_bytes(
+            &ChangeType::Add,
+            &entry.dn,
+            serde_json::to_vec(&entry).unwrap().as_slice(),
+        );
+        batch_processor.apply_entry(&encoded).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_add_conflict_returns_error() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = BatchProcessorImpl::new(backend.clone());
+        let existing = DirectoryEntry::new(
+            "cn=user1,dc=example,dc=org",
+            HashMap::from([("cn".to_string(), vec!["local".to_string()])]),
+        );
+        backend.add_entry(existing, Vec::new()).await.unwrap();
+
+        let replicated = DirectoryEntry::new(
+            "cn=user1,dc=example,dc=org",
+            HashMap::from([("cn".to_string(), vec!["provider".to_string()])]),
+        );
+        let encoded = encode_change_bytes(
+            &ChangeType::Add,
+            &replicated.dn,
+            serde_json::to_vec(&replicated).unwrap().as_slice(),
+        );
+
+        let err = batch_processor.apply_entry(&encoded).await.unwrap_err();
+        assert!(matches!(err, ConsumerError::ProcessingError { .. }));
+        assert_eq!(
+            backend
+                .get_entry("cn=user1,dc=example,dc=org")
+                .await
+                .unwrap()
+                .unwrap()
+                .attributes
+                .get("cn"),
+            Some(&vec!["local".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_delete_missing_entry_is_idempotent() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = BatchProcessorImpl::new(backend);
+        let encoded = encode_change_bytes(&ChangeType::Delete, "cn=missing,dc=example,dc=org", &[]);
+
+        batch_processor.apply_entry(&encoded).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_delete_backend_failure_returns_error() {
+        let backend = Arc::new(DeleteFailingBackend {
+            inner: MockBackend::new(),
+            fail_dn: "cn=fail,dc=example,dc=org".to_string(),
+        });
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=fail,dc=example,dc=org",
+                    HashMap::from([("cn".to_string(), vec!["fail".to_string()])]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let batch_processor = BatchProcessorImpl::new(backend);
+        let encoded = encode_change_bytes(&ChangeType::Delete, "cn=fail,dc=example,dc=org", &[]);
+
+        let err = batch_processor.apply_entry(&encoded).await.unwrap_err();
+        assert!(matches!(err, ConsumerError::ProcessingError { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_rename_already_applied_is_idempotent() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = BatchProcessorImpl::new(backend.clone());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=renamed,dc=example,dc=org",
+                    HashMap::from([("cn".to_string(), vec!["renamed".to_string()])]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let encoded = encode_change_bytes(
+            &ChangeType::Rename,
+            "cn=original,dc=example,dc=org",
+            &encode_rename_change("cn=renamed", true, None),
+        );
+
+        batch_processor.apply_entry(&encoded).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_state_manager_save_cookie_failure_does_not_update_cache() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let invalid_storage_path = tempdir.path().join("state-file");
+        std::fs::write(&invalid_storage_path, "not-a-directory").unwrap();
+
+        let manager = StateManagerImpl::new(invalid_storage_path.to_string_lossy().into_owned());
+        let result = manager.save_cookie("csn-1").await;
+
+        assert!(result.is_err());
+        assert_eq!(*manager.cookie.lock().unwrap(), None);
     }
 }

@@ -3,6 +3,7 @@
 //! This test suite validates the end-to-end replication functionality
 //! between provider and consumer servers.
 
+use async_trait::async_trait;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
 use opendr::fsm::{
@@ -135,6 +136,101 @@ fn create_entry_with_password(dn: &str, cn: &str, password: &str) -> DirectoryEn
             ("userPassword".to_string(), vec![password.to_string()]),
         ]),
     )
+}
+
+fn encode_entry_change(entry: DirectoryEntry) -> Vec<u8> {
+    serde_json::to_vec(&entry).expect("replication entry fixture should serialize")
+}
+
+struct DeleteFailingBackend {
+    inner: MockBackend,
+    fail_dn: String,
+}
+
+#[async_trait]
+impl DirectoryBackend for DeleteFailingBackend {
+    async fn authenticate(
+        &self,
+        dn: &str,
+        password: &[u8],
+    ) -> Result<bool, opendr::backend::BackendError> {
+        self.inner.authenticate(dn, password).await
+    }
+
+    async fn get_entry(
+        &self,
+        dn: &str,
+    ) -> Result<Option<DirectoryEntry>, opendr::backend::BackendError> {
+        self.inner.get_entry(dn).await
+    }
+
+    async fn add_entry(
+        &self,
+        entry: DirectoryEntry,
+        password: Vec<u8>,
+    ) -> Result<(), opendr::backend::BackendError> {
+        self.inner.add_entry(entry, password).await
+    }
+
+    async fn delete_entry(&self, dn: &str) -> Result<(), opendr::backend::BackendError> {
+        if dn == self.fail_dn {
+            Err(opendr::backend::BackendError::Storage(
+                "forced delete failure".to_string(),
+            ))
+        } else {
+            self.inner.delete_entry(dn).await
+        }
+    }
+
+    async fn modify_entry(
+        &self,
+        dn: &str,
+        modifications: Vec<opendr::backend::Modification>,
+    ) -> Result<(), opendr::backend::BackendError> {
+        self.inner.modify_entry(dn, modifications).await
+    }
+
+    async fn compare_attribute(
+        &self,
+        dn: &str,
+        attribute: &str,
+        value: &str,
+    ) -> Result<bool, opendr::backend::BackendError> {
+        self.inner.compare_attribute(dn, attribute, value).await
+    }
+
+    async fn rename_entry(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old: bool,
+        new_superior: Option<String>,
+    ) -> Result<(), opendr::backend::BackendError> {
+        self.inner
+            .rename_entry(dn, new_rdn, delete_old, new_superior)
+            .await
+    }
+
+    async fn search_entries(
+        &self,
+        base_dn: &str,
+        scope: ldap_parser::ldap::SearchScope,
+    ) -> Result<Vec<DirectoryEntry>, opendr::backend::BackendError> {
+        self.inner.search_entries(base_dn, scope).await
+    }
+
+    async fn get_context_csn(
+        &self,
+    ) -> Result<Option<opendr::csn::Csn>, opendr::backend::BackendError> {
+        self.inner.get_context_csn().await
+    }
+
+    async fn set_context_csn(
+        &self,
+        csn: opendr::csn::Csn,
+    ) -> Result<(), opendr::backend::BackendError> {
+        self.inner.set_context_csn(csn).await
+    }
 }
 
 #[tokio::test]
@@ -455,12 +551,20 @@ async fn test_consumer_fsm_receive_and_apply_batch() {
     let first_csn = tracker.record_change(
         ChangeType::Add,
         "cn=old1,dc=example,dc=org".to_string(),
-        b"old".to_vec(),
+        encode_entry_change(create_entry_with_password(
+            "cn=old1,dc=example,dc=org",
+            "old1",
+            "old-secret",
+        )),
     );
     tracker.record_change(
         ChangeType::Add,
         "cn=new1,dc=example,dc=org".to_string(),
-        b"new".to_vec(),
+        encode_entry_change(create_entry_with_password(
+            "cn=new1,dc=example,dc=org",
+            "new1",
+            "new-secret",
+        )),
     );
     let changelog_provider = Arc::new(ChangelogProviderImpl::new(tracker, backend.clone()));
 
@@ -549,7 +653,11 @@ async fn test_consumer_fsm_receive_real_time_changes() {
             encode_replication_change(
                 ChangeType::Add,
                 "cn=live,dc=example,dc=org",
-                b"live change data",
+                &encode_entry_change(create_entry_with_password(
+                    "cn=live,dc=example,dc=org",
+                    "live",
+                    "live-secret",
+                )),
             ),
         ))
         .await;
@@ -562,6 +670,168 @@ async fn test_consumer_fsm_receive_real_time_changes() {
     // Entries applied count should increment
     assert_eq!(fsm.entries_applied(), 1);
     assert!(fsm.current_cookie().is_some());
+}
+
+#[tokio::test]
+async fn test_consumer_fsm_conflicting_full_sync_add_does_not_advance_cookie() {
+    let provider_backend = Arc::new(create_test_backend().await);
+    let changelog_provider = Arc::new(ChangelogProviderImpl::new(
+        ChangelogTracker::new(),
+        provider_backend,
+    ));
+
+    let consumer_backend = Arc::new(create_test_backend().await);
+    consumer_backend
+        .modify_entry(
+            "cn=user1,dc=example,dc=org",
+            vec![opendr::backend::Modification {
+                operation: opendr::backend::ModifyOperation::Replace,
+                attribute: "cn".to_string(),
+                values: vec!["consumer-conflict".to_string()],
+            }],
+        )
+        .await
+        .unwrap();
+
+    let state_path = unique_state_path();
+    let cookie_path = std::path::Path::new(&state_path).join("replication_cookie.txt");
+    let mut fsm =
+        create_consumer_fsm_with_state_path(consumer_backend, changelog_provider, state_path);
+
+    let result = fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: None,
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(fsm.current_cookie(), None);
+    assert!(!cookie_path.exists());
+}
+
+#[tokio::test]
+async fn test_consumer_fsm_incremental_modify_failure_keeps_resume_cookie() {
+    let tracker = ChangelogTracker::new();
+    let resume_csn = tracker.record_change(
+        ChangeType::Add,
+        "cn=before,dc=example,dc=org".to_string(),
+        b"before".to_vec(),
+    );
+    let desired_entry = DirectoryEntry::new(
+        "cn=missing,dc=example,dc=org",
+        HashMap::from([("cn".to_string(), vec!["missing".to_string()])]),
+    );
+    tracker.record_change(
+        ChangeType::Modify,
+        desired_entry.dn.clone(),
+        serde_json::to_vec(&desired_entry).unwrap(),
+    );
+
+    let state_path = unique_state_path();
+    let cookie_path = std::path::Path::new(&state_path).join("replication_cookie.txt");
+    let changelog_provider = Arc::new(ChangelogProviderImpl::new(
+        tracker,
+        Arc::new(create_test_backend().await),
+    ));
+    let mut fsm = create_consumer_fsm_with_state_path(
+        Arc::new(create_test_backend().await),
+        changelog_provider,
+        state_path,
+    );
+    let resume_cookie = format!("csn-{resume_csn}");
+
+    let result = fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: Some(resume_cookie.clone()),
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(fsm.current_cookie(), Some(resume_cookie.as_str()));
+    assert!(!cookie_path.exists());
+}
+
+#[tokio::test]
+async fn test_consumer_fsm_incremental_delete_failure_keeps_resume_cookie() {
+    let fail_dn = "cn=delete-me,dc=example,dc=org";
+    let tracker = ChangelogTracker::new();
+    let resume_csn = tracker.record_change(
+        ChangeType::Add,
+        "cn=before-delete,dc=example,dc=org".to_string(),
+        b"before".to_vec(),
+    );
+    tracker.record_change(ChangeType::Delete, fail_dn.to_string(), Vec::new());
+
+    let delete_backend = DeleteFailingBackend {
+        inner: create_test_backend().await,
+        fail_dn: fail_dn.to_string(),
+    };
+    delete_backend
+        .inner
+        .add_entry(
+            DirectoryEntry::new(
+                fail_dn,
+                HashMap::from([("cn".to_string(), vec!["delete-me".to_string()])]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let state_path = unique_state_path();
+    let cookie_path = std::path::Path::new(&state_path).join("replication_cookie.txt");
+    let changelog_provider = Arc::new(ChangelogProviderImpl::new(
+        tracker,
+        Arc::new(create_test_backend().await),
+    ));
+    let mut fsm = create_consumer_fsm_with_state_path(
+        Arc::new(delete_backend),
+        changelog_provider,
+        state_path,
+    );
+    let resume_cookie = format!("csn-{resume_csn}");
+
+    let result = fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: Some(resume_cookie.clone()),
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(fsm.current_cookie(), Some(resume_cookie.as_str()));
+    assert!(!cookie_path.exists());
+}
+
+#[tokio::test]
+async fn test_consumer_fsm_save_failure_does_not_advance_cookie() {
+    let provider_backend = Arc::new(create_test_backend().await);
+    let changelog_provider = Arc::new(ChangelogProviderImpl::new(
+        ChangelogTracker::new(),
+        provider_backend,
+    ));
+
+    let invalid_path_dir = tempfile::tempdir().unwrap();
+    let invalid_state_path = invalid_path_dir.path().join("state-file");
+    std::fs::write(&invalid_state_path, "not-a-directory").unwrap();
+
+    let mut fsm = create_consumer_fsm_with_state_path(
+        Arc::new(MockBackend::new()),
+        changelog_provider,
+        invalid_state_path.to_string_lossy().into_owned(),
+    );
+
+    let result = fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: None,
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(fsm.current_cookie(), None);
 }
 
 #[tokio::test]
@@ -697,13 +967,24 @@ async fn test_end_to_end_replication_flow() {
     tracker.record_change(
         ChangeType::Add,
         "cn=user3,dc=example,dc=org".to_string(),
-        b"user3 data".to_vec(),
+        encode_entry_change(create_entry_with_password(
+            "cn=user3,dc=example,dc=org",
+            "user3",
+            "user3-secret",
+        )),
     );
 
     tracker.record_change(
         ChangeType::Modify,
         "cn=user1,dc=example,dc=org".to_string(),
-        b"modified user1 data".to_vec(),
+        encode_entry_change(DirectoryEntry::new(
+            "cn=user1,dc=example,dc=org",
+            HashMap::from([
+                ("cn".to_string(), vec!["user1".to_string()]),
+                ("objectclass".to_string(), vec!["person".to_string()]),
+                ("description".to_string(), vec!["modified".to_string()]),
+            ]),
+        )),
     );
 
     let mut provider_fsm = create_provider_fsm(provider_backend.clone());
@@ -770,7 +1051,14 @@ async fn test_end_to_end_replication_flow() {
             encode_replication_change(
                 ChangeType::Modify,
                 "cn=user1,dc=example,dc=org",
-                b"modified user1 data",
+                &encode_entry_change(DirectoryEntry::new(
+                    "cn=user1,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["user1".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                        ("description".to_string(), vec!["modified".to_string()]),
+                    ]),
+                )),
             ),
         ))
         .await
