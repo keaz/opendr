@@ -1516,6 +1516,7 @@ async fn log_authz_denial(
 #[allow(clippy::too_many_arguments)]
 async fn authorize_operation(
     socket: &mut (impl AsyncWrite + Unpin),
+    backend: Option<&dyn DirectoryBackend>,
     message_id: u32,
     response_op: ResponseOp,
     session: &ConnectionSession,
@@ -1537,10 +1538,23 @@ async fn authorize_operation(
         return Ok(true);
     }
 
-    match aci_engine
-        .check_permission(session.bound_dn(), target_dn, attribute, permission)
-        .await
-    {
+    let authz_result = if let Some(backend) = backend {
+        aci_engine
+            .check_permission_with_backend(
+                session.bound_dn(),
+                target_dn,
+                attribute,
+                permission,
+                backend,
+            )
+            .await
+    } else {
+        aci_engine
+            .check_permission(session.bound_dn(), target_dn, attribute, permission)
+            .await
+    };
+
+    match authz_result {
         Ok(()) => {
             log_authz_success(request_context, session, operation, target_dn).await;
             Ok(true)
@@ -1947,6 +1961,7 @@ async fn handle_search_request_with_context(
 
     if !authorize_operation(
         socket,
+        Some(backend),
         message_id,
         ResponseOp::SearchDone,
         session,
@@ -2277,6 +2292,7 @@ async fn handle_modify_request_with_context(
 
     if !authorize_operation(
         socket,
+        Some(backend),
         message_id,
         ResponseOp::Modify,
         session,
@@ -2375,6 +2391,7 @@ async fn handle_add_request_with_context(
 
     if !authorize_operation(
         socket,
+        Some(backend),
         message_id,
         ResponseOp::Add,
         session,
@@ -2506,6 +2523,7 @@ async fn handle_delete_request_with_context(
 
     if !authorize_operation(
         socket,
+        Some(backend),
         message_id,
         ResponseOp::Delete,
         session,
@@ -2613,6 +2631,7 @@ async fn handle_moddn_request_with_context(
 
     if !authorize_operation(
         socket,
+        Some(backend),
         message_id,
         ResponseOp::ModifyDn,
         session,
@@ -2725,6 +2744,7 @@ async fn handle_compare_request_with_context(
 
     if !authorize_operation(
         socket,
+        Some(backend),
         message_id,
         ResponseOp::Compare,
         session,
@@ -2921,6 +2941,7 @@ async fn handle_extended_request_with_session(
         let target_dn = session.bound_dn().unwrap_or("");
         if !authorize_operation(
             socket,
+            None,
             message_id,
             ResponseOp::Extended,
             session,

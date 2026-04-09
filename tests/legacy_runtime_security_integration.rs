@@ -37,6 +37,8 @@ const ADMIN_DN: &str = "cn=admin,dc=example,dc=org";
 const ADMIN_PASSWORD: &str = "secret";
 const USER_DN: &str = "cn=user,dc=example,dc=org";
 const USER_PASSWORD: &str = "user-secret";
+const OTHER_DN: &str = "cn=other,dc=example,dc=org";
+const OTHER_PASSWORD: &str = "other-secret";
 const NEW_ENTRY_DN: &str = "cn=alice,dc=example,dc=org";
 const COMPARE_TARGET_DN: &str = "cn=target,dc=example,dc=org";
 
@@ -109,9 +111,17 @@ async fn spawn_plain_runtime_server_with(
     access_control: Option<Arc<AciEngine>>,
     root_dn: Option<String>,
 ) -> RuntimeServer {
+    let backend: Arc<dyn DirectoryBackend> = Arc::new(MockBackend::from_credentials(credentials));
+    spawn_plain_runtime_server_with_backend(backend, access_control, root_dn).await
+}
+
+async fn spawn_plain_runtime_server_with_backend(
+    backend: Arc<dyn DirectoryBackend>,
+    access_control: Option<Arc<AciEngine>>,
+    root_dn: Option<String>,
+) -> RuntimeServer {
     let tempdir = tempfile::tempdir().unwrap();
     let audit_log_path = tempdir.path().join("audit.log");
-    let backend: Arc<dyn DirectoryBackend> = Arc::new(MockBackend::from_credentials(credentials));
     let security = build_security_config(&audit_log_path, access_control, root_dn).await;
     let port = reserve_port();
     let addr = format!("127.0.0.1:{port}");
@@ -312,6 +322,16 @@ where
     stream.write_all(message).await.unwrap();
     stream.flush().await.unwrap();
     read_response_bytes(stream).await
+}
+
+fn assert_bind_success(response: &[u8]) {
+    let (_, messages) = parse_ldap_messages(response).unwrap();
+    match &messages[0].protocol_op {
+        ProtocolOp::BindResponse(bind_result) => {
+            assert_eq!(bind_result.result.result_code, ParserResultCode::Success);
+        }
+        other => panic!("unexpected bind response: {:?}", other),
+    }
 }
 
 fn trusted_tls_connector(cert_pem: &str) -> TlsConnector {
@@ -550,6 +570,181 @@ async fn restrictive_aci_denies_compare_in_live_runtime_and_audits_denial() {
         ],
     )
     .await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_aci_grants_compare_and_add_for_member_in_live_runtime() {
+    let backend = MockBackend::from_credentials([
+        (ADMIN_DN.to_string(), ADMIN_PASSWORD.as_bytes().to_vec()),
+        (USER_DN.to_string(), USER_PASSWORD.as_bytes().to_vec()),
+    ]);
+    backend
+        .add_entry(
+            opendr::backend::DirectoryEntry::new(
+                COMPARE_TARGET_DN,
+                std::collections::HashMap::from([
+                    ("cn".to_string(), vec!["target".to_string()]),
+                    ("objectclass".to_string(), vec!["person".to_string()]),
+                ]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    backend
+        .add_entry(
+            opendr::backend::DirectoryEntry::new(
+                "cn=operators,dc=example,dc=org",
+                std::collections::HashMap::from([
+                    ("member".to_string(), vec![USER_DN.to_string()]),
+                    ("objectclass".to_string(), vec!["groupOfNames".to_string()]),
+                ]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let engine = Arc::new(AciEngine::restrictive());
+    engine
+        .add_rule(
+            opendr::aci::AciRuleBuilder::grant("group-compare")
+                .target_subtree("dc=example,dc=org")
+                .permission(opendr::aci::Permission::Compare)
+                .subject_group("cn=operators,dc=example,dc=org")
+                .build()
+                .unwrap(),
+        )
+        .await;
+    engine
+        .add_rule(
+            opendr::aci::AciRuleBuilder::grant("group-add")
+                .target_subtree("dc=example,dc=org")
+                .permission(opendr::aci::Permission::Add)
+                .subject_group("cn=operators,dc=example,dc=org")
+                .build()
+                .unwrap(),
+        )
+        .await;
+
+    let server = spawn_plain_runtime_server_with_backend(
+        Arc::new(backend),
+        Some(engine),
+        Some(ADMIN_DN.to_string()),
+    )
+    .await;
+    let mut stream = connect_with_retry(server.port).await;
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, USER_DN, USER_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let compare_response = send_message(
+        &mut stream,
+        &encode_compare_request(2, COMPARE_TARGET_DN, "cn", "target"),
+    )
+    .await;
+    let (_, compare_messages) = parse_ldap_messages(&compare_response).unwrap();
+    match &compare_messages[0].protocol_op {
+        ProtocolOp::CompareResponse(compare_result) => {
+            assert_eq!(compare_result.result_code, ParserResultCode::CompareTrue);
+        }
+        other => panic!("unexpected compare response: {:?}", other),
+    }
+
+    let add_response = send_message(&mut stream, &encode_add_request(3, NEW_ENTRY_DN)).await;
+    let (_, add_messages) = parse_ldap_messages(&add_response).unwrap();
+    match &add_messages[0].protocol_op {
+        ProtocolOp::AddResponse(add_result) => {
+            assert_eq!(add_result.result_code, ParserResultCode::Success);
+        }
+        other => panic!("unexpected add response: {:?}", other),
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_aci_denies_non_member_in_live_runtime() {
+    let backend = MockBackend::from_credentials([
+        (ADMIN_DN.to_string(), ADMIN_PASSWORD.as_bytes().to_vec()),
+        (USER_DN.to_string(), USER_PASSWORD.as_bytes().to_vec()),
+        (OTHER_DN.to_string(), OTHER_PASSWORD.as_bytes().to_vec()),
+    ]);
+    backend
+        .add_entry(
+            opendr::backend::DirectoryEntry::new(
+                COMPARE_TARGET_DN,
+                std::collections::HashMap::from([
+                    ("cn".to_string(), vec!["target".to_string()]),
+                    ("objectclass".to_string(), vec!["person".to_string()]),
+                ]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    backend
+        .add_entry(
+            opendr::backend::DirectoryEntry::new(
+                "cn=operators,dc=example,dc=org",
+                std::collections::HashMap::from([
+                    ("member".to_string(), vec![USER_DN.to_string()]),
+                    ("objectclass".to_string(), vec!["groupOfNames".to_string()]),
+                ]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let engine = Arc::new(AciEngine::restrictive());
+    engine
+        .add_rule(
+            opendr::aci::AciRuleBuilder::grant("group-compare")
+                .target_subtree("dc=example,dc=org")
+                .permission(opendr::aci::Permission::Compare)
+                .subject_group("cn=operators,dc=example,dc=org")
+                .build()
+                .unwrap(),
+        )
+        .await;
+
+    let server = spawn_plain_runtime_server_with_backend(
+        Arc::new(backend),
+        Some(engine),
+        Some(ADMIN_DN.to_string()),
+    )
+    .await;
+    let mut stream = connect_with_retry(server.port).await;
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, OTHER_DN, OTHER_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let compare_response = send_message(
+        &mut stream,
+        &encode_compare_request(2, COMPARE_TARGET_DN, "cn", "target"),
+    )
+    .await;
+    let (_, compare_messages) = parse_ldap_messages(&compare_response).unwrap();
+    match &compare_messages[0].protocol_op {
+        ProtocolOp::CompareResponse(compare_result) => {
+            assert_eq!(
+                compare_result.result_code,
+                ParserResultCode::InsufficientAccessRights
+            );
+        }
+        other => panic!("unexpected compare response: {:?}", other),
+    }
 
     server.shutdown().await;
 }

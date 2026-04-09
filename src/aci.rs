@@ -3,6 +3,7 @@
 //! This module provides a comprehensive ACI system for fine-grained access control
 //! in LDAP operations, following LDAP ACI specifications.
 
+use crate::backend::DirectoryBackend;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -140,6 +141,39 @@ impl AciSubject {
                 .unwrap_or(false),
         }
     }
+
+    async fn matches_user_with_backend(
+        &self,
+        user_dn: Option<&str>,
+        target_dn: &str,
+        backend: &dyn DirectoryBackend,
+    ) -> Result<bool, String> {
+        match self {
+            AciSubject::Group(group_dn) => {
+                let Some(user_dn) = user_dn else {
+                    return Ok(false);
+                };
+                let group_entry = backend.get_entry(group_dn).await.map_err(|err| {
+                    format!("unable to resolve group '{}' membership: {}", group_dn, err)
+                })?;
+                let Some(group_entry) = group_entry else {
+                    return Err(format!(
+                        "unable to resolve group '{}' membership: group not found",
+                        group_dn
+                    ));
+                };
+
+                Ok(group_entry
+                    .attributes
+                    .get("member")
+                    .into_iter()
+                    .chain(group_entry.attributes.get("uniquemember"))
+                    .flat_map(|values| values.iter())
+                    .any(|member_dn| member_dn.eq_ignore_ascii_case(user_dn)))
+            }
+            _ => Ok(self.matches_user(user_dn, target_dn)),
+        }
+    }
 }
 
 /// ACI rule defining access control
@@ -200,6 +234,29 @@ impl AciRule {
         self
     }
 
+    fn target_matches(
+        &self,
+        target_dn: &str,
+        attribute: Option<&str>,
+        permission: Permission,
+    ) -> bool {
+        if !self.permissions.contains(&permission) {
+            return false;
+        }
+
+        if !self.target.matches_dn(target_dn) {
+            return false;
+        }
+
+        if let Some(attr) = attribute {
+            if !self.target.matches_attribute(attr) {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Check if this rule matches the given parameters
     pub fn matches(
         &self,
@@ -208,21 +265,8 @@ impl AciRule {
         attribute: Option<&str>,
         permission: Permission,
     ) -> Option<bool> {
-        // Check if permission matches
-        if !self.permissions.contains(&permission) {
+        if !self.target_matches(target_dn, attribute, permission) {
             return None;
-        }
-
-        // Check if target matches
-        if !self.target.matches_dn(target_dn) {
-            return None;
-        }
-
-        // Check if attribute matches (if specified)
-        if let Some(attr) = attribute {
-            if !self.target.matches_attribute(attr) {
-                return None;
-            }
         }
 
         // Check if subject matches
@@ -232,6 +276,29 @@ impl AciRule {
 
         // Return grant/deny decision
         Some(self.is_grant)
+    }
+
+    async fn matches_with_backend(
+        &self,
+        user_dn: Option<&str>,
+        target_dn: &str,
+        attribute: Option<&str>,
+        permission: Permission,
+        backend: &dyn DirectoryBackend,
+    ) -> Result<Option<bool>, String> {
+        if !self.target_matches(target_dn, attribute, permission) {
+            return Ok(None);
+        }
+
+        if !self
+            .subject
+            .matches_user_with_backend(user_dn, target_dn, backend)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(self.is_grant))
     }
 }
 
@@ -318,6 +385,17 @@ impl AciEngine {
 
         // Evaluate rules in priority order
         for rule in rules.iter() {
+            if !rule.target_matches(target_dn, attribute, permission) {
+                continue;
+            }
+
+            if matches!(rule.subject, AciSubject::Group(_)) {
+                return Err(format!(
+                    "Access denied by rule '{}' because group membership requires backend context",
+                    rule.name
+                ));
+            }
+
             if let Some(decision) = rule.matches(user_dn, target_dn, attribute, permission) {
                 if decision {
                     return Ok(()); // Explicitly granted
@@ -344,6 +422,54 @@ impl AciEngine {
         }
     }
 
+    pub async fn check_permission_with_backend(
+        &self,
+        user_dn: Option<&str>,
+        target_dn: &str,
+        attribute: Option<&str>,
+        permission: Permission,
+        backend: &dyn DirectoryBackend,
+    ) -> Result<(), String> {
+        let rules = self.rules.read().await;
+
+        for rule in rules.iter() {
+            match rule
+                .matches_with_backend(user_dn, target_dn, attribute, permission, backend)
+                .await
+            {
+                Ok(Some(true)) => return Ok(()),
+                Ok(Some(false)) => {
+                    return Err(format!(
+                        "Access denied by rule '{}' for {} on {}",
+                        rule.name,
+                        permission.as_str(),
+                        target_dn
+                    ));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(format!(
+                        "Access denied by rule '{}' for {} on {}: {}",
+                        rule.name,
+                        permission.as_str(),
+                        target_dn,
+                        err
+                    ));
+                }
+            }
+        }
+
+        if self.default_allow {
+            Ok(())
+        } else {
+            Err(format!(
+                "Access denied (no matching rules) for {} on {}",
+                permission.as_str(),
+                target_dn
+            ))
+        }
+    }
+
     /// Check multiple permissions at once
     pub async fn check_permissions(
         &self,
@@ -354,6 +480,21 @@ impl AciEngine {
     ) -> Result<(), String> {
         for permission in permissions {
             self.check_permission(user_dn, target_dn, attribute, *permission)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn check_permissions_with_backend(
+        &self,
+        user_dn: Option<&str>,
+        target_dn: &str,
+        attribute: Option<&str>,
+        permissions: &[Permission],
+        backend: &dyn DirectoryBackend,
+    ) -> Result<(), String> {
+        for permission in permissions {
+            self.check_permission_with_backend(user_dn, target_dn, attribute, *permission, backend)
                 .await?;
         }
         Ok(())
@@ -443,6 +584,12 @@ impl AciRuleBuilder {
         self
     }
 
+    /// Set subject to group membership
+    pub fn subject_group(mut self, dn: impl Into<String>) -> Self {
+        self.subject = Some(AciSubject::Group(dn.into()));
+        self
+    }
+
     /// Set subject to all users
     pub fn subject_all(mut self) -> Self {
         self.subject = Some(AciSubject::All);
@@ -484,6 +631,8 @@ impl AciRuleBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
+    use std::collections::HashMap;
 
     #[test]
     fn test_permission_from_str() {
@@ -552,6 +701,21 @@ mod tests {
             Some("cn=other,dc=example,dc=org"),
             "cn=user,dc=example,dc=org"
         ));
+    }
+
+    #[test]
+    fn test_aci_rule_builder_group_subject() {
+        let rule = AciRuleBuilder::grant("group-rule")
+            .target_subtree("dc=example,dc=org")
+            .permission(Permission::Read)
+            .subject_group("cn=admins,dc=example,dc=org")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            rule.subject,
+            AciSubject::Group("cn=admins,dc=example,dc=org".to_string())
+        );
     }
 
     #[tokio::test]
@@ -730,5 +894,107 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_group_rules_require_backend_context() {
+        let engine = AciEngine::restrictive();
+        let rule = AciRuleBuilder::grant("group-read")
+            .target_subtree("dc=example,dc=org")
+            .permission(Permission::Read)
+            .subject_group("cn=admins,dc=example,dc=org")
+            .build()
+            .unwrap();
+        engine.add_rule(rule).await;
+
+        let result = engine
+            .check_permission(
+                Some("cn=alice,dc=example,dc=org"),
+                "cn=target,dc=example,dc=org",
+                None,
+                Permission::Read,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("backend context"));
+    }
+
+    #[tokio::test]
+    async fn test_group_rules_allow_member_with_backend() {
+        let engine = AciEngine::restrictive();
+        let backend = MockBackend::new();
+        let group_dn = "cn=admins,dc=example,dc=org";
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    group_dn,
+                    HashMap::from([
+                        (
+                            "member".to_string(),
+                            vec!["cn=alice,dc=example,dc=org".to_string()],
+                        ),
+                        ("objectclass".to_string(), vec!["groupOfNames".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let rule = AciRuleBuilder::grant("group-read")
+            .target_subtree("dc=example,dc=org")
+            .permission(Permission::Read)
+            .subject_group(group_dn)
+            .build()
+            .unwrap();
+        engine.add_rule(rule).await;
+
+        let result = engine
+            .check_permission_with_backend(
+                Some("cn=alice,dc=example,dc=org"),
+                "cn=target,dc=example,dc=org",
+                None,
+                Permission::Read,
+                &backend,
+            )
+            .await;
+        assert!(result.is_ok());
+
+        let denied = engine
+            .check_permission_with_backend(
+                Some("cn=bob,dc=example,dc=org"),
+                "cn=target,dc=example,dc=org",
+                None,
+                Permission::Read,
+                &backend,
+            )
+            .await;
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_group_rules_fail_closed_when_group_cannot_be_resolved() {
+        let engine = AciEngine::restrictive();
+        let backend = MockBackend::new();
+
+        let rule = AciRuleBuilder::grant("group-read")
+            .target_subtree("dc=example,dc=org")
+            .permission(Permission::Read)
+            .subject_group("cn=missing,dc=example,dc=org")
+            .build()
+            .unwrap();
+        engine.add_rule(rule).await;
+
+        let result = engine
+            .check_permission_with_backend(
+                Some("cn=alice,dc=example,dc=org"),
+                "cn=target,dc=example,dc=org",
+                None,
+                Permission::Read,
+                &backend,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("group not found"));
     }
 }

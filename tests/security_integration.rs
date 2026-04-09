@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use opendr::aci::{AciEngine, AciRuleBuilder, Permission};
+use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::connection_fsm::{ConnectionFsmImpl, TlsHandler};
 use opendr::extended_op_fsm::{ExtendedOpBackend, ExtendedOpMetrics, ExtendedOpParser};
 use opendr::extended_ops::{
@@ -18,6 +19,7 @@ use opendr::fsm::{ConnectionEvent, ConnectionState, SaslEvent, SaslFsm, StateMac
 use opendr::sasl_fsm::{CredentialVerifier, SaslFsmImpl, SaslMechanismHandler};
 use opendr::sasl_mechanisms::MultiMechanismHandler;
 use opendr::tls::{RustlsTlsHandler, TlsConfig, TlsVersion};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ========================================================================
@@ -372,6 +374,110 @@ async fn test_aci_basic_access_control() {
         )
         .await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_aci_group_grant_with_backend_lookup() {
+    let engine = AciEngine::restrictive();
+    let backend = MockBackend::new();
+    backend
+        .add_entry(
+            DirectoryEntry::new(
+                "cn=admins,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "member".to_string(),
+                        vec!["cn=alice,dc=example,dc=org".to_string()],
+                    ),
+                    ("objectclass".to_string(), vec!["groupOfNames".to_string()]),
+                ]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let rule = AciRuleBuilder::grant("admins-read")
+        .target_subtree("dc=example,dc=org")
+        .permission(Permission::Read)
+        .subject_group("cn=admins,dc=example,dc=org")
+        .build()
+        .unwrap();
+    engine.add_rule(rule).await;
+
+    let allowed = engine
+        .check_permission_with_backend(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            Permission::Read,
+            &backend,
+        )
+        .await;
+    assert!(allowed.is_ok());
+
+    let denied = engine
+        .check_permission_with_backend(
+            Some("cn=bob,dc=example,dc=org"),
+            "cn=alice,dc=example,dc=org",
+            None,
+            Permission::Read,
+            &backend,
+        )
+        .await;
+    assert!(denied.is_err());
+}
+
+#[tokio::test]
+async fn test_aci_group_deny_with_backend_lookup() {
+    let engine = AciEngine::permissive();
+    let backend = MockBackend::new();
+    backend
+        .add_entry(
+            DirectoryEntry::new(
+                "cn=blocked,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "uniquemember".to_string(),
+                        vec!["cn=alice,dc=example,dc=org".to_string()],
+                    ),
+                    ("objectclass".to_string(), vec!["groupOfNames".to_string()]),
+                ]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let rule = AciRuleBuilder::deny("blocked-delete")
+        .target_subtree("dc=example,dc=org")
+        .permission(Permission::Delete)
+        .subject_group("cn=blocked,dc=example,dc=org")
+        .build()
+        .unwrap();
+    engine.add_rule(rule).await;
+
+    let denied = engine
+        .check_permission_with_backend(
+            Some("cn=alice,dc=example,dc=org"),
+            "cn=bob,dc=example,dc=org",
+            None,
+            Permission::Delete,
+            &backend,
+        )
+        .await;
+    assert!(denied.is_err());
+
+    let allowed = engine
+        .check_permission_with_backend(
+            Some("cn=bob,dc=example,dc=org"),
+            "cn=alice,dc=example,dc=org",
+            None,
+            Permission::Delete,
+            &backend,
+        )
+        .await;
+    assert!(allowed.is_ok());
 }
 
 #[tokio::test]
