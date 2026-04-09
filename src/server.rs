@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -2670,6 +2670,8 @@ async fn handle_search_request_with_context_and_registry(
         .iter()
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
+    let deref_aliases = request.deref_aliases;
+    let time_limit = request.time_limit;
 
     if try_handle_virtual_search_request(
         socket,
@@ -2706,6 +2708,40 @@ async fn handle_search_request_with_context_and_registry(
         return Ok(());
     }
 
+    let effective_base_dn = match resolve_search_base_dn(backend, &base_dn, deref_aliases).await {
+        Ok(dn) => dn,
+        Err((result_code, diagnostic)) => {
+            increment_control_counter(
+                request_context,
+                "ldap_search_alias_dereference_failures_total",
+                1,
+            );
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "search_alias_deref",
+                false,
+                Some(base_dn.as_str()),
+                Some(diagnostic.as_str()),
+                Vec::new(),
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                result_code,
+                &base_dn,
+                diagnostic.as_str(),
+            )
+            .await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
+        }
+    };
+
     if attribute_selection
         .iter()
         .any(|attribute| attribute.eq_ignore_ascii_case(REPLICATION_STREAM_ATTRIBUTE))
@@ -2714,7 +2750,7 @@ async fn handle_search_request_with_context_and_registry(
             socket,
             backend,
             message_id,
-            &base_dn,
+            &effective_base_dn,
             &attribute_selection,
             session,
             operation_registry,
@@ -2727,18 +2763,18 @@ async fn handle_search_request_with_context_and_registry(
 
     let search_hint = extract_search_hint(&request.filter);
     let entries = match backend
-        .search_entries_with_hint(&base_dn, request.scope, search_hint)
+        .search_entries_with_hint(&effective_base_dn, request.scope, search_hint)
         .await
     {
         Ok(entries) => entries,
         Err(err) => {
-            error!("Search backend failure for {}: {}", base_dn, err);
+            error!("Search backend failure for {}: {}", effective_base_dn, err);
             send_result(
                 socket,
                 message_id,
                 ResponseOp::SearchDone,
                 map_backend_error(&err),
-                &base_dn,
+                &effective_base_dn,
                 diagnostic_for_error(&err),
             )
             .await?;
@@ -2747,11 +2783,63 @@ async fn handle_search_request_with_context_and_registry(
         }
     };
 
+    let search_deadline = if time_limit == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_secs(time_limit as u64))
+    };
     let mut returned = 0usize;
     let mut size_limit_hit = false;
+    let mut time_limit_hit = false;
+    let mut returned_dns = HashSet::new();
 
     for entry in entries {
+        if let Some(deadline) = search_deadline {
+            if Instant::now() >= deadline {
+                time_limit_hit = true;
+                break;
+            }
+        }
+
+        let entry = match resolve_search_candidate_entry(backend, &entry, deref_aliases).await {
+            Ok(entry) => entry,
+            Err((result_code, diagnostic)) => {
+                increment_control_counter(
+                    request_context,
+                    "ldap_search_alias_dereference_failures_total",
+                    1,
+                );
+                log_generic_audit_event(
+                    request_context,
+                    session,
+                    AuditLevel::Warning,
+                    AuditEventType::Authorization,
+                    "search_alias_deref",
+                    false,
+                    Some(entry.dn.as_str()),
+                    Some(diagnostic.as_str()),
+                    Vec::new(),
+                )
+                .await;
+                send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::SearchDone,
+                    result_code,
+                    &base_dn,
+                    diagnostic.as_str(),
+                )
+                .await?;
+                operation_registry.finish(message_id, FinishedOperationState::Completed);
+                return Ok(());
+            }
+        };
+
         if !entry_matches_filter(&entry, &request.filter) {
+            continue;
+        }
+
+        if !returned_dns.insert(normalize_search_dn(&entry.dn)) {
             continue;
         }
 
@@ -2773,7 +2861,30 @@ async fn handle_search_request_with_context_and_registry(
         returned += 1;
     }
 
-    let (result_code, diagnostic) = if size_limit_hit {
+    if !time_limit_hit {
+        if let Some(deadline) = search_deadline {
+            if Instant::now() >= deadline {
+                time_limit_hit = true;
+            }
+        }
+    }
+
+    let (result_code, diagnostic) = if time_limit_hit {
+        increment_control_counter(request_context, "ldap_search_time_limit_exceeded_total", 1);
+        log_generic_audit_event(
+            request_context,
+            session,
+            AuditLevel::Warning,
+            AuditEventType::Authorization,
+            "search_time_limit",
+            false,
+            Some(base_dn.as_str()),
+            Some("search time limit exceeded"),
+            vec![("entries_returned".to_string(), returned.to_string())],
+        )
+        .await;
+        (ResultCode::TimeLimitExceeded, "time limit exceeded")
+    } else if size_limit_hit {
         (ResultCode::SizeLimitExceeded, "size limit exceeded")
     } else {
         (ResultCode::Success, "")
@@ -2805,6 +2916,112 @@ fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
         }),
         _ => None,
     }
+}
+
+fn should_deref_search_base(deref_aliases: ldap_parser::ldap::DerefAliases) -> bool {
+    matches!(deref_aliases.0, 2 | 3)
+}
+
+fn should_deref_search_candidates(deref_aliases: ldap_parser::ldap::DerefAliases) -> bool {
+    matches!(deref_aliases.0, 1 | 3)
+}
+
+fn entry_is_alias(entry: &DirectoryEntry) -> bool {
+    entry
+        .attributes
+        .get("objectclass")
+        .map(|values| values.iter().any(|value| value.eq_ignore_ascii_case("alias")))
+        .unwrap_or(false)
+        && entry.attributes.contains_key("aliasedobjectname")
+}
+
+fn alias_target_dn(entry: &DirectoryEntry) -> Option<&str> {
+    entry.attributes
+        .get("aliasedobjectname")
+        .and_then(|values| values.first())
+        .map(String::as_str)
+}
+
+fn normalize_search_dn(dn: &str) -> String {
+    dn.trim().to_ascii_lowercase()
+}
+
+async fn resolve_alias_chain(
+    backend: &dyn DirectoryBackend,
+    entry: &DirectoryEntry,
+    visited_dns: &mut HashSet<String>,
+) -> Result<DirectoryEntry, (ResultCode, String)> {
+    let current_dn = normalize_search_dn(&entry.dn);
+    if !visited_dns.insert(current_dn) {
+        return Err((
+            ResultCode::LoopDetect,
+            format!("alias loop detected for {}", entry.dn),
+        ));
+    }
+
+    let Some(target_dn) = alias_target_dn(entry) else {
+        return Err((
+            ResultCode::AliasProblem,
+            format!("alias {} is missing aliasedObjectName", entry.dn),
+        ));
+    };
+
+    let Some(target_entry) = backend
+        .get_entry(target_dn)
+        .await
+        .map_err(|err| (map_backend_error(&err), diagnostic_for_error(&err).to_string()))?
+    else {
+        return Err((
+            ResultCode::AliasDereferencingProblem,
+            format!("alias target {} not found", target_dn),
+        ));
+    };
+
+    if entry_is_alias(&target_entry) {
+        return Box::pin(resolve_alias_chain(backend, &target_entry, visited_dns)).await;
+    }
+
+    Ok(target_entry)
+}
+
+async fn resolve_search_base_dn(
+    backend: &dyn DirectoryBackend,
+    base_dn: &str,
+    deref_aliases: ldap_parser::ldap::DerefAliases,
+) -> Result<String, (ResultCode, String)> {
+    if !should_deref_search_base(deref_aliases) {
+        return Ok(base_dn.to_string());
+    }
+
+    let Some(entry) = backend
+        .get_entry(base_dn)
+        .await
+        .map_err(|err| (map_backend_error(&err), diagnostic_for_error(&err).to_string()))?
+    else {
+        return Ok(base_dn.to_string());
+    };
+
+    if !entry_is_alias(&entry) {
+        return Ok(base_dn.to_string());
+    }
+
+    let mut visited_dns = HashSet::new();
+    resolve_alias_chain(backend, &entry, &mut visited_dns)
+        .await
+        .map(|resolved| resolved.dn)
+}
+
+async fn resolve_search_candidate_entry(
+    backend: &dyn DirectoryBackend,
+    entry: &DirectoryEntry,
+    deref_aliases: ldap_parser::ldap::DerefAliases,
+) -> Result<DirectoryEntry, (ResultCode, String)> {
+    if !should_deref_search_candidates(deref_aliases) || !entry_is_alias(entry) {
+        return Ok(entry.clone());
+    }
+
+    let mut visited_dns = HashSet::new();
+    resolve_alias_chain(backend, entry, &mut visited_dns).await
 }
 
 async fn handle_replication_stream_request(
@@ -4803,11 +5020,13 @@ mod tests {
         LdapMessage as RasnLdapMessage, ProtocolOp as RasnProtocolOp,
     };
     use std::borrow::Cow;
+    use std::future::Future;
+    use std::io;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{timeout, Duration, Sleep};
 
     async fn connected_stream_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4818,6 +5037,80 @@ mod tests {
         let client_stream = client.await.unwrap();
 
         (server_stream, client_stream)
+    }
+
+    #[derive(Default)]
+    struct DelayedCaptureStream {
+        write_delay: Duration,
+        pending_write: Option<Pin<Box<Sleep>>>,
+        written: Vec<u8>,
+    }
+
+    impl DelayedCaptureStream {
+        fn new(write_delay: Duration) -> Self {
+            Self {
+                write_delay,
+                pending_write: None,
+                written: Vec::new(),
+            }
+        }
+
+        fn written_bytes(&self) -> &[u8] {
+            &self.written
+        }
+    }
+
+    impl tokio::io::AsyncRead for DelayedCaptureStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DelayedCaptureStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            if self.write_delay.is_zero() {
+                self.written.extend_from_slice(buf);
+                return Poll::Ready(Ok(buf.len()));
+            }
+
+            if self.pending_write.is_none() {
+                self.pending_write = Some(Box::pin(tokio::time::sleep(self.write_delay)));
+            }
+
+            let Some(delay) = self.pending_write.as_mut() else {
+                return Poll::Pending;
+            };
+
+            if delay.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+
+            self.pending_write = None;
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
@@ -5978,6 +6271,336 @@ mod tests {
         ];
         expected_extensions.sort();
         assert_eq!(supported_extensions, expected_extensions);
+    }
+
+    #[tokio::test]
+    async fn search_honors_time_limit_and_returns_partial_results() {
+        let backend = MockBackend::new();
+        for user in ["one", "two", "three"] {
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        format!("cn={},dc=example,dc=org", user),
+                        HashMap::from([
+                            ("cn".to_string(), vec![user.to_string()]),
+                            ("sn".to_string(), vec!["User".to_string()]),
+                            ("objectclass".to_string(), vec!["person".to_string()]),
+                        ]),
+                    ),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+        let request_controls = RequestControls::default();
+        let request = SearchRequest {
+            base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
+            scope: SearchScope::WholeSubtree,
+            deref_aliases: DerefAliases(0),
+            size_limit: 0,
+            time_limit: 1,
+            types_only: false,
+            filter: Filter::Present(LdapString(Cow::Owned("cn".to_string()))),
+            attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
+        };
+        let mut stream = DelayedCaptureStream::new(Duration::from_millis(450));
+
+        handle_search_request_with_context(
+            &mut stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            60,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let (_, messages) = parse_ldap_messages(stream.written_bytes()).unwrap();
+        let entry_count = messages
+            .iter()
+            .filter(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_)))
+            .count();
+        assert!(entry_count >= 1);
+        match &messages.last().unwrap().protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::TimeLimitExceeded);
+            }
+            other => panic!("unexpected completion: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_deref_finding_base_object_resolves_alias_base() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=target,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Target User".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=alias,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Alias Entry".to_string()]),
+                        ("objectclass".to_string(), vec!["alias".to_string()]),
+                        (
+                            "aliasedobjectname".to_string(),
+                            vec!["cn=target,dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+        let request_controls = RequestControls::default();
+        let request = SearchRequest {
+            base_object: LdapDN(Cow::Owned("cn=alias,dc=example,dc=org".to_string())),
+            scope: SearchScope::BaseObject,
+            deref_aliases: DerefAliases(2),
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter: Filter::Present(LdapString(Cow::Owned("objectClass".to_string()))),
+            attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
+        };
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_search_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            61,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "cn=target,dc=example,dc=org");
+                assert_eq!(
+                    search_entry_attribute_map(entry).get("cn").unwrap(),
+                    &vec!["Target User".to_string()]
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_deref_always_differs_from_never_and_detects_alias_cycles() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=target,ou=people,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Target User".to_string()]),
+                        ("sn".to_string(), vec!["Target".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=external,ou=aliases,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["External Alias".to_string()]),
+                        ("objectclass".to_string(), vec!["alias".to_string()]),
+                        (
+                            "aliasedobjectname".to_string(),
+                            vec!["cn=target,ou=people,dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=loop-a,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Loop A".to_string()]),
+                        ("objectclass".to_string(), vec!["alias".to_string()]),
+                        (
+                            "aliasedobjectname".to_string(),
+                            vec!["cn=loop-b,dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=loop-b,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Loop B".to_string()]),
+                        ("objectclass".to_string(), vec!["alias".to_string()]),
+                        (
+                            "aliasedobjectname".to_string(),
+                            vec!["cn=loop-a,dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+        let request_controls = RequestControls::default();
+        let subtree_request = |deref_aliases| SearchRequest {
+            base_object: LdapDN(Cow::Owned("ou=aliases,dc=example,dc=org".to_string())),
+            scope: SearchScope::WholeSubtree,
+            deref_aliases: DerefAliases(deref_aliases),
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter: Filter::EqualityMatch(AttributeValueAssertion {
+                attribute_desc: LdapString(Cow::Owned("sn".to_string())),
+                assertion_value: b"Target".as_ref(),
+            }),
+            attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
+        };
+
+        let (mut never_server, mut never_client) = connected_stream_pair().await;
+        handle_search_request_with_context(
+            &mut never_server,
+            &backend,
+            &schema,
+            &runtime_config,
+            62,
+            subtree_request(0),
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let never_response = read_response(&mut never_client).await;
+        let (_, never_messages) = parse_ldap_messages(&never_response).unwrap();
+        assert_eq!(
+            never_messages
+                .iter()
+                .filter(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_)))
+                .count(),
+            0
+        );
+
+        let (mut always_server, mut always_client) = connected_stream_pair().await;
+        handle_search_request_with_context(
+            &mut always_server,
+            &backend,
+            &schema,
+            &runtime_config,
+            63,
+            subtree_request(3),
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let always_response = read_response(&mut always_client).await;
+        let (_, always_messages) = parse_ldap_messages(&always_response).unwrap();
+        match &always_messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(
+                    entry.object_name.0.as_ref(),
+                    "cn=target,ou=people,dc=example,dc=org"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let cycle_request = SearchRequest {
+            base_object: LdapDN(Cow::Owned("cn=loop-a,dc=example,dc=org".to_string())),
+            scope: SearchScope::BaseObject,
+            deref_aliases: DerefAliases(3),
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter: Filter::Present(LdapString(Cow::Owned("objectClass".to_string()))),
+            attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
+        };
+        let (mut cycle_server, mut cycle_client) = connected_stream_pair().await;
+        handle_search_request_with_context(
+            &mut cycle_server,
+            &backend,
+            &schema,
+            &runtime_config,
+            64,
+            cycle_request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let cycle_response = read_response(&mut cycle_client).await;
+        let (_, cycle_messages) = parse_ldap_messages(&cycle_response).unwrap();
+        match &cycle_messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::LoopDetect);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
     }
 
     #[tokio::test]
