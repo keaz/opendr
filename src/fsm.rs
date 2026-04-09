@@ -1,5 +1,5 @@
 //! Finite State Machine (FSM) traits and definitions for LDAP server operations
-//! 
+//!
 //! This module defines a comprehensive set of state machines that model the various
 //! concurrent processes in an LDAP server, from connection handling to replication.
 //!
@@ -27,14 +27,14 @@
 //! ## FSM Categories
 //!
 //! 1. **Transport Layer**: ConnectionFsm, BerDecoderFsm
-//! 2. **Authentication**: AuthFsm, SaslFsm 
+//! 2. **Authentication**: AuthFsm, SaslFsm
 //! 3. **Operations**: SearchFsm, WriteFsm, CompareFsm, ExtendedOpFsm
 //! 4. **Distribution**: ReferralFsm, ReplicationProviderFsm, ReplicationConsumerFsm
 //! 5. **Storage**: BackendTxnFsm
 
+use async_trait::async_trait;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};
-use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Base trait for all finite state machines in the LDAP server
@@ -49,7 +49,10 @@ pub trait StateMachine {
     fn current_state(&self) -> &Self::State;
 
     /// Process an event and potentially transition to a new state
-    async fn handle_event(&mut self, event: Self::Event) -> Result<Option<Self::Output>, Self::Error>;
+    async fn handle_event(
+        &mut self,
+        event: Self::Event,
+    ) -> Result<Option<Self::Output>, Self::Error>;
 
     /// Check if the FSM is in a terminal state
     fn is_terminal(&self) -> bool;
@@ -63,7 +66,7 @@ pub trait StateMachine {
 pub trait AbandonableFsm: StateMachine {
     /// Abandon the current operation and transition to abandoned state
     async fn abandon(&mut self) -> Result<(), Self::Error>;
-    
+
     /// Check if the FSM has been abandoned
     fn is_abandoned(&self) -> bool;
 }
@@ -72,10 +75,10 @@ pub trait AbandonableFsm: StateMachine {
 pub trait TimeoutFsm: StateMachine {
     /// Get the timeout duration for this FSM
     fn timeout(&self) -> Option<Duration>;
-    
+
     /// Get the start time of the current operation
     fn start_time(&self) -> Instant;
-    
+
     /// Check if the FSM has timed out
     fn is_timed_out(&self) -> bool {
         if let Some(timeout) = self.timeout() {
@@ -116,16 +119,16 @@ pub enum ConnectionEvent {
 #[async_trait]
 pub trait ConnectionFsm: StateMachine<State = ConnectionState, Event = ConnectionEvent> {
     type Stream: AsyncRead + AsyncWrite + Unpin + Send;
-    
+
     /// Get the underlying stream if available
     fn stream(&self) -> Option<&Self::Stream>;
-    
+
     /// Get the mutable stream if available
     fn stream_mut(&mut self) -> Option<&mut Self::Stream>;
-    
+
     /// Check if the connection is secure (TLS)
     fn is_secure(&self) -> bool;
-    
+
     /// Get connection information (remote address, etc.)
     fn connection_info(&self) -> ConnectionInfo;
 }
@@ -162,13 +165,13 @@ pub enum BerDecoderEvent {
 pub trait BerDecoderFsm: StateMachine<State = BerDecoderState, Event = BerDecoderEvent> {
     /// Get the current buffer contents
     fn buffer(&self) -> &[u8];
-    
+
     /// Get the bytes needed to complete the current state
     fn bytes_needed(&self) -> Option<usize>;
-    
+
     /// Extract a complete message if available
     fn extract_message(&mut self) -> Option<Vec<u8>>;
-    
+
     /// Get the current message progress
     fn progress(&self) -> BerDecodingProgress;
 }
@@ -206,10 +209,10 @@ pub enum AuthEvent {
 pub trait AuthFsm: StateMachine<State = AuthState, Event = AuthEvent> {
     /// Get the authenticated DN if bound
     fn authenticated_dn(&self) -> Option<&str>;
-    
+
     /// Check if the session is authenticated
     fn is_authenticated(&self) -> bool;
-    
+
     /// Get the authentication level
     fn auth_level(&self) -> AuthLevel;
 }
@@ -236,10 +239,15 @@ pub enum SaslState {
 
 #[derive(Debug)]
 pub enum SaslEvent {
-    InitiateBind { mechanism: String, initial_data: Option<Vec<u8>> },
+    InitiateBind {
+        mechanism: String,
+        initial_data: Option<Vec<u8>>,
+    },
     ChallengeGenerated(Vec<u8>),
     ResponseReceived(Vec<u8>),
-    AuthenticationComplete { dn: String },
+    AuthenticationComplete {
+        dn: String,
+    },
     AuthenticationFailed,
     Reset,
 }
@@ -248,13 +256,13 @@ pub enum SaslEvent {
 pub trait SaslFsm: StateMachine<State = SaslState, Event = SaslEvent> {
     /// Get the current SASL mechanism
     fn mechanism(&self) -> Option<&str>;
-    
+
     /// Get the current step number
     fn step(&self) -> u32;
-    
+
     /// Get the authenticated identity
     fn authenticated_identity(&self) -> Option<&str>;
-    
+
     /// Check if more steps are needed
     fn needs_more_steps(&self) -> bool;
 }
@@ -267,12 +275,12 @@ pub trait SaslFsm: StateMachine<State = SaslState, Event = SaslEvent> {
 pub enum SearchState {
     Initializing,
     FindingCandidates,
-    Iterating { 
+    Iterating {
         candidates_found: usize,
         entries_sent: usize,
     },
     EmittingEntries,
-    Completed { 
+    Completed {
         entries_sent: usize,
         result_code: SearchResultCode,
     },
@@ -283,7 +291,7 @@ pub enum SearchState {
 
 #[derive(Debug)]
 pub enum SearchEvent {
-    StartSearch { 
+    StartSearch {
         base_dn: String,
         scope: i32,
         filter: String,
@@ -310,17 +318,18 @@ pub enum SearchResultCode {
 }
 
 #[async_trait]
-pub trait SearchFsm: StateMachine<State = SearchState, Event = SearchEvent> 
-    + AbandonableFsm + TimeoutFsm {
+pub trait SearchFsm:
+    StateMachine<State = SearchState, Event = SearchEvent> + AbandonableFsm + TimeoutFsm
+{
     /// Get search parameters
     fn search_params(&self) -> Option<&SearchParams>;
-    
+
     /// Get current entry count
     fn entries_sent(&self) -> usize;
-    
+
     /// Get size limit
     fn size_limit(&self) -> u32;
-    
+
     /// Check if size limit would be exceeded
     fn would_exceed_size_limit(&self) -> bool;
 }
@@ -368,10 +377,23 @@ pub enum WriteEvent {
 
 #[derive(Debug, Clone)]
 pub enum WriteOperation {
-    Add { dn: String, entry: Vec<u8> },
-    Modify { dn: String, changes: Vec<u8> },
-    ModifyDn { dn: String, new_rdn: String, delete_old: bool, new_superior: Option<String> },
-    Delete { dn: String },
+    Add {
+        dn: String,
+        entry: Vec<u8>,
+    },
+    Modify {
+        dn: String,
+        changes: Vec<u8>,
+    },
+    ModifyDn {
+        dn: String,
+        new_rdn: String,
+        delete_old: bool,
+        new_superior: Option<String>,
+    },
+    Delete {
+        dn: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -388,10 +410,10 @@ pub enum WriteResultCode {
 pub trait WriteFsm: StateMachine<State = WriteState, Event = WriteEvent> {
     /// Get the write operation being performed
     fn operation(&self) -> Option<&WriteOperation>;
-    
+
     /// Get transaction ID if in transaction
     fn transaction_id(&self) -> Option<&str>;
-    
+
     /// Check if rollback is possible
     fn can_rollback(&self) -> bool;
 }
@@ -410,7 +432,11 @@ pub enum CompareState {
 
 #[derive(Debug)]
 pub enum CompareEvent {
-    StartCompare { dn: String, attribute: String, value: Vec<u8> },
+    StartCompare {
+        dn: String,
+        attribute: String,
+        value: Vec<u8>,
+    },
     EntryRead,
     ComparisonComplete(bool),
     ResultEmitted,
@@ -421,7 +447,7 @@ pub enum CompareEvent {
 pub trait CompareFsm: StateMachine<State = CompareState, Event = CompareEvent> {
     /// Get the comparison parameters
     fn compare_params(&self) -> Option<&CompareParams>;
-    
+
     /// Get the comparison result if available
     fn result(&self) -> Option<bool>;
 }
@@ -469,13 +495,13 @@ pub enum ExtendedOpResultCode {
 pub trait ExtendedOpFsm: StateMachine<State = ExtendedOpState, Event = ExtendedOpEvent> {
     /// Get the operation OID
     fn operation_oid(&self) -> Option<&str>;
-    
+
     /// Get the operation value
     fn operation_value(&self) -> Option<&[u8]>;
-    
+
     /// Get the response value if ready
     fn response_value(&self) -> Option<&[u8]>;
-    
+
     /// Check if this operation requires delegation
     fn requires_delegation(&self) -> bool;
 }
@@ -520,16 +546,16 @@ pub enum ReferralResultCode {
 pub trait ReferralFsm: StateMachine<State = ReferralState, Event = ReferralEvent> {
     /// Get current hop count
     fn hop_count(&self) -> u32;
-    
+
     /// Get maximum hop limit
     fn hop_limit(&self) -> u32;
-    
+
     /// Get current target DSA
     fn current_target(&self) -> Option<&str>;
-    
+
     /// Get referral URLs
     fn referral_urls(&self) -> Option<&[String]>;
-    
+
     /// Check if more hops are allowed
     fn can_hop(&self) -> bool {
         self.hop_count() < self.hop_limit()
@@ -545,7 +571,10 @@ pub enum ReplicationProviderState {
     /// Initial state waiting for sync request
     Initializing,
     /// Refresh phase - sending existing entries
-    Refresh { entries_sent: usize, total_entries: usize },
+    Refresh {
+        entries_sent: usize,
+        total_entries: usize,
+    },
     /// Present phase - streaming changelog entries  
     Present { entries_streamed: usize },
     /// Persist phase - maintaining replication cookie
@@ -561,13 +590,19 @@ pub enum ReplicationProviderState {
 #[derive(Debug, Clone)]
 pub enum ReplicationProviderEvent {
     /// Consumer requests sync replication from cookie
-    StartSyncReplication { consumer_id: String, cookie: Option<String> },
+    StartSyncReplication {
+        consumer_id: String,
+        cookie: Option<String>,
+    },
     /// Refresh phase completed, ready to stream changes
     RefreshComplete { entries_sent: usize },
     /// Present phase completed, ready to persist
     PresentComplete { entries_streamed: usize },
     /// New changelog entry available for streaming (CSN-based)
-    ChangelogEntry { entry: Vec<u8>, csn: crate::csn::Csn },
+    ChangelogEntry {
+        entry: Vec<u8>,
+        csn: crate::csn::Csn,
+    },
     /// Entry successfully streamed to consumer
     EntryStreamed { consumer_id: String },
     /// Consumer disconnected
@@ -579,28 +614,30 @@ pub enum ReplicationProviderEvent {
 }
 
 #[async_trait]
-pub trait ReplicationProviderFsm: StateMachine<State = ReplicationProviderState, Event = ReplicationProviderEvent> {
+pub trait ReplicationProviderFsm:
+    StateMachine<State = ReplicationProviderState, Event = ReplicationProviderEvent>
+{
     /// Get primary consumer identifier (for single consumer)
     fn consumer_id(&self) -> Option<&str>;
-    
+
     /// Get current replication cookie
     fn cookie(&self) -> Option<&str>;
-    
+
     /// Get entries sent count during refresh phase
     fn entries_sent(&self) -> usize;
-    
+
     /// Get entries streamed count during present phase
     fn entries_streamed(&self) -> usize;
-    
+
     /// Check if in streaming mode
     fn is_streaming(&self) -> bool;
-    
+
     /// Get active consumer count
     fn active_consumers(&self) -> usize;
-    
+
     /// Get current replication phase
     fn current_phase(&self) -> ReplicationPhase;
-    
+
     /// Get sync replication statistics
     fn sync_stats(&self) -> (usize, usize, usize); // (refresh_entries, present_entries, total_consumers)
 }
@@ -613,7 +650,7 @@ pub enum ReplicationPhase {
     /// Refresh phase - sending existing entries
     Refresh,
     /// Present phase - streaming changelog entries
-    Present, 
+    Present,
     /// Persist phase - maintaining cookie state
     Persist,
     /// Streaming phase - continuous replication
@@ -641,26 +678,35 @@ pub enum ReplicationConsumerState {
 
 #[derive(Debug)]
 pub enum ReplicationConsumerEvent {
-    StartConsumption { provider_url: String, cookie: Option<String> },
-    BatchReceived { entries: Vec<Vec<u8>> },
+    StartConsumption {
+        provider_url: String,
+        cookie: Option<String>,
+    },
+    BatchReceived {
+        entries: Vec<Vec<u8>>,
+    },
     EntryApplied,
-    StatePersisted { cookie: String },
+    StatePersisted {
+        cookie: String,
+    },
     ChangeReceived(Vec<u8>),
     ProviderDisconnected,
     Error(String),
 }
 
 #[async_trait]
-pub trait ReplicationConsumerFsm: StateMachine<State = ReplicationConsumerState, Event = ReplicationConsumerEvent> {
+pub trait ReplicationConsumerFsm:
+    StateMachine<State = ReplicationConsumerState, Event = ReplicationConsumerEvent>
+{
     /// Get provider URL
     fn provider_url(&self) -> Option<&str>;
-    
+
     /// Get current cookie
     fn current_cookie(&self) -> Option<&str>;
-    
+
     /// Get entries applied count
     fn entries_applied(&self) -> usize;
-    
+
     /// Check if listening for changes
     fn is_listening(&self) -> bool;
 }
@@ -684,21 +730,24 @@ pub enum BackendTxnState {
 #[derive(Debug)]
 pub enum BackendTxnEvent {
     OpenTransaction,
-    TransactionOpened { txn_id: String },
-    ReadRequest,
-    ReadComplete,
+    ReadRequest { key: String },
     WriteRequest { operation: BackendOperation },
-    WriteComplete,
-    IndexUpdateRequest,
-    IndexUpdateComplete,
+    IndexUpdateRequest { index_keys: Vec<String> },
     CommitRequest,
-    CommitComplete,
     RollbackRequest { reason: String },
-    RollbackComplete,
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendTxnOutput {
+    TransactionOpened { txn_id: String },
+    ReadResult { value: Option<Vec<u8>> },
+    WriteApplied { writes_performed: usize },
+    IndexesUpdated { updated: usize, total: usize },
+    Finished { committed: bool },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum BackendOperation {
     Insert { key: String, value: Vec<u8> },
     Update { key: String, value: Vec<u8> },
@@ -709,19 +758,19 @@ pub enum BackendOperation {
 pub trait BackendTxnFsm: StateMachine<State = BackendTxnState, Event = BackendTxnEvent> {
     /// Get transaction ID
     fn transaction_id(&self) -> Option<&str>;
-    
+
     /// Get read count
     fn reads_performed(&self) -> usize;
-    
+
     /// Get write count
     fn writes_performed(&self) -> usize;
-    
+
     /// Check if transaction can be committed
     fn can_commit(&self) -> bool;
-    
+
     /// Check if transaction can be rolled back
     fn can_rollback(&self) -> bool;
-    
+
     /// Get nested transaction level
     fn nesting_level(&self) -> u32;
 }
@@ -731,33 +780,58 @@ pub trait BackendTxnFsm: StateMachine<State = BackendTxnState, Event = BackendTx
 // ================================================================================================
 
 // Runtime FSM Management - Type aliases for convenience
-pub type DynConnectionFsm = Box<dyn ConnectionFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = ConnectionInfo, Stream = tokio::net::TcpStream>>;
-pub type DynBerDecoderFsm = Box<dyn BerDecoderFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = Vec<u8>>>;
-pub type DynAuthFsm = Box<dyn AuthFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = String>>;
-pub type DynSaslFsm = Box<dyn SaslFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = String>>;
-pub type DynSearchFsm = Box<dyn SearchFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = SearchResultCode>>;
-pub type DynWriteFsm = Box<dyn WriteFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = WriteResultCode>>;
-pub type DynCompareFsm = Box<dyn CompareFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = bool>>;
-pub type DynExtendedOpFsm = Box<dyn ExtendedOpFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = ExtendedOpResultCode>>;
-pub type DynReferralFsm = Box<dyn ReferralFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = ReferralResultCode>>;
-pub type DynBackendTxnFsm = Box<dyn BackendTxnFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = bool>>;
-pub type DynReplicationProviderFsm = Box<dyn ReplicationProviderFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = usize>>;
-pub type DynReplicationConsumerFsm = Box<dyn ReplicationConsumerFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = usize>>;
+pub type DynConnectionFsm = Box<
+    dyn ConnectionFsm<
+        Error = Box<dyn std::error::Error + Send + Sync>,
+        Output = ConnectionInfo,
+        Stream = tokio::net::TcpStream,
+    >,
+>;
+pub type DynBerDecoderFsm =
+    Box<dyn BerDecoderFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = Vec<u8>>>;
+pub type DynAuthFsm =
+    Box<dyn AuthFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = String>>;
+pub type DynSaslFsm =
+    Box<dyn SaslFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = String>>;
+pub type DynSearchFsm =
+    Box<dyn SearchFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = SearchResultCode>>;
+pub type DynWriteFsm =
+    Box<dyn WriteFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = WriteResultCode>>;
+pub type DynCompareFsm =
+    Box<dyn CompareFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = bool>>;
+pub type DynExtendedOpFsm = Box<
+    dyn ExtendedOpFsm<
+        Error = Box<dyn std::error::Error + Send + Sync>,
+        Output = ExtendedOpResultCode,
+    >,
+>;
+pub type DynReferralFsm = Box<
+    dyn ReferralFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = ReferralResultCode>,
+>;
+pub type DynBackendTxnFsm = Box<
+    dyn BackendTxnFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = BackendTxnOutput>,
+>;
+pub type DynReplicationProviderFsm = Box<
+    dyn ReplicationProviderFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = usize>,
+>;
+pub type DynReplicationConsumerFsm = Box<
+    dyn ReplicationConsumerFsm<Error = Box<dyn std::error::Error + Send + Sync>, Output = usize>,
+>;
 
 /// Represents the runtime instances of FSMs for a single connection
 pub struct ConnectionFsmSet {
     /// Connection lifecycle management
     pub connection: DynConnectionFsm,
-    
+
     /// BER message decoder
     pub decoder: DynBerDecoderFsm,
-    
+
     /// Authentication state (Simple or SASL)
     pub auth: AuthenticationFsm,
-    
+
     /// Active operation FSMs (multiple can run in parallel)
     pub operations: Vec<OperationFsm>,
-    
+
     /// Replication FSMs (if this connection is doing replication)
     pub replication: Option<ReplicationFsm>,
 }
@@ -768,8 +842,14 @@ impl std::fmt::Debug for ConnectionFsmSet {
             .field("connection", &"<ConnectionFsm>")
             .field("decoder", &"<BerDecoderFsm>")
             .field("auth", &self.auth)
-            .field("operations", &format!("[{} operations]", self.operations.len()))
-            .field("replication", &self.replication.as_ref().map(|_| "<ReplicationFsm>"))
+            .field(
+                "operations",
+                &format!("[{} operations]", self.operations.len()),
+            )
+            .field(
+                "replication",
+                &self.replication.as_ref().map(|_| "<ReplicationFsm>"),
+            )
             .finish()
     }
 }

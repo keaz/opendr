@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use std::time::{Duration, Instant};
 
 use crate::fsm::{
-    BackendOperation, BackendTxnEvent, BackendTxnFsm, BackendTxnState, StateMachine,
+    BackendOperation, BackendTxnEvent, BackendTxnFsm, BackendTxnOutput, BackendTxnState,
+    StateMachine,
 };
 
 // ================================================================================================
@@ -23,7 +24,10 @@ use crate::fsm::{
 #[derive(Debug)]
 pub enum BackendTxnError {
     /// Invalid state transition attempted
-    InvalidStateTransition { from: BackendTxnState, to: BackendTxnState },
+    InvalidStateTransition {
+        from: BackendTxnState,
+        to: BackendTxnState,
+    },
     /// Transaction manager error
     TransactionError(String),
     /// Data store error
@@ -93,7 +97,7 @@ pub trait DataStore: Send + Sync {
 #[async_trait]
 pub trait IndexManager: Send + Sync {
     /// Request index update for the given transaction context
-    async fn update_indexes(&self, txn_id: &str) -> Result<usize, String>;
+    async fn update_indexes(&self, txn_id: &str, index_keys: &[String]) -> Result<usize, String>;
 }
 
 /// Optional metrics collection for the backend txn FSM
@@ -154,28 +158,36 @@ impl BackendTxnFsmImpl {
         self
     }
 
-    fn can_transition(&self, from: &BackendTxnState, to: &BackendTxnState) -> bool {
-        use BackendTxnState as S;
-        match (from, to) {
-            (S::Opening, S::Reading { .. }) => true,
-            (S::Opening, S::Writing { .. }) => true,
-            (S::Reading { .. }, S::Reading { .. }) => true,
-            (S::Writing { .. }, S::Writing { .. }) => true,
-            (S::Reading { .. }, S::Writing { .. }) => true,
-            (S::Writing { .. }, S::Reading { .. }) => true,
-            (S::Reading { .. }, S::UpdatingIndexes { .. }) => true,
-            (S::Writing { .. }, S::UpdatingIndexes { .. }) => true,
-            (S::UpdatingIndexes { .. }, S::Reading { .. }) => true,
-            (S::UpdatingIndexes { .. }, S::Writing { .. }) => true,
-            (S::Reading { .. }, S::Committing) => true,
-            (S::Writing { .. }, S::Committing) => true,
-            (S::UpdatingIndexes { .. }, S::Committing) => true,
-            (_, S::RollingBack { .. }) => true,
-            (S::Committing, S::Completed { .. }) => true,
-            (S::RollingBack { .. }, S::Completed { .. }) => true,
-            (_, S::Failed { .. }) => true,
-            _ => false,
+    fn invalid_transition(&self, to: BackendTxnState) -> BackendTxnError {
+        BackendTxnError::InvalidStateTransition {
+            from: self.state.clone(),
+            to,
         }
+    }
+
+    fn fail(&mut self, context: &str, err: BackendTxnError) -> BackendTxnError {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_error(context, &err.to_string());
+        }
+        self.state = BackendTxnState::Failed {
+            error: err.to_string(),
+        };
+        err
+    }
+
+    fn require_txn_id(&mut self, context: &str) -> Result<String, BackendTxnError> {
+        self.txn_id
+            .clone()
+            .ok_or_else(|| self.fail(context, BackendTxnError::NoTransactionId))
+    }
+
+    fn in_active_transaction(&self) -> bool {
+        matches!(
+            self.state,
+            BackendTxnState::Reading { .. }
+                | BackendTxnState::Writing { .. }
+                | BackendTxnState::UpdatingIndexes { .. }
+        )
     }
 }
 
@@ -184,14 +196,17 @@ impl StateMachine for BackendTxnFsmImpl {
     type State = BackendTxnState;
     type Event = BackendTxnEvent;
     type Error = BackendTxnError;
-    type Output = bool; // committed: true, rolled back: false
+    type Output = BackendTxnOutput;
 
     fn current_state(&self) -> &Self::State {
         &self.state
     }
 
     fn is_terminal(&self) -> bool {
-        matches!(self.state, BackendTxnState::Completed { .. } | BackendTxnState::Failed { .. })
+        matches!(
+            self.state,
+            BackendTxnState::Completed { .. } | BackendTxnState::Failed { .. }
+        )
     }
 
     async fn handle_event(
@@ -203,216 +218,146 @@ impl StateMachine for BackendTxnFsmImpl {
 
         match event {
             E::OpenTransaction => {
-                // Only valid from Opening state
                 if !matches!(self.state, S::Opening) {
-                    let msg = format!("Invalid transition: {:?} -> OpenTransaction", self.state);
-                    if let Some(m) = &self.metrics { m.record_error("open", &msg) }
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
+                    return Err(self.invalid_transition(S::Opening));
                 }
+
                 let t0 = Instant::now();
-                let txn_id = self
-                    .txn_mgr
-                    .open_transaction()
-                    .await
-                    .map_err(|e| {
-                        if let Some(m) = &self.metrics { m.record_error("open", &e) }
-                        e
-                    })?;
+                let txn_id = match self.txn_mgr.open_transaction().await {
+                    Ok(txn_id) => txn_id,
+                    Err(err) => {
+                        return Err(self.fail("open", BackendTxnError::TransactionError(err)));
+                    }
+                };
+
                 self.txn_id = Some(txn_id);
-                if let Some(m) = &self.metrics { m.record_txn_open(t0.elapsed()) }
-                // After open, we allow reads/writes; default to Reading state with zero reads
-                let next = S::Reading { reads_performed: 0 };
-                if !self.can_transition(&self.state, &next) {
-                    let msg = "Illegal state transition after open".to_string();
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
+                if let Some(m) = &self.metrics {
+                    m.record_txn_open(t0.elapsed())
                 }
-                self.state = next;
-                Ok(None)
+
+                let txn_id = self.txn_id.clone().expect("txn_id set after open");
+                self.state = S::Reading { reads_performed: 0 };
+                Ok(Some(BackendTxnOutput::TransactionOpened { txn_id }))
             }
-            E::TransactionOpened { .. } => {
-                // This event is not needed as we perform open synchronously above; reject if used
-                let msg = "TransactionOpened event is not used in this FSM".to_string();
-                if let Some(m) = &self.metrics { m.record_error("opened_evt", &msg) }
-                self.state = S::Failed { error: msg.clone() };
-                Err(msg.into())
-            }
-            E::ReadRequest => {
-                // Valid from Reading or Writing (allow switching back to reading)
-                let next = S::Reading {
+            E::ReadRequest { key } => {
+                if !self.in_active_transaction() {
+                    return Err(self.invalid_transition(S::Reading {
+                        reads_performed: self.reads_performed,
+                    }));
+                }
+
+                let _txn_id = self.require_txn_id("read_txn")?;
+                let t0 = Instant::now();
+                let value = match self.store.read(&key).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return Err(self.fail("read", BackendTxnError::DataStoreError(err)));
+                    }
+                };
+
+                self.reads_performed += 1;
+                self.state = S::Reading {
                     reads_performed: self.reads_performed,
                 };
-                if !self.can_transition(&self.state, &next) {
-                    let msg = format!("Invalid transition: {:?} -> ReadRequest", self.state);
-                    if let Some(m) = &self.metrics { m.record_error("read_req", &msg) }
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
+                if let Some(m) = &self.metrics {
+                    m.record_read(t0.elapsed())
                 }
-                self.state = next;
-                Ok(None)
-            }
-            E::ReadComplete => {
-                // Simulate a read via store.read on a fixed key to validate path
-                let t0 = Instant::now();
-                // We use a static key for init tests; real integration would supply via event payload
-                let _ = self
-                    .store
-                    .read("_health_check_")
-                    .await
-                    .map_err(|e| {
-                        if let Some(m) = &self.metrics { m.record_error("read", &e) }
-                        e
-                    })?;
-                self.reads_performed += 1;
-                if let S::Reading { reads_performed: rp } = &mut self.state {
-                    *rp = self.reads_performed;
-                }
-                if let Some(m) = &self.metrics { m.record_read(t0.elapsed()) }
-                Ok(Some(false)) // operation complete signal not used for read; false placeholder
+
+                Ok(Some(BackendTxnOutput::ReadResult { value }))
             }
             E::WriteRequest { operation } => {
-                // Move to Writing state and perform the write
-                let next = S::Writing {
+                if !self.in_active_transaction() {
+                    return Err(self.invalid_transition(S::Writing {
+                        writes_performed: self.writes_performed,
+                    }));
+                }
+
+                let t0 = Instant::now();
+                let txn_id = self.require_txn_id("write_txn")?;
+                if let Err(err) = self.store.write(&txn_id, operation).await {
+                    return Err(self.fail("write", BackendTxnError::DataStoreError(err)));
+                }
+
+                self.writes_performed += 1;
+                self.state = S::Writing {
                     writes_performed: self.writes_performed,
                 };
-                if !self.can_transition(&self.state, &next) {
-                    let msg = format!("Invalid transition: {:?} -> WriteRequest", self.state);
-                    if let Some(m) = &self.metrics { m.record_error("write_req", &msg) }
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
+                if let Some(m) = &self.metrics {
+                    m.record_write(t0.elapsed())
                 }
-                self.state = next;
-                // Execute write
+
+                Ok(Some(BackendTxnOutput::WriteApplied {
+                    writes_performed: self.writes_performed,
+                }))
+            }
+            E::IndexUpdateRequest { index_keys } => {
+                if !self.in_active_transaction() {
+                    return Err(self.invalid_transition(S::UpdatingIndexes {
+                        indexes_updated: self.indexes_updated,
+                    }));
+                }
+
                 let t0 = Instant::now();
-                let txn_id = self
-                    .txn_id
-                    .as_deref()
-                    .ok_or_else(|| "No transaction id present".to_string())?;
-                self.store.write(txn_id, operation).await.map_err(|e| {
-                    if let Some(m) = &self.metrics { m.record_error("write", &e) }
-                    e
-                })?;
-                if let Some(m) = &self.metrics { m.record_write(t0.elapsed()) }
-                Ok(None)
-            }
-            E::WriteComplete => {
-                if !matches!(self.state, S::Writing { .. }) {
-                    let msg = format!("Invalid transition: {:?} -> WriteComplete", self.state);
-                    if let Some(m) = &self.metrics { m.record_error("write_complete", &msg) }
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
-                }
-                self.writes_performed += 1;
-                if let S::Writing { writes_performed } = &mut self.state {
-                    *writes_performed = self.writes_performed;
-                }
-                Ok(Some(false))
-            }
-            E::IndexUpdateRequest => {
-                // Allow index update from Reading or Writing
-                let next = S::UpdatingIndexes {
+                let txn_id = self.require_txn_id("index_txn")?;
+                let updated = match self.indexer.update_indexes(&txn_id, &index_keys).await {
+                    Ok(updated) => updated,
+                    Err(err) => {
+                        return Err(self.fail("index_update", BackendTxnError::IndexError(err)));
+                    }
+                };
+
+                self.indexes_updated += updated;
+                self.state = S::UpdatingIndexes {
                     indexes_updated: self.indexes_updated,
                 };
-                if !self.can_transition(&self.state, &next) {
-                    let msg = format!("Invalid transition: {:?} -> IndexUpdateRequest", self.state);
-                    if let Some(m) = &self.metrics { m.record_error("index_req", &msg) }
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
+                if let Some(m) = &self.metrics {
+                    m.record_index_update(t0.elapsed(), updated)
                 }
-                self.state = next;
-                Ok(None)
-            }
-            E::IndexUpdateComplete => {
-                // Perform index update call
-                let t0 = Instant::now();
-                let txn_id = self
-                    .txn_id
-                    .as_deref()
-                    .ok_or_else(|| "No transaction id present".to_string())?;
-                let updated = self.indexer.update_indexes(txn_id).await.map_err(|e| {
-                    if let Some(m) = &self.metrics { m.record_error("index_update", &e) }
-                    e
-                })?;
-                self.indexes_updated += updated;
-                if let S::UpdatingIndexes { indexes_updated } = &mut self.state {
-                    *indexes_updated = self.indexes_updated;
-                }
-                if let Some(m) = &self.metrics { m.record_index_update(t0.elapsed(), updated) }
-                // Return to Reading by default
-                let next = S::Reading {
-                    reads_performed: self.reads_performed,
-                };
-                self.state = next;
-                Ok(Some(false))
+
+                Ok(Some(BackendTxnOutput::IndexesUpdated {
+                    updated,
+                    total: self.indexes_updated,
+                }))
             }
             E::CommitRequest => {
-                let next = S::Committing;
-                if !self.can_transition(&self.state, &next) {
-                    let msg = format!("Invalid transition: {:?} -> CommitRequest", self.state);
-                    if let Some(m) = &self.metrics { m.record_error("commit_req", &msg) }
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
+                if !self.in_active_transaction() {
+                    return Err(self.invalid_transition(S::Committing));
                 }
-                self.state = next;
-                Ok(None)
-            }
-            E::CommitComplete => {
-                // Perform commit action
+
                 let t0 = Instant::now();
-                if !matches!(self.state, S::Committing) {
-                    let msg = format!("Invalid transition: {:?} -> CommitComplete", self.state);
-                    if let Some(m) = &self.metrics { m.record_error("commit_complete", &msg) }
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
+                let txn_id = self.require_txn_id("commit_txn")?;
+                self.state = S::Committing;
+                if let Err(err) = self.txn_mgr.commit(&txn_id).await {
+                    return Err(self.fail("commit", BackendTxnError::TransactionError(err)));
                 }
-                let txn_id = self
-                    .txn_id
-                    .as_deref()
-                    .ok_or_else(|| "No transaction id present".to_string())?;
-                self.txn_mgr.commit(txn_id).await.map_err(|e| {
-                    if let Some(m) = &self.metrics { m.record_error("commit", &e) }
-                    e
-                })?;
-                if let Some(m) = &self.metrics { m.record_commit(t0.elapsed()) }
+                if let Some(m) = &self.metrics {
+                    m.record_commit(t0.elapsed())
+                }
                 self.state = S::Completed { committed: true };
-                Ok(Some(true))
+                Ok(Some(BackendTxnOutput::Finished { committed: true }))
             }
             E::RollbackRequest { reason } => {
-                let next = S::RollingBack { reason: reason.clone() };
-                if !self.can_transition(&self.state, &next) {
-                    let msg = format!("Invalid transition: {:?} -> RollbackRequest", self.state);
-                    if let Some(m) = &self.metrics { m.record_error("rollback_req", &msg) }
-                    self.state = S::Failed { error: msg.clone() };
-                    return Err(msg.into());
+                if !self.in_active_transaction() {
+                    return Err(self.invalid_transition(S::RollingBack {
+                        reason: reason.clone(),
+                    }));
                 }
-                self.state = next;
-                Ok(None)
-            }
-            E::RollbackComplete => {
-                // Perform rollback action
+
                 let t0 = Instant::now();
-                let txn_id = self
-                    .txn_id
-                    .as_deref()
-                    .ok_or_else(|| "No transaction id present".to_string())?;
-                let reason = match &self.state {
-                    S::RollingBack { reason } => reason.as_str(),
-                    _ => "unspecified",
+                let txn_id = self.require_txn_id("rollback_txn")?;
+                self.state = S::RollingBack {
+                    reason: reason.clone(),
                 };
-                self.txn_mgr.rollback(txn_id, reason).await.map_err(|e| {
-                    if let Some(m) = &self.metrics { m.record_error("rollback", &e) }
-                    e
-                })?;
-                if let Some(m) = &self.metrics { m.record_rollback(t0.elapsed(), reason) }
+                if let Err(err) = self.txn_mgr.rollback(&txn_id, &reason).await {
+                    return Err(self.fail("rollback", BackendTxnError::TransactionError(err)));
+                }
+                if let Some(m) = &self.metrics {
+                    m.record_rollback(t0.elapsed(), &reason)
+                }
                 self.state = S::Completed { committed: false };
-                Ok(Some(false))
+                Ok(Some(BackendTxnOutput::Finished { committed: false }))
             }
-            E::Error(message) => {
-                if let Some(m) = &self.metrics { m.record_error("event_error", &message) }
-                self.state = S::Failed { error: message.clone() };
-                Err(message.into())
-            }
+            E::Error(message) => Err(self.fail("event_error", BackendTxnError::Generic(message))),
         }
     }
 
@@ -442,15 +387,11 @@ impl BackendTxnFsm for BackendTxnFsmImpl {
     }
 
     fn can_commit(&self) -> bool {
-        use BackendTxnState as S;
-        matches!(
-            self.state,
-            S::Reading { .. } | S::Writing { .. } | S::UpdatingIndexes { .. } | S::Committing
-        ) && self.txn_id.is_some()
+        self.in_active_transaction() && self.txn_id.is_some()
     }
 
     fn can_rollback(&self) -> bool {
-        !matches!(self.state, BackendTxnState::Completed { .. }) && self.txn_id.is_some()
+        self.in_active_transaction() && self.txn_id.is_some()
     }
 
     fn nesting_level(&self) -> u32 {
@@ -467,16 +408,15 @@ pub mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    // ----------------------------
-    // Mocks
-    // ----------------------------
-
     pub struct MockTxnMgr {
         pub next_id: Arc<Mutex<u64>>,
         pub commit_calls: Arc<Mutex<usize>>,
         pub rollback_calls: Arc<Mutex<usize>>,
+        pub rollback_reasons: Arc<Mutex<Vec<String>>>,
         pub level: u32,
-        pub fail_mode: bool,
+        pub open_fail: bool,
+        pub commit_fail: bool,
+        pub rollback_fail: bool,
     }
 
     impl MockTxnMgr {
@@ -485,82 +425,187 @@ pub mod tests {
                 next_id: Arc::new(Mutex::new(1)),
                 commit_calls: Arc::new(Mutex::new(0)),
                 rollback_calls: Arc::new(Mutex::new(0)),
+                rollback_reasons: Arc::new(Mutex::new(Vec::new())),
                 level: 1,
-                fail_mode: false,
+                open_fail: false,
+                commit_fail: false,
+                rollback_fail: false,
             }
         }
-        pub fn with_fail(mut self) -> Self { self.fail_mode = true; self }
-        pub fn with_level(mut self, level: u32) -> Self { self.level = level; self }
+
+        pub fn with_open_fail(mut self) -> Self {
+            self.open_fail = true;
+            self
+        }
+
+        pub fn with_commit_fail(mut self) -> Self {
+            self.commit_fail = true;
+            self
+        }
+
+        pub fn with_rollback_fail(mut self) -> Self {
+            self.rollback_fail = true;
+            self
+        }
+
+        pub fn with_level(mut self, level: u32) -> Self {
+            self.level = level;
+            self
+        }
     }
 
     #[async_trait]
     impl TransactionManager for MockTxnMgr {
         async fn open_transaction(&self) -> Result<String, String> {
-            if self.fail_mode { return Err("open fail".into()); }
+            if self.open_fail {
+                return Err("open fail".into());
+            }
             let mut id = self.next_id.lock().unwrap();
-            let s = format!("txn-{}", *id);
+            let txn_id = format!("txn-{}", *id);
             *id += 1;
-            Ok(s)
+            Ok(txn_id)
         }
+
         async fn commit(&self, _txn_id: &str) -> Result<(), String> {
-            if self.fail_mode { return Err("commit fail".into()); }
+            if self.commit_fail {
+                return Err("commit fail".into());
+            }
             *self.commit_calls.lock().unwrap() += 1;
             Ok(())
         }
-        async fn rollback(&self, _txn_id: &str, _reason: &str) -> Result<(), String> {
-            if self.fail_mode { return Err("rollback fail".into()); }
+
+        async fn rollback(&self, _txn_id: &str, reason: &str) -> Result<(), String> {
+            if self.rollback_fail {
+                return Err("rollback fail".into());
+            }
             *self.rollback_calls.lock().unwrap() += 1;
+            self.rollback_reasons
+                .lock()
+                .unwrap()
+                .push(reason.to_string());
             Ok(())
         }
-        fn nesting_level(&self) -> u32 { self.level }
+
+        fn nesting_level(&self) -> u32 {
+            self.level
+        }
     }
 
     pub struct MockStore {
-        pub reads: Arc<Mutex<usize>>,
-        pub writes: Arc<Mutex<usize>>,
-        pub fail_mode: bool,
+        pub read_keys: Arc<Mutex<Vec<String>>>,
+        pub write_ops: Arc<Mutex<Vec<BackendOperation>>>,
+        pub read_fail: bool,
+        pub write_fail: bool,
     }
-    impl MockStore { pub fn new() -> Self { Self { reads: Arc::new(Mutex::new(0)), writes: Arc::new(Mutex::new(0)), fail_mode: false } } pub fn with_fail(mut self) -> Self { self.fail_mode = true; self } }
+
+    impl MockStore {
+        pub fn new() -> Self {
+            Self {
+                read_keys: Arc::new(Mutex::new(Vec::new())),
+                write_ops: Arc::new(Mutex::new(Vec::new())),
+                read_fail: false,
+                write_fail: false,
+            }
+        }
+
+        pub fn with_read_fail(mut self) -> Self {
+            self.read_fail = true;
+            self
+        }
+
+        pub fn with_write_fail(mut self) -> Self {
+            self.write_fail = true;
+            self
+        }
+    }
 
     #[async_trait]
     impl DataStore for MockStore {
-        async fn read(&self, _key: &str) -> Result<Option<Vec<u8>>, String> {
-            if self.fail_mode { return Err("read fail".into()); }
-            *self.reads.lock().unwrap() += 1;
-            Ok(Some(b"value".to_vec()))
+        async fn read(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+            if self.read_fail {
+                return Err("read fail".into());
+            }
+            self.read_keys.lock().unwrap().push(key.to_string());
+            Ok(Some(format!("value:{key}").into_bytes()))
         }
-        async fn write(&self, _txn_id: &str, _op: BackendOperation) -> Result<(), String> {
-            if self.fail_mode { return Err("write fail".into()); }
-            *self.writes.lock().unwrap() += 1;
+
+        async fn write(&self, _txn_id: &str, op: BackendOperation) -> Result<(), String> {
+            if self.write_fail {
+                return Err("write fail".into());
+            }
+            self.write_ops.lock().unwrap().push(op);
             Ok(())
         }
     }
 
     pub struct MockIndexer {
-        pub updates: Arc<Mutex<usize>>,
+        pub update_calls: Arc<Mutex<Vec<Vec<String>>>>,
         pub fail_mode: bool,
     }
-    impl MockIndexer { pub fn new() -> Self { Self { updates: Arc::new(Mutex::new(0)), fail_mode: false } } pub fn with_fail(mut self) -> Self { self.fail_mode = true; self } }
 
-    #[async_trait]
-    impl IndexManager for MockIndexer {
-        async fn update_indexes(&self, _txn_id: &str) -> Result<usize, String> {
-            if self.fail_mode { return Err("index fail".into()); }
-            *self.updates.lock().unwrap() += 1;
-            Ok(1)
+    impl MockIndexer {
+        pub fn new() -> Self {
+            Self {
+                update_calls: Arc::new(Mutex::new(Vec::new())),
+                fail_mode: false,
+            }
+        }
+
+        pub fn with_fail(mut self) -> Self {
+            self.fail_mode = true;
+            self
         }
     }
 
-    pub struct MockMetrics { pub events: Arc<Mutex<Vec<String>>> }
-    impl MockMetrics { pub fn new() -> Self { Self { events: Arc::new(Mutex::new(vec![])) } } }
+    #[async_trait]
+    impl IndexManager for MockIndexer {
+        async fn update_indexes(
+            &self,
+            _txn_id: &str,
+            index_keys: &[String],
+        ) -> Result<usize, String> {
+            if self.fail_mode {
+                return Err("index fail".into());
+            }
+            self.update_calls.lock().unwrap().push(index_keys.to_vec());
+            Ok(index_keys.len())
+        }
+    }
+
+    pub struct MockMetrics {
+        pub events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockMetrics {
+        pub fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
     impl TxnMetrics for MockMetrics {
-        fn record_txn_open(&self, _t: Duration) { self.events.lock().unwrap().push("open".into()); }
-        fn record_read(&self, _t: Duration) { self.events.lock().unwrap().push("read".into()); }
-        fn record_write(&self, _t: Duration) { self.events.lock().unwrap().push("write".into()); }
-        fn record_index_update(&self, _t: Duration, _i: usize) { self.events.lock().unwrap().push("index".into()); }
-        fn record_commit(&self, _t: Duration) { self.events.lock().unwrap().push("commit".into()); }
-        fn record_rollback(&self, _t: Duration, _r: &str) { self.events.lock().unwrap().push("rollback".into()); }
-        fn record_error(&self, ctx: &str, _m: &str) { self.events.lock().unwrap().push(format!("error:{ctx}")); }
+        fn record_txn_open(&self, _t: Duration) {
+            self.events.lock().unwrap().push("open".into());
+        }
+        fn record_read(&self, _t: Duration) {
+            self.events.lock().unwrap().push("read".into());
+        }
+        fn record_write(&self, _t: Duration) {
+            self.events.lock().unwrap().push("write".into());
+        }
+        fn record_index_update(&self, _t: Duration, _i: usize) {
+            self.events.lock().unwrap().push("index".into());
+        }
+        fn record_commit(&self, _t: Duration) {
+            self.events.lock().unwrap().push("commit".into());
+        }
+        fn record_rollback(&self, _t: Duration, _r: &str) {
+            self.events.lock().unwrap().push("rollback".into());
+        }
+        fn record_error(&self, ctx: &str, _m: &str) {
+            self.events.lock().unwrap().push(format!("error:{ctx}"));
+        }
     }
 
     fn make_fsm() -> BackendTxnFsmImpl {
@@ -571,417 +616,591 @@ pub mod tests {
         )
     }
 
-    // ----------------------------
-    // Init tests for each method and basic transitions
-    // ----------------------------
-
     #[tokio::test]
-    async fn test_open_transaction_flow() {
+    async fn test_open_transaction_returns_txn_id_and_enters_reading() {
         let mut fsm = make_fsm();
-        assert!(matches!(fsm.current_state(), BackendTxnState::Opening));
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        assert!(matches!(fsm.current_state(), BackendTxnState::Reading { .. }));
-        assert!(fsm.transaction_id().is_some());
-        assert_eq!(fsm.nesting_level(), 1);
+
+        let result = fsm
+            .handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            Some(BackendTxnOutput::TransactionOpened {
+                txn_id: "txn-1".to_string(),
+            })
+        );
+        assert_eq!(fsm.transaction_id(), Some("txn-1"));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Reading { reads_performed: 0 }
+        ));
     }
 
     #[tokio::test]
-    async fn test_read_flow() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::ReadRequest).await.unwrap();
-        let res = fsm.handle_event(BackendTxnEvent::ReadComplete).await.unwrap();
-        assert_eq!(res, Some(false));
+    async fn test_read_request_uses_explicit_key_and_returns_store_value() {
+        let store = MockStore::new();
+        let read_keys = store.read_keys.clone();
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new()),
+            Box::new(store),
+            Box::new(MockIndexer::new()),
+        );
+
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        let result = fsm
+            .handle_event(BackendTxnEvent::ReadRequest {
+                key: "user:42".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            Some(BackendTxnOutput::ReadResult {
+                value: Some(b"value:user:42".to_vec()),
+            })
+        );
+        assert_eq!(read_keys.lock().unwrap().as_slice(), ["user:42"]);
         assert_eq!(fsm.reads_performed(), 1);
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Reading { reads_performed: 1 }
+        ));
     }
 
     #[tokio::test]
-    async fn test_write_flow() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        fsm
-            .handle_event(BackendTxnEvent::WriteRequest { operation: BackendOperation::Insert { key: "k".into(), value: b"v".to_vec() } })
+    async fn test_write_request_executes_side_effect_once_and_updates_count() {
+        let store = MockStore::new();
+        let write_ops = store.write_ops.clone();
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new()),
+            Box::new(store),
+            Box::new(MockIndexer::new()),
+        );
+
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
             .await
             .unwrap();
-        let res = fsm.handle_event(BackendTxnEvent::WriteComplete).await.unwrap();
-        assert_eq!(res, Some(false));
+
+        let operation = BackendOperation::Insert {
+            key: "k".into(),
+            value: b"v".to_vec(),
+        };
+        let result = fsm
+            .handle_event(BackendTxnEvent::WriteRequest {
+                operation: operation.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            Some(BackendTxnOutput::WriteApplied {
+                writes_performed: 1,
+            })
+        );
+        assert_eq!(write_ops.lock().unwrap().as_slice(), &[operation]);
         assert_eq!(fsm.writes_performed(), 1);
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Writing {
+                writes_performed: 1
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn test_index_update_flow() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::IndexUpdateRequest).await.unwrap();
-        let res = fsm.handle_event(BackendTxnEvent::IndexUpdateComplete).await.unwrap();
-        assert_eq!(res, Some(false));
-        assert!(matches!(fsm.current_state(), BackendTxnState::Reading { .. }));
-    }
+    async fn test_index_update_request_uses_explicit_keys_and_returns_updated_count() {
+        let indexer = MockIndexer::new();
+        let update_calls = indexer.update_calls.clone();
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new()),
+            Box::new(MockStore::new()),
+            Box::new(indexer),
+        );
 
-    #[tokio::test]
-    async fn test_commit_flow() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        assert!(fsm.can_commit());
-        fsm.handle_event(BackendTxnEvent::CommitRequest).await.unwrap();
-        let res = fsm.handle_event(BackendTxnEvent::CommitComplete).await.unwrap();
-        assert_eq!(res, Some(true));
-        assert!(matches!(fsm.current_state(), BackendTxnState::Completed { committed: true }));
-    }
-
-    #[tokio::test]
-    async fn test_rollback_flow() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        assert!(fsm.can_rollback());
-        fsm
-            .handle_event(BackendTxnEvent::RollbackRequest { reason: "test".into() })
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
             .await
             .unwrap();
-        let res = fsm.handle_event(BackendTxnEvent::RollbackComplete).await.unwrap();
-        assert_eq!(res, Some(false));
-        assert!(matches!(fsm.current_state(), BackendTxnState::Completed { committed: false }));
+
+        let result = fsm
+            .handle_event(BackendTxnEvent::IndexUpdateRequest {
+                index_keys: vec!["cn".into(), "mail".into()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            Some(BackendTxnOutput::IndexesUpdated {
+                updated: 2,
+                total: 2,
+            })
+        );
+        assert_eq!(
+            update_calls.lock().unwrap().as_slice(),
+            &[vec!["cn".to_string(), "mail".to_string()]]
+        );
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::UpdatingIndexes { indexes_updated: 2 }
+        ));
     }
 
     #[tokio::test]
-    async fn test_invalid_transition_rejected() {
-        let mut fsm = make_fsm();
-        // Cannot commit before opening transaction
-        let err = fsm.handle_event(BackendTxnEvent::CommitRequest).await.unwrap_err();
-        let _ = err; // just ensure it errored
-        assert!(matches!(fsm.current_state(), BackendTxnState::Failed { .. }));
+    async fn test_commit_request_performs_commit_and_finishes() {
+        let txn_mgr = MockTxnMgr::new();
+        let commit_calls = txn_mgr.commit_calls.clone();
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(txn_mgr),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new()),
+        );
+
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        let result = fsm
+            .handle_event(BackendTxnEvent::CommitRequest)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(BackendTxnOutput::Finished { committed: true }));
+        assert_eq!(*commit_calls.lock().unwrap(), 1);
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Completed { committed: true }
+        ));
     }
 
     #[tokio::test]
-    async fn test_reset() {
+    async fn test_rollback_request_performs_rollback_and_finishes() {
+        let txn_mgr = MockTxnMgr::new();
+        let rollback_calls = txn_mgr.rollback_calls.clone();
+        let rollback_reasons = txn_mgr.rollback_reasons.clone();
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(txn_mgr),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new()),
+        );
+
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        let result = fsm
+            .handle_event(BackendTxnEvent::RollbackRequest {
+                reason: "user_cancelled".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            Some(BackendTxnOutput::Finished { committed: false })
+        );
+        assert_eq!(*rollback_calls.lock().unwrap(), 1);
+        assert_eq!(
+            rollback_reasons.lock().unwrap().as_slice(),
+            &["user_cancelled".to_string()]
+        );
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Completed { committed: false }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_txn_id_moves_to_failed_on_read_request() {
         let mut fsm = make_fsm();
-        let _ = fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
+        fsm.state = BackendTxnState::Reading { reads_performed: 0 };
+        fsm.txn_id = None;
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::ReadRequest { key: "k".into() })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::NoTransactionId));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_txn_id_moves_to_failed_on_write_request() {
+        let mut fsm = make_fsm();
+        fsm.state = BackendTxnState::Writing {
+            writes_performed: 0,
+        };
+        fsm.txn_id = None;
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::WriteRequest {
+                operation: BackendOperation::Delete { key: "k".into() },
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::NoTransactionId));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_txn_id_moves_to_failed_on_index_update_request() {
+        let mut fsm = make_fsm();
+        fsm.state = BackendTxnState::UpdatingIndexes { indexes_updated: 0 };
+        fsm.txn_id = None;
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::IndexUpdateRequest {
+                index_keys: vec!["cn".into()],
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::NoTransactionId));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_txn_id_moves_to_failed_on_commit_request() {
+        let mut fsm = make_fsm();
+        fsm.state = BackendTxnState::Reading { reads_performed: 0 };
+        fsm.txn_id = None;
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::CommitRequest)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::NoTransactionId));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_txn_id_moves_to_failed_on_rollback_request() {
+        let mut fsm = make_fsm();
+        fsm.state = BackendTxnState::Reading { reads_performed: 0 };
+        fsm.txn_id = None;
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::RollbackRequest {
+                reason: "missing".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::NoTransactionId));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_open_failure_moves_to_failed() {
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new().with_open_fail()),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new()),
+        );
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::TransactionError(_)));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_store_read_failure_moves_to_failed() {
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new()),
+            Box::new(MockStore::new().with_read_fail()),
+            Box::new(MockIndexer::new()),
+        );
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::ReadRequest { key: "k".into() })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::DataStoreError(_)));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_store_write_failure_moves_to_failed() {
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new()),
+            Box::new(MockStore::new().with_write_fail()),
+            Box::new(MockIndexer::new()),
+        );
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::WriteRequest {
+                operation: BackendOperation::Insert {
+                    key: "k".into(),
+                    value: b"v".to_vec(),
+                },
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::DataStoreError(_)));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_index_update_failure_moves_to_failed() {
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new()),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new().with_fail()),
+        );
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::IndexUpdateRequest {
+                index_keys: vec!["cn".into()],
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::IndexError(_)));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_commit_failure_moves_to_failed() {
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new().with_commit_fail()),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new()),
+        );
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::CommitRequest)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::TransactionError(_)));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_failure_moves_to_failed() {
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new().with_rollback_fail()),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new()),
+        );
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::RollbackRequest {
+                reason: "failed".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, BackendTxnError::TransactionError(_)));
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_completed_state_rejects_follow_up_write_without_side_effect() {
+        let store = MockStore::new();
+        let write_ops = store.write_ops.clone();
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new()),
+            Box::new(store),
+            Box::new(MockIndexer::new()),
+        );
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+        fsm.handle_event(BackendTxnEvent::CommitRequest)
+            .await
+            .unwrap();
+
+        let err = fsm
+            .handle_event(BackendTxnEvent::WriteRequest {
+                operation: BackendOperation::Delete { key: "k".into() },
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackendTxnError::InvalidStateTransition { .. }
+        ));
+        assert!(write_ops.lock().unwrap().is_empty());
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Completed { committed: true }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_failed_state_rejects_follow_up_commit_without_side_effect() {
+        let txn_mgr = MockTxnMgr::new();
+        let commit_calls = txn_mgr.commit_calls.clone();
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(txn_mgr.with_open_fail()),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new()),
+        );
+
+        let _ = fsm.handle_event(BackendTxnEvent::OpenTransaction).await;
+        let err = fsm
+            .handle_event(BackendTxnEvent::CommitRequest)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackendTxnError::InvalidStateTransition { .. }
+        ));
+        assert_eq!(*commit_calls.lock().unwrap(), 0);
+        assert!(matches!(
+            fsm.current_state(),
+            BackendTxnState::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reset_restores_opening_state() {
+        let mut fsm = make_fsm();
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+        fsm.handle_event(BackendTxnEvent::WriteRequest {
+            operation: BackendOperation::Delete { key: "k".into() },
+        })
+        .await
+        .unwrap();
+
         fsm.reset().await.unwrap();
+
         assert!(matches!(fsm.current_state(), BackendTxnState::Opening));
         assert!(fsm.transaction_id().is_none());
         assert_eq!(fsm.reads_performed(), 0);
         assert_eq!(fsm.writes_performed(), 0);
     }
 
-    // ----------------------------
-    // Additional comprehensive tests
-    // ----------------------------
-
     #[tokio::test]
-    async fn test_fsm_with_metrics() {
-        let txn_mgr = Box::new(MockTxnMgr::new());
-        let store = Box::new(MockStore::new());
-        let indexer = Box::new(MockIndexer::new());
+    async fn test_metrics_collect_request_driven_operations() {
         let metrics = Box::new(MockMetrics::new());
-        
-        let mut fsm = BackendTxnFsmImpl::new(txn_mgr, store, indexer).with_metrics(metrics);
-        
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::ReadRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::ReadComplete).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::CommitRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::CommitComplete).await.unwrap();
-        
-        assert!(matches!(fsm.current_state(), BackendTxnState::Completed { committed: true }));
-    }
+        let events = metrics.events.clone();
+        let mut fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new()),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new()),
+        )
+        .with_metrics(metrics);
 
-    #[tokio::test]
-    async fn test_transaction_opened_event_rejected() {
-        let mut fsm = make_fsm();
-        let err = fsm.handle_event(BackendTxnEvent::TransactionOpened { txn_id: "test".into() }).await.unwrap_err();
-        assert!(err.to_string().contains("TransactionOpened event is not used"));
-        assert!(matches!(fsm.current_state(), BackendTxnState::Failed { .. }));
-    }
+        fsm.handle_event(BackendTxnEvent::OpenTransaction)
+            .await
+            .unwrap();
+        fsm.handle_event(BackendTxnEvent::ReadRequest { key: "k".into() })
+            .await
+            .unwrap();
+        fsm.handle_event(BackendTxnEvent::WriteRequest {
+            operation: BackendOperation::Delete { key: "k".into() },
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(BackendTxnEvent::IndexUpdateRequest {
+            index_keys: vec!["cn".into()],
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(BackendTxnEvent::CommitRequest)
+            .await
+            .unwrap();
 
-    #[tokio::test]
-    async fn test_multiple_read_write_cycle() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        
-        // Read -> Write -> Read -> Write
-        fsm.handle_event(BackendTxnEvent::ReadRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::ReadComplete).await.unwrap();
-        
-        fsm.handle_event(BackendTxnEvent::WriteRequest { 
-            operation: BackendOperation::Insert { key: "k1".into(), value: b"v1".to_vec() } 
-        }).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::WriteComplete).await.unwrap();
-        
-        fsm.handle_event(BackendTxnEvent::ReadRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::ReadComplete).await.unwrap();
-        
-        fsm.handle_event(BackendTxnEvent::WriteRequest { 
-            operation: BackendOperation::Update { key: "k1".into(), value: b"v2".to_vec() } 
-        }).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::WriteComplete).await.unwrap();
-        
-        assert_eq!(fsm.reads_performed(), 2);
-        assert_eq!(fsm.writes_performed(), 2);
-        assert!(fsm.can_commit());
-        assert!(fsm.can_rollback());
-    }
-
-    #[tokio::test]
-    async fn test_index_update_between_operations() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        
-        // Write -> Index Update -> Read -> Index Update -> Commit
-        fsm.handle_event(BackendTxnEvent::WriteRequest { 
-            operation: BackendOperation::Insert { key: "k".into(), value: b"v".to_vec() } 
-        }).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::WriteComplete).await.unwrap();
-        
-        fsm.handle_event(BackendTxnEvent::IndexUpdateRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::IndexUpdateComplete).await.unwrap();
-        
-        fsm.handle_event(BackendTxnEvent::ReadRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::ReadComplete).await.unwrap();
-        
-        fsm.handle_event(BackendTxnEvent::IndexUpdateRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::IndexUpdateComplete).await.unwrap();
-        
-        fsm.handle_event(BackendTxnEvent::CommitRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::CommitComplete).await.unwrap();
-        
-        assert_eq!(fsm.reads_performed(), 1);
-        assert_eq!(fsm.writes_performed(), 1);
-        assert!(matches!(fsm.current_state(), BackendTxnState::Completed { committed: true }));
-    }
-
-    #[tokio::test]
-    async fn test_error_event_handling() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        
-        let err = fsm.handle_event(BackendTxnEvent::Error("Test error".into())).await.unwrap_err();
-        assert_eq!(err.to_string(), "Backend transaction error: Test error");
-        assert!(matches!(fsm.current_state(), BackendTxnState::Failed { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_terminal_state_detection() {
-        let mut fsm = make_fsm();
-        assert!(!fsm.is_terminal()); // Opening
-        
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        assert!(!fsm.is_terminal()); // Reading
-        
-        fsm.handle_event(BackendTxnEvent::CommitRequest).await.unwrap();
-        assert!(!fsm.is_terminal()); // Committing
-        
-        fsm.handle_event(BackendTxnEvent::CommitComplete).await.unwrap();
-        assert!(fsm.is_terminal()); // Completed
-    }
-
-    #[tokio::test]
-    async fn test_failed_state_is_terminal() {
-        let mut fsm = make_fsm();
-        let _ = fsm.handle_event(BackendTxnEvent::CommitRequest).await.unwrap_err(); // Invalid transition
-        assert!(fsm.is_terminal());
-    }
-
-    #[tokio::test]
-    async fn test_write_complete_in_wrong_state() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        
-        let err = fsm.handle_event(BackendTxnEvent::WriteComplete).await.unwrap_err();
-        assert!(err.to_string().contains("Invalid transition"));
-        assert!(matches!(fsm.current_state(), BackendTxnState::Failed { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_rollback_with_reason() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        
-        fsm.handle_event(BackendTxnEvent::RollbackRequest { reason: "User requested".into() }).await.unwrap();
-        assert!(matches!(fsm.current_state(), BackendTxnState::RollingBack { .. }));
-        
-        let res = fsm.handle_event(BackendTxnEvent::RollbackComplete).await.unwrap();
-        assert_eq!(res, Some(false));
-        assert!(matches!(fsm.current_state(), BackendTxnState::Completed { committed: false }));
-    }
-
-    #[tokio::test]
-    async fn test_different_write_operations() {
-        let mut fsm = make_fsm();
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        
-        // Insert
-        fsm.handle_event(BackendTxnEvent::WriteRequest { 
-            operation: BackendOperation::Insert { key: "k1".into(), value: b"v1".to_vec() } 
-        }).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::WriteComplete).await.unwrap();
-        
-        // Update
-        fsm.handle_event(BackendTxnEvent::WriteRequest { 
-            operation: BackendOperation::Update { key: "k1".into(), value: b"v2".to_vec() } 
-        }).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::WriteComplete).await.unwrap();
-        
-        // Delete
-        fsm.handle_event(BackendTxnEvent::WriteRequest { 
-            operation: BackendOperation::Delete { key: "k1".into() } 
-        }).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::WriteComplete).await.unwrap();
-        
-        assert_eq!(fsm.writes_performed(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_can_commit_can_rollback_logic() {
-        let mut fsm = make_fsm();
-        
-        // Before transaction
-        assert!(!fsm.can_commit());
-        assert!(!fsm.can_rollback());
-        
-        fsm.handle_event(BackendTxnEvent::OpenTransaction).await.unwrap();
-        
-        // After transaction open
-        assert!(fsm.can_commit());
-        assert!(fsm.can_rollback());
-        
-        // After write
-        fsm.handle_event(BackendTxnEvent::WriteRequest { 
-            operation: BackendOperation::Insert { key: "k".into(), value: b"v".to_vec() } 
-        }).await.unwrap();
-        assert!(fsm.can_commit());
-        assert!(fsm.can_rollback());
-        
-        // After index update
-        fsm.handle_event(BackendTxnEvent::IndexUpdateRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::IndexUpdateComplete).await.unwrap();
-        assert!(fsm.can_commit());
-        assert!(fsm.can_rollback());
-        
-        // After commit
-        fsm.handle_event(BackendTxnEvent::CommitRequest).await.unwrap();
-        fsm.handle_event(BackendTxnEvent::CommitComplete).await.unwrap();
-        assert!(!fsm.can_commit());
-        assert!(!fsm.can_rollback());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[
+                "open".to_string(),
+                "read".to_string(),
+                "write".to_string(),
+                "index".to_string(),
+                "commit".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
     async fn test_nesting_level() {
-        let txn_mgr = Box::new(MockTxnMgr::new().with_level(2));
-        let store = Box::new(MockStore::new());
-        let indexer = Box::new(MockIndexer::new());
-        
-        let fsm = BackendTxnFsmImpl::new(txn_mgr, store, indexer);
+        let fsm = BackendTxnFsmImpl::new(
+            Box::new(MockTxnMgr::new().with_level(2)),
+            Box::new(MockStore::new()),
+            Box::new(MockIndexer::new()),
+        );
+
         assert_eq!(fsm.nesting_level(), 2);
-    }
-
-    // ----------------------------
-    // Mock behavior tests
-    // ----------------------------
-
-    #[tokio::test]
-    async fn test_mock_txn_mgr_behavior() {
-        let mock = MockTxnMgr::new();
-        
-        let txn_id = mock.open_transaction().await.unwrap();
-        assert_eq!(txn_id, "txn-1");
-        
-        let txn_id2 = mock.open_transaction().await.unwrap();
-        assert_eq!(txn_id2, "txn-2");
-        
-        mock.commit(&txn_id).await.unwrap();
-        assert_eq!(*mock.commit_calls.lock().unwrap(), 1);
-        
-        mock.rollback(&txn_id2, "test reason").await.unwrap();
-        assert_eq!(*mock.rollback_calls.lock().unwrap(), 1);
-        
-        assert_eq!(mock.nesting_level(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_mock_txn_mgr_failure() {
-        let mock = MockTxnMgr::new().with_fail();
-        
-        let err = mock.open_transaction().await.unwrap_err();
-        assert_eq!(err, "open fail");
-        
-        let err = mock.commit("test").await.unwrap_err();
-        assert_eq!(err, "commit fail");
-        
-        let err = mock.rollback("test", "reason").await.unwrap_err();
-        assert_eq!(err, "rollback fail");
-    }
-
-    #[tokio::test]
-    async fn test_mock_store_behavior() {
-        let mock = MockStore::new();
-        
-        let value = mock.read("test-key").await.unwrap();
-        assert_eq!(value, Some(b"value".to_vec()));
-        assert_eq!(*mock.reads.lock().unwrap(), 1);
-        
-        mock.write("txn-1", BackendOperation::Insert { key: "k".into(), value: b"v".to_vec() }).await.unwrap();
-        assert_eq!(*mock.writes.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_mock_store_failure() {
-        let mock = MockStore::new().with_fail();
-        
-        let err = mock.read("test-key").await.unwrap_err();
-        assert_eq!(err, "read fail");
-        
-        let err = mock.write("txn-1", BackendOperation::Insert { key: "k".into(), value: b"v".to_vec() }).await.unwrap_err();
-        assert_eq!(err, "write fail");
-    }
-
-    #[tokio::test]
-    async fn test_mock_indexer_behavior() {
-        let mock = MockIndexer::new();
-        
-        let updated = mock.update_indexes("txn-1").await.unwrap();
-        assert_eq!(updated, 1);
-        assert_eq!(*mock.updates.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_mock_indexer_failure() {
-        let mock = MockIndexer::new().with_fail();
-        
-        let err = mock.update_indexes("txn-1").await.unwrap_err();
-        assert_eq!(err, "index fail");
-    }
-
-    #[tokio::test]
-    async fn test_mock_metrics_behavior() {
-        let mock = MockMetrics::new();
-        
-        mock.record_txn_open(Duration::from_millis(1));
-        mock.record_read(Duration::from_millis(2));
-        mock.record_write(Duration::from_millis(3));
-        mock.record_index_update(Duration::from_millis(4), 2);
-        mock.record_commit(Duration::from_millis(5));
-        mock.record_rollback(Duration::from_millis(6), "test");
-        mock.record_error("test_context", "test message");
-        
-        let events = mock.events.lock().unwrap();
-        assert_eq!(events.len(), 7);
-        assert!(events.contains(&"open".to_string()));
-        assert!(events.contains(&"read".to_string()));
-        assert!(events.contains(&"write".to_string()));
-        assert!(events.contains(&"index".to_string()));
-        assert!(events.contains(&"commit".to_string()));
-        assert!(events.contains(&"rollback".to_string()));
-        assert!(events.contains(&"error:test_context".to_string()));
     }
 
     #[tokio::test]
     async fn test_error_display() {
         let error = BackendTxnError::Generic("Test error".into());
         assert_eq!(error.to_string(), "Backend transaction error: Test error");
-        
+
         let error = BackendTxnError::TransactionError("Txn error".into());
         assert_eq!(error.to_string(), "Transaction error: Txn error");
-        
+
         let error = BackendTxnError::NoTransactionId;
         assert_eq!(error.to_string(), "No transaction ID present");
     }
