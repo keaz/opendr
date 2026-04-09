@@ -18,6 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
+    SearchCandidateHint,
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
@@ -977,7 +978,11 @@ pub async fn handle_search_request(
         .await;
     }
 
-    let entries = match backend.search_entries(&base_dn, request.scope).await {
+    let search_hint = extract_search_hint(&request.filter);
+    let entries = match backend
+        .search_entries_with_hint(&base_dn, request.scope, search_hint)
+        .await
+    {
         Ok(entries) => entries,
         Err(err) => {
             error!("Search backend failure for {}: {}", base_dn, err);
@@ -1030,6 +1035,20 @@ pub async fn handle_search_request(
     .await?;
 
     Ok(())
+}
+
+fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
+    match filter {
+        Filter::And(filters) => filters.iter().find_map(extract_search_hint),
+        Filter::EqualityMatch(ava) => Some(SearchCandidateHint::Equality {
+            attribute: ava.attribute_desc.0.as_ref().to_string(),
+            value: bytes_to_string(ava.assertion_value),
+        }),
+        Filter::Present(attribute) => Some(SearchCandidateHint::Present {
+            attribute: attribute.0.as_ref().to_string(),
+        }),
+        _ => None,
+    }
 }
 
 async fn handle_replication_stream_request(
@@ -1754,6 +1773,40 @@ mod tests {
 
         let missing_filter = Filter::Present(LdapString(Cow::Owned("mail".to_string())));
         assert!(!entry_matches_filter(&entry, &missing_filter));
+    }
+
+    #[test]
+    fn extract_search_hint_prefers_indexable_terms() {
+        let equality_filter = Filter::EqualityMatch(AttributeValueAssertion {
+            attribute_desc: LdapString(Cow::Owned("uid".to_string())),
+            assertion_value: b"alice",
+        });
+        assert_eq!(
+            extract_search_hint(&equality_filter),
+            Some(SearchCandidateHint::Equality {
+                attribute: "uid".to_string(),
+                value: "alice".to_string(),
+            })
+        );
+
+        let and_filter = Filter::And(vec![
+            Filter::Substrings(SubstringFilter {
+                filter_type: LdapString(Cow::Owned("cn".to_string())),
+                substrings: vec![],
+            }),
+            Filter::Present(LdapString(Cow::Owned("mail".to_string()))),
+        ]);
+        assert_eq!(
+            extract_search_hint(&and_filter),
+            Some(SearchCandidateHint::Present {
+                attribute: "mail".to_string(),
+            })
+        );
+
+        let unsupported = Filter::Or(vec![Filter::Not(Box::new(Filter::Present(LdapString(
+            Cow::Owned("cn".to_string()),
+        ))))]);
+        assert_eq!(extract_search_hint(&unsupported), None);
     }
 
     #[tokio::test]

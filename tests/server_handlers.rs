@@ -15,6 +15,7 @@ use ldap_parser::parse_ldap_messages;
 use mockall::mock;
 use opendr::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
+    SearchCandidateHint,
 };
 use opendr::schema::LdapSchema;
 use opendr::server;
@@ -54,6 +55,12 @@ mock! {
             &self,
             base_dn: &str,
             scope: SearchScope,
+        ) -> Result<Vec<DirectoryEntry>, BackendError>;
+        async fn search_entries_with_hint(
+            &self,
+            base_dn: &str,
+            scope: SearchScope,
+            hint: Option<SearchCandidateHint>,
         ) -> Result<Vec<DirectoryEntry>, BackendError>;
         async fn get_context_csn(&self) -> Result<Option<opendr::csn::Csn>, BackendError>;
         async fn set_context_csn(&self, csn: opendr::csn::Csn) -> Result<(), BackendError>;
@@ -232,9 +239,17 @@ async fn search_returns_entries_and_success() {
     let entry_clone = entry.clone();
 
     backend
-        .expect_search_entries()
-        .withf(|base_dn, scope| base_dn == "dc=example,dc=org" && *scope == SearchScope(2))
-        .return_once(move |_, _| Ok(vec![entry_clone.clone()]));
+        .expect_search_entries_with_hint()
+        .withf(|base_dn, scope, hint| {
+            base_dn == "dc=example,dc=org"
+                && *scope == SearchScope(2)
+                && *hint
+                    == Some(SearchCandidateHint::Equality {
+                        attribute: "cn".to_string(),
+                        value: "Alice".to_string(),
+                    })
+        })
+        .return_once(move |_, _, _| Ok(vec![entry_clone.clone()]));
 
     let request = SearchRequest {
         base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
@@ -286,8 +301,16 @@ async fn search_returns_entries_and_success() {
 async fn search_backend_error_returns_result_code() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_search_entries()
-        .returning(|_, _| Err(BackendError::NotFound));
+        .expect_search_entries_with_hint()
+        .withf(|base_dn, scope, hint| {
+            base_dn == "dc=example,dc=org"
+                && *scope == SearchScope(1)
+                && *hint
+                    == Some(SearchCandidateHint::Present {
+                        attribute: "cn".to_string(),
+                    })
+        })
+        .returning(|_, _, _| Err(BackendError::NotFound));
 
     let request = SearchRequest {
         base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),

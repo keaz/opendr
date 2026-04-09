@@ -31,7 +31,9 @@ use ldap_parser::ldap::SearchScope as Scope;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, Modification};
+use crate::backend::{
+    BackendError, DirectoryBackend, DirectoryEntry, Modification, SearchCandidateHint,
+};
 use crate::change_observer::ChangeObserver;
 use crate::replication::{encode_rename_change, ChangelogTracker};
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
@@ -232,6 +234,17 @@ impl DirectoryBackend for ChangelogBackendWrapper {
     ) -> Result<Vec<DirectoryEntry>, BackendError> {
         // Read operation, no changelog recording needed
         self.backend.search_entries(base_dn, scope).await
+    }
+
+    async fn search_entries_with_hint(
+        &self,
+        base_dn: &str,
+        scope: Scope,
+        hint: Option<SearchCandidateHint>,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        self.backend
+            .search_entries_with_hint(base_dn, scope, hint)
+            .await
     }
 
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {

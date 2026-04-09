@@ -227,6 +227,15 @@ pub trait DirectoryBackend: Send + Sync {
         scope: SearchScope,
     ) -> Result<Vec<DirectoryEntry>, BackendError>;
 
+    async fn search_entries_with_hint(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        _hint: Option<SearchCandidateHint>,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        self.search_entries(base_dn, scope).await
+    }
+
     /// Get the current contextCSN for the database
     ///
     /// # Returns
@@ -264,6 +273,12 @@ pub enum ModifyOperation {
     Add,
     Delete,
     Replace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchCandidateHint {
+    Equality { attribute: String, value: String },
+    Present { attribute: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

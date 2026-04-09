@@ -23,7 +23,7 @@
 //! - Indexed attribute lookups
 //! - DN normalization for fast case-insensitive searches
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,14 +35,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use tokio::sync::RwLock;
 
-// LMDB cursor operation constants
-const MDB_SET: u32 = 15;
-const MDB_NEXT_DUP: u32 = 18;
-
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
+    SearchCandidateHint,
 };
-use crate::csn::{Csn, CsnGenerator};
+use crate::csn::CsnGenerator;
 
 /// Serialized entry structure for LMDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +108,8 @@ pub struct LmdbBackend {
     write_lock: Arc<RwLock<()>>,
     /// Database directory path
     db_path: PathBuf,
+    /// Configured maximum reader slots
+    max_readers: u32,
     /// CSN generator for operational attributes
     csn_generator: Arc<CsnGenerator>,
 }
@@ -130,7 +129,7 @@ impl LmdbBackend {
         max_size_mb: usize,
         replica_id: u16,
     ) -> Result<Self, BackendError> {
-        Self::new_with_config(path, max_size_mb, replica_id, IndexConfig::default())
+        Self::new_with_runtime_config(path, max_size_mb, replica_id, IndexConfig::default(), 126)
     }
 
     /// Create a new LMDB backend with custom index configuration
@@ -149,6 +148,16 @@ impl LmdbBackend {
         replica_id: u16,
         index_config: IndexConfig,
     ) -> Result<Self, BackendError> {
+        Self::new_with_runtime_config(path, max_size_mb, replica_id, index_config, 126)
+    }
+
+    pub fn new_with_runtime_config<P: AsRef<Path>>(
+        path: P,
+        max_size_mb: usize,
+        replica_id: u16,
+        index_config: IndexConfig,
+        max_readers: u32,
+    ) -> Result<Self, BackendError> {
         let db_path = path.as_ref().to_path_buf();
 
         // Create directory if it doesn't exist
@@ -160,7 +169,7 @@ impl LmdbBackend {
         let env = Environment::new()
             .set_max_dbs(50) // Increased for attribute indexes
             .set_map_size(max_size_mb * 1024 * 1024) // Set max size
-            .set_max_readers(126) // High reader concurrency
+            .set_max_readers(max_readers)
             .open(&db_path)
             .map_err(|e| BackendError::Storage(format!("Failed to open LMDB env: {}", e)))?;
 
@@ -210,6 +219,7 @@ impl LmdbBackend {
             index_config,
             write_lock: Arc::new(RwLock::new(())),
             db_path,
+            max_readers,
             csn_generator,
         })
     }
@@ -588,6 +598,66 @@ impl LmdbBackend {
         Ok(results)
     }
 
+    fn search_present_by_index(&self, attribute: &str) -> Result<Vec<String>, BackendError> {
+        let attr_lower = attribute.to_lowercase();
+        let indexes = self
+            .attr_indexes
+            .try_read()
+            .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
+        let index_db = match indexes.get(&attr_lower) {
+            Some(db) => *db,
+            None => return Ok(Vec::new()),
+        };
+
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let mut cursor = txn
+            .open_ro_cursor(index_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+        let mut results = HashSet::new();
+
+        for (key, _) in cursor.iter() {
+            let key = String::from_utf8_lossy(key);
+            if let Some((_, dn)) = key.split_once(':') {
+                results.insert(dn.to_string());
+            }
+        }
+
+        Ok(results.into_iter().collect())
+    }
+
+    fn load_entries_by_dns(
+        &self,
+        dns: &[String],
+        base_dn: &str,
+        scope: SearchScope,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let base_components = Self::dn_components(base_dn);
+        let mut results = Vec::new();
+
+        for dn in dns {
+            let entry_bytes = match txn.get(self.entries_db, &dn.as_bytes()) {
+                Ok(bytes) => bytes,
+                Err(lmdb::Error::NotFound) => continue,
+                Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
+            };
+            let entry: StoredEntry = bincode::deserialize(entry_bytes).map_err(|e| {
+                BackendError::Storage(format!("Failed to deserialize entry: {}", e))
+            })?;
+            if Self::entry_in_scope(&entry.dn, &base_components, scope) {
+                results.push(entry.to_directory_entry());
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Check if an attribute is indexed
     pub fn is_indexed(&self, attribute: &str) -> bool {
         let attr_lower = attribute.to_lowercase();
@@ -595,6 +665,10 @@ impl LmdbBackend {
             .indexed_attributes
             .iter()
             .any(|a| a.to_lowercase() == attr_lower)
+    }
+
+    pub fn configured_max_readers(&self) -> u32 {
+        self.max_readers
     }
 }
 
@@ -1060,6 +1134,34 @@ impl DirectoryBackend for LmdbBackend {
             .collect())
     }
 
+    async fn search_entries_with_hint(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        hint: Option<SearchCandidateHint>,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        let Some(hint) = hint else {
+            return self.search_entries(base_dn, scope).await;
+        };
+
+        let candidates = match hint {
+            SearchCandidateHint::Equality { attribute, value } => {
+                if !self.is_indexed(&attribute) {
+                    return self.search_entries(base_dn, scope).await;
+                }
+                self.search_by_index(&attribute, &value)?
+            }
+            SearchCandidateHint::Present { attribute } => {
+                if !self.is_indexed(&attribute) {
+                    return self.search_entries(base_dn, scope).await;
+                }
+                self.search_present_by_index(&attribute)?
+            }
+        };
+
+        self.load_entries_by_dns(&candidates, base_dn, scope)
+    }
+
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
         let txn = self.env.begin_ro_txn().map_err(|e| {
             BackendError::Storage(format!("Failed to begin read transaction: {}", e))
@@ -1393,6 +1495,118 @@ mod tests {
 
         let results = backend.search_by_index("custom", "value").unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_config_applies_indexes_and_max_readers() {
+        let dir = tempdir().unwrap();
+        let config = IndexConfig {
+            indexed_attributes: vec!["departmentnumber".to_string()],
+        };
+        let backend = LmdbBackend::new_with_runtime_config(dir.path(), 100, 1, config, 64).unwrap();
+
+        assert_eq!(backend.configured_max_readers(), 64);
+        assert!(backend.is_indexed("departmentNumber"));
+        assert!(!backend.is_indexed("cn"));
+
+        let mut attributes = HashMap::new();
+        attributes.insert("departmentNumber".to_string(), vec!["42".to_string()]);
+        let entry = DirectoryEntry::new("uid=test,dc=example,dc=org", attributes);
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        let results = backend.search_by_index("departmentNumber", "42").unwrap();
+        assert_eq!(results, vec!["uid=test,dc=example,dc=org".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_search_entries_with_equality_hint_uses_index_candidates() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        let mut alice_attributes = HashMap::new();
+        alice_attributes.insert("cn".to_string(), vec!["Alice".to_string()]);
+        let alice = DirectoryEntry::new("uid=alice,ou=people,dc=example,dc=org", alice_attributes);
+        backend.add_entry(alice, vec![]).await.unwrap();
+
+        let mut bob_attributes = HashMap::new();
+        bob_attributes.insert("cn".to_string(), vec!["Bob".to_string()]);
+        let bob = DirectoryEntry::new("uid=bob,ou=people,dc=example,dc=org", bob_attributes);
+        backend.add_entry(bob, vec![]).await.unwrap();
+
+        let results = backend
+            .search_entries_with_hint(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Equality {
+                    attribute: "cn".to_string(),
+                    value: "Alice".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].dn, "uid=alice,ou=people,dc=example,dc=org");
+    }
+
+    #[tokio::test]
+    async fn test_search_entries_with_present_hint_respects_scope() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        let mut in_scope_attributes = HashMap::new();
+        in_scope_attributes.insert("mail".to_string(), vec!["alice@example.org".to_string()]);
+        let in_scope =
+            DirectoryEntry::new("uid=alice,ou=people,dc=example,dc=org", in_scope_attributes);
+        backend.add_entry(in_scope, vec![]).await.unwrap();
+
+        let mut out_of_scope_attributes = HashMap::new();
+        out_of_scope_attributes.insert("mail".to_string(), vec!["bob@example.org".to_string()]);
+        let out_of_scope =
+            DirectoryEntry::new("uid=bob,ou=ops,dc=example,dc=org", out_of_scope_attributes);
+        backend.add_entry(out_of_scope, vec![]).await.unwrap();
+
+        let results = backend
+            .search_entries_with_hint(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Present {
+                    attribute: "mail".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].dn, "uid=alice,ou=people,dc=example,dc=org");
+    }
+
+    #[tokio::test]
+    async fn test_search_entries_with_nonindexed_hint_falls_back_to_full_scan() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "description".to_string(),
+            vec!["indexed-by-scan".to_string()],
+        );
+        let entry = DirectoryEntry::new("uid=test,dc=example,dc=org", attributes);
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        let results = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Present {
+                    attribute: "description".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].dn, "uid=test,dc=example,dc=org");
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
-use opendr::backend_lmdb::LmdbBackend;
+use opendr::backend_lmdb::{IndexConfig, LmdbBackend};
 use opendr::config::ServerConfig;
 use opendr::metrics::MetricsCollector;
 use opendr::monitoring_runtime::{spawn_monitoring_server, ComponentStatus, RuntimeHealthRegistry};
@@ -60,8 +60,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Create LMDB backend with configured max size (convert to MB)
                 let max_size_mb = (config.backend.lmdb_max_size / (1024 * 1024)) as usize;
                 let replica_id = config.server.replica_id;
-                let mut backend =
-                    LmdbBackend::new(&config.backend.data_directory, max_size_mb, replica_id)?;
+                let index_config = IndexConfig {
+                    indexed_attributes: if config.performance.indexing_enabled {
+                        config.backend.indexed_attributes.clone()
+                    } else {
+                        Vec::new()
+                    },
+                };
+                let mut backend = LmdbBackend::new_with_runtime_config(
+                    &config.backend.data_directory,
+                    max_size_mb,
+                    replica_id,
+                    index_config,
+                    config.backend.lmdb_max_readers,
+                )?;
 
                 // Initialize with base structure if needed
                 match backend.get_entry(&config.server.base_dn).await {
