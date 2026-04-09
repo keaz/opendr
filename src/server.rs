@@ -19,6 +19,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
 
+use crate::aci::{AciEngine, Permission};
+use crate::audit::{AuditEvent, AuditEventType, AuditLevel, AuditLogger};
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
     SearchCandidateHint,
@@ -28,7 +30,8 @@ use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
 use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
 use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
-    encode_bind_response, encode_result_response, encode_search_entry, ResponseOp,
+    encode_bind_response, encode_extended_response, encode_result_response, encode_search_entry,
+    ResponseOp,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::real_time_propagation::is_dn_in_scope;
@@ -86,7 +89,6 @@ impl ConnectionSession {
         self.bound_dn.is_some()
     }
 
-    #[cfg(test)]
     fn bound_dn(&self) -> Option<&str> {
         self.bound_dn.as_deref()
     }
@@ -135,6 +137,40 @@ struct ConnectionControls {
     rate_limiter: Option<Arc<RateLimiter>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LegacyAuditConfig {
+    pub log_authentication: bool,
+    pub log_authorization: bool,
+    pub log_modifications: bool,
+    pub log_connections: bool,
+}
+
+impl Default for LegacyAuditConfig {
+    fn default() -> Self {
+        Self {
+            log_authentication: true,
+            log_authorization: true,
+            log_modifications: true,
+            log_connections: true,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct LegacySecurityConfig {
+    pub audit_logger: Option<Arc<AuditLogger>>,
+    pub audit_config: LegacyAuditConfig,
+    pub access_control: Option<Arc<AciEngine>>,
+    pub root_dn: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct RequestContext {
+    client_ip: Option<IpAddr>,
+    session_id: Option<ConnectionId>,
+    security: Option<Arc<LegacySecurityConfig>>,
+}
+
 #[derive(Clone, Copy)]
 enum RejectionResponse {
     Bind,
@@ -166,7 +202,10 @@ impl ConnectionStream {
         matches!(self, Self::Tls(_))
     }
 
-    async fn upgrade_in_place(&mut self, tls_handler: &RustlsTlsHandler) -> Result<(), ServerError> {
+    async fn upgrade_in_place(
+        &mut self,
+        tls_handler: &RustlsTlsHandler,
+    ) -> Result<(), ServerError> {
         if self.is_secure() {
             return Err(ServerError::Io(std::io::Error::other(
                 "connection already uses TLS",
@@ -276,12 +315,13 @@ pub async fn run_with_metrics(
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     metrics: Option<Arc<MetricsCollector>>,
 ) -> Result<(), ServerError> {
-    run_with_metrics_and_config_with_tls(
+    run_with_metrics_and_config_with_tls_and_security(
         addr,
         backend,
         shutdown_rx,
         metrics,
         LegacyServerConfig::default(),
+        None,
         None,
     )
     .await
@@ -294,12 +334,13 @@ pub async fn run_with_metrics_and_config(
     metrics: Option<Arc<MetricsCollector>>,
     runtime_config: LegacyServerConfig,
 ) -> Result<(), ServerError> {
-    run_with_metrics_and_config_with_tls(
+    run_with_metrics_and_config_with_tls_and_security(
         addr,
         backend,
         shutdown_rx,
         metrics,
         runtime_config,
+        None,
         None,
     )
     .await
@@ -313,6 +354,27 @@ pub async fn run_with_metrics_and_config_with_tls(
     runtime_config: LegacyServerConfig,
     tls_handler: Option<Arc<RustlsTlsHandler>>,
 ) -> Result<(), ServerError> {
+    run_with_metrics_and_config_with_tls_and_security(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        runtime_config,
+        tls_handler,
+        None,
+    )
+    .await
+}
+
+pub async fn run_with_metrics_and_config_with_tls_and_security(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+    tls_handler: Option<Arc<RustlsTlsHandler>>,
+    security: Option<Arc<LegacySecurityConfig>>,
+) -> Result<(), ServerError> {
     run_plain_listener(
         addr,
         backend,
@@ -320,6 +382,7 @@ pub async fn run_with_metrics_and_config_with_tls(
         metrics,
         runtime_config,
         tls_handler,
+        security,
     )
     .await
 }
@@ -331,6 +394,7 @@ async fn run_plain_listener(
     metrics: Option<Arc<MetricsCollector>>,
     runtime_config: LegacyServerConfig,
     tls_handler: Option<Arc<RustlsTlsHandler>>,
+    security: Option<Arc<LegacySecurityConfig>>,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAP server listening on {}", addr);
@@ -380,6 +444,7 @@ async fn run_plain_listener(
                 let metrics = metrics.clone();
                 let pool = pool.clone();
                 let tls_handler = tls_handler.clone();
+                let security = security.clone();
                 let controls = ConnectionControls {
                     conn_id,
                     client_ip: addr.ip(),
@@ -392,7 +457,25 @@ async fn run_plain_listener(
                     metrics.record_connection_accepted();
                 }
 
+                if let Some(security) = security.as_ref() {
+                    if let Some(audit) = security.audit_logger.as_ref() {
+                        if security.audit_config.log_connections {
+                            audit
+                                .log_connection_accepted(
+                                    &addr.ip().to_string(),
+                                    &conn_id.to_string(),
+                                )
+                                .await;
+                        }
+                    }
+                }
+
                 tokio::spawn(async move {
+                    let request_context = RequestContext {
+                        client_ip: Some(addr.ip()),
+                        session_id: Some(conn_id),
+                        security: security.clone(),
+                    };
                     handle_client_with_metrics_and_tls(
                         ConnectionStream::plain(socket),
                         backend,
@@ -400,11 +483,24 @@ async fn run_plain_listener(
                         tls_handler,
                         metrics.clone(),
                         Some(controls),
+                        request_context.clone(),
                     )
                     .await;
                     pool.release_connection(conn_id).await;
                     if let Some(metrics) = metrics.as_ref() {
                         metrics.record_connection_closed();
+                    }
+                    if let Some(security) = request_context.security.as_ref() {
+                        if let Some(audit) = security.audit_logger.as_ref() {
+                            if security.audit_config.log_connections {
+                                audit
+                                    .log_connection_closed(
+                                        &addr.ip().to_string(),
+                                        &conn_id.to_string(),
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                     info!("Connection {:?} (conn_id={}) closed", addr, conn_id);
                 });
@@ -423,10 +519,31 @@ async fn run_plain_listener(
 pub async fn run_tls_with_metrics_and_config(
     addr: &str,
     backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+    tls_handler: Arc<RustlsTlsHandler>,
+) -> Result<(), ServerError> {
+    run_tls_with_metrics_and_config_and_security(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        runtime_config,
+        tls_handler,
+        None,
+    )
+    .await
+}
+
+pub async fn run_tls_with_metrics_and_config_and_security(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     metrics: Option<Arc<MetricsCollector>>,
     runtime_config: LegacyServerConfig,
     tls_handler: Arc<RustlsTlsHandler>,
+    security: Option<Arc<LegacySecurityConfig>>,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAPS server listening on {}", addr);
@@ -484,6 +601,7 @@ pub async fn run_tls_with_metrics_and_config(
                 let metrics = metrics.clone();
                 let pool = pool.clone();
                 let tls_handler = tls_handler.clone();
+                let security = security.clone();
                 let controls = ConnectionControls {
                     conn_id,
                     client_ip: addr.ip(),
@@ -496,7 +614,25 @@ pub async fn run_tls_with_metrics_and_config(
                     metrics.record_connection_accepted();
                 }
 
+                if let Some(security) = security.as_ref() {
+                    if let Some(audit) = security.audit_logger.as_ref() {
+                        if security.audit_config.log_connections {
+                            audit
+                                .log_connection_accepted(
+                                    &addr.ip().to_string(),
+                                    &conn_id.to_string(),
+                                )
+                                .await;
+                        }
+                    }
+                }
+
                 tokio::spawn(async move {
+                    let request_context = RequestContext {
+                        client_ip: Some(addr.ip()),
+                        session_id: Some(conn_id),
+                        security: security.clone(),
+                    };
                     handle_client_with_metrics_and_tls(
                         ConnectionStream::tls(tls_stream),
                         backend,
@@ -504,11 +640,24 @@ pub async fn run_tls_with_metrics_and_config(
                         Some(tls_handler),
                         metrics.clone(),
                         Some(controls),
+                        request_context.clone(),
                     )
                     .await;
                     pool.release_connection(conn_id).await;
                     if let Some(metrics) = metrics.as_ref() {
                         metrics.record_connection_closed();
+                    }
+                    if let Some(security) = request_context.security.as_ref() {
+                        if let Some(audit) = security.audit_logger.as_ref() {
+                            if security.audit_config.log_connections {
+                                audit
+                                    .log_connection_closed(
+                                        &addr.ip().to_string(),
+                                        &conn_id.to_string(),
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                     info!("LDAPS connection {:?} (conn_id={}) closed", addr, conn_id);
                 });
@@ -536,6 +685,7 @@ pub async fn handle_client(
         None,
         None,
         None,
+        RequestContext::default(),
     )
     .await;
 }
@@ -554,6 +704,7 @@ async fn handle_client_with_metrics(
         None,
         metrics,
         controls,
+        RequestContext::default(),
     )
     .await;
 }
@@ -565,6 +716,7 @@ async fn handle_client_with_metrics_and_tls(
     tls_handler: Option<Arc<RustlsTlsHandler>>,
     metrics: Option<Arc<MetricsCollector>>,
     controls: Option<ConnectionControls>,
+    request_context: RequestContext,
 ) {
     let mut read_buffer = vec![0; 8192];
     let mut decoder = BerDecoderFsmImpl::new();
@@ -740,6 +892,7 @@ async fn handle_client_with_metrics_and_tls(
                                     &mut session,
                                     message,
                                     tls_handler.as_deref(),
+                                    &request_context,
                                 )
                                 .await;
 
@@ -992,7 +1145,16 @@ pub async fn process_message(
     message: ldap_parser::ldap::LdapMessage<'_>,
 ) -> Result<(), ServerError> {
     let mut session = ConnectionSession::default();
-    process_message_with_session(socket, backend, schema, &mut session, message, None).await
+    process_message_with_session(
+        socket,
+        backend,
+        schema,
+        &mut session,
+        message,
+        None,
+        &RequestContext::default(),
+    )
+    .await
 }
 
 async fn process_message_with_session(
@@ -1002,16 +1164,33 @@ async fn process_message_with_session(
     session: &mut ConnectionSession,
     message: ldap_parser::ldap::LdapMessage<'_>,
     tls_handler: Option<&RustlsTlsHandler>,
+    request_context: &RequestContext,
 ) -> Result<(), ServerError> {
     let message_id = message.message_id.0;
 
     match message.protocol_op {
         ProtocolOp::BindRequest(bind_request) => {
-            handle_bind_request_with_session(socket, backend, message_id, bind_request, session)
-                .await?;
+            handle_bind_request_with_session_and_context(
+                socket,
+                backend,
+                message_id,
+                bind_request,
+                session,
+                request_context,
+                socket.is_secure(),
+            )
+            .await?;
         }
         ProtocolOp::SearchRequest(search_request) => {
-            handle_search_request(socket, backend, message_id, search_request).await?;
+            handle_search_request_with_context(
+                socket,
+                backend,
+                message_id,
+                search_request,
+                session,
+                request_context,
+            )
+            .await?;
         }
         ProtocolOp::ModifyRequest(modify_request) => {
             let dn = modify_request.object.0.as_ref().trim().to_owned();
@@ -1026,7 +1205,15 @@ async fn process_message_with_session(
             {
                 return Ok(());
             }
-            handle_modify_request(socket, backend, message_id, modify_request).await?;
+            handle_modify_request_with_context(
+                socket,
+                backend,
+                message_id,
+                modify_request,
+                session,
+                request_context,
+            )
+            .await?;
         }
         ProtocolOp::AddRequest(add_request) => {
             let dn = add_request.entry.0.as_ref().trim().to_owned();
@@ -1035,7 +1222,16 @@ async fn process_message_with_session(
             {
                 return Ok(());
             }
-            handle_add_request(socket, backend, schema, message_id, add_request).await?;
+            handle_add_request_with_context(
+                socket,
+                backend,
+                schema,
+                message_id,
+                add_request,
+                session,
+                request_context,
+            )
+            .await?;
         }
         ProtocolOp::DelRequest(delete_request) => {
             let dn = delete_request.0.as_ref().trim().to_owned();
@@ -1050,7 +1246,15 @@ async fn process_message_with_session(
             {
                 return Ok(());
             }
-            handle_delete_request(socket, backend, message_id, delete_request).await?;
+            handle_delete_request_with_context(
+                socket,
+                backend,
+                message_id,
+                delete_request,
+                session,
+                request_context,
+            )
+            .await?;
         }
         ProtocolOp::ModDnRequest(rename_request) => {
             let dn = rename_request.entry.0.as_ref().trim().to_owned();
@@ -1065,10 +1269,26 @@ async fn process_message_with_session(
             {
                 return Ok(());
             }
-            handle_moddn_request(socket, backend, message_id, rename_request).await?;
+            handle_moddn_request_with_context(
+                socket,
+                backend,
+                message_id,
+                rename_request,
+                session,
+                request_context,
+            )
+            .await?;
         }
         ProtocolOp::CompareRequest(compare_request) => {
-            handle_compare_request(socket, backend, message_id, compare_request).await?;
+            handle_compare_request_with_context(
+                socket,
+                backend,
+                message_id,
+                compare_request,
+                session,
+                request_context,
+            )
+            .await?;
         }
         ProtocolOp::UnbindRequest => {
             info!("Received unbind request");
@@ -1085,6 +1305,7 @@ async fn process_message_with_session(
                 request,
                 session,
                 tls_handler,
+                request_context,
             )
             .await?;
         }
@@ -1103,18 +1324,292 @@ pub async fn handle_bind_request(
     request: BindRequest<'_>,
 ) -> Result<(), ServerError> {
     let mut session = ConnectionSession::default();
-    handle_bind_request_with_session(socket, backend, message_id, request, &mut session).await
+    handle_bind_request_with_session_and_context(
+        socket,
+        backend,
+        message_id,
+        request,
+        &mut session,
+        &RequestContext::default(),
+        false,
+    )
+    .await
 }
 
-async fn handle_bind_request_with_session(
+fn client_ip_for_audit(request_context: &RequestContext) -> String {
+    request_context
+        .client_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn session_id_for_audit(request_context: &RequestContext) -> Option<String> {
+    request_context
+        .session_id
+        .map(|session_id| session_id.to_string())
+}
+
+fn audit_user_dn(session: &ConnectionSession) -> Option<String> {
+    session.bound_dn().map(|dn| dn.to_string())
+}
+
+fn audit_actor(session: &ConnectionSession) -> String {
+    session
+        .bound_dn()
+        .map(|dn| dn.to_string())
+        .unwrap_or_else(|| "anonymous".to_string())
+}
+
+fn is_root_dn(session: &ConnectionSession, request_context: &RequestContext) -> bool {
+    let Some(bound_dn) = session.bound_dn() else {
+        return false;
+    };
+
+    request_context
+        .security
+        .as_ref()
+        .and_then(|security| security.root_dn.as_deref())
+        .map(|root_dn| bound_dn.eq_ignore_ascii_case(root_dn))
+        .unwrap_or(false)
+}
+
+async fn log_generic_audit_event(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    level: AuditLevel,
+    event_type: AuditEventType,
+    action: impl Into<String>,
+    success: bool,
+    target_dn: Option<&str>,
+    error_message: Option<&str>,
+    details: Vec<(String, String)>,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    let Some(logger) = security.audit_logger.as_ref() else {
+        return;
+    };
+
+    let mut event = AuditEvent::new(level, event_type, action.into(), success)
+        .with_client_ip(client_ip_for_audit(request_context));
+
+    if let Some(user_dn) = audit_user_dn(session) {
+        event = event.with_user_dn(user_dn);
+    }
+    if let Some(target_dn) = target_dn {
+        event = event.with_target_dn(target_dn);
+    }
+    if let Some(session_id) = session_id_for_audit(request_context) {
+        event = event.with_session_id(session_id);
+    }
+    if let Some(error_message) = error_message {
+        event = event.with_error(error_message);
+    }
+    for (key, value) in details {
+        event = event.with_detail(key, value);
+    }
+
+    logger.log_event(event).await;
+}
+
+async fn log_simple_bind_success(request_context: &RequestContext, user_dn: &str) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_authentication {
+        return;
+    }
+    let Some(logger) = security.audit_logger.as_ref() else {
+        return;
+    };
+    logger
+        .log_auth_success(user_dn, &client_ip_for_audit(request_context))
+        .await;
+}
+
+async fn log_simple_bind_failure(request_context: &RequestContext, user_dn: &str, reason: &str) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_authentication {
+        return;
+    }
+    let Some(logger) = security.audit_logger.as_ref() else {
+        return;
+    };
+    logger
+        .log_auth_failure(user_dn, &client_ip_for_audit(request_context), reason)
+        .await;
+}
+
+async fn log_sasl_bind(
+    request_context: &RequestContext,
+    user_dn: &str,
+    mechanism: &str,
+    success: bool,
+    error_message: Option<&str>,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_authentication {
+        return;
+    }
+    let Some(logger) = security.audit_logger.as_ref() else {
+        return;
+    };
+    logger
+        .log_sasl_auth(
+            user_dn,
+            &client_ip_for_audit(request_context),
+            mechanism,
+            success,
+            error_message,
+        )
+        .await;
+}
+
+async fn log_anonymous_bind(request_context: &RequestContext) {
+    let session = ConnectionSession::default();
+    if let Some(security) = request_context.security.as_ref() {
+        if security.audit_config.log_authentication {
+            log_generic_audit_event(
+                request_context,
+                &session,
+                AuditLevel::Info,
+                AuditEventType::Authentication,
+                "anonymous_bind",
+                true,
+                None,
+                None,
+                Vec::new(),
+            )
+            .await;
+        }
+    }
+}
+
+async fn log_authz_success(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    operation: &str,
+    target_dn: &str,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_authorization {
+        return;
+    }
+    let Some(logger) = security.audit_logger.as_ref() else {
+        return;
+    };
+    logger
+        .log_authz_success(&audit_actor(session), operation, target_dn)
+        .await;
+}
+
+async fn log_authz_denial(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    operation: &str,
+    target_dn: &str,
+    reason: &str,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_authorization {
+        return;
+    }
+    let Some(logger) = security.audit_logger.as_ref() else {
+        return;
+    };
+    logger
+        .log_authz_denial(&audit_actor(session), operation, target_dn, reason)
+        .await;
+}
+
+async fn authorize_operation(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    response_op: ResponseOp,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+    permission: Permission,
+    operation: &str,
+    target_dn: &str,
+    attribute: Option<&str>,
+) -> Result<bool, ServerError> {
+    let Some(security) = request_context.security.as_ref() else {
+        return Ok(true);
+    };
+    let Some(aci_engine) = security.access_control.as_ref() else {
+        return Ok(true);
+    };
+
+    if is_root_dn(session, request_context) {
+        log_authz_success(request_context, session, operation, target_dn).await;
+        return Ok(true);
+    }
+
+    match aci_engine
+        .check_permission(session.bound_dn(), target_dn, attribute, permission)
+        .await
+    {
+        Ok(()) => {
+            log_authz_success(request_context, session, operation, target_dn).await;
+            Ok(true)
+        }
+        Err(err) => {
+            log_authz_denial(request_context, session, operation, target_dn, &err).await;
+            send_result(
+                socket,
+                message_id,
+                response_op,
+                ResultCode::InsufficientAccessRights,
+                target_dn,
+                &err,
+            )
+            .await?;
+            Ok(false)
+        }
+    }
+}
+
+fn parse_sasl_plain_credentials(
+    credentials: Option<&[u8]>,
+) -> Result<(String, String, Vec<u8>), &'static str> {
+    let Some(credentials) = credentials else {
+        return Err("SASL PLAIN requires credentials");
+    };
+
+    let parts: Vec<&[u8]> = credentials.split(|&byte| byte == 0).collect();
+    if parts.len() != 3 {
+        return Err("invalid SASL PLAIN credential format");
+    }
+
+    let authzid =
+        String::from_utf8(parts[0].to_vec()).map_err(|_| "invalid SASL authzid encoding")?;
+    let authcid =
+        String::from_utf8(parts[1].to_vec()).map_err(|_| "invalid SASL authcid encoding")?;
+
+    Ok((authzid, authcid, parts[2].to_vec()))
+}
+
+async fn handle_bind_request_with_session_and_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: BindRequest<'_>,
     session: &mut ConnectionSession,
+    request_context: &RequestContext,
+    connection_is_secure: bool,
 ) -> Result<(), ServerError> {
     if request.version != 3 {
         session.clear();
+        log_simple_bind_failure(request_context, "unknown", "unsupported LDAP version").await;
         send_bind_response(
             socket,
             message_id,
@@ -1130,6 +1625,7 @@ async fn handle_bind_request_with_session(
             let dn = request.name.0.as_ref().trim().to_owned();
             if dn.is_empty() && password.as_ref().is_empty() {
                 session.clear();
+                log_anonymous_bind(request_context).await;
                 send_bind_success(socket, message_id).await?;
                 return Ok(());
             }
@@ -1137,10 +1633,16 @@ async fn handle_bind_request_with_session(
             match backend.authenticate(&dn, password.as_ref()).await {
                 Ok(true) => {
                     session.bind(dn);
+                    log_simple_bind_success(
+                        request_context,
+                        session.bound_dn().unwrap_or("anonymous"),
+                    )
+                    .await;
                     send_bind_success(socket, message_id).await?;
                 }
                 Ok(false) => {
                     session.clear();
+                    log_simple_bind_failure(request_context, &dn, "invalid credentials").await;
                     send_bind_response(
                         socket,
                         message_id,
@@ -1152,6 +1654,7 @@ async fn handle_bind_request_with_session(
                 Err(err) => {
                     session.clear();
                     error!("Backend authentication error for {}: {}", dn, err);
+                    log_simple_bind_failure(request_context, &dn, "backend failure").await;
                     send_bind_response(
                         socket,
                         message_id,
@@ -1162,15 +1665,157 @@ async fn handle_bind_request_with_session(
                 }
             }
         }
-        AuthenticationChoice::Sasl(_) => {
-            session.clear();
-            send_bind_response(
-                socket,
-                message_id,
-                ResultCode::AuthMethodNotSupported,
-                "SASL authentication is not supported",
-            )
-            .await?;
+        AuthenticationChoice::Sasl(credentials) => {
+            let mechanism = credentials.mechanism.0.as_ref().trim().to_owned();
+            if !mechanism.eq_ignore_ascii_case("PLAIN") {
+                session.clear();
+                log_sasl_bind(
+                    request_context,
+                    request.name.0.as_ref().trim(),
+                    &mechanism,
+                    false,
+                    Some("unsupported SASL mechanism"),
+                )
+                .await;
+                send_bind_response(
+                    socket,
+                    message_id,
+                    ResultCode::AuthMethodNotSupported,
+                    "only SASL PLAIN is supported",
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if !connection_is_secure {
+                session.clear();
+                log_sasl_bind(
+                    request_context,
+                    request.name.0.as_ref().trim(),
+                    "PLAIN",
+                    false,
+                    Some("SASL PLAIN requires TLS"),
+                )
+                .await;
+                send_bind_response(
+                    socket,
+                    message_id,
+                    ResultCode::ConfidentialityRequired,
+                    "SASL PLAIN requires TLS",
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let (authzid, authcid, password) =
+                match parse_sasl_plain_credentials(credentials.credentials.as_deref()) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        session.clear();
+                        log_sasl_bind(
+                            request_context,
+                            request.name.0.as_ref().trim(),
+                            "PLAIN",
+                            false,
+                            Some(err),
+                        )
+                        .await;
+                        send_bind_response(socket, message_id, ResultCode::InvalidCredentials, err)
+                            .await?;
+                        return Ok(());
+                    }
+                };
+
+            let bind_dn = if request.name.0.as_ref().trim().is_empty() {
+                authcid.clone()
+            } else {
+                request.name.0.as_ref().trim().to_owned()
+            };
+
+            if bind_dn.is_empty() {
+                session.clear();
+                log_sasl_bind(
+                    request_context,
+                    "anonymous",
+                    "PLAIN",
+                    false,
+                    Some("empty SASL identity"),
+                )
+                .await;
+                send_bind_response(
+                    socket,
+                    message_id,
+                    ResultCode::InvalidCredentials,
+                    "empty SASL identity",
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if !authzid.is_empty() && !authzid.eq_ignore_ascii_case(&bind_dn) {
+                session.clear();
+                log_sasl_bind(
+                    request_context,
+                    &bind_dn,
+                    "PLAIN",
+                    false,
+                    Some("proxy authorization is not supported"),
+                )
+                .await;
+                send_bind_response(
+                    socket,
+                    message_id,
+                    ResultCode::InappropriateAuthentication,
+                    "proxy authorization is not supported",
+                )
+                .await?;
+                return Ok(());
+            }
+
+            match backend.authenticate(&bind_dn, &password).await {
+                Ok(true) => {
+                    session.bind(bind_dn.clone());
+                    log_sasl_bind(request_context, &bind_dn, "PLAIN", true, None).await;
+                    send_bind_success(socket, message_id).await?;
+                }
+                Ok(false) => {
+                    session.clear();
+                    log_sasl_bind(
+                        request_context,
+                        &bind_dn,
+                        "PLAIN",
+                        false,
+                        Some("invalid credentials"),
+                    )
+                    .await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::InvalidCredentials,
+                        "invalid credentials",
+                    )
+                    .await?;
+                }
+                Err(err) => {
+                    session.clear();
+                    error!("Backend SASL authentication error for {}: {}", bind_dn, err);
+                    log_sasl_bind(
+                        request_context,
+                        &bind_dn,
+                        "PLAIN",
+                        false,
+                        Some("backend failure"),
+                    )
+                    .await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::Unavailable,
+                        "backend failure",
+                    )
+                    .await?;
+                }
+            }
         }
     }
 
@@ -1233,6 +1878,27 @@ async fn send_result(
     Ok(())
 }
 
+async fn send_extended_response(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    result_code: ResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+    response_name: Option<String>,
+    response_value: Option<Vec<u8>>,
+) -> Result<(), ServerError> {
+    let encoded = encode_extended_response(
+        message_id,
+        result_code,
+        matched_dn,
+        diagnostic_message,
+        response_name,
+        response_value,
+    )?;
+    socket.write_all(&encoded).await?;
+    Ok(())
+}
+
 fn map_backend_error(err: &BackendError) -> ResultCode {
     match err {
         BackendError::AlreadyExists => ResultCode::EntryAlreadyExists,
@@ -1249,11 +1915,45 @@ fn diagnostic_for_error(err: &BackendError) -> &'static str {
     }
 }
 
+fn compute_new_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {
+    if let Some(superior) = new_superior {
+        format!("{},{}", new_rdn, superior)
+    } else if let Some((_, rest)) = dn.split_once(',') {
+        if rest.is_empty() {
+            new_rdn.to_string()
+        } else {
+            format!("{},{}", new_rdn, rest)
+        }
+    } else {
+        new_rdn.to_string()
+    }
+}
+
 pub async fn handle_search_request(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: SearchRequest<'_>,
+) -> Result<(), ServerError> {
+    let session = ConnectionSession::default();
+    handle_search_request_with_context(
+        socket,
+        backend,
+        message_id,
+        request,
+        &session,
+        &RequestContext::default(),
+    )
+    .await
+}
+
+async fn handle_search_request_with_context(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    request: SearchRequest<'_>,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
 ) -> Result<(), ServerError> {
     let base_dn = request.base_object.0.as_ref().trim().to_owned();
     let attribute_selection: Vec<String> = request
@@ -1261,6 +1961,22 @@ pub async fn handle_search_request(
         .iter()
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
+
+    if !authorize_operation(
+        socket,
+        message_id,
+        ResponseOp::SearchDone,
+        session,
+        request_context,
+        Permission::Search,
+        "search",
+        &base_dn,
+        None,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     if attribute_selection
         .iter()
@@ -1464,17 +2180,145 @@ impl<'a, S: AsyncWrite + Unpin> ProviderOwnedReplicationSession<'a, S> {
     }
 }
 
+async fn log_compare_audit(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    attribute: &str,
+    success: bool,
+    result: &str,
+    error_message: Option<&str>,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_authorization {
+        return;
+    }
+    log_generic_audit_event(
+        request_context,
+        session,
+        if success {
+            AuditLevel::Info
+        } else {
+            AuditLevel::Warning
+        },
+        AuditEventType::Authorization,
+        "compare",
+        success,
+        Some(dn),
+        error_message,
+        vec![
+            ("attribute".to_string(), attribute.to_string()),
+            ("result".to_string(), result.to_string()),
+        ],
+    )
+    .await;
+}
+
+async fn log_modify_audit_event(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    success: bool,
+    attribute_names: &[String],
+    error_message: Option<&str>,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_modifications {
+        return;
+    }
+    if success {
+        if let Some(logger) = security.audit_logger.as_ref() {
+            let attribute_refs: Vec<&str> = attribute_names.iter().map(String::as_str).collect();
+            logger
+                .log_modify(
+                    dn,
+                    &audit_actor(session),
+                    &client_ip_for_audit(request_context),
+                    &attribute_refs,
+                )
+                .await;
+        }
+        return;
+    }
+
+    log_generic_audit_event(
+        request_context,
+        session,
+        AuditLevel::Error,
+        AuditEventType::DataModification,
+        "modify",
+        false,
+        Some(dn),
+        error_message,
+        vec![("attributes".to_string(), attribute_names.join(","))],
+    )
+    .await;
+}
+
 pub async fn handle_modify_request(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: ModifyRequest<'_>,
 ) -> Result<(), ServerError> {
+    let session = ConnectionSession::default();
+    handle_modify_request_with_context(
+        socket,
+        backend,
+        message_id,
+        request,
+        &session,
+        &RequestContext::default(),
+    )
+    .await
+}
+
+async fn handle_modify_request_with_context(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    request: ModifyRequest<'_>,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> Result<(), ServerError> {
     let dn = request.object.0.as_ref().trim().to_owned();
     let modifications = convert_modifications(request.changes);
+    let modified_attributes: Vec<String> = modifications
+        .iter()
+        .map(|modification| modification.attribute.clone())
+        .collect();
+
+    if !authorize_operation(
+        socket,
+        message_id,
+        ResponseOp::Modify,
+        session,
+        request_context,
+        Permission::Modify,
+        "modify",
+        &dn,
+        None,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     match backend.modify_entry(&dn, modifications).await {
         Ok(()) => {
+            log_modify_audit_event(
+                request_context,
+                session,
+                &dn,
+                true,
+                &modified_attributes,
+                None,
+            )
+            .await;
             send_result(
                 socket,
                 message_id,
@@ -1487,6 +2331,15 @@ pub async fn handle_modify_request(
         }
         Err(err) => {
             error!("Modify operation failed for {}: {}", dn, err);
+            log_modify_audit_event(
+                request_context,
+                session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(diagnostic_for_error(&err)),
+            )
+            .await;
             send_result(
                 socket,
                 message_id,
@@ -1509,12 +2362,62 @@ pub async fn handle_add_request(
     message_id: u32,
     request: AddRequest<'_>,
 ) -> Result<(), ServerError> {
+    let session = ConnectionSession::default();
+    handle_add_request_with_context(
+        socket,
+        backend,
+        schema,
+        message_id,
+        request,
+        &session,
+        &RequestContext::default(),
+    )
+    .await
+}
+
+async fn handle_add_request_with_context(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
+    message_id: u32,
+    request: AddRequest<'_>,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let (entry, password) = build_entry_from_add_request(&dn, request.attributes);
+
+    if !authorize_operation(
+        socket,
+        message_id,
+        ResponseOp::Add,
+        session,
+        request_context,
+        Permission::Add,
+        "add",
+        &dn,
+        None,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     // Perform schema validation before adding
     if let Err(schema_error) = schema.validate_entry(&entry.attributes) {
         error!("Schema validation failed for {}: {}", dn, schema_error);
+        log_generic_audit_event(
+            request_context,
+            session,
+            AuditLevel::Error,
+            AuditEventType::DataModification,
+            "add",
+            false,
+            Some(&dn),
+            Some(&format!("Schema validation failed: {}", schema_error)),
+            Vec::new(),
+        )
+        .await;
         send_result(
             socket,
             message_id,
@@ -1529,6 +2432,20 @@ pub async fn handle_add_request(
 
     match backend.add_entry(entry, password).await {
         Ok(()) => {
+            if let Some(security) = request_context.security.as_ref() {
+                if security.audit_config.log_modifications {
+                    if let Some(logger) = security.audit_logger.as_ref() {
+                        logger
+                            .log_add(
+                                &dn,
+                                &audit_actor(session),
+                                &client_ip_for_audit(request_context),
+                                true,
+                            )
+                            .await;
+                    }
+                }
+            }
             send_result(
                 socket,
                 message_id,
@@ -1541,6 +2458,20 @@ pub async fn handle_add_request(
         }
         Err(err) => {
             error!("Add operation failed for {}: {}", dn, err);
+            if let Some(security) = request_context.security.as_ref() {
+                if security.audit_config.log_modifications {
+                    if let Some(logger) = security.audit_logger.as_ref() {
+                        logger
+                            .log_add(
+                                &dn,
+                                &audit_actor(session),
+                                &client_ip_for_audit(request_context),
+                                false,
+                            )
+                            .await;
+                    }
+                }
+            }
             send_result(
                 socket,
                 message_id,
@@ -1562,10 +2493,60 @@ pub async fn handle_delete_request(
     message_id: u32,
     dn: ldap_parser::ldap::LdapDN<'_>,
 ) -> Result<(), ServerError> {
+    let session = ConnectionSession::default();
+    handle_delete_request_with_context(
+        socket,
+        backend,
+        message_id,
+        dn,
+        &session,
+        &RequestContext::default(),
+    )
+    .await
+}
+
+async fn handle_delete_request_with_context(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    dn: ldap_parser::ldap::LdapDN<'_>,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> Result<(), ServerError> {
     let dn = dn.0.as_ref().trim().to_owned();
+
+    if !authorize_operation(
+        socket,
+        message_id,
+        ResponseOp::Delete,
+        session,
+        request_context,
+        Permission::Delete,
+        "delete",
+        &dn,
+        None,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     match backend.delete_entry(&dn).await {
         Ok(()) => {
+            if let Some(security) = request_context.security.as_ref() {
+                if security.audit_config.log_modifications {
+                    if let Some(logger) = security.audit_logger.as_ref() {
+                        logger
+                            .log_delete(
+                                &dn,
+                                &audit_actor(session),
+                                &client_ip_for_audit(request_context),
+                                true,
+                            )
+                            .await;
+                    }
+                }
+            }
             send_result(
                 socket,
                 message_id,
@@ -1578,6 +2559,20 @@ pub async fn handle_delete_request(
         }
         Err(err) => {
             error!("Delete operation failed for {}: {}", dn, err);
+            if let Some(security) = request_context.security.as_ref() {
+                if security.audit_config.log_modifications {
+                    if let Some(logger) = security.audit_logger.as_ref() {
+                        logger
+                            .log_delete(
+                                &dn,
+                                &audit_actor(session),
+                                &client_ip_for_audit(request_context),
+                                false,
+                            )
+                            .await;
+                    }
+                }
+            }
             send_result(
                 socket,
                 message_id,
@@ -1599,6 +2594,26 @@ pub async fn handle_moddn_request(
     message_id: u32,
     request: ModDnRequest<'_>,
 ) -> Result<(), ServerError> {
+    let session = ConnectionSession::default();
+    handle_moddn_request_with_context(
+        socket,
+        backend,
+        message_id,
+        request,
+        &session,
+        &RequestContext::default(),
+    )
+    .await
+}
+
+async fn handle_moddn_request_with_context(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    request: ModDnRequest<'_>,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let new_rdn = request.newrdn.0.as_ref().trim().to_owned();
     let delete_old = request.deleteoldrdn;
@@ -1607,11 +2622,43 @@ pub async fn handle_moddn_request(
         .map(|sup| sup.0.into_owned())
         .filter(|sup| !sup.is_empty());
 
+    if !authorize_operation(
+        socket,
+        message_id,
+        ResponseOp::ModifyDn,
+        session,
+        request_context,
+        Permission::Modify,
+        "modifydn",
+        &dn,
+        None,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let new_dn = compute_new_dn(&dn, &new_rdn, new_superior.as_deref());
+
     match backend
         .rename_entry(&dn, &new_rdn, delete_old, new_superior)
         .await
     {
         Ok(()) => {
+            if let Some(security) = request_context.security.as_ref() {
+                if security.audit_config.log_modifications {
+                    if let Some(logger) = security.audit_logger.as_ref() {
+                        logger
+                            .log_modifydn(
+                                &dn,
+                                &new_dn,
+                                &audit_actor(session),
+                                &client_ip_for_audit(request_context),
+                            )
+                            .await;
+                    }
+                }
+            }
             send_result(
                 socket,
                 message_id,
@@ -1624,6 +2671,18 @@ pub async fn handle_moddn_request(
         }
         Err(err) => {
             error!("ModifyDN operation failed for {}: {}", dn, err);
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Error,
+                AuditEventType::DataModification,
+                "modifydn",
+                false,
+                Some(&dn),
+                Some(diagnostic_for_error(&err)),
+                vec![("new_dn".to_string(), new_dn)],
+            )
+            .await;
             send_result(
                 socket,
                 message_id,
@@ -1645,12 +2704,58 @@ pub async fn handle_compare_request(
     message_id: u32,
     request: CompareRequest<'_>,
 ) -> Result<(), ServerError> {
+    let session = ConnectionSession::default();
+    handle_compare_request_with_context(
+        socket,
+        backend,
+        message_id,
+        request,
+        &session,
+        &RequestContext::default(),
+    )
+    .await
+}
+
+async fn handle_compare_request_with_context(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    request: CompareRequest<'_>,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let attribute = request.ava.attribute_desc.0.as_ref().trim().to_owned();
     let assertion = bytes_to_string(request.ava.assertion_value);
 
+    if !authorize_operation(
+        socket,
+        message_id,
+        ResponseOp::Compare,
+        session,
+        request_context,
+        Permission::Compare,
+        "compare",
+        &dn,
+        Some(&attribute),
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     match backend.compare_attribute(&dn, &attribute, &assertion).await {
         Ok(true) => {
+            log_compare_audit(
+                request_context,
+                session,
+                &dn,
+                &attribute,
+                true,
+                "true",
+                None,
+            )
+            .await;
             send_result(
                 socket,
                 message_id,
@@ -1662,6 +2767,16 @@ pub async fn handle_compare_request(
             .await?;
         }
         Ok(false) => {
+            log_compare_audit(
+                request_context,
+                session,
+                &dn,
+                &attribute,
+                true,
+                "false",
+                None,
+            )
+            .await;
             send_result(
                 socket,
                 message_id,
@@ -1674,6 +2789,16 @@ pub async fn handle_compare_request(
         }
         Err(err) => {
             error!("Compare operation failed for {}: {}", dn, err);
+            log_compare_audit(
+                request_context,
+                session,
+                &dn,
+                &attribute,
+                false,
+                "error",
+                Some(diagnostic_for_error(&err)),
+            )
+            .await;
             send_result(
                 socket,
                 message_id,
@@ -1697,9 +2822,17 @@ pub async fn handle_extended_request(
     socket: &mut ConnectionStream,
     message_id: u32,
     request: ExtendedRequest<'_>,
- ) -> Result<(), ServerError> {
+) -> Result<(), ServerError> {
     let mut session = ConnectionSession::default();
-    handle_extended_request_with_session(socket, message_id, request, &mut session, None).await
+    handle_extended_request_with_session(
+        socket,
+        message_id,
+        request,
+        &mut session,
+        None,
+        &RequestContext::default(),
+    )
+    .await
 }
 
 async fn handle_extended_request_with_session(
@@ -1708,12 +2841,26 @@ async fn handle_extended_request_with_session(
     request: ExtendedRequest<'_>,
     session: &mut ConnectionSession,
     tls_handler: Option<&RustlsTlsHandler>,
+    request_context: &RequestContext,
 ) -> Result<(), ServerError> {
     const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
+    const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
     let oid = request.request_name.0.as_ref();
 
     if oid == START_TLS_OID {
         if socket.is_secure() {
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::System,
+                "starttls",
+                false,
+                None,
+                Some("connection already uses TLS"),
+                Vec::new(),
+            )
+            .await;
             return send_result(
                 socket,
                 message_id,
@@ -1726,6 +2873,18 @@ async fn handle_extended_request_with_session(
         }
 
         let Some(tls_handler) = tls_handler else {
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::System,
+                "starttls",
+                false,
+                None,
+                Some("StartTLS is not available"),
+                Vec::new(),
+            )
+            .await;
             return send_result(
                 socket,
                 message_id,
@@ -1748,10 +2907,85 @@ async fn handle_extended_request_with_session(
         .await?;
         socket.upgrade_in_place(tls_handler).await?;
         session.clear();
+        log_generic_audit_event(
+            request_context,
+            session,
+            AuditLevel::Info,
+            AuditEventType::System,
+            "starttls",
+            true,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        return Ok(());
+    }
+
+    if oid == WHO_AM_I_OID {
+        let target_dn = session.bound_dn().unwrap_or("");
+        if !authorize_operation(
+            socket,
+            message_id,
+            ResponseOp::Extended,
+            session,
+            request_context,
+            Permission::Read,
+            "whoami",
+            target_dn,
+            None,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+
+        let authz_id = session
+            .bound_dn()
+            .map(|dn| format!("dn:{}", dn))
+            .unwrap_or_default();
+        send_extended_response(
+            socket,
+            message_id,
+            ResultCode::Success,
+            "",
+            "",
+            Some(WHO_AM_I_OID.to_string()),
+            Some(authz_id.into_bytes()),
+        )
+        .await?;
+        log_generic_audit_event(
+            request_context,
+            session,
+            AuditLevel::Info,
+            AuditEventType::System,
+            "whoami",
+            true,
+            if target_dn.is_empty() {
+                None
+            } else {
+                Some(target_dn)
+            },
+            None,
+            Vec::new(),
+        )
+        .await;
         return Ok(());
     }
 
     warn!("Unsupported extended operation requested: {}", oid);
+    log_generic_audit_event(
+        request_context,
+        session,
+        AuditLevel::Warning,
+        AuditEventType::System,
+        format!("extended:{}", oid),
+        false,
+        session.bound_dn(),
+        Some("extended operations are not supported"),
+        Vec::new(),
+    )
+    .await;
 
     send_result(
         socket,
@@ -2021,6 +3255,7 @@ fn bytes_to_string(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aci::AciEngine;
     use crate::backend::MockBackend;
     use crate::config::ServerConfig;
     use crate::replication::REPLICATION_STREAM_ATTRIBUTE;
@@ -2031,14 +3266,15 @@ mod tests {
     };
     use ldap_parser::ldap::LdapString;
     use ldap_parser::ldap::{
-        AuthenticationChoice, BindRequest, DerefAliases, LdapDN, ResultCode as ParserResultCode,
-        SearchRequest, SearchScope,
+        AuthenticationChoice, BindRequest, CompareRequest, DerefAliases, ExtendedRequest, LdapDN,
+        LdapOID, ResultCode as ParserResultCode, SaslCredentials, SearchRequest, SearchScope,
     };
     use ldap_parser::ldap::{Change, Operation};
     use rasn::der;
     use rasn_ldap::{AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest};
     use std::borrow::Cow;
     use std::sync::Arc;
+    use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Duration};
@@ -2218,9 +3454,17 @@ mod tests {
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
 
-        handle_bind_request_with_session(&mut server_stream, &backend, 1, request, &mut session)
-            .await
-            .unwrap();
+        handle_bind_request_with_session_and_context(
+            &mut server_stream,
+            &backend,
+            1,
+            request,
+            &mut session,
+            &RequestContext::default(),
+            false,
+        )
+        .await
+        .unwrap();
 
         let response = read_response(&mut client_stream).await;
         let (_, messages) = parse_ldap_messages(&response).unwrap();
@@ -2230,6 +3474,215 @@ mod tests {
         match &messages[0].protocol_op {
             ProtocolOp::BindResponse(bind_response) => {
                 assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sasl_plain_bind_requires_secure_transport() {
+        let backend = MockBackend::from_credentials([(
+            String::from("cn=admin,dc=example,dc=org"),
+            b"secret".to_vec(),
+        )]);
+        let mut session = ConnectionSession::default();
+        let request = BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned("cn=admin,dc=example,dc=org".to_string())),
+            authentication: AuthenticationChoice::Sasl(SaslCredentials {
+                mechanism: LdapString(Cow::Owned("PLAIN".to_string())),
+                credentials: Some(Cow::Owned(b"\0cn=admin,dc=example,dc=org\0secret".to_vec())),
+            }),
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_bind_request_with_session_and_context(
+            &mut server_stream,
+            &backend,
+            2,
+            request,
+            &mut session,
+            &RequestContext::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(session.bound_dn(), None);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(
+                    bind_response.result.result_code,
+                    ParserResultCode::ConfidentialityRequired
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sasl_plain_bind_success_logs_audit_event() {
+        let backend = MockBackend::from_credentials([(
+            String::from("cn=admin,dc=example,dc=org"),
+            b"secret".to_vec(),
+        )]);
+        let temp_file = NamedTempFile::new().unwrap();
+        let audit_logger = AuditLogger::new(temp_file.path(), AuditLevel::Debug);
+        audit_logger.initialize().await.unwrap();
+        let request_context = RequestContext {
+            client_ip: Some("127.0.0.1".parse().unwrap()),
+            session_id: Some(55),
+            security: Some(Arc::new(LegacySecurityConfig {
+                audit_logger: Some(audit_logger.clone()),
+                audit_config: LegacyAuditConfig::default(),
+                access_control: None,
+                root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
+            })),
+        };
+
+        let mut session = ConnectionSession::default();
+        let request = BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned("cn=admin,dc=example,dc=org".to_string())),
+            authentication: AuthenticationChoice::Sasl(SaslCredentials {
+                mechanism: LdapString(Cow::Owned("PLAIN".to_string())),
+                credentials: Some(Cow::Owned(b"\0cn=admin,dc=example,dc=org\0secret".to_vec())),
+            }),
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_bind_request_with_session_and_context(
+            &mut server_stream,
+            &backend,
+            3,
+            request,
+            &mut session,
+            &request_context,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        let log_content = tokio::fs::read_to_string(temp_file.path()).await.unwrap();
+
+        assert_eq!(session.bound_dn(), Some("cn=admin,dc=example,dc=org"));
+        assert!(log_content.contains("sasl_bind"));
+        assert!(log_content.contains("PLAIN"));
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_denial_returns_insufficient_access_and_audits_denial() {
+        let backend = MockBackend::new();
+        let temp_file = NamedTempFile::new().unwrap();
+        let audit_logger = AuditLogger::new(temp_file.path(), AuditLevel::Debug);
+        audit_logger.initialize().await.unwrap();
+        let request_context = RequestContext {
+            client_ip: Some("127.0.0.1".parse().unwrap()),
+            session_id: Some(77),
+            security: Some(Arc::new(LegacySecurityConfig {
+                audit_logger: Some(audit_logger.clone()),
+                audit_config: LegacyAuditConfig::default(),
+                access_control: Some(Arc::new(AciEngine::restrictive())),
+                root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
+            })),
+        };
+        let mut session = ConnectionSession::default();
+        session.bind("cn=user,dc=example,dc=org".to_string());
+
+        let request = CompareRequest {
+            entry: LdapDN(Cow::Owned("cn=target,dc=example,dc=org".to_string())),
+            ava: AttributeValueAssertion {
+                attribute_desc: LdapString(Cow::Owned("cn".to_string())),
+                assertion_value: b"target",
+            },
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_compare_request_with_context(
+            &mut server_stream,
+            &backend,
+            4,
+            request,
+            &session,
+            &request_context,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        let log_content = tokio::fs::read_to_string(temp_file.path()).await.unwrap();
+
+        assert!(log_content.contains("authz_compare"));
+        assert!(log_content.contains("Access denied"));
+        match &messages[0].protocol_op {
+            ProtocolOp::CompareResponse(compare_response) => {
+                assert_eq!(
+                    compare_response.result_code,
+                    ParserResultCode::InsufficientAccessRights
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn whoami_extended_request_returns_bound_dn() {
+        let request = ExtendedRequest {
+            request_name: LdapOID(Cow::Owned("1.3.6.1.4.1.4203.1.11.3".to_string())),
+            request_value: None,
+        };
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut server_stream = ConnectionStream::Plain(server_stream);
+        let mut session = ConnectionSession::default();
+        session.bind("cn=admin,dc=example,dc=org".to_string());
+
+        handle_extended_request_with_session(
+            &mut server_stream,
+            5,
+            request,
+            &mut session,
+            None,
+            &RequestContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        match &messages[0].protocol_op {
+            ProtocolOp::ExtendedResponse(extended_response) => {
+                assert_eq!(
+                    extended_response.result.result_code,
+                    ParserResultCode::Success
+                );
+                assert_eq!(
+                    extended_response
+                        .response_name
+                        .as_ref()
+                        .map(|oid| oid.0.as_ref()),
+                    Some("1.3.6.1.4.1.4203.1.11.3")
+                );
+                assert_eq!(
+                    extended_response
+                        .response_value
+                        .as_ref()
+                        .map(|value| value.as_ref()),
+                    Some(b"dn:cn=admin,dc=example,dc=org".as_ref())
+                );
             }
             other => panic!("unexpected response: {:?}", other),
         }

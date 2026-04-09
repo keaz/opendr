@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use opendr::aci::AciEngine;
+use opendr::audit::{AuditConfig, AuditFormat, AuditLevel, AuditLogger};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::{IndexConfig, LmdbBackend};
 use opendr::config::ServerConfig;
@@ -11,6 +14,71 @@ use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use opendr::tls::{RustlsTlsHandler, TlsConfig as RuntimeTlsConfig, TlsVersion};
+
+fn parse_audit_level(level: &str) -> Result<AuditLevel, Box<dyn Error>> {
+    match level {
+        "debug" => Ok(AuditLevel::Debug),
+        "info" => Ok(AuditLevel::Info),
+        "warning" => Ok(AuditLevel::Warning),
+        "error" => Ok(AuditLevel::Error),
+        "critical" => Ok(AuditLevel::Critical),
+        other => Err(format!("unsupported audit level: {}", other).into()),
+    }
+}
+
+fn parse_audit_format(format: &str) -> Result<AuditFormat, Box<dyn Error>> {
+    match format {
+        "json" => Ok(AuditFormat::Json),
+        "syslog" => Ok(AuditFormat::Syslog),
+        "text" => Ok(AuditFormat::Text),
+        other => Err(format!("unsupported audit format: {}", other).into()),
+    }
+}
+
+async fn build_legacy_security_config(
+    config: &ServerConfig,
+) -> Result<Option<Arc<server::LegacySecurityConfig>>, Box<dyn Error>> {
+    let audit_logger = if config.audit.enabled {
+        let audit_logger = AuditLogger::with_config(AuditConfig {
+            log_path: PathBuf::from(&config.audit.log_file),
+            min_level: parse_audit_level(&config.audit.level)?,
+            format: parse_audit_format(&config.audit.format)?,
+            ..Default::default()
+        });
+        audit_logger.initialize().await?;
+        Some(audit_logger)
+    } else {
+        None
+    };
+
+    let access_control = if config.access_control.enabled {
+        Some(Arc::new(
+            match config.access_control.default_policy.as_str() {
+                "allow" => AciEngine::permissive(),
+                "deny" => AciEngine::restrictive(),
+                other => return Err(format!("unsupported access control policy: {}", other).into()),
+            },
+        ))
+    } else {
+        None
+    };
+
+    if audit_logger.is_none() && access_control.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(Arc::new(server::LegacySecurityConfig {
+        audit_logger,
+        audit_config: server::LegacyAuditConfig {
+            log_authentication: config.audit.log_authentication,
+            log_authorization: config.audit.log_authorization,
+            log_modifications: config.audit.log_modifications,
+            log_connections: config.audit.log_connections,
+        },
+        access_control,
+        root_dn: Some(config.server.root_user_dn.clone()),
+    })))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -259,6 +327,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ldaps_bind_addr = config.ldaps_bind_address();
     println!("Starting LDAP server on {}", bind_addr);
     let legacy_server_config = server::LegacyServerConfig::from_server_config(&config);
+    let legacy_security_config = build_legacy_security_config(&config).await?;
     let tls_handler = if config.tls.enabled {
         let min_tls_version = match config.tls.min_tls_version.as_str() {
             "1.2" => TlsVersion::Tls12,
@@ -271,7 +340,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let runtime_tls_config = RuntimeTlsConfig {
             cert_path: config.tls.cert_file.display().to_string(),
             key_path: config.tls.key_file.display().to_string(),
-            ca_file: config.tls.ca_file.as_ref().map(|path| path.display().to_string()),
+            ca_file: config
+                .tls
+                .ca_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
             min_tls_version,
             max_tls_version: TlsVersion::Tls13,
             require_client_cert: config.tls.require_client_cert,
@@ -292,16 +365,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ldap_metrics = monitoring_metrics.clone();
     let ldap_runtime_config = legacy_server_config.clone();
     let ldap_tls_handler = tls_handler.clone();
+    let ldap_security = legacy_security_config.clone();
     let ldap_server_task = tokio::spawn(async move {
         let result = match selected_runtime.as_str() {
             "legacy" => {
-                server::run_with_metrics_and_config_with_tls(
+                server::run_with_metrics_and_config_with_tls_and_security(
                     &bind_addr,
                     ldap_backend,
                     ldap_shutdown_rx,
                     ldap_metrics,
                     ldap_runtime_config,
                     ldap_tls_handler,
+                    ldap_security,
                 )
                 .await
             }
@@ -321,15 +396,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let ldaps_backend = backend.clone();
         let ldaps_metrics = monitoring_metrics.clone();
         let ldaps_runtime_config = legacy_server_config.clone();
+        let ldaps_security = legacy_security_config.clone();
         println!("Starting LDAPS server on {}", ldaps_bind_addr);
         Some(tokio::spawn(async move {
-            if let Err(e) = server::run_tls_with_metrics_and_config(
+            if let Err(e) = server::run_tls_with_metrics_and_config_and_security(
                 &ldaps_bind_addr,
                 ldaps_backend,
                 ldaps_shutdown_rx,
                 ldaps_metrics,
                 ldaps_runtime_config,
                 tls_handler,
+                ldaps_security,
             )
             .await
             {

@@ -86,6 +86,30 @@ pub fn encode_result_response(
     der::encode(&message)
 }
 
+pub fn encode_extended_response(
+    message_id: u32,
+    result_code: ResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+    response_name: Option<String>,
+    response_value: Option<Vec<u8>>,
+) -> Result<Vec<u8>, EncodeError> {
+    let matched_dn = matched_dn.into();
+    let diagnostic = diagnostic_message.into();
+    let response = rasn_ldap::ExtendedResponse {
+        result_code,
+        matched_dn: matched_dn.into_bytes().into(),
+        diagnostic_message: diagnostic.into_bytes().into(),
+        referral: None,
+        response_name: response_name.map(|name| name.into_bytes().into()),
+        response_value: response_value.map(|value| value.into()),
+    };
+
+    let message =
+        rasn_ldap::LdapMessage::new(message_id, rasn_ldap::ProtocolOp::ExtendedResp(response));
+    der::encode(&message)
+}
+
 pub fn encode_search_entry(
     message_id: u32,
     entry: &DirectoryEntry,
