@@ -46,6 +46,7 @@ pub mod sasl_fsm;
 pub mod sasl_mechanisms;
 pub mod schema;
 pub mod schema_adapter;
+pub mod search_controls;
 pub mod search_fsm;
 pub mod server;
 pub mod setup;

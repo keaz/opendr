@@ -47,6 +47,10 @@ use crate::replication::{
     REPLICATION_STREAM_ATTRIBUTE,
 };
 use crate::schema::LdapSchema;
+use crate::search_controls::{
+    decode_paged_results_control, encode_paged_results_control, PagedResultsControl,
+    PAGED_RESULTS_OID,
+};
 use crate::tls::RustlsTlsHandler;
 
 #[derive(Debug)]
@@ -142,10 +146,84 @@ struct RegisteredOperation {
     state: ActiveOperationState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchRequestSignature {
+    base_dn: String,
+    scope: u32,
+    deref_aliases: u32,
+    size_limit: u32,
+    time_limit: u32,
+    types_only: bool,
+    filter_repr: String,
+    attributes: Vec<String>,
+}
+
+impl SearchRequestSignature {
+    fn from_request(
+        base_dn: &str,
+        request: &SearchRequest<'_>,
+        attribute_selection: &[String],
+    ) -> Self {
+        let mut attributes = attribute_selection
+            .iter()
+            .map(|attribute| attribute.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        attributes.sort();
+        attributes.dedup();
+
+        Self {
+            base_dn: normalize_search_dn(base_dn),
+            scope: request.scope.0,
+            deref_aliases: request.deref_aliases.0,
+            size_limit: request.size_limit,
+            time_limit: request.time_limit,
+            types_only: request.types_only,
+            filter_repr: format!("{:?}", request.filter),
+            attributes,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PagedSearchCursor {
+    signature: SearchRequestSignature,
+    total_size: usize,
+    remaining_entries: Vec<DirectoryEntry>,
+    completion_code: ResultCode,
+    completion_diagnostic: &'static str,
+}
+
+impl PagedSearchCursor {
+    fn total_size(&self) -> u32 {
+        u32::try_from(self.total_size).unwrap_or(u32::MAX)
+    }
+
+    fn next_page(
+        &mut self,
+        page_size: usize,
+    ) -> (Vec<DirectoryEntry>, ResultCode, &'static str, bool) {
+        let rest = if self.remaining_entries.len() > page_size {
+            self.remaining_entries.split_off(page_size)
+        } else {
+            Vec::new()
+        };
+        let page = std::mem::replace(&mut self.remaining_entries, rest);
+        let complete = self.remaining_entries.is_empty();
+
+        if complete {
+            (page, self.completion_code, self.completion_diagnostic, true)
+        } else {
+            (page, ResultCode::Success, "", false)
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ConnectionOperationRegistry {
     active: HashMap<u32, RegisteredOperation>,
     finished: HashMap<u32, FinishedOperationState>,
+    paged_searches: HashMap<Vec<u8>, PagedSearchCursor>,
+    active_paged_searches: HashMap<u32, Vec<u8>>,
 }
 
 impl ConnectionOperationRegistry {
@@ -198,7 +276,49 @@ impl ConnectionOperationRegistry {
 
     fn finish(&mut self, message_id: u32, outcome: FinishedOperationState) {
         self.active.remove(&message_id);
+        if let Some(cookie) = self.active_paged_searches.remove(&message_id) {
+            if matches!(
+                outcome,
+                FinishedOperationState::Canceled | FinishedOperationState::Abandoned
+            ) {
+                self.paged_searches.remove(&cookie);
+            }
+        }
         self.finished.insert(message_id, outcome);
+    }
+
+    fn clear_paged_searches(&mut self) {
+        self.paged_searches.clear();
+        self.active_paged_searches.clear();
+    }
+
+    fn remember_paged_search(&mut self, cursor: PagedSearchCursor) -> Vec<u8> {
+        loop {
+            let cookie = Alphanumeric
+                .sample_string(&mut rand::thread_rng(), 24)
+                .into_bytes();
+            if self.paged_searches.contains_key(&cookie) {
+                continue;
+            }
+            self.paged_searches.insert(cookie.clone(), cursor);
+            return cookie;
+        }
+    }
+
+    fn paged_search(&self, cookie: &[u8]) -> Option<&PagedSearchCursor> {
+        self.paged_searches.get(cookie)
+    }
+
+    fn paged_search_mut(&mut self, cookie: &[u8]) -> Option<&mut PagedSearchCursor> {
+        self.paged_searches.get_mut(cookie)
+    }
+
+    fn remove_paged_search(&mut self, cookie: &[u8]) -> Option<PagedSearchCursor> {
+        self.paged_searches.remove(cookie)
+    }
+
+    fn attach_paged_search_to_operation(&mut self, message_id: u32, cookie: Vec<u8>) {
+        self.active_paged_searches.insert(message_id, cookie);
     }
 }
 
@@ -1306,6 +1426,7 @@ async fn process_message_with_session(
 
     match message.protocol_op {
         ProtocolOp::BindRequest(bind_request) => {
+            operation_registry.clear_paged_searches();
             handle_bind_request_with_session_and_context(
                 socket,
                 backend,
@@ -1440,6 +1561,7 @@ async fn process_message_with_session(
         }
         ProtocolOp::UnbindRequest => {
             info!("Received unbind request");
+            operation_registry.clear_paged_searches();
             session.clear();
             return Ok(());
         }
@@ -1469,7 +1591,11 @@ async fn process_message_with_session(
 }
 
 fn active_runtime_control_registry() -> ControlRegistry {
-    ControlRegistry::default()
+    let mut registry = ControlRegistry::default();
+    registry
+        .register_request_control(PAGED_RESULTS_OID)
+        .register_response_control(PAGED_RESULTS_OID);
+    registry
 }
 
 fn control_metric_fragment(oid: &str) -> String {
@@ -1638,6 +1764,121 @@ async fn validate_message_controls(
             Ok(None)
         }
     }
+}
+
+#[derive(Debug)]
+struct SearchResultSet {
+    entries: Vec<DirectoryEntry>,
+    size_limit_hit: bool,
+    time_limit_hit: bool,
+}
+
+#[derive(Debug)]
+struct SearchExecutionError {
+    result_code: ResultCode,
+    diagnostic: String,
+    target_dn: String,
+    alias_dereference_failure: bool,
+}
+
+#[derive(Debug)]
+enum PagedSearchRequestError {
+    ProtocolError(String),
+    InvalidCookie(String),
+    UnsupportedCombination(String),
+}
+
+impl PagedSearchRequestError {
+    fn result_code(&self) -> ResultCode {
+        match self {
+            Self::ProtocolError(_) => ResultCode::ProtocolError,
+            Self::InvalidCookie(_) | Self::UnsupportedCombination(_) => {
+                ResultCode::UnwillingToPerform
+            }
+        }
+    }
+
+    fn diagnostic(&self) -> &str {
+        match self {
+            Self::ProtocolError(message)
+            | Self::InvalidCookie(message)
+            | Self::UnsupportedCombination(message) => message.as_str(),
+        }
+    }
+}
+
+fn paged_results_response_control(
+    total_size: usize,
+    cookie: &[u8],
+) -> Result<LdapControl, ServerError> {
+    let value = encode_paged_results_control(u32::try_from(total_size).unwrap_or(u32::MAX), cookie)
+        .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?;
+    Ok(LdapControl::new(PAGED_RESULTS_OID, false, Some(value)))
+}
+
+fn parse_paged_results_request(
+    request_controls: &RequestControls,
+) -> Result<Option<PagedResultsControl>, PagedSearchRequestError> {
+    let control = request_controls
+        .singleton(PAGED_RESULTS_OID)
+        .map_err(|err| PagedSearchRequestError::ProtocolError(err.to_string()))?;
+    let Some(control) = control else {
+        return Ok(None);
+    };
+
+    decode_paged_results_control(control.value())
+        .map(Some)
+        .map_err(|err| {
+            PagedSearchRequestError::ProtocolError(format!(
+                "malformed paged results control: {err}"
+            ))
+        })
+}
+
+fn record_paged_search_invalid_cookie(request_context: &RequestContext) {
+    increment_control_counter(request_context, "ldap_paged_search_invalid_cookie_total", 1);
+}
+
+async fn reject_paged_search_request(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    base_dn: &str,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+    error: &PagedSearchRequestError,
+) -> Result<(), ServerError> {
+    if matches!(error, PagedSearchRequestError::InvalidCookie(_)) {
+        record_paged_search_invalid_cookie(request_context);
+    }
+
+    let error_kind = match error {
+        PagedSearchRequestError::ProtocolError(_) => "protocol_error",
+        PagedSearchRequestError::InvalidCookie(_) => "invalid_cookie",
+        PagedSearchRequestError::UnsupportedCombination(_) => "unsupported_combination",
+    };
+
+    log_generic_audit_event(
+        request_context,
+        session,
+        AuditLevel::Warning,
+        AuditEventType::Authorization,
+        "paged_search",
+        false,
+        Some(base_dn),
+        Some(error.diagnostic()),
+        vec![("error_kind".to_string(), error_kind.to_string())],
+    )
+    .await;
+
+    send_result(
+        socket,
+        message_id,
+        ResponseOp::SearchDone,
+        error.result_code(),
+        base_dn,
+        error.diagnostic(),
+    )
+    .await
 }
 
 pub async fn handle_bind_request(
@@ -2339,6 +2580,7 @@ async fn try_handle_virtual_search_request(
     scope: ldap_parser::ldap::SearchScope,
     requested_attributes: &[String],
     types_only: bool,
+    result_controls: &[LdapControl],
     connection_is_secure: bool,
     starttls_available: bool,
 ) -> Result<bool, ServerError> {
@@ -2378,13 +2620,14 @@ async fn try_handle_virtual_search_request(
             types_only,
         )
         .await?;
-        send_result(
+        send_result_with_controls(
             socket,
             message_id,
             ResponseOp::SearchDone,
             ResultCode::Success,
             "",
             "",
+            result_controls,
         )
         .await?;
         return Ok(true);
@@ -2401,13 +2644,14 @@ async fn try_handle_virtual_search_request(
             types_only,
         )
         .await?;
-        send_result(
+        send_result_with_controls(
             socket,
             message_id,
             ResponseOp::SearchDone,
             ResultCode::Success,
             &runtime_config.subschema_dn,
             "",
+            result_controls,
         )
         .await?;
         return Ok(true);
@@ -2660,7 +2904,7 @@ async fn handle_search_request_with_context_and_registry(
     session: &ConnectionSession,
     operation_registry: &mut ConnectionOperationRegistry,
     request_context: &RequestContext,
-    _request_controls: &RequestControls,
+    request_controls: &RequestControls,
     connection_is_secure: bool,
     starttls_available: bool,
 ) -> Result<(), ServerError> {
@@ -2671,7 +2915,77 @@ async fn handle_search_request_with_context_and_registry(
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
     let deref_aliases = request.deref_aliases;
-    let time_limit = request.time_limit;
+    let search_deadline = if request.time_limit == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_secs(request.time_limit as u64))
+    };
+    let paged_results = match parse_paged_results_request(request_controls) {
+        Ok(controls) => controls,
+        Err(err) => {
+            reject_paged_search_request(
+                socket,
+                message_id,
+                &base_dn,
+                session,
+                request_context,
+                &err,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if paged_results.is_some() {
+        increment_control_counter(request_context, "ldap_paged_search_requests_total", 1);
+    }
+
+    if let Some(control) = paged_results.as_ref() {
+        if control.size == 0 && control.cookie.is_empty() {
+            let err = PagedSearchRequestError::ProtocolError(
+                "paged results page size must be greater than zero on the initial request"
+                    .to_string(),
+            );
+            reject_paged_search_request(
+                socket,
+                message_id,
+                &base_dn,
+                session,
+                request_context,
+                &err,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    let is_virtual_base =
+        base_dn.is_empty() || base_dn.eq_ignore_ascii_case(&runtime_config.subschema_dn);
+    let virtual_result_controls = if let Some(control) = paged_results.as_ref() {
+        if !control.cookie.is_empty() && is_virtual_base {
+            let err = PagedSearchRequestError::InvalidCookie(
+                "paged results cookie is not valid for this search sequence".to_string(),
+            );
+            reject_paged_search_request(
+                socket,
+                message_id,
+                &base_dn,
+                session,
+                request_context,
+                &err,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if is_virtual_base {
+            vec![paged_results_response_control(1, &[])?]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     if try_handle_virtual_search_request(
         socket,
@@ -2683,6 +2997,7 @@ async fn handle_search_request_with_context_and_registry(
         request.scope,
         &attribute_selection,
         request.types_only,
+        &virtual_result_controls,
         connection_is_secure,
         starttls_available,
     )
@@ -2746,6 +3061,22 @@ async fn handle_search_request_with_context_and_registry(
         .iter()
         .any(|attribute| attribute.eq_ignore_ascii_case(REPLICATION_STREAM_ATTRIBUTE))
     {
+        if let Some(_control) = paged_results.as_ref() {
+            let err = PagedSearchRequestError::UnsupportedCombination(
+                "paged results are not supported for replication stream searches".to_string(),
+            );
+            reject_paged_search_request(
+                socket,
+                message_id,
+                &base_dn,
+                session,
+                request_context,
+                &err,
+            )
+            .await?;
+            return Ok(());
+        }
+
         return handle_replication_stream_request(
             socket,
             backend,
@@ -2761,49 +3092,145 @@ async fn handle_search_request_with_context_and_registry(
 
     operation_registry.register(message_id, ConnectionOperationKind::Search, true);
 
-    let search_hint = extract_search_hint(&request.filter);
-    let entries = match backend
-        .search_entries_with_hint(&effective_base_dn, request.scope, search_hint)
-        .await
+    let search_signature = paged_results
+        .as_ref()
+        .map(|_| SearchRequestSignature::from_request(&base_dn, &request, &attribute_selection));
+
+    if let Some(control) = paged_results
+        .as_ref()
+        .filter(|control| !control.cookie.is_empty())
     {
-        Ok(entries) => entries,
-        Err(err) => {
-            error!("Search backend failure for {}: {}", effective_base_dn, err);
-            send_result(
+        let Some(cursor) = operation_registry.paged_search(control.cookie.as_slice()) else {
+            let err = PagedSearchRequestError::InvalidCookie(
+                "paged results cookie is not valid for this search sequence".to_string(),
+            );
+            reject_paged_search_request(
                 socket,
                 message_id,
-                ResponseOp::SearchDone,
-                map_backend_error(&err),
-                &effective_base_dn,
-                diagnostic_for_error(&err),
+                &base_dn,
+                session,
+                request_context,
+                &err,
+            )
+            .await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
+        };
+
+        if Some(&cursor.signature) != search_signature.as_ref() {
+            let err = PagedSearchRequestError::InvalidCookie(
+                "paged results cookie does not match the active search sequence".to_string(),
+            );
+            reject_paged_search_request(
+                socket,
+                message_id,
+                &base_dn,
+                session,
+                request_context,
+                &err,
             )
             .await?;
             operation_registry.finish(message_id, FinishedOperationState::Completed);
             return Ok(());
         }
-    };
 
-    let search_deadline = if time_limit == 0 {
-        None
-    } else {
-        Some(Instant::now() + Duration::from_secs(time_limit as u64))
-    };
-    let mut returned = 0usize;
-    let mut size_limit_hit = false;
-    let mut time_limit_hit = false;
-    let mut returned_dns = HashSet::new();
-
-    for entry in entries {
-        if let Some(deadline) = search_deadline {
-            if Instant::now() >= deadline {
-                time_limit_hit = true;
-                break;
-            }
+        if control.size == 0 {
+            operation_registry.remove_paged_search(control.cookie.as_slice());
+            increment_control_counter(request_context, "ldap_paged_search_abandoned_total", 1);
+            let response_control = paged_results_response_control(0, &[])?;
+            send_result_with_controls(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                ResultCode::Success,
+                &base_dn,
+                "",
+                &[response_control],
+            )
+            .await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
         }
 
-        let entry = match resolve_search_candidate_entry(backend, &entry, deref_aliases).await {
-            Ok(entry) => entry,
-            Err((result_code, diagnostic)) => {
+        let total_size = operation_registry
+            .paged_search(control.cookie.as_slice())
+            .map(|cursor| cursor.total_size() as usize)
+            .unwrap_or_default();
+        operation_registry.attach_paged_search_to_operation(message_id, control.cookie.clone());
+        let (page_entries, result_code, diagnostic, complete) = operation_registry
+            .paged_search_mut(control.cookie.as_slice())
+            .expect("paged search cursor must exist after validation")
+            .next_page(control.size as usize);
+        if complete {
+            operation_registry.remove_paged_search(control.cookie.as_slice());
+        }
+
+        let (returned, time_limit_hit) = emit_search_entries(
+            socket,
+            message_id,
+            &page_entries,
+            &attribute_selection,
+            request.types_only,
+            search_deadline,
+        )
+        .await?;
+        increment_control_counter(request_context, "ldap_paged_search_pages_total", 1);
+
+        let response_cookie = if complete || time_limit_hit {
+            if time_limit_hit {
+                operation_registry.remove_paged_search(control.cookie.as_slice());
+            }
+            Vec::new()
+        } else {
+            control.cookie.clone()
+        };
+        let response_control = paged_results_response_control(total_size, &response_cookie)?;
+        let (result_code, diagnostic) = if time_limit_hit {
+            (ResultCode::TimeLimitExceeded, "time limit exceeded")
+        } else {
+            (result_code, diagnostic)
+        };
+        send_result_with_controls(
+            socket,
+            message_id,
+            ResponseOp::SearchDone,
+            result_code,
+            &base_dn,
+            diagnostic,
+            &[response_control],
+        )
+        .await?;
+        if result_code == ResultCode::TimeLimitExceeded {
+            increment_control_counter(request_context, "ldap_search_time_limit_exceeded_total", 1);
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "search_time_limit",
+                false,
+                Some(base_dn.as_str()),
+                Some("search time limit exceeded"),
+                vec![("entries_returned".to_string(), returned.to_string())],
+            )
+            .await;
+        }
+        operation_registry.finish(message_id, FinishedOperationState::Completed);
+        return Ok(());
+    }
+
+    let search_result_set = match collect_search_result_set(
+        backend,
+        &effective_base_dn,
+        &request,
+        deref_aliases,
+        search_deadline,
+    )
+    .await
+    {
+        Ok(result_set) => result_set,
+        Err(err) => {
+            if err.alias_dereference_failure {
                 increment_control_counter(
                     request_context,
                     "ldap_search_alias_dereference_failures_total",
@@ -2816,24 +3243,213 @@ async fn handle_search_request_with_context_and_registry(
                     AuditEventType::Authorization,
                     "search_alias_deref",
                     false,
-                    Some(entry.dn.as_str()),
-                    Some(diagnostic.as_str()),
+                    Some(err.target_dn.as_str()),
+                    Some(err.diagnostic.as_str()),
                     Vec::new(),
                 )
                 .await;
-                send_result(
-                    socket,
-                    message_id,
-                    ResponseOp::SearchDone,
-                    result_code,
-                    &base_dn,
-                    diagnostic.as_str(),
-                )
-                .await?;
-                operation_registry.finish(message_id, FinishedOperationState::Completed);
-                return Ok(());
+            } else {
+                error!(
+                    "Search backend failure for {}: {}",
+                    effective_base_dn, err.diagnostic
+                );
             }
+
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                err.result_code,
+                &base_dn,
+                err.diagnostic.as_str(),
+            )
+            .await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
+        }
+    };
+
+    if let Some(control) = paged_results.as_ref() {
+        let page_size = control.size as usize;
+        let mut entries = search_result_set.entries;
+        let total_size = entries.len();
+        let (page_entries, response_cookie, result_code, diagnostic) =
+            if search_result_set.time_limit_hit {
+                (
+                    entries.into_iter().take(page_size).collect::<Vec<_>>(),
+                    Vec::new(),
+                    ResultCode::TimeLimitExceeded,
+                    "time limit exceeded",
+                )
+            } else if entries.len() > page_size {
+                let remaining_entries = entries.split_off(page_size);
+                let cursor = PagedSearchCursor {
+                    signature: search_signature
+                        .clone()
+                        .expect("paged search signature must exist"),
+                    total_size,
+                    remaining_entries,
+                    completion_code: if search_result_set.size_limit_hit {
+                        ResultCode::SizeLimitExceeded
+                    } else {
+                        ResultCode::Success
+                    },
+                    completion_diagnostic: if search_result_set.size_limit_hit {
+                        "size limit exceeded"
+                    } else {
+                        ""
+                    },
+                };
+                let cookie = operation_registry.remember_paged_search(cursor);
+                operation_registry.attach_paged_search_to_operation(message_id, cookie.clone());
+                increment_control_counter(request_context, "ldap_paged_search_sequences_total", 1);
+                (entries, cookie, ResultCode::Success, "")
+            } else if search_result_set.size_limit_hit {
+                (
+                    entries,
+                    Vec::new(),
+                    ResultCode::SizeLimitExceeded,
+                    "size limit exceeded",
+                )
+            } else {
+                (entries, Vec::new(), ResultCode::Success, "")
+            };
+
+        let (returned, time_limit_hit) = emit_search_entries(
+            socket,
+            message_id,
+            &page_entries,
+            &attribute_selection,
+            request.types_only,
+            search_deadline,
+        )
+        .await?;
+        increment_control_counter(request_context, "ldap_paged_search_pages_total", 1);
+        if time_limit_hit && !response_cookie.is_empty() {
+            operation_registry.remove_paged_search(response_cookie.as_slice());
+        }
+        let final_cookie = if time_limit_hit {
+            Vec::new()
+        } else {
+            response_cookie
         };
+        let response_control = paged_results_response_control(total_size, &final_cookie)?;
+        let (result_code, diagnostic) = if time_limit_hit {
+            (ResultCode::TimeLimitExceeded, "time limit exceeded")
+        } else {
+            (result_code, diagnostic)
+        };
+        send_result_with_controls(
+            socket,
+            message_id,
+            ResponseOp::SearchDone,
+            result_code,
+            &base_dn,
+            diagnostic,
+            &[response_control],
+        )
+        .await?;
+        if result_code == ResultCode::TimeLimitExceeded {
+            increment_control_counter(request_context, "ldap_search_time_limit_exceeded_total", 1);
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "search_time_limit",
+                false,
+                Some(base_dn.as_str()),
+                Some("search time limit exceeded"),
+                vec![("entries_returned".to_string(), returned.to_string())],
+            )
+            .await;
+        }
+    } else {
+        let (returned, emit_time_limit_hit) = emit_search_entries(
+            socket,
+            message_id,
+            &search_result_set.entries,
+            &attribute_selection,
+            request.types_only,
+            search_deadline,
+        )
+        .await?;
+        let (result_code, diagnostic) = if search_result_set.time_limit_hit || emit_time_limit_hit {
+            increment_control_counter(request_context, "ldap_search_time_limit_exceeded_total", 1);
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "search_time_limit",
+                false,
+                Some(base_dn.as_str()),
+                Some("search time limit exceeded"),
+                vec![("entries_returned".to_string(), returned.to_string())],
+            )
+            .await;
+            (ResultCode::TimeLimitExceeded, "time limit exceeded")
+        } else if search_result_set.size_limit_hit {
+            (ResultCode::SizeLimitExceeded, "size limit exceeded")
+        } else {
+            (ResultCode::Success, "")
+        };
+
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::SearchDone,
+            result_code,
+            &base_dn,
+            diagnostic,
+        )
+        .await?;
+    }
+
+    operation_registry.finish(message_id, FinishedOperationState::Completed);
+
+    Ok(())
+}
+
+async fn collect_search_result_set(
+    backend: &dyn DirectoryBackend,
+    effective_base_dn: &str,
+    request: &SearchRequest<'_>,
+    deref_aliases: ldap_parser::ldap::DerefAliases,
+    search_deadline: Option<Instant>,
+) -> Result<SearchResultSet, SearchExecutionError> {
+    let search_hint = extract_search_hint(&request.filter);
+    let entries = backend
+        .search_entries_with_hint(effective_base_dn, request.scope, search_hint)
+        .await
+        .map_err(|err| SearchExecutionError {
+            result_code: map_backend_error(&err),
+            diagnostic: diagnostic_for_error(&err).to_string(),
+            target_dn: effective_base_dn.to_string(),
+            alias_dereference_failure: false,
+        })?;
+
+    let mut collected = Vec::new();
+    let mut size_limit_hit = false;
+    let mut time_limit_hit = false;
+    let mut returned_dns = HashSet::new();
+
+    for entry in entries {
+        if let Some(deadline) = search_deadline {
+            if Instant::now() >= deadline {
+                time_limit_hit = true;
+                break;
+            }
+        }
+
+        let entry = resolve_search_candidate_entry(backend, &entry, deref_aliases)
+            .await
+            .map_err(|(result_code, diagnostic)| SearchExecutionError {
+                result_code,
+                diagnostic,
+                target_dn: entry.dn.clone(),
+                alias_dereference_failure: true,
+            })?;
 
         if !entry_matches_filter(&entry, &request.filter) {
             continue;
@@ -2843,22 +3459,12 @@ async fn handle_search_request_with_context_and_registry(
             continue;
         }
 
-        if request.size_limit != 0 && returned >= request.size_limit as usize {
+        if request.size_limit != 0 && collected.len() >= request.size_limit as usize {
             size_limit_hit = true;
             break;
         }
 
-        let attributes = select_attributes(&entry, &attribute_selection);
-        send_search_entry_with_controls(
-            socket,
-            message_id,
-            &entry,
-            &attributes,
-            request.types_only,
-            &[],
-        )
-        .await?;
-        returned += 1;
+        collected.push(entry);
     }
 
     if !time_limit_hit {
@@ -2869,39 +3475,42 @@ async fn handle_search_request_with_context_and_registry(
         }
     }
 
-    let (result_code, diagnostic) = if time_limit_hit {
-        increment_control_counter(request_context, "ldap_search_time_limit_exceeded_total", 1);
-        log_generic_audit_event(
-            request_context,
-            session,
-            AuditLevel::Warning,
-            AuditEventType::Authorization,
-            "search_time_limit",
-            false,
-            Some(base_dn.as_str()),
-            Some("search time limit exceeded"),
-            vec![("entries_returned".to_string(), returned.to_string())],
-        )
-        .await;
-        (ResultCode::TimeLimitExceeded, "time limit exceeded")
-    } else if size_limit_hit {
-        (ResultCode::SizeLimitExceeded, "size limit exceeded")
-    } else {
-        (ResultCode::Success, "")
-    };
+    Ok(SearchResultSet {
+        entries: collected,
+        size_limit_hit,
+        time_limit_hit,
+    })
+}
 
-    send_result(
-        socket,
-        message_id,
-        ResponseOp::SearchDone,
-        result_code,
-        &base_dn,
-        diagnostic,
-    )
-    .await?;
-    operation_registry.finish(message_id, FinishedOperationState::Completed);
+async fn emit_search_entries(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    entries: &[DirectoryEntry],
+    attribute_selection: &[String],
+    types_only: bool,
+    search_deadline: Option<Instant>,
+) -> Result<(usize, bool), ServerError> {
+    let mut returned = 0usize;
+    for entry in entries {
+        if let Some(deadline) = search_deadline {
+            if Instant::now() >= deadline {
+                return Ok((returned, true));
+            }
+        }
 
-    Ok(())
+        let attributes = select_attributes(entry, attribute_selection);
+        send_search_entry_with_controls(socket, message_id, entry, &attributes, types_only, &[])
+            .await?;
+        returned += 1;
+
+        if let Some(deadline) = search_deadline {
+            if Instant::now() >= deadline {
+                return Ok((returned, true));
+            }
+        }
+    }
+
+    Ok((returned, false))
 }
 
 fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
@@ -2930,13 +3539,18 @@ fn entry_is_alias(entry: &DirectoryEntry) -> bool {
     entry
         .attributes
         .get("objectclass")
-        .map(|values| values.iter().any(|value| value.eq_ignore_ascii_case("alias")))
+        .map(|values| {
+            values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case("alias"))
+        })
         .unwrap_or(false)
         && entry.attributes.contains_key("aliasedobjectname")
 }
 
 fn alias_target_dn(entry: &DirectoryEntry) -> Option<&str> {
-    entry.attributes
+    entry
+        .attributes
         .get("aliasedobjectname")
         .and_then(|values| values.first())
         .map(String::as_str)
@@ -2966,10 +3580,12 @@ async fn resolve_alias_chain(
         ));
     };
 
-    let Some(target_entry) = backend
-        .get_entry(target_dn)
-        .await
-        .map_err(|err| (map_backend_error(&err), diagnostic_for_error(&err).to_string()))?
+    let Some(target_entry) = backend.get_entry(target_dn).await.map_err(|err| {
+        (
+            map_backend_error(&err),
+            diagnostic_for_error(&err).to_string(),
+        )
+    })?
     else {
         return Err((
             ResultCode::AliasDereferencingProblem,
@@ -2993,10 +3609,12 @@ async fn resolve_search_base_dn(
         return Ok(base_dn.to_string());
     }
 
-    let Some(entry) = backend
-        .get_entry(base_dn)
-        .await
-        .map_err(|err| (map_backend_error(&err), diagnostic_for_error(&err).to_string()))?
+    let Some(entry) = backend.get_entry(base_dn).await.map_err(|err| {
+        (
+            map_backend_error(&err),
+            diagnostic_for_error(&err).to_string(),
+        )
+    })?
     else {
         return Ok(base_dn.to_string());
     };
@@ -5002,6 +5620,10 @@ mod tests {
     use crate::replication::REPLICATION_STREAM_ATTRIBUTE;
     use crate::replication_service::ReplicationService;
     use crate::schema::LdapSchema;
+    use crate::search_controls::{
+        decode_paged_results_control, encode_paged_results_control, PagedResultsControl,
+        PAGED_RESULTS_OID,
+    };
     use ldap_parser::filter::{
         Attribute as FilterAttribute, AttributeValue, AttributeValueAssertion, Filter,
         PartialAttribute, SubstringFilter,
@@ -5098,10 +5720,7 @@ mod tests {
             Poll::Ready(Ok(buf.len()))
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), io::Error>> {
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
             Poll::Ready(Ok(()))
         }
 
@@ -5269,6 +5888,39 @@ mod tests {
                 REPLICATION_STREAM_ATTRIBUTE.to_string(),
             ))],
         }
+    }
+
+    fn subtree_search_request(base_dn: &str, attributes: &[&str]) -> SearchRequest<'static> {
+        SearchRequest {
+            base_object: LdapDN(Cow::Owned(base_dn.to_string())),
+            scope: SearchScope::WholeSubtree,
+            deref_aliases: DerefAliases(0),
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter: Filter::Present(LdapString(Cow::Owned("objectClass".to_string()))),
+            attributes: attributes
+                .iter()
+                .map(|attribute| LdapString(Cow::Owned((*attribute).to_string())))
+                .collect(),
+        }
+    }
+
+    fn paged_results_request_controls(size: u32, cookie: &[u8]) -> RequestControls {
+        RequestControls::new(vec![LdapControl::new(
+            PAGED_RESULTS_OID,
+            false,
+            Some(encode_paged_results_control(size, cookie).unwrap()),
+        )])
+    }
+
+    fn paged_results_response(message: &ldap_parser::ldap::LdapMessage<'_>) -> PagedResultsControl {
+        let controls = message.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == PAGED_RESULTS_OID)
+            .expect("paged results response control");
+        decode_paged_results_control(control.control_value.as_deref()).unwrap()
     }
 
     #[test]
@@ -5686,6 +6338,53 @@ mod tests {
         registry.register(9, ConnectionOperationKind::ReplicationStream, true);
         assert!(registry.request_abandon(9));
         assert!(!registry.request_abandon(9));
+    }
+
+    #[test]
+    fn connection_operation_registry_cleans_up_paged_searches_on_cancel_and_abandon() {
+        let mut registry = ConnectionOperationRegistry::default();
+        let signature = SearchRequestSignature {
+            base_dn: "dc=example,dc=org".to_string(),
+            scope: 2,
+            deref_aliases: 0,
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter_repr: "present".to_string(),
+            attributes: vec!["cn".to_string()],
+        };
+
+        let cancel_cookie = registry.remember_paged_search(PagedSearchCursor {
+            signature: signature.clone(),
+            total_size: 3,
+            remaining_entries: vec![DirectoryEntry::new(
+                "cn=a,dc=example,dc=org",
+                HashMap::from([("cn".to_string(), vec!["a".to_string()])]),
+            )],
+            completion_code: ResultCode::Success,
+            completion_diagnostic: "",
+        });
+        registry.register(41, ConnectionOperationKind::Search, true);
+        registry.attach_paged_search_to_operation(41, cancel_cookie.clone());
+        assert_eq!(registry.request_cancel(41), CancelRequestOutcome::Accepted);
+        registry.finish(41, FinishedOperationState::Canceled);
+        assert!(registry.paged_search(cancel_cookie.as_slice()).is_none());
+
+        let abandon_cookie = registry.remember_paged_search(PagedSearchCursor {
+            signature,
+            total_size: 2,
+            remaining_entries: vec![DirectoryEntry::new(
+                "cn=b,dc=example,dc=org",
+                HashMap::from([("cn".to_string(), vec!["b".to_string()])]),
+            )],
+            completion_code: ResultCode::Success,
+            completion_diagnostic: "",
+        });
+        registry.register(42, ConnectionOperationKind::Search, true);
+        registry.attach_paged_search_to_operation(42, abandon_cookie.clone());
+        assert!(registry.request_abandon(42));
+        registry.finish(42, FinishedOperationState::Abandoned);
+        assert!(registry.paged_search(abandon_cookie.as_slice()).is_none());
     }
 
     #[tokio::test]
@@ -6217,7 +6916,10 @@ mod tests {
         ];
         expected_extensions.sort();
         assert_eq!(supported_extensions, expected_extensions);
-        assert!(!attributes.contains_key("supportedControl"));
+        assert_eq!(
+            attributes.get("supportedControl").unwrap(),
+            &vec![PAGED_RESULTS_OID.to_string()]
+        );
 
         match &messages[1].protocol_op {
             ProtocolOp::SearchResultDone(done) => {
@@ -6271,6 +6973,224 @@ mod tests {
         ];
         expected_extensions.sort();
         assert_eq!(supported_extensions, expected_extensions);
+    }
+
+    #[tokio::test]
+    async fn paged_search_returns_multi_page_results_and_final_empty_cookie() {
+        let backend = MockBackend::new();
+        for user in ["one", "two", "three", "four", "five"] {
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        format!("cn={},dc=example,dc=org", user),
+                        HashMap::from([
+                            ("cn".to_string(), vec![user.to_string()]),
+                            ("sn".to_string(), vec!["User".to_string()]),
+                            ("objectclass".to_string(), vec!["person".to_string()]),
+                        ]),
+                    ),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig::default();
+        let request_context = RequestContext::default();
+        let session = ConnectionSession::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let request_controls = paged_results_request_controls(2, &[]);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            31,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 3);
+        let first_cookie = paged_results_response(messages.last().unwrap());
+        assert_eq!(first_cookie.size, 5);
+        assert!(!first_cookie.cookie.is_empty());
+
+        let request_controls = paged_results_request_controls(2, &first_cookie.cookie);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            32,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 3);
+        let second_cookie = paged_results_response(messages.last().unwrap());
+        assert_eq!(second_cookie.size, 5);
+        assert_eq!(second_cookie.cookie, first_cookie.cookie);
+
+        let request_controls = paged_results_request_controls(2, &second_cookie.cookie);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            33,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 2);
+        let final_cookie = paged_results_response(messages.last().unwrap());
+        assert_eq!(final_cookie.size, 5);
+        assert!(final_cookie.cookie.is_empty());
+
+        let mut seen_dns = Vec::new();
+        for message in messages {
+            if let ProtocolOp::SearchResultEntry(entry) = &message.protocol_op {
+                seen_dns.push(entry.object_name.0.as_ref().to_string());
+            }
+        }
+        assert_eq!(seen_dns.len(), 1);
+        assert!(operation_registry
+            .paged_search(first_cookie.cookie.as_slice())
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn paged_search_rejects_replayed_cookie_after_completion() {
+        let backend = MockBackend::new();
+        for user in ["one", "two", "three"] {
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        format!("cn={},dc=example,dc=org", user),
+                        HashMap::from([
+                            ("cn".to_string(), vec![user.to_string()]),
+                            ("sn".to_string(), vec!["User".to_string()]),
+                            ("objectclass".to_string(), vec!["person".to_string()]),
+                        ]),
+                    ),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig::default();
+        let request_context = RequestContext::default();
+        let session = ConnectionSession::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let request_controls = paged_results_request_controls(2, &[]);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            34,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        let first_cookie = paged_results_response(messages.last().unwrap());
+
+        let request_controls = paged_results_request_controls(2, &first_cookie.cookie);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            35,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert!(paged_results_response(messages.last().unwrap())
+            .cookie
+            .is_empty());
+
+        let request_controls = paged_results_request_controls(2, &first_cookie.cookie);
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            36,
+            subtree_search_request("dc=example,dc=org", &["cn"]),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &request_controls,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::UnwillingToPerform);
+                assert_eq!(
+                    done.diagnostic_message.0.as_ref(),
+                    "paged results cookie is not valid for this search sequence"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
     }
 
     #[tokio::test]
