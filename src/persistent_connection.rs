@@ -59,8 +59,9 @@
 use ldap3::{Ldap, LdapConnAsync};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 /// Represents the synchronization state of a directory entry
 ///
@@ -163,7 +164,10 @@ pub struct PersistentConsumer {
     /// Unique identifier for this consumer
     pub consumer_id: String,
 
-    /// The persistent LDAP connection (wrapped in Arc<Mutex> for thread safety)
+    /// The persistent LDAP connection.
+    ///
+    /// Async tasks take ownership of the connection before any network await so
+    /// no mutex guard is held across LDAP operations.
     pub ldap_connection: Arc<Mutex<Option<Ldap>>>,
 
     /// The consumer's LDAP URL (for reconnection)
@@ -309,8 +313,8 @@ impl PersistentConsumer {
     }
 
     /// Get connection statistics
-    pub fn get_stats(&self) -> ConnectionStats {
-        self.stats.lock().unwrap().clone()
+    pub async fn get_stats(&self) -> ConnectionStats {
+        self.stats.lock().await.clone()
     }
 
     /// Establish LDAP connection to consumer
@@ -370,9 +374,8 @@ impl PersistentConsumer {
 
         // Update cookie if provided
         if let Some(ref cookie_val) = cookie {
-            let mut last_cookie = self.last_cookie.lock().unwrap();
+            let mut last_cookie = self.last_cookie.lock().await;
             *last_cookie = cookie_val.clone();
-            drop(last_cookie); // Explicitly drop the lock
         }
 
         // In a real implementation, we would:
@@ -383,9 +386,9 @@ impl PersistentConsumer {
         // For now, we simulate this by logging (actual LDAP protocol
         // encoding would be added in production)
 
-        let ldap_guard = self.ldap_connection.lock().unwrap();
+        let ldap_guard = self.ldap_connection.lock().await;
         let has_connection = ldap_guard.is_some();
-        drop(ldap_guard); // Explicitly drop the lock
+        drop(ldap_guard);
 
         if !has_connection {
             return Err("No active connection".to_string());
@@ -399,9 +402,9 @@ impl PersistentConsumer {
 
         // Update statistics
         {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = self.stats.lock().await;
             stats.entries_sent += 1;
-        } // Lock explicitly dropped here
+        }
 
         Ok(())
     }
@@ -446,16 +449,15 @@ impl PersistentConsumer {
                 cookie: Some(cookie),
                 ..
             } => {
-                let mut last_cookie = self.last_cookie.lock().unwrap();
+                let mut last_cookie = self.last_cookie.lock().await;
                 *last_cookie = cookie.clone();
-                drop(last_cookie); // Explicitly drop the lock
             }
             _ => {}
         }
 
-        let ldap_guard = self.ldap_connection.lock().unwrap();
+        let ldap_guard = self.ldap_connection.lock().await;
         let has_connection = ldap_guard.is_some();
-        drop(ldap_guard); // Explicitly drop the lock
+        drop(ldap_guard);
 
         if !has_connection {
             return Err("No active connection".to_string());
@@ -466,9 +468,9 @@ impl PersistentConsumer {
 
         // Update statistics
         {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = self.stats.lock().await;
             stats.sync_info_sent += 1;
-        } // Lock explicitly dropped here
+        }
 
         Ok(())
     }
@@ -487,14 +489,14 @@ impl PersistentConsumer {
         // In production, this would use the LDAP "Who Am I?" extended operation
 
         {
-            let mut last_heartbeat = self.last_heartbeat.lock().unwrap();
+            let mut last_heartbeat = self.last_heartbeat.lock().await;
             *last_heartbeat = Instant::now();
-        } // Lock dropped
+        }
 
         {
-            let mut stats = self.stats.lock().unwrap();
+            let mut stats = self.stats.lock().await;
             stats.heartbeats_sent += 1;
-        } // Lock dropped
+        }
 
         debug!("Heartbeat successful for consumer {}", self.consumer_id);
         Ok(())
@@ -510,13 +512,13 @@ impl PersistentConsumer {
     ///
     /// `true` if connection is healthy, `false` if dead or timing out
     pub async fn is_alive(&self) -> bool {
-        let ldap_guard = self.ldap_connection.lock().unwrap();
+        let ldap_guard = self.ldap_connection.lock().await;
         if ldap_guard.is_none() {
             return false;
         }
         drop(ldap_guard);
 
-        let last_heartbeat = self.last_heartbeat.lock().unwrap();
+        let last_heartbeat = self.last_heartbeat.lock().await;
         let elapsed = last_heartbeat.elapsed();
 
         elapsed < self.connection_timeout
@@ -528,26 +530,26 @@ impl PersistentConsumer {
 
         // Close existing connection if any (outside of lock to avoid holding across await)
         {
-            let mut ldap_guard = self.ldap_connection.lock().unwrap();
+            let mut ldap_guard = self.ldap_connection.lock().await;
             if ldap_guard.is_some() {
                 let _old = ldap_guard.take();
                 // Connection will be dropped here
             }
-        } // Lock dropped
+        }
 
         // Establish new connection (no lock held during await)
         match Self::connect(&self.consumer_url).await {
             Ok(ldap) => {
                 {
-                    let mut ldap_guard = self.ldap_connection.lock().unwrap();
+                    let mut ldap_guard = self.ldap_connection.lock().await;
                     *ldap_guard = Some(ldap);
-                } // Lock dropped
+                }
 
                 // Update heartbeat timestamp
                 {
-                    let mut last_heartbeat = self.last_heartbeat.lock().unwrap();
+                    let mut last_heartbeat = self.last_heartbeat.lock().await;
                     *last_heartbeat = Instant::now();
-                } // Lock dropped
+                }
 
                 info!("Successfully reconnected to consumer {}", self.consumer_id);
                 Ok(())
@@ -559,10 +561,10 @@ impl PersistentConsumer {
                 );
 
                 {
-                    let mut stats = self.stats.lock().unwrap();
+                    let mut stats = self.stats.lock().await;
                     stats.errors += 1;
                     stats.last_error = Some(format!("Reconnection failed: {}", e));
-                } // Lock dropped
+                }
 
                 Err(format!("Reconnection failed: {}", e))
             }
@@ -578,12 +580,12 @@ impl PersistentConsumer {
 
         // Take connection outside of lock to avoid holding across await
         {
-            let mut ldap_guard = self.ldap_connection.lock().unwrap();
+            let mut ldap_guard = self.ldap_connection.lock().await;
             if ldap_guard.is_some() {
                 let _old = ldap_guard.take();
                 // Connection will be dropped here, closing it
             }
-        } // Lock dropped
+        }
 
         Ok(())
     }
@@ -594,8 +596,8 @@ impl PersistentConsumer {
     }
 
     /// Get the last cookie
-    pub fn get_last_cookie(&self) -> String {
-        self.last_cookie.lock().unwrap().clone()
+    pub async fn get_last_cookie(&self) -> String {
+        self.last_cookie.lock().await.clone()
     }
 
     /// Get the base DN

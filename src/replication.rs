@@ -51,9 +51,10 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tokio::task::JoinHandle;
 
 use crate::backend::DirectoryBackend;
@@ -75,7 +76,10 @@ use crate::replication_provider_fsm::*;
 pub struct ChangelogTracker {
     /// CSN generator for creating unique change identifiers
     csn_generator: Arc<CsnGenerator>,
-    /// Changelog entries (CSN string -> entry)
+    /// Changelog entries (CSN string -> entry).
+    ///
+    /// This tracker stays synchronous because backend write hooks call it from a
+    /// synchronous API surface; async hot paths below use async-aware locks.
     entries: Arc<Mutex<BTreeMap<String, ChangelogEntry>>>,
     /// Maximum entries to keep in memory
     max_entries: usize,
@@ -786,7 +790,7 @@ impl ChangelogProvider for ChangelogProviderImpl {
 
 /// Simple in-memory consumer registry
 pub struct ConsumerRegistryImpl {
-    consumers: Arc<Mutex<HashMap<String, ConsumerConnection>>>,
+    consumers: Arc<AsyncRwLock<HashMap<String, ConsumerConnection>>>,
 }
 
 impl Default for ConsumerRegistryImpl {
@@ -798,7 +802,7 @@ impl Default for ConsumerRegistryImpl {
 impl ConsumerRegistryImpl {
     pub fn new() -> Self {
         Self {
-            consumers: Arc::new(Mutex::new(HashMap::new())),
+            consumers: Arc::new(AsyncRwLock::new(HashMap::new())),
         }
     }
 }
@@ -811,33 +815,33 @@ impl ConsumerRegistry for ConsumerRegistryImpl {
         connection_info: ConsumerConnection,
     ) -> Result<(), String> {
         self.consumers
-            .lock()
-            .unwrap()
+            .write()
+            .await
             .insert(consumer_id.to_string(), connection_info);
         Ok(())
     }
 
     async fn unregister_consumer(&mut self, consumer_id: &str) -> Result<bool, String> {
-        Ok(self.consumers.lock().unwrap().remove(consumer_id).is_some())
+        Ok(self.consumers.write().await.remove(consumer_id).is_some())
     }
 
     async fn is_consumer_connected(&self, consumer_id: &str) -> Result<bool, String> {
-        Ok(self.consumers.lock().unwrap().contains_key(consumer_id))
+        Ok(self.consumers.read().await.contains_key(consumer_id))
     }
 
     async fn get_active_consumers(&self) -> Result<Vec<String>, String> {
-        Ok(self.consumers.lock().unwrap().keys().cloned().collect())
+        Ok(self.consumers.read().await.keys().cloned().collect())
     }
 
     async fn update_consumer_activity(&mut self, consumer_id: &str) -> Result<(), String> {
-        if let Some(conn) = self.consumers.lock().unwrap().get_mut(consumer_id) {
+        if let Some(conn) = self.consumers.write().await.get_mut(consumer_id) {
             conn.update_activity();
         }
         Ok(())
     }
 
     async fn get_persistent_consumers(&self) -> Result<Vec<String>, String> {
-        let consumers = self.consumers.lock().unwrap();
+        let consumers = self.consumers.read().await;
         Ok(consumers
             .iter()
             .filter(|(_, conn)| conn.is_persistent_mode())
@@ -846,7 +850,7 @@ impl ConsumerRegistry for ConsumerRegistryImpl {
     }
 
     async fn get_consumer(&self, consumer_id: &str) -> Result<Option<ConsumerConnection>, String> {
-        Ok(self.consumers.lock().unwrap().get(consumer_id).cloned())
+        Ok(self.consumers.read().await.get(consumer_id).cloned())
     }
 
     async fn update_consumer_cookie(
@@ -854,7 +858,7 @@ impl ConsumerRegistry for ConsumerRegistryImpl {
         consumer_id: &str,
         cookie: String,
     ) -> Result<(), String> {
-        if let Some(conn) = self.consumers.lock().unwrap().get_mut(consumer_id) {
+        if let Some(conn) = self.consumers.write().await.get_mut(consumer_id) {
             conn.update_cookie(cookie);
         }
         Ok(())
@@ -863,7 +867,7 @@ impl ConsumerRegistry for ConsumerRegistryImpl {
 
 /// Streaming manager for real-time change delivery
 pub struct StreamingManagerImpl {
-    active_streams: Arc<Mutex<HashMap<String, StreamingStats>>>,
+    active_streams: Arc<AsyncRwLock<HashMap<String, StreamingStats>>>,
 }
 
 impl Default for StreamingManagerImpl {
@@ -875,7 +879,7 @@ impl Default for StreamingManagerImpl {
 impl StreamingManagerImpl {
     pub fn new() -> Self {
         Self {
-            active_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_streams: Arc::new(AsyncRwLock::new(HashMap::new())),
         }
     }
 }
@@ -888,19 +892,19 @@ impl StreamingManager for StreamingManagerImpl {
         _start_cookie: Option<&str>,
     ) -> Result<(), String> {
         self.active_streams
-            .lock()
-            .unwrap()
+            .write()
+            .await
             .insert(consumer_id.to_string(), StreamingStats::new());
         Ok(())
     }
 
     async fn stop_streaming(&mut self, consumer_id: &str) -> Result<(), String> {
-        self.active_streams.lock().unwrap().remove(consumer_id);
+        self.active_streams.write().await.remove(consumer_id);
         Ok(())
     }
 
     async fn send_entry(&self, consumer_id: &str, entry: &ChangelogEntry) -> Result<(), String> {
-        if let Some(stats) = self.active_streams.lock().unwrap().get_mut(consumer_id) {
+        if let Some(stats) = self.active_streams.write().await.get_mut(consumer_id) {
             stats.record_entry(entry.data_size());
             Ok(())
         } else {
@@ -909,17 +913,13 @@ impl StreamingManager for StreamingManagerImpl {
     }
 
     async fn is_streaming_active(&self, consumer_id: &str) -> Result<bool, String> {
-        Ok(self
-            .active_streams
-            .lock()
-            .unwrap()
-            .contains_key(consumer_id))
+        Ok(self.active_streams.read().await.contains_key(consumer_id))
     }
 
     async fn get_streaming_stats(&self, consumer_id: &str) -> Result<StreamingStats, String> {
         self.active_streams
-            .lock()
-            .unwrap()
+            .read()
+            .await
             .get(consumer_id)
             .cloned()
             .ok_or_else(|| format!("Consumer {} not found", consumer_id))
@@ -972,10 +972,10 @@ impl SyncRequestHandler for SyncRequestHandlerImpl {
 
 /// Mock provider connection for consumer
 pub struct ProviderConnectionImpl {
-    provider_url: Arc<Mutex<Option<String>>>,
-    connected: Arc<Mutex<bool>>,
+    provider_url: Arc<AsyncRwLock<Option<String>>>,
+    connected: Arc<AtomicBool>,
     changelog_provider: Arc<dyn ChangelogProvider>,
-    ldap_connection: Arc<Mutex<Option<ldap3::Ldap>>>,
+    ldap_connection: Arc<AsyncMutex<Option<ldap3::Ldap>>>,
     bind_dn: Option<String>,
     bind_password: Option<String>,
     base_dn: String,
@@ -1011,10 +1011,10 @@ impl ProviderConnectionImpl {
         base_dn: String,
     ) -> Self {
         Self {
-            provider_url: Arc::new(Mutex::new(None)),
-            connected: Arc::new(Mutex::new(false)),
+            provider_url: Arc::new(AsyncRwLock::new(None)),
+            connected: Arc::new(AtomicBool::new(false)),
             changelog_provider,
-            ldap_connection: Arc::new(Mutex::new(None)),
+            ldap_connection: Arc::new(AsyncMutex::new(None)),
             bind_dn,
             bind_password,
             base_dn,
@@ -1088,8 +1088,8 @@ impl ProviderConnectionImpl {
 impl ProviderConnection for ProviderConnectionImpl {
     async fn connect(&self, url: &str) -> Result<(), ConsumerError> {
         if url.starts_with("local://") || url.starts_with("in-memory://") {
-            *self.provider_url.lock().unwrap() = Some(url.to_string());
-            *self.connected.lock().unwrap() = true;
+            *self.provider_url.write().await = Some(url.to_string());
+            self.connected.store(true, Ordering::SeqCst);
             return Ok(());
         }
 
@@ -1143,9 +1143,9 @@ impl ProviderConnection for ProviderConnectionImpl {
                 }
 
                 // Store connection
-                *self.ldap_connection.lock().unwrap() = Some(ldap);
-                *self.provider_url.lock().unwrap() = Some(url.to_string());
-                *self.connected.lock().unwrap() = true;
+                *self.ldap_connection.lock().await = Some(ldap);
+                *self.provider_url.write().await = Some(url.to_string());
+                self.connected.store(true, Ordering::SeqCst);
 
                 info!("Successfully connected to replication provider: {}", url);
                 Ok(())
@@ -1164,7 +1164,7 @@ impl ProviderConnection for ProviderConnectionImpl {
         cookie: Option<&str>,
     ) -> Result<Vec<Vec<u8>>, ConsumerError> {
         // Check if we have an LDAP connection
-        let has_ldap = self.ldap_connection.lock().unwrap().is_some();
+        let has_ldap = self.ldap_connection.lock().await.is_some();
 
         if !has_ldap {
             if cookie.is_none() || matches!(cookie, Some("csn-empty")) {
@@ -1220,7 +1220,7 @@ impl ProviderConnection for ProviderConnectionImpl {
 
         // Clone the LDAP connection to avoid holding the lock across await
         let mut ldap = {
-            let mut guard = self.ldap_connection.lock().unwrap();
+            let mut guard = self.ldap_connection.lock().await;
             guard.take().ok_or_else(|| ConsumerError::ConnectionError {
                 message: "LDAP connection not available".to_string(),
             })?
@@ -1248,7 +1248,7 @@ impl ProviderConnection for ProviderConnectionImpl {
             })?;
 
         // Restore the connection for future use
-        *self.ldap_connection.lock().unwrap() = Some(ldap);
+        *self.ldap_connection.lock().await = Some(ldap);
 
         info!("Retrieved {} entries from provider", rs.len());
 
@@ -1338,7 +1338,7 @@ impl ProviderConnection for ProviderConnectionImpl {
             return Ok(Vec::new());
         }
 
-        let has_ldap = self.ldap_connection.lock().unwrap().is_some();
+        let has_ldap = self.ldap_connection.lock().await.is_some();
         if !has_ldap {
             if cookie.is_none() || matches!(cookie, Some("csn-empty")) {
                 return self.request_local_refresh_batch(offset, limit).await;
@@ -1369,7 +1369,7 @@ impl ProviderConnection for ProviderConnectionImpl {
         // Close LDAP connection if exists
         let ldap_opt = {
             // Extract ldap from mutex and immediately drop the guard
-            self.ldap_connection.lock().unwrap().take()
+            self.ldap_connection.lock().await.take()
         };
 
         if let Some(mut ldap) = ldap_opt {
@@ -1378,22 +1378,17 @@ impl ProviderConnection for ProviderConnectionImpl {
             }
         }
 
-        *self.connected.lock().unwrap() = false;
+        self.connected.store(false, Ordering::SeqCst);
         info!("Disconnected from replication provider");
         Ok(())
     }
 
     async fn is_connected(&self) -> Result<bool, ConsumerError> {
-        Ok(*self.connected.lock().unwrap())
+        Ok(self.connected.load(Ordering::SeqCst))
     }
 
     async fn get_connection_info(&self) -> Result<ConnectionInfo, ConsumerError> {
-        let url = self
-            .provider_url
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_default();
+        let url = self.provider_url.read().await.clone().unwrap_or_default();
         Ok(ConnectionInfo::new(url, "3.0".to_string(), false))
     }
 }
@@ -1401,14 +1396,14 @@ impl ProviderConnection for ProviderConnectionImpl {
 /// Batch processor for applying changes to consumer
 pub struct BatchProcessorImpl {
     backend: Arc<dyn DirectoryBackend>,
-    stats: Arc<Mutex<ProcessingStats>>,
+    stats: Arc<AsyncMutex<ProcessingStats>>,
 }
 
 impl BatchProcessorImpl {
     pub fn new(backend: Arc<dyn DirectoryBackend>) -> Self {
         Self {
             backend,
-            stats: Arc::new(Mutex::new(ProcessingStats::new())),
+            stats: Arc::new(AsyncMutex::new(ProcessingStats::new())),
         }
     }
 }
@@ -1651,7 +1646,7 @@ impl BatchProcessor for BatchProcessorImpl {
         }
 
         // Record stats
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().await;
         stats.record_entry(entry.len(), start.elapsed());
 
         Ok(())
@@ -1662,7 +1657,7 @@ impl BatchProcessor for BatchProcessorImpl {
     }
 
     async fn get_processing_stats(&self) -> Result<ProcessingStats, ConsumerError> {
-        Ok(self.stats.lock().unwrap().clone())
+        Ok(self.stats.lock().await.clone())
     }
 
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, ConsumerError> {
@@ -1679,14 +1674,14 @@ impl BatchProcessor for BatchProcessorImpl {
 /// State manager for consumer replication state
 pub struct StateManagerImpl {
     storage_path: String,
-    cookie: Arc<Mutex<Option<String>>>,
+    cookie: Arc<AsyncMutex<Option<String>>>,
 }
 
 impl StateManagerImpl {
     pub fn new(storage_path: String) -> Self {
         Self {
             storage_path,
-            cookie: Arc::new(Mutex::new(None)),
+            cookie: Arc::new(AsyncMutex::new(None)),
         }
     }
 
@@ -1734,7 +1729,7 @@ impl StateManager for StateManagerImpl {
                 message: format!("Failed to rename cookie file: {}", e),
             })?;
 
-        *self.cookie.lock().unwrap() = Some(cookie.to_string());
+        *self.cookie.lock().await = Some(cookie.to_string());
         log::info!("Saved replication cookie to {}", cookie_path.display());
         Ok(())
     }
@@ -1767,7 +1762,7 @@ impl StateManager for StateManagerImpl {
         }
 
         // Update in-memory cache
-        *self.cookie.lock().unwrap() = Some(cookie.clone());
+        *self.cookie.lock().await = Some(cookie.clone());
 
         log::info!(
             "Loaded replication cookie from {}: {}",
@@ -1779,7 +1774,7 @@ impl StateManager for StateManagerImpl {
 
     async fn delete_cookie(&self) -> Result<(), ConsumerError> {
         // Clear in-memory cache
-        *self.cookie.lock().unwrap() = None;
+        *self.cookie.lock().await = None;
 
         // Delete file if it exists
         let cookie_path = self.cookie_file_path();
@@ -1824,8 +1819,8 @@ impl StateManager for StateManagerImpl {
 
 /// Change listener for real-time updates
 pub struct ChangeListenerImpl {
-    listening: Arc<Mutex<bool>>,
-    stats: Arc<Mutex<ListeningStats>>,
+    listening: Arc<AtomicBool>,
+    stats: Arc<AsyncMutex<ListeningStats>>,
 }
 
 impl Default for ChangeListenerImpl {
@@ -1837,8 +1832,8 @@ impl Default for ChangeListenerImpl {
 impl ChangeListenerImpl {
     pub fn new() -> Self {
         Self {
-            listening: Arc::new(Mutex::new(false)),
-            stats: Arc::new(Mutex::new(ListeningStats::new())),
+            listening: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(AsyncMutex::new(ListeningStats::new())),
         }
     }
 }
@@ -1846,7 +1841,7 @@ impl ChangeListenerImpl {
 #[async_trait]
 impl ChangeListener for ChangeListenerImpl {
     async fn start_listening(&self, _cookie: Option<&str>) -> Result<(), ConsumerError> {
-        *self.listening.lock().unwrap() = true;
+        self.listening.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1857,31 +1852,31 @@ impl ChangeListener for ChangeListenerImpl {
     }
 
     async fn stop_listening(&self) -> Result<(), ConsumerError> {
-        *self.listening.lock().unwrap() = false;
+        self.listening.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn is_listening(&self) -> Result<bool, ConsumerError> {
-        Ok(*self.listening.lock().unwrap())
+        Ok(self.listening.load(Ordering::SeqCst))
     }
 
     async fn get_listening_stats(&self) -> Result<ListeningStats, ConsumerError> {
-        Ok(self.stats.lock().unwrap().clone())
+        Ok(self.stats.lock().await.clone())
     }
 }
 
 /// Change listener backed by an in-process broadcast stream.
 pub struct BroadcastChangeListener {
-    listening: Arc<Mutex<bool>>,
-    stats: Arc<Mutex<ListeningStats>>,
+    listening: Arc<AtomicBool>,
+    stats: Arc<AsyncMutex<ListeningStats>>,
     receiver: Arc<AsyncMutex<broadcast::Receiver<ChangelogEntry>>>,
 }
 
 impl BroadcastChangeListener {
     pub fn new(receiver: broadcast::Receiver<ChangelogEntry>) -> Self {
         Self {
-            listening: Arc::new(Mutex::new(false)),
-            stats: Arc::new(Mutex::new(ListeningStats::new())),
+            listening: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(AsyncMutex::new(ListeningStats::new())),
             receiver: Arc::new(AsyncMutex::new(receiver)),
         }
     }
@@ -1890,12 +1885,12 @@ impl BroadcastChangeListener {
 #[async_trait]
 impl ChangeListener for BroadcastChangeListener {
     async fn start_listening(&self, _cookie: Option<&str>) -> Result<(), ConsumerError> {
-        *self.listening.lock().unwrap() = true;
+        self.listening.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn receive_change(&self) -> Result<Option<Vec<u8>>, ConsumerError> {
-        if !*self.listening.lock().unwrap() {
+        if !self.listening.load(Ordering::SeqCst) {
             return Ok(None);
         }
 
@@ -1904,11 +1899,11 @@ impl ChangeListener for BroadcastChangeListener {
             Ok(Ok(change)) => {
                 let encoded =
                     encode_change_bytes(&change.change_type, &change.dn, &change.change_data);
-                self.stats.lock().unwrap().record_change(encoded.len());
+                self.stats.lock().await.record_change(encoded.len());
                 Ok(Some(encoded))
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                self.stats.lock().unwrap().record_error();
+                self.stats.lock().await.record_error();
                 Ok(None)
             }
             Ok(Err(broadcast::error::RecvError::Closed)) => Ok(None),
@@ -1917,16 +1912,16 @@ impl ChangeListener for BroadcastChangeListener {
     }
 
     async fn stop_listening(&self) -> Result<(), ConsumerError> {
-        *self.listening.lock().unwrap() = false;
+        self.listening.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn is_listening(&self) -> Result<bool, ConsumerError> {
-        Ok(*self.listening.lock().unwrap())
+        Ok(self.listening.load(Ordering::SeqCst))
     }
 
     async fn get_listening_stats(&self) -> Result<ListeningStats, ConsumerError> {
-        Ok(self.stats.lock().unwrap().clone())
+        Ok(self.stats.lock().await.clone())
     }
 }
 
@@ -1936,12 +1931,12 @@ pub struct LdapChangeListener {
     base_dn: String,
     bind_dn: Option<String>,
     bind_password: Option<String>,
-    listening: Arc<Mutex<bool>>,
-    stats: Arc<Mutex<ListeningStats>>,
-    last_error: Arc<Mutex<Option<String>>>,
+    listening: Arc<AtomicBool>,
+    stats: Arc<AsyncMutex<ListeningStats>>,
+    last_error: Arc<AsyncMutex<Option<String>>>,
     change_rx: Arc<AsyncMutex<mpsc::Receiver<Vec<u8>>>>,
     change_tx: mpsc::Sender<Vec<u8>>,
-    task_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    task_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
 }
 
 impl LdapChangeListener {
@@ -1958,12 +1953,12 @@ impl LdapChangeListener {
             base_dn,
             bind_dn,
             bind_password,
-            listening: Arc::new(Mutex::new(false)),
-            stats: Arc::new(Mutex::new(ListeningStats::new())),
-            last_error: Arc::new(Mutex::new(None)),
+            listening: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(AsyncMutex::new(ListeningStats::new())),
+            last_error: Arc::new(AsyncMutex::new(None)),
             change_rx: Arc::new(AsyncMutex::new(change_rx)),
             change_tx,
-            task_handle: Arc::new(Mutex::new(None)),
+            task_handle: Arc::new(AsyncMutex::new(None)),
         }
     }
 }
@@ -1971,11 +1966,11 @@ impl LdapChangeListener {
 #[async_trait]
 impl ChangeListener for LdapChangeListener {
     async fn start_listening(&self, cookie: Option<&str>) -> Result<(), ConsumerError> {
-        if *self.listening.lock().unwrap() {
+        if self.listening.load(Ordering::SeqCst) {
             return Ok(());
         }
 
-        *self.last_error.lock().unwrap() = None;
+        *self.last_error.lock().await = None;
 
         let provider_url = self.provider_url.clone();
         let base_dn = self.base_dn.clone();
@@ -1998,7 +1993,7 @@ impl ChangeListener for LdapChangeListener {
                 Err(e) => {
                     let message =
                         format!("Failed to create LDAP change listener connection: {}", e);
-                    *last_error.lock().unwrap() = Some(message.clone());
+                    *last_error.lock().await = Some(message.clone());
                     error!("{}", message);
                     if let Some(sender) = ready_tx.take() {
                         let _ = sender.send(Err(message));
@@ -2021,7 +2016,7 @@ impl ChangeListener for LdapChangeListener {
                 .and_then(|result| result.success())
             {
                 let message = format!("Failed to bind LDAP change listener: {}", e);
-                *last_error.lock().unwrap() = Some(message.clone());
+                *last_error.lock().await = Some(message.clone());
                 error!("{}", message);
                 if let Some(sender) = ready_tx.take() {
                     let _ = sender.send(Err(message));
@@ -2041,7 +2036,7 @@ impl ChangeListener for LdapChangeListener {
                 Ok(search) => search,
                 Err(e) => {
                     let message = format!("Failed to start LDAP replication stream: {}", e);
-                    *last_error.lock().unwrap() = Some(message.clone());
+                    *last_error.lock().await = Some(message.clone());
                     error!("{}", message);
                     if let Some(sender) = ready_tx.take() {
                         let _ = sender.send(Err(message));
@@ -2050,13 +2045,13 @@ impl ChangeListener for LdapChangeListener {
                 }
             };
 
-            *listening.lock().unwrap() = true;
+            listening.store(true, Ordering::SeqCst);
             if let Some(sender) = ready_tx.take() {
                 let _ = sender.send(Ok(()));
             }
 
             loop {
-                if !*listening.lock().unwrap() {
+                if !listening.load(Ordering::SeqCst) {
                     break;
                 }
 
@@ -2070,31 +2065,33 @@ impl ChangeListener for LdapChangeListener {
                                 }
                             }
                             Err(e) => {
-                                stats.lock().unwrap().record_error();
+                                stats.lock().await.record_error();
                                 warn!("Skipping invalid replication stream entry: {}", e);
                             }
                         }
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        stats.lock().unwrap().record_error();
+                        stats.lock().await.record_error();
                         let message = format!("LDAP replication stream ended with error: {}", e);
-                        *last_error.lock().unwrap() = Some(message.clone());
+                        *last_error.lock().await = Some(message.clone());
                         warn!("{}", message);
                         break;
                     }
                 }
             }
 
-            *listening.lock().unwrap() = false;
-            if last_error.lock().unwrap().is_none() {
-                *last_error.lock().unwrap() = Some("LDAP replication stream ended".to_string());
+            listening.store(false, Ordering::SeqCst);
+            let mut last_error_guard = last_error.lock().await;
+            if last_error_guard.is_none() {
+                *last_error_guard = Some("LDAP replication stream ended".to_string());
             }
+            drop(last_error_guard);
             let _ = search.finish().await;
             let _ = ldap.unbind().await;
         });
 
-        *self.task_handle.lock().unwrap() = Some(handle);
+        *self.task_handle.lock().await = Some(handle);
         match tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(message))) => Err(ConsumerError::ListeningError { message }),
@@ -2108,25 +2105,26 @@ impl ChangeListener for LdapChangeListener {
     }
 
     async fn receive_change(&self) -> Result<Option<Vec<u8>>, ConsumerError> {
-        if let Some(message) = self.last_error.lock().unwrap().take() {
+        if let Some(message) = self.last_error.lock().await.take() {
             return Err(ConsumerError::ListeningError { message });
         }
 
-        if !*self.listening.lock().unwrap() {
+        if !self.listening.load(Ordering::SeqCst) {
             return Ok(None);
         }
 
         let mut receiver = self.change_rx.lock().await;
         let received =
             tokio::time::timeout(std::time::Duration::from_millis(250), receiver.recv()).await;
+        drop(receiver);
 
-        if let Some(message) = self.last_error.lock().unwrap().take() {
+        if let Some(message) = self.last_error.lock().await.take() {
             return Err(ConsumerError::ListeningError { message });
         }
 
         match received {
             Ok(Some(change)) => {
-                self.stats.lock().unwrap().record_change(change.len());
+                self.stats.lock().await.record_change(change.len());
                 Ok(Some(change))
             }
             Ok(None) => Err(ConsumerError::ListeningError {
@@ -2137,20 +2135,20 @@ impl ChangeListener for LdapChangeListener {
     }
 
     async fn stop_listening(&self) -> Result<(), ConsumerError> {
-        *self.listening.lock().unwrap() = false;
-        *self.last_error.lock().unwrap() = None;
-        if let Some(handle) = self.task_handle.lock().unwrap().take() {
+        self.listening.store(false, Ordering::SeqCst);
+        *self.last_error.lock().await = None;
+        if let Some(handle) = self.task_handle.lock().await.take() {
             handle.abort();
         }
         Ok(())
     }
 
     async fn is_listening(&self) -> Result<bool, ConsumerError> {
-        Ok(*self.listening.lock().unwrap())
+        Ok(self.listening.load(Ordering::SeqCst))
     }
 
     async fn get_listening_stats(&self) -> Result<ListeningStats, ConsumerError> {
-        Ok(self.stats.lock().unwrap().clone())
+        Ok(self.stats.lock().await.clone())
     }
 }
 
@@ -2639,6 +2637,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_batch_processor_concurrent_apply_updates_stats_without_deadlock() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = Arc::new(BatchProcessorImpl::new(backend.clone()));
+
+        let first = DirectoryEntry::new(
+            "cn=user1,dc=example,dc=org",
+            HashMap::from([("cn".to_string(), vec!["user1".to_string()])]),
+        );
+        let second = DirectoryEntry::new(
+            "cn=user2,dc=example,dc=org",
+            HashMap::from([("cn".to_string(), vec!["user2".to_string()])]),
+        );
+
+        let first_encoded = encode_change_bytes(
+            &ChangeType::Add,
+            &first.dn,
+            serde_json::to_vec(&first).unwrap().as_slice(),
+        );
+        let second_encoded = encode_change_bytes(
+            &ChangeType::Add,
+            &second.dn,
+            serde_json::to_vec(&second).unwrap().as_slice(),
+        );
+        let expected_bytes = first_encoded.len() + second_encoded.len();
+
+        let first_task = {
+            let batch_processor = batch_processor.clone();
+            let encoded = first_encoded.clone();
+            tokio::spawn(async move { batch_processor.apply_entry(&encoded).await })
+        };
+        let second_task = {
+            let batch_processor = batch_processor.clone();
+            let encoded = second_encoded.clone();
+            tokio::spawn(async move { batch_processor.apply_entry(&encoded).await })
+        };
+
+        let (first_result, second_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                tokio::join!(first_task, second_task)
+            })
+            .await
+            .expect("concurrent batch application should complete promptly");
+
+        first_result.unwrap().unwrap();
+        second_result.unwrap().unwrap();
+
+        let stats = batch_processor.get_processing_stats().await.unwrap();
+        assert_eq!(stats.entries_processed, 2);
+        assert_eq!(stats.bytes_processed, expected_bytes);
+    }
+
+    #[tokio::test]
     async fn test_state_manager_save_cookie_failure_does_not_update_cache() {
         let tempdir = tempfile::tempdir().unwrap();
         let invalid_storage_path = tempdir.path().join("state-file");
@@ -2648,6 +2698,6 @@ mod tests {
         let result = manager.save_cookie("csn-1").await;
 
         assert!(result.is_err());
-        assert_eq!(*manager.cookie.lock().unwrap(), None);
+        assert_eq!(*manager.cookie.lock().await, None);
     }
 }

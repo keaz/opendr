@@ -419,6 +419,49 @@ async fn test_large_batch() {
     assert_eq!(consumer.get_entries_count(), 1000);
 }
 
+/// Test: Concurrent reconnect attempts fail cleanly without deadlocking
+#[tokio::test]
+async fn test_persistent_consumer_concurrent_reconnect_attempts_are_bounded() {
+    let consumer = Arc::new(PersistentConsumer::new_lazy(
+        "test-consumer-reconnect".to_string(),
+        "not-a-url".to_string(),
+        "dc=example,dc=com".to_string(),
+        Duration::from_secs(30),
+    ));
+    let entry = DirectoryEntry::new(
+        "cn=Reconnect Test,dc=example,dc=com".to_string(),
+        "550e8400-e29b-41d4-a716-446655440001".to_string(),
+        vec![("cn".to_string(), vec!["Reconnect Test".to_string()])],
+    );
+
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let consumer = consumer.clone();
+        let entry = entry.clone();
+        tasks.push(tokio::spawn(async move {
+            consumer
+                .send_entry(&entry, SyncState::Add, Some("cookie-1".to_string()))
+                .await
+        }));
+    }
+
+    let joined = tokio::time::timeout(Duration::from_secs(2), async move {
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        results
+    })
+    .await
+    .expect("concurrent reconnect attempts should finish promptly");
+
+    assert!(joined.iter().all(|result| result.is_err()));
+
+    let stats = consumer.get_stats().await;
+    assert!(stats.errors >= 1);
+    assert!(stats.last_error.is_some());
+}
+
 /// Test: Entry with complex attributes
 #[test]
 fn test_complex_directory_entry() {
