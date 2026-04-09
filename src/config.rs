@@ -1372,7 +1372,15 @@ impl ServerConfig {
     /// Validate that the selected runtime is supported by the shipped `opendr` binary.
     pub fn validate_for_shipped_binary(&self) -> Result<(), ConfigError> {
         match self.server.runtime.as_str() {
-            "legacy" => Ok(()),
+            "legacy" => {
+                if self.rate_limit.burst_size != default_burst_size() {
+                    return Err(ConfigError::ValidationError(
+                        "rate_limit.burst_size is not supported by the shipped legacy runtime yet; use the default value"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
             "fsm" => Err(ConfigError::ValidationError(
                 "server.runtime = \"fsm\" is not supported by the shipped opendr binary yet; use \"legacy\""
                     .to_string(),

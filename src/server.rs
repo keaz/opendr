@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ldap_parser::filter::{Filter, Substring, SubstringFilter};
 use ldap_parser::ldap::{
@@ -19,11 +20,13 @@ use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
+use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
 use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
 use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
     encode_bind_response, encode_result_response, encode_search_entry, ResponseOp,
 };
+use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::real_time_propagation::is_dn_in_scope;
 use crate::replication::{
     changelog_entry_to_replication_attrs, REPLICATION_COOKIE_ATTRIBUTE_PREFIX,
@@ -84,30 +87,117 @@ impl ConnectionSession {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LegacyServerConfig {
+    pub resource_limits: ResourceLimits,
+    pub rate_limit_config: RateLimitConfig,
+    pub rate_limiting_enabled: bool,
+}
+
+impl Default for LegacyServerConfig {
+    fn default() -> Self {
+        Self {
+            resource_limits: ResourceLimits::default(),
+            rate_limit_config: RateLimitConfig::default(),
+            rate_limiting_enabled: true,
+        }
+    }
+}
+
+impl LegacyServerConfig {
+    pub fn from_server_config(config: &crate::config::ServerConfig) -> Self {
+        Self {
+            resource_limits: ResourceLimits {
+                max_connections: config.resources.max_connections,
+                max_connections_per_ip: config.resources.max_connections_per_ip,
+                max_operations_per_connection: config.resources.max_operations_per_connection,
+                max_memory_per_connection: config.resources.max_memory_per_connection,
+                max_total_memory: config.resources.max_total_memory,
+                connection_idle_timeout: config.connection_idle_timeout(),
+            },
+            rate_limit_config: config.to_rate_limit_config(),
+            rate_limiting_enabled: config.rate_limit.enabled,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionControls {
+    conn_id: ConnectionId,
+    client_ip: IpAddr,
+    idle_timeout: Duration,
+    pool: Arc<ConnectionPool>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+}
+
+#[derive(Clone, Copy)]
+enum RejectionResponse {
+    Bind,
+    SearchDone,
+    Modify,
+    Add,
+    Delete,
+    ModifyDn,
+    Compare,
+    Extended,
+}
+
 pub async fn run(
     addr: &str,
     backend: Arc<dyn DirectoryBackend>,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), ServerError> {
-    run_with_metrics(addr, backend, shutdown_rx, None).await
+    run_with_metrics_and_config(
+        addr,
+        backend,
+        shutdown_rx,
+        None,
+        LegacyServerConfig::default(),
+    )
+    .await
 }
 
 pub async fn run_with_metrics(
     addr: &str,
     backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+) -> Result<(), ServerError> {
+    run_with_metrics_and_config(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        LegacyServerConfig::default(),
+    )
+    .await
+}
+
+pub async fn run_with_metrics_and_config(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAP server listening on {}", addr);
 
     // Create schema validator with core schema
     let schema = Arc::new(LdapSchema::with_core_schema());
+    let pool = Arc::new(ConnectionPool::new(runtime_config.resource_limits.clone()));
+    let rate_limiter = if runtime_config.rate_limiting_enabled {
+        Some(Arc::new(RateLimiter::new(
+            runtime_config.rate_limit_config.clone(),
+        )))
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (socket, addr) = match result {
+                let (mut socket, addr) = match result {
                     Ok(accepted) => accepted,
                     Err(err) => {
                         if let Some(metrics) = metrics.as_ref() {
@@ -116,22 +206,53 @@ pub async fn run_with_metrics(
                         return Err(err.into());
                     }
                 };
-                info!("Accepted connection from {:?}", addr);
+
+                let conn_id = match pool.acquire_connection(addr).await {
+                    Some(conn_id) => conn_id,
+                    None => {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_connection_failed();
+                        }
+                        warn!("Connection from {:?} rejected due to resource limits", addr);
+                        if let Err(err) = send_connection_rejected(&mut socket).await {
+                            error!("Failed to send connection rejection to {:?}: {}", addr, err);
+                        }
+                        continue;
+                    }
+                };
+
+                info!("Accepted connection from {:?} (conn_id={})", addr, conn_id);
 
                 let backend = backend.clone();
                 let schema = schema.clone();
                 let metrics = metrics.clone();
+                let pool = pool.clone();
+                let controls = ConnectionControls {
+                    conn_id,
+                    client_ip: addr.ip(),
+                    idle_timeout: runtime_config.resource_limits.connection_idle_timeout,
+                    pool: pool.clone(),
+                    rate_limiter: rate_limiter.clone(),
+                };
 
                 if let Some(metrics) = metrics.as_ref() {
                     metrics.record_connection_accepted();
                 }
 
                 tokio::spawn(async move {
-                    handle_client_with_metrics(socket, backend, schema, metrics.clone()).await;
+                    handle_client_with_metrics(
+                        socket,
+                        backend,
+                        schema,
+                        metrics.clone(),
+                        Some(controls),
+                    )
+                    .await;
+                    pool.release_connection(conn_id).await;
                     if let Some(metrics) = metrics.as_ref() {
                         metrics.record_connection_closed();
                     }
-                    info!("Connection {:?} closed", addr);
+                    info!("Connection {:?} (conn_id={}) closed", addr, conn_id);
                 });
             }
             _ = shutdown_rx.recv() => {
@@ -150,7 +271,7 @@ pub async fn handle_client(
     backend: Arc<dyn DirectoryBackend>,
     schema: Arc<LdapSchema>,
 ) {
-    handle_client_with_metrics(socket, backend, schema, None).await;
+    handle_client_with_metrics(socket, backend, schema, None, None).await;
 }
 
 async fn handle_client_with_metrics(
@@ -158,19 +279,67 @@ async fn handle_client_with_metrics(
     backend: Arc<dyn DirectoryBackend>,
     schema: Arc<LdapSchema>,
     metrics: Option<Arc<MetricsCollector>>,
+    controls: Option<ConnectionControls>,
 ) {
     let mut read_buffer = vec![0; 8192];
     let mut decoder = BerDecoderFsmImpl::new();
     let mut session = ConnectionSession::default();
 
     loop {
-        match socket.read(&mut read_buffer).await {
-            Ok(0) => break,
-            Ok(n) => {
+        let read_result = match controls.as_ref() {
+            Some(controls) => {
+                match tokio::time::timeout(controls.idle_timeout, socket.read(&mut read_buffer))
+                    .await
+                {
+                    Ok(result) => result.map(Some),
+                    Err(_) => Ok(None),
+                }
+            }
+            None => socket.read(&mut read_buffer).await.map(Some),
+        };
+
+        match read_result {
+            Ok(None) => {
+                info!("Closing idle connection after timeout");
+                break;
+            }
+            Ok(Some(0)) => break,
+            Ok(Some(n)) => {
+                let mut accounted_read_bytes = false;
+                if let Some(controls) = controls.as_ref() {
+                    controls.pool.update_activity(controls.conn_id).await;
+                    if !controls
+                        .pool
+                        .update_memory_usage(controls.conn_id, n as isize)
+                        .await
+                    {
+                        warn!(
+                            "Connection {} exceeded memory/resource limits while reading",
+                            controls.conn_id
+                        );
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_connection_failed();
+                        }
+                        if let Err(err) = send_connection_rejected(&mut socket).await {
+                            error!("Failed to send resource rejection: {}", err);
+                        }
+                        return;
+                    }
+                    accounted_read_bytes = true;
+                }
+
                 let decoded_messages =
                     match decode_messages(&mut decoder, read_buffer[..n].to_vec()).await {
                         Ok(messages) => messages,
                         Err(err) => {
+                            if let Some(controls) = controls.as_ref() {
+                                if accounted_read_bytes {
+                                    controls
+                                        .pool
+                                        .update_memory_usage(controls.conn_id, -(n as isize))
+                                        .await;
+                                }
+                            }
                             error!("Failed to decode BER message: {}", err);
                             if let Err(write_err) = send_bind_response(
                                 &mut socket,
@@ -186,16 +355,96 @@ async fn handle_client_with_metrics(
                         }
                     };
 
+                if let Some(controls) = controls.as_ref() {
+                    if accounted_read_bytes {
+                        controls
+                            .pool
+                            .update_memory_usage(controls.conn_id, -(n as isize))
+                            .await;
+                    }
+                }
+
                 for message_bytes in decoded_messages {
                     match parse_ldap_messages(&message_bytes) {
                         Ok((_, messages)) => {
                             for message in messages {
                                 let operation_type =
                                     operation_type_for_protocol(&message.protocol_op);
+                                let response_kind =
+                                    rejection_response_for_protocol(&message.protocol_op);
                                 let started_at = Instant::now();
                                 if let Some(metrics) = metrics.as_ref() {
                                     if let Some(operation_type) = operation_type {
                                         metrics.record_operation_start(operation_type, "");
+                                    }
+                                }
+
+                                if let Some(controls) = controls.as_ref() {
+                                    if let Some(operation_name) =
+                                        rate_limited_operation_name_for_protocol(
+                                            &message.protocol_op,
+                                        )
+                                    {
+                                        if let Some(rate_limiter) = controls.rate_limiter.as_ref() {
+                                            if !rate_limiter
+                                                .check_rate_limit(
+                                                    controls.client_ip,
+                                                    operation_name,
+                                                )
+                                                .await
+                                            {
+                                                let result = send_rejection_response(
+                                                    &mut socket,
+                                                    message.message_id.0,
+                                                    response_kind.clone(),
+                                                    ResultCode::Busy,
+                                                    "Rate limit exceeded - please slow down",
+                                                )
+                                                .await;
+                                                if let Some(metrics) = metrics.as_ref() {
+                                                    if let Some(operation_type) = operation_type {
+                                                        metrics.record_operation_complete(
+                                                            operation_type,
+                                                            started_at.elapsed(),
+                                                            false,
+                                                        );
+                                                    }
+                                                }
+                                                if let Err(err) = result {
+                                                    error!(
+                                                        "Failed to send rate-limit response: {}",
+                                                        err
+                                                    );
+                                                    return;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    if !controls.pool.start_operation(controls.conn_id).await {
+                                        let result = send_rejection_response(
+                                            &mut socket,
+                                            message.message_id.0,
+                                            response_kind.clone(),
+                                            ResultCode::Busy,
+                                            "Server is busy - operation limit exceeded",
+                                        )
+                                        .await;
+                                        if let Some(metrics) = metrics.as_ref() {
+                                            if let Some(operation_type) = operation_type {
+                                                metrics.record_operation_complete(
+                                                    operation_type,
+                                                    started_at.elapsed(),
+                                                    false,
+                                                );
+                                            }
+                                        }
+                                        if let Err(err) = result {
+                                            error!("Failed to send busy response: {}", err);
+                                            return;
+                                        }
+                                        continue;
                                     }
                                 }
 
@@ -207,6 +456,10 @@ async fn handle_client_with_metrics(
                                     message,
                                 )
                                 .await;
+
+                                if let Some(controls) = controls.as_ref() {
+                                    controls.pool.end_operation(controls.conn_id).await;
+                                }
 
                                 if let Some(metrics) = metrics.as_ref() {
                                     if let Some(operation_type) = operation_type {
@@ -265,6 +518,150 @@ fn operation_type_for_protocol(protocol_op: &ProtocolOp<'_>) -> Option<Operation
         ProtocolOp::AbandonRequest(_) => Some(OperationType::Abandon),
         ProtocolOp::ExtendedRequest(_) => Some(OperationType::Extended),
         _ => None,
+    }
+}
+
+fn rate_limited_operation_name_for_protocol(protocol_op: &ProtocolOp<'_>) -> Option<&'static str> {
+    match protocol_op {
+        ProtocolOp::BindRequest(_) => Some("bind"),
+        ProtocolOp::SearchRequest(_) => Some("search"),
+        ProtocolOp::ModifyRequest(_) => Some("modify"),
+        ProtocolOp::AddRequest(_) => Some("add"),
+        ProtocolOp::DelRequest(_) => Some("delete"),
+        ProtocolOp::ModDnRequest(_) => Some("modifydn"),
+        ProtocolOp::CompareRequest(_) => Some("compare"),
+        ProtocolOp::ExtendedRequest(_) => Some("extended"),
+        _ => None,
+    }
+}
+
+fn rejection_response_for_protocol(protocol_op: &ProtocolOp<'_>) -> Option<RejectionResponse> {
+    match protocol_op {
+        ProtocolOp::BindRequest(_) => Some(RejectionResponse::Bind),
+        ProtocolOp::SearchRequest(_) => Some(RejectionResponse::SearchDone),
+        ProtocolOp::ModifyRequest(_) => Some(RejectionResponse::Modify),
+        ProtocolOp::AddRequest(_) => Some(RejectionResponse::Add),
+        ProtocolOp::DelRequest(_) => Some(RejectionResponse::Delete),
+        ProtocolOp::ModDnRequest(_) => Some(RejectionResponse::ModifyDn),
+        ProtocolOp::CompareRequest(_) => Some(RejectionResponse::Compare),
+        ProtocolOp::ExtendedRequest(_) => Some(RejectionResponse::Extended),
+        _ => None,
+    }
+}
+
+async fn send_connection_rejected(socket: &mut TcpStream) -> Result<(), ServerError> {
+    send_result(
+        socket,
+        0,
+        ResponseOp::SearchDone,
+        ResultCode::Unavailable,
+        "",
+        "Server resource limits exceeded",
+    )
+    .await?;
+    socket.shutdown().await?;
+    Ok(())
+}
+
+async fn send_rejection_response(
+    socket: &mut TcpStream,
+    message_id: u32,
+    response_kind: Option<RejectionResponse>,
+    result_code: ResultCode,
+    diagnostic_message: &str,
+) -> Result<(), ServerError> {
+    match response_kind {
+        Some(RejectionResponse::Bind) => {
+            send_bind_response(socket, message_id, result_code, diagnostic_message).await
+        }
+        Some(RejectionResponse::SearchDone) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                result_code,
+                "",
+                diagnostic_message,
+            )
+            .await
+        }
+        Some(RejectionResponse::Modify) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                result_code,
+                "",
+                diagnostic_message,
+            )
+            .await
+        }
+        Some(RejectionResponse::Add) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Add,
+                result_code,
+                "",
+                diagnostic_message,
+            )
+            .await
+        }
+        Some(RejectionResponse::Delete) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Delete,
+                result_code,
+                "",
+                diagnostic_message,
+            )
+            .await
+        }
+        Some(RejectionResponse::ModifyDn) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::ModifyDn,
+                result_code,
+                "",
+                diagnostic_message,
+            )
+            .await
+        }
+        Some(RejectionResponse::Compare) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Compare,
+                result_code,
+                "",
+                diagnostic_message,
+            )
+            .await
+        }
+        Some(RejectionResponse::Extended) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Extended,
+                result_code,
+                "",
+                diagnostic_message,
+            )
+            .await
+        }
+        None => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                result_code,
+                "",
+                diagnostic_message,
+            )
+            .await
+        }
     }
 }
 

@@ -39,3 +39,24 @@ runtime = "legacy"
     let serialized = config.to_toml_string().unwrap();
     assert!(serialized.contains("runtime = \"legacy\""));
 }
+
+#[test]
+fn test_legacy_runtime_rejects_nondefault_burst_size() {
+    let toml = r#"
+[server]
+runtime = "legacy"
+
+[rate_limit]
+burst_size = 5
+"#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    assert!(config.validate().is_ok());
+
+    let error = config
+        .validate_for_shipped_binary()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("burst_size"));
+    assert!(error.contains("legacy runtime"));
+}

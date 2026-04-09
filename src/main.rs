@@ -80,14 +80,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "memory" => {
                 println!("Initializing in-memory backend (MockBackend)");
 
-                // Create mock backend with credentials from config
-                let mut backend = MockBackend::from_credentials_with_replica_id(
-                    [(
-                        &format!("{},{}", config.server.root_user_dn, config.server.base_dn),
-                        root_password.as_bytes().to_vec(),
-                    )],
-                    config.server.replica_id,
-                );
+                // Start with an empty in-memory backend; initialize_base_structure
+                // installs the base entry and root user with the configured password.
+                let mut backend = MockBackend::with_replica_id(config.server.replica_id);
 
                 // Add base structure entries
                 initialize_base_structure(&mut backend, &config, &root_password).await?;
@@ -249,6 +244,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let bind_addr = config.ldap_bind_address();
     println!("Starting LDAP server on {}", bind_addr);
+    let legacy_server_config = server::LegacyServerConfig::from_server_config(&config);
 
     // Create a channel for server shutdown
     let shutdown_rx = shutdown_clone.subscribe();
@@ -258,7 +254,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let server_task = tokio::spawn(async move {
         let result = match selected_runtime.as_str() {
             "legacy" => {
-                server::run_with_metrics(&bind_addr, backend, shutdown_rx, monitoring_metrics).await
+                server::run_with_metrics_and_config(
+                    &bind_addr,
+                    backend,
+                    shutdown_rx,
+                    monitoring_metrics,
+                    legacy_server_config,
+                )
+                .await
             }
             unsupported => Err(std::io::Error::other(format!(
                 "server.runtime = {:?} is not supported by the shipped opendr binary",
