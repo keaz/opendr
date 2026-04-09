@@ -58,6 +58,8 @@
 //!     reconnect_delay: Duration::from_secs(5),
 //!     max_reconnect_attempts: 3,
 //!     change_buffer_size: 1000,
+//!     receive_timeout: Duration::from_secs(60),
+//!     max_idle_time: Duration::from_secs(300),
 //! };
 //!
 //! // Create persist mode manager
@@ -320,9 +322,9 @@ impl PersistModeManager {
             .start_listening(cookie.as_deref())
             .await
             .map_err(|e| {
-            error!("Failed to start change listener: {}", e);
-            e
-        })?;
+                error!("Failed to start change listener: {}", e);
+                e
+            })?;
 
         info!("Persist mode connection established");
 

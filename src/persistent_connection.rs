@@ -228,7 +228,6 @@ impl PersistentConsumer {
 
         // Attempt to establish connection
         let ldap = Self::connect(&consumer_url).await?;
-
         let consumer = Self {
             consumer_id,
             ldap_connection: Arc::new(Mutex::new(Some(ldap))),
@@ -260,6 +259,55 @@ impl PersistentConsumer {
         consumer.filter = Some(filter);
         consumer.attributes = attributes;
         Ok(consumer)
+    }
+
+    /// Create a persistent consumer without establishing the network connection yet.
+    ///
+    /// The first send attempt will reconnect on demand.
+    pub fn new_lazy(
+        consumer_id: String,
+        consumer_url: String,
+        base_dn: String,
+        heartbeat_interval: Duration,
+    ) -> Self {
+        Self {
+            consumer_id,
+            ldap_connection: Arc::new(Mutex::new(None)),
+            consumer_url,
+            last_cookie: Arc::new(Mutex::new(String::new())),
+            filter: None,
+            base_dn,
+            attributes: vec!["*".to_string(), "+".to_string()],
+            heartbeat_interval,
+            last_heartbeat: Arc::new(Mutex::new(Instant::now())),
+            connection_timeout: Duration::from_secs(90),
+            stats: Arc::new(Mutex::new(ConnectionStats::default())),
+        }
+    }
+
+    /// Create a lazy persistent consumer with a filter and explicit attributes.
+    pub fn with_filter_lazy(
+        consumer_id: String,
+        consumer_url: String,
+        base_dn: String,
+        filter: String,
+        attributes: Vec<String>,
+        heartbeat_interval: Duration,
+    ) -> Self {
+        let mut consumer = Self::new_lazy(consumer_id, consumer_url, base_dn, heartbeat_interval);
+        consumer.filter = Some(filter);
+        consumer.attributes = attributes;
+        consumer
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_disconnected_for_test(
+        consumer_id: String,
+        consumer_url: String,
+        base_dn: String,
+        heartbeat_interval: Duration,
+    ) -> Self {
+        Self::new_lazy(consumer_id, consumer_url, base_dn, heartbeat_interval)
     }
 
     /// Set the connection timeout

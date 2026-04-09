@@ -3,19 +3,20 @@
 //! This test suite validates the end-to-end replication functionality
 //! between provider and consumer servers.
 
-use opendr::backend::{DirectoryBackend, DirectoryEntry, BackendError, MockBackend};
+use opendr::backend::{BackendError, DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::fsm::{
-    StateMachine,
-    ReplicationProviderEvent, ReplicationConsumerEvent,
-    ReplicationProviderState, ReplicationConsumerState,
-    ReplicationProviderFsm, ReplicationConsumerFsm,
+    ReplicationConsumerEvent, ReplicationConsumerFsm, ReplicationConsumerState,
+    ReplicationProviderEvent, ReplicationProviderFsm, ReplicationProviderState, StateMachine,
 };
 use opendr::replication::*;
-use opendr::replication_provider_fsm::*;
 use opendr::replication_consumer_fsm::*;
+use opendr::replication_provider_fsm::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio;
+
+const LOCAL_PROVIDER_URL: &str = "in-memory://provider.example.com";
 
 // Helper to create mock backend with test data
 async fn create_test_backend() -> MockBackend {
@@ -54,10 +55,37 @@ fn create_provider_fsm(backend: Arc<dyn DirectoryBackend>) -> ReplicationProvide
 }
 
 // Helper to create consumer FSM
-fn create_consumer_fsm(backend: Arc<dyn DirectoryBackend>, changelog_provider: Arc<dyn ChangelogProvider>) -> ReplicationConsumerFsmImpl {
-    let provider_connection = Box::new(ProviderConnectionImpl::new(changelog_provider));
+fn unique_state_path() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!("opendr-repl-state-{}-{nanos}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn create_consumer_fsm(
+    backend: Arc<dyn DirectoryBackend>,
+    changelog_provider: Arc<dyn ChangelogProvider>,
+) -> ReplicationConsumerFsmImpl {
+    create_consumer_fsm_with_state_path(backend, changelog_provider, unique_state_path())
+}
+
+fn create_consumer_fsm_with_state_path(
+    backend: Arc<dyn DirectoryBackend>,
+    changelog_provider: Arc<dyn ChangelogProvider>,
+    state_path: String,
+) -> ReplicationConsumerFsmImpl {
+    let provider_connection = Box::new(ProviderConnectionImpl::with_credentials_and_base(
+        changelog_provider,
+        None,
+        None,
+        "dc=example,dc=org".to_string(),
+    ));
     let batch_processor = Box::new(BatchProcessorImpl::new(backend.clone()));
-    let state_manager = Box::new(StateManagerImpl::new("/tmp/repl_state".to_string()));
+    let state_manager = Box::new(StateManagerImpl::new(state_path));
     let change_listener = Box::new(ChangeListenerImpl::new());
 
     ReplicationConsumerFsmImpl::new(
@@ -66,6 +94,20 @@ fn create_consumer_fsm(backend: Arc<dyn DirectoryBackend>, changelog_provider: A
         state_manager,
         change_listener,
     )
+}
+
+fn encode_replication_change(change_type: ChangeType, dn: &str, change_data: &[u8]) -> Vec<u8> {
+    let change_type = match change_type {
+        ChangeType::Add => "add",
+        ChangeType::Modify => "modify",
+        ChangeType::Delete => "delete",
+        ChangeType::Rename => "rename",
+    };
+
+    let header = format!("0|{change_type}|{dn}|{}|", change_data.len());
+    let mut encoded = header.into_bytes();
+    encoded.extend_from_slice(change_data);
+    encoded
 }
 
 #[tokio::test]
@@ -94,7 +136,7 @@ async fn test_changelog_tracker_records_changes() {
     // Verify CSNs are unique and properly ordered
     assert!(csn2 > csn1);
     assert!(csn3 > csn2);
-    
+
     // Verify context CSN is updated
     let context_csn = tracker.get_context_csn();
     assert_eq!(context_csn, Some(csn3.clone()));
@@ -112,7 +154,10 @@ async fn test_changelog_provider_get_all_entries() {
     let tracker = ChangelogTracker::new();
     let provider = ChangelogProviderImpl::new(tracker, backend);
 
-    let entries = provider.get_all_entries("dc=example,dc=org", None).await.unwrap();
+    let entries = provider
+        .get_all_entries("dc=example,dc=org", None)
+        .await
+        .unwrap();
 
     // Should return all entries from backend (at least the 2 we added + admin)
     assert!(entries.len() >= 2);
@@ -147,7 +192,10 @@ async fn test_changelog_provider_get_changelog_since() {
     // Get changes with a CSN-based cookie
     let context_csn = provider.get_context_csn().await.unwrap().unwrap();
     let cookie = format!("csn-{}", context_csn);
-    let changes = provider.get_changelog_since(Some(&cookie), 100).await.unwrap();
+    let changes = provider
+        .get_changelog_since(Some(&cookie), 100)
+        .await
+        .unwrap();
     // Should return empty since we're asking for changes after the latest CSN
     assert_eq!(changes.len(), 0);
 }
@@ -158,20 +206,29 @@ async fn test_provider_fsm_start_sync_replication() {
     let mut fsm = create_provider_fsm(backend);
 
     // Start sync replication
-    let result = fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-        consumer_id: "consumer1".to_string(),
-        cookie: None,
-    }).await;
+    let result = fsm
+        .handle_event(ReplicationProviderEvent::StartSyncReplication {
+            consumer_id: "consumer1".to_string(),
+            cookie: None,
+        })
+        .await;
 
     assert!(result.is_ok());
 
     // Should return number of entries to sync (at least 2 from our test data + default admin)
     let count = result.unwrap();
     assert!(count.is_some());
-    assert!(count.unwrap() >= 2, "Expected at least 2 entries, got {}", count.unwrap());
+    assert!(
+        count.unwrap() >= 2,
+        "Expected at least 2 entries, got {}",
+        count.unwrap()
+    );
 
     // FSM should be in Refresh state
-    assert!(matches!(fsm.current_state(), ReplicationProviderState::Refresh { .. }));
+    assert!(matches!(
+        fsm.current_state(),
+        ReplicationProviderState::Refresh { .. }
+    ));
 
     // Should have 1 active consumer
     assert_eq!(fsm.active_consumers(), 1);
@@ -186,17 +243,22 @@ async fn test_provider_fsm_complete_refresh_phase() {
     fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
         consumer_id: "consumer1".to_string(),
         cookie: None,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     // Complete refresh phase
-    let result = fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
-        entries_sent: 2,
-    }).await;
+    let result = fsm
+        .handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
+        .await;
 
     assert!(result.is_ok());
 
     // FSM should transition to Present state
-    assert!(matches!(fsm.current_state(), ReplicationProviderState::Present { .. }));
+    assert!(matches!(
+        fsm.current_state(),
+        ReplicationProviderState::Present { .. }
+    ));
 
     // Should report 2 entries sent
     assert_eq!(fsm.entries_sent(), 2);
@@ -211,21 +273,28 @@ async fn test_provider_fsm_complete_present_phase() {
     fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
         consumer_id: "consumer1".to_string(),
         cookie: None,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
-        entries_sent: 2,
-    }).await.unwrap();
+    fsm.handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
+        .await
+        .unwrap();
 
     // Complete present phase
-    let result = fsm.handle_event(ReplicationProviderEvent::PresentComplete {
-        entries_streamed: 0,
-    }).await;
+    let result = fsm
+        .handle_event(ReplicationProviderEvent::PresentComplete {
+            entries_streamed: 0,
+        })
+        .await;
 
     assert!(result.is_ok());
 
     // FSM should transition to Persist state
-    assert!(matches!(fsm.current_state(), ReplicationProviderState::Persist { .. }));
+    assert!(matches!(
+        fsm.current_state(),
+        ReplicationProviderState::Persist { .. }
+    ));
 
     // Should have a cookie
     assert!(fsm.cookie().is_some());
@@ -240,24 +309,31 @@ async fn test_provider_fsm_stream_changelog_entries() {
     fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
         consumer_id: "consumer1".to_string(),
         cookie: None,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
-        entries_sent: 2,
-    }).await.unwrap();
+    fsm.handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
+        .await
+        .unwrap();
 
     // Stream a changelog entry with CSN
     let csn_gen = opendr::csn::CsnGenerator::new(1);
     let csn = csn_gen.generate();
-    let result = fsm.handle_event(ReplicationProviderEvent::ChangelogEntry {
-        entry: b"test entry data".to_vec(),
-        csn: csn,
-    }).await;
+    let result = fsm
+        .handle_event(ReplicationProviderEvent::ChangelogEntry {
+            entry: b"test entry data".to_vec(),
+            csn: csn,
+        })
+        .await;
 
     assert!(result.is_ok());
 
     // FSM should transition to Streaming state
-    assert!(matches!(fsm.current_state(), ReplicationProviderState::Streaming { .. }));
+    assert!(matches!(
+        fsm.current_state(),
+        ReplicationProviderState::Streaming { .. }
+    ));
     assert!(fsm.is_streaming());
 }
 
@@ -270,19 +346,26 @@ async fn test_provider_fsm_consumer_disconnect() {
     fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
         consumer_id: "consumer1".to_string(),
         cookie: None,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     assert_eq!(fsm.active_consumers(), 1);
 
     // Consumer disconnects
-    let result = fsm.handle_event(ReplicationProviderEvent::ConsumerDisconnected {
-        consumer_id: "consumer1".to_string(),
-    }).await;
+    let result = fsm
+        .handle_event(ReplicationProviderEvent::ConsumerDisconnected {
+            consumer_id: "consumer1".to_string(),
+        })
+        .await;
 
     assert!(result.is_ok());
 
     // FSM should transition to Completed state
-    assert!(matches!(fsm.current_state(), ReplicationProviderState::Completed));
+    assert!(matches!(
+        fsm.current_state(),
+        ReplicationProviderState::Completed
+    ));
     assert_eq!(fsm.active_consumers(), 0);
 }
 
@@ -295,43 +378,61 @@ async fn test_consumer_fsm_start_consumption() {
     let mut fsm = create_consumer_fsm(backend, changelog_provider);
 
     // Start consumption
-    let result = fsm.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://provider.example.com:389".to_string(),
-        cookie: None,
-    }).await;
+    let result = fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: None,
+        })
+        .await;
 
     assert!(result.is_ok());
+    assert!(result.unwrap().unwrap() >= 2);
 
-    // FSM should be in ReceivingBatches state
-    assert!(matches!(fsm.current_state(), ReplicationConsumerState::ReceivingBatches { .. }));
+    // The concrete in-memory consumer performs the initial request immediately and then
+    // transitions to listening for live changes.
+    assert!(matches!(
+        fsm.current_state(),
+        ReplicationConsumerState::Listening
+    ));
 
     // Provider URL should be set
-    assert_eq!(fsm.provider_url(), Some("ldap://provider.example.com:389"));
+    assert_eq!(fsm.provider_url(), Some(LOCAL_PROVIDER_URL));
+    assert!(fsm.current_cookie().is_some());
 }
 
 #[tokio::test]
 async fn test_consumer_fsm_receive_and_apply_batch() {
     let backend = Arc::new(create_test_backend().await);
     let tracker = ChangelogTracker::new();
+    let first_csn = tracker.record_change(
+        ChangeType::Add,
+        "cn=old1,dc=example,dc=org".to_string(),
+        b"old".to_vec(),
+    );
+    tracker.record_change(
+        ChangeType::Add,
+        "cn=new1,dc=example,dc=org".to_string(),
+        b"new".to_vec(),
+    );
     let changelog_provider = Arc::new(ChangelogProviderImpl::new(tracker, backend.clone()));
 
     let mut fsm = create_consumer_fsm(backend, changelog_provider);
 
-    // Start consumption
-    fsm.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://provider.example.com:389".to_string(),
-        cookie: None,
-    }).await.unwrap();
-
-    // Receive batch
-    let result = fsm.handle_event(ReplicationConsumerEvent::BatchReceived {
-        entries: vec![b"entry1".to_vec(), b"entry2".to_vec()],
-    }).await;
+    // Start incremental consumption from the first recorded CSN.
+    let result = fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: Some(format!("csn-{first_csn}")),
+        })
+        .await;
 
     assert!(result.is_ok());
-
-    // FSM should transition to ApplyingChanges state
-    assert!(matches!(fsm.current_state(), ReplicationConsumerState::ApplyingChanges { .. }));
+    assert_eq!(result.unwrap(), Some(1));
+    assert!(matches!(
+        fsm.current_state(),
+        ReplicationConsumerState::Listening
+    ));
+    assert!(fsm.current_cookie().is_some());
 }
 
 #[tokio::test]
@@ -339,33 +440,44 @@ async fn test_consumer_fsm_persist_state() {
     let backend = Arc::new(create_test_backend().await);
     let tracker = ChangelogTracker::new();
     let changelog_provider = Arc::new(ChangelogProviderImpl::new(tracker, backend.clone()));
+    let state_path = unique_state_path();
 
-    let mut fsm = create_consumer_fsm(backend, changelog_provider);
+    let mut first_fsm = create_consumer_fsm_with_state_path(
+        backend,
+        changelog_provider.clone(),
+        state_path.clone(),
+    );
 
-    // Progress through states
-    fsm.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://provider.example.com:389".to_string(),
-        cookie: None,
-    }).await.unwrap();
+    first_fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: None,
+        })
+        .await
+        .unwrap();
 
-    fsm.handle_event(ReplicationConsumerEvent::BatchReceived {
-        entries: vec![b"entry1".to_vec()],
-    }).await.unwrap();
+    let persisted_cookie = first_fsm
+        .current_cookie()
+        .expect("initial sync should persist a cookie")
+        .to_string();
 
-    fsm.handle_event(ReplicationConsumerEvent::EntryApplied).await.unwrap();
+    let second_backend = Arc::new(create_test_backend().await);
+    let mut second_fsm =
+        create_consumer_fsm_with_state_path(second_backend, changelog_provider, state_path);
 
-    // Persist state
-    let result = fsm.handle_event(ReplicationConsumerEvent::StatePersisted {
-        cookie: "seq-42".to_string(),
-    }).await;
+    let result = second_fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: None,
+        })
+        .await;
 
     assert!(result.is_ok());
-
-    // FSM should be in Listening state (if change listening is enabled)
-    assert!(matches!(fsm.current_state(), ReplicationConsumerState::Listening));
-
-    // Cookie should be saved
-    assert_eq!(fsm.current_cookie(), Some("seq-42"));
+    assert!(matches!(
+        second_fsm.current_state(),
+        ReplicationConsumerState::Listening
+    ));
+    assert_eq!(second_fsm.current_cookie(), Some(persisted_cookie.as_str()));
 }
 
 #[tokio::test]
@@ -376,26 +488,23 @@ async fn test_consumer_fsm_receive_real_time_changes() {
 
     let mut fsm = create_consumer_fsm(backend, changelog_provider);
 
-    // Progress to listening state
     fsm.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://provider.example.com:389".to_string(),
+        provider_url: LOCAL_PROVIDER_URL.to_string(),
         cookie: None,
-    }).await.unwrap();
-
-    fsm.handle_event(ReplicationConsumerEvent::BatchReceived {
-        entries: vec![b"entry1".to_vec()],
-    }).await.unwrap();
-
-    fsm.handle_event(ReplicationConsumerEvent::EntryApplied).await.unwrap();
-
-    fsm.handle_event(ReplicationConsumerEvent::StatePersisted {
-        cookie: "seq-1".to_string(),
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     // Receive real-time change
-    let result = fsm.handle_event(ReplicationConsumerEvent::ChangeReceived(
-        b"realtime change data".to_vec()
-    )).await;
+    let result = fsm
+        .handle_event(ReplicationConsumerEvent::ChangeReceived(
+            encode_replication_change(
+                ChangeType::Add,
+                "cn=live,dc=example,dc=org",
+                b"live change data",
+            ),
+        ))
+        .await;
 
     assert!(result.is_ok());
 
@@ -403,7 +512,8 @@ async fn test_consumer_fsm_receive_real_time_changes() {
     assert!(fsm.is_listening());
 
     // Entries applied count should increment
-    assert_eq!(fsm.entries_applied(), 2);
+    assert_eq!(fsm.entries_applied(), 1);
+    assert!(fsm.current_cookie().is_some());
 }
 
 #[tokio::test]
@@ -429,61 +539,97 @@ async fn test_end_to_end_replication_flow() {
 
     // Setup consumer
     let consumer_backend = Arc::new(create_test_backend().await);
-    let changelog_provider = Arc::new(ChangelogProviderImpl::new(tracker.clone(), provider_backend));
+    let changelog_provider = Arc::new(ChangelogProviderImpl::new(
+        tracker.clone(),
+        provider_backend,
+    ));
     let mut consumer_fsm = create_consumer_fsm(consumer_backend, changelog_provider);
 
     // Provider: Start sync replication
-    let provider_result = provider_fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
-        consumer_id: "consumer1".to_string(),
-        cookie: None,
-    }).await;
+    let provider_result = provider_fsm
+        .handle_event(ReplicationProviderEvent::StartSyncReplication {
+            consumer_id: "consumer1".to_string(),
+            cookie: None,
+        })
+        .await;
     assert!(provider_result.is_ok());
     let entry_count = provider_result.unwrap().unwrap();
-    assert!(entry_count >= 2, "Expected at least 2 entries, got {}", entry_count);
+    assert!(
+        entry_count >= 2,
+        "Expected at least 2 entries, got {}",
+        entry_count
+    );
 
     // Consumer: Start consumption
-    let consumer_result = consumer_fsm.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://provider.example.com:389".to_string(),
-        cookie: None,
-    }).await;
+    let consumer_result = consumer_fsm
+        .handle_event(ReplicationConsumerEvent::StartConsumption {
+            provider_url: LOCAL_PROVIDER_URL.to_string(),
+            cookie: None,
+        })
+        .await;
     assert!(consumer_result.is_ok());
 
     // Provider: Complete refresh
-    provider_fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
-        entries_sent: entry_count,
-    }).await.unwrap();
+    provider_fsm
+        .handle_event(ReplicationProviderEvent::RefreshComplete {
+            entries_sent: entry_count,
+        })
+        .await
+        .unwrap();
 
     // Provider: Complete present
-    provider_fsm.handle_event(ReplicationProviderEvent::PresentComplete {
-        entries_streamed: 2,
-    }).await.unwrap();
+    provider_fsm
+        .handle_event(ReplicationProviderEvent::PresentComplete {
+            entries_streamed: 2,
+        })
+        .await
+        .unwrap();
 
     // Verify provider state
-    assert!(matches!(provider_fsm.current_state(), ReplicationProviderState::Persist { .. }));
+    assert!(matches!(
+        provider_fsm.current_state(),
+        ReplicationProviderState::Persist { .. }
+    ));
     assert!(provider_fsm.cookie().is_some());
 
-    // Consumer: Apply entries
-    consumer_fsm.handle_event(ReplicationConsumerEvent::BatchReceived {
-        entries: vec![b"entry1".to_vec(), b"entry2".to_vec()],
-    }).await.unwrap();
-
-    consumer_fsm.handle_event(ReplicationConsumerEvent::EntryApplied).await.unwrap();
-
-    // Consumer: Persist state
-    let cookie = provider_fsm.cookie().unwrap().to_string();
-    consumer_fsm.handle_event(ReplicationConsumerEvent::StatePersisted {
-        cookie: cookie.clone(),
-    }).await.unwrap();
+    // Consumer: Apply a live change after the initial sync session starts listening.
+    consumer_fsm
+        .handle_event(ReplicationConsumerEvent::ChangeReceived(
+            encode_replication_change(
+                ChangeType::Modify,
+                "cn=user1,dc=example,dc=org",
+                b"modified user1 data",
+            ),
+        ))
+        .await
+        .unwrap();
 
     // Verify consumer state
     assert!(consumer_fsm.is_listening());
-    assert_eq!(consumer_fsm.current_cookie(), Some(cookie.as_str()));
+    assert!(consumer_fsm.current_cookie().is_some());
+
+    // Provider sessions are only marked successful once the consumer disconnects.
+    provider_fsm
+        .handle_event(ReplicationProviderEvent::ConsumerDisconnected {
+            consumer_id: "consumer1".to_string(),
+        })
+        .await
+        .unwrap();
 
     // Verify replication stats
     let (provider_sessions, provider_successful, _, provider_entries, _) = provider_fsm.get_stats();
     assert_eq!(provider_sessions, 1);
+    assert_eq!(provider_successful, 1);
+    assert!(matches!(
+        provider_fsm.current_state(),
+        ReplicationProviderState::Completed
+    ));
     // entry_count from refresh + 2 changelog entries from present
-    assert!(provider_entries >= 4, "Expected at least 4 provider entries, got {}", provider_entries);
+    assert!(
+        provider_entries >= 4,
+        "Expected at least 4 provider entries, got {}",
+        provider_entries
+    );
 
     let (consumer_sessions, _, _, consumer_entries, _) = consumer_fsm.get_stats();
     assert_eq!(consumer_sessions, 1);
@@ -496,26 +642,45 @@ async fn test_replication_with_existing_cookie() {
     let tracker = ChangelogTracker::new();
 
     // Record changes with specific sequence numbers
-    tracker.record_change(ChangeType::Add, "cn=old1,dc=example,dc=org".to_string(), b"old".to_vec());
-    tracker.record_change(ChangeType::Add, "cn=old2,dc=example,dc=org".to_string(), b"old".to_vec());
-    tracker.record_change(ChangeType::Add, "cn=new1,dc=example,dc=org".to_string(), b"new".to_vec());
-    tracker.record_change(ChangeType::Add, "cn=new2,dc=example,dc=org".to_string(), b"new".to_vec());
+    tracker.record_change(
+        ChangeType::Add,
+        "cn=old1,dc=example,dc=org".to_string(),
+        b"old".to_vec(),
+    );
+    tracker.record_change(
+        ChangeType::Add,
+        "cn=old2,dc=example,dc=org".to_string(),
+        b"old".to_vec(),
+    );
+    tracker.record_change(
+        ChangeType::Add,
+        "cn=new1,dc=example,dc=org".to_string(),
+        b"new".to_vec(),
+    );
+    tracker.record_change(
+        ChangeType::Add,
+        "cn=new2,dc=example,dc=org".to_string(),
+        b"new".to_vec(),
+    );
 
     let changelog_provider = Arc::new(ChangelogProviderImpl::new(tracker.clone(), backend.clone()));
 
     // Get all changes
-    let changes = changelog_provider.get_changelog_since(None, 100).await.unwrap();
+    let changes = changelog_provider
+        .get_changelog_since(None, 100)
+        .await
+        .unwrap();
 
     // Should get all recorded changes
     assert_eq!(changes.len(), 4);
-    
+
     // Verify CSNs are in order
     for i in 1..changes.len() {
-        assert!(changes[i].csn > changes[i-1].csn);
+        assert!(changes[i].csn > changes[i - 1].csn);
     }
-    
-    assert_eq!(changes[0].dn, "cn=admin,dc=example,dc=org");
-    assert_eq!(changes[1].dn, "cn=admin,dc=example,dc=org");
+
+    assert_eq!(changes[0].dn, "cn=old1,dc=example,dc=org");
+    assert_eq!(changes[1].dn, "cn=old2,dc=example,dc=org");
     assert_eq!(changes[2].dn, "cn=new1,dc=example,dc=org");
     assert_eq!(changes[3].dn, "cn=new2,dc=example,dc=org");
 }
@@ -526,12 +691,15 @@ async fn test_replication_error_handling() {
     let mut fsm = create_provider_fsm(backend);
 
     // Try to complete refresh without starting sync
-    let result = fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
-        entries_sent: 2,
-    }).await;
+    let result = fsm
+        .handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
+        .await;
 
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), ReplicationProviderError::InvalidStateTransition { .. }));
+    assert!(matches!(
+        result.unwrap_err(),
+        ReplicationProviderError::InvalidStateTransition { .. }
+    ));
 }
 
 #[tokio::test]
@@ -541,7 +709,10 @@ async fn test_consumer_registry() {
     let connection = ConsumerConnection::new("consumer1".to_string());
 
     // Register consumer
-    registry.register_consumer("consumer1", connection.clone()).await.unwrap();
+    registry
+        .register_consumer("consumer1", connection.clone())
+        .await
+        .unwrap();
 
     // Check if connected
     assert!(registry.is_consumer_connected("consumer1").await.unwrap());
@@ -572,7 +743,12 @@ async fn test_streaming_manager() {
     // Send entry with CSN
     let csn_gen = opendr::csn::CsnGenerator::new(1);
     let csn = csn_gen.generate();
-    let entry = ChangelogEntry::new(csn, ChangeType::Add, "cn=test,dc=example,dc=org".to_string(), b"data".to_vec());
+    let entry = ChangelogEntry::new(
+        csn,
+        ChangeType::Add,
+        "cn=test,dc=example,dc=org".to_string(),
+        b"data".to_vec(),
+    );
     manager.send_entry("consumer1", &entry).await.unwrap();
 
     // Get stats

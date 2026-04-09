@@ -991,7 +991,6 @@ impl ReplicationConsumerFsmImpl {
                     log::error!("Failed to get contextCSN from backend: {}", e);
                 }
             }
-
         } else {
             // No entries means we're already up to date
             // If we have a cookie, just keep using it
@@ -1228,18 +1227,20 @@ impl ReplicationConsumerFsmImpl {
         }
 
         // Persist the latest contextCSN so reconnects resume from the live stream.
-        if let Some(context_csn) = self.batch_processor.get_context_csn().await.map_err(|e| {
-            ConsumerError::StateError {
-                message: format!("Failed to retrieve contextCSN after live change: {}", e),
-            }
-        })? {
-            let cookie = format!("csn-{}", context_csn);
-            self.state_manager
-                .save_cookie(&cookie)
+        if let Some(context_csn) =
+            self.batch_processor
+                .get_context_csn()
                 .await
                 .map_err(|e| ConsumerError::StateError {
+                    message: format!("Failed to retrieve contextCSN after live change: {}", e),
+                })?
+        {
+            let cookie = format!("csn-{}", context_csn);
+            self.state_manager.save_cookie(&cookie).await.map_err(|e| {
+                ConsumerError::StateError {
                     message: format!("Failed to persist live change cookie: {}", e),
-                })?;
+                }
+            })?;
             self.current_cookie = Some(cookie);
         }
 
@@ -2428,6 +2429,7 @@ pub mod tests {
         assert_eq!(connection_info.provider_url, "ldap://test.example.com:389");
         assert_eq!(connection_info.protocol_version, "3.0");
         assert!(connection_info.is_secure);
+        tokio::time::sleep(Duration::from_millis(1)).await;
         assert!(connection_info.connection_duration().as_nanos() > 0);
 
         connection_info.update_activity();
@@ -2446,6 +2448,7 @@ pub mod tests {
         assert_eq!(stats.bytes_processed, 300);
         assert_eq!(stats.error_count, 1);
         assert!(stats.last_entry_time.is_some());
+        tokio::time::sleep(Duration::from_millis(1)).await;
         assert!(stats.processing_duration().as_nanos() > 0);
         assert_eq!(stats.average_processing_time, Duration::from_millis(15));
     }
@@ -2471,6 +2474,7 @@ pub mod tests {
         assert_eq!(stats.bytes_received, 125);
         assert_eq!(stats.error_count, 1);
         assert!(stats.last_change_time.is_some());
+        tokio::time::sleep(Duration::from_millis(1)).await;
         assert!(stats.listening_duration().as_nanos() > 0);
     }
 
@@ -2483,6 +2487,7 @@ pub mod tests {
         assert_eq!(stats.total_entries_applied, 0);
         assert_eq!(stats.total_bytes_processed, 0);
         assert_eq!(stats.total_errors, 0);
+        tokio::time::sleep(Duration::from_millis(1)).await;
         assert!(stats.collection_duration().as_nanos() > 0);
         assert_eq!(stats.entries_per_second(), 0.0);
     }

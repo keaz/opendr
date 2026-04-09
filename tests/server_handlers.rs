@@ -74,13 +74,46 @@ async fn connected_stream_pair() -> (TcpStream, TcpStream) {
 }
 
 async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
     let mut buf = vec![0u8; 4096];
-    let len = timeout(RESPONSE_TIMEOUT, stream.read(&mut buf))
-        .await
-        .expect("response timeout")
-        .expect("failed to read response");
-    buf.truncate(len);
-    buf
+
+    loop {
+        match timeout(RESPONSE_TIMEOUT, stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(len)) => response.extend_from_slice(&buf[..len]),
+            Ok(Err(err)) => panic!("failed to read response: {err}"),
+            Err(_) if !response.is_empty() => break,
+            Err(_) => panic!("response timeout"),
+        }
+    }
+
+    response
+}
+
+fn person_add_attributes(include_password: bool) -> Vec<FilterAttribute<'static>> {
+    let mut attributes = vec![
+        FilterAttribute {
+            attr_type: LdapString(Cow::Owned("objectClass".to_string())),
+            attr_vals: vec![AttributeValue(Cow::Owned(b"person".to_vec()))],
+        },
+        FilterAttribute {
+            attr_type: LdapString(Cow::Owned("cn".to_string())),
+            attr_vals: vec![AttributeValue(Cow::Owned(b"Alice".to_vec()))],
+        },
+        FilterAttribute {
+            attr_type: LdapString(Cow::Owned("sn".to_string())),
+            attr_vals: vec![AttributeValue(Cow::Owned(b"Smith".to_vec()))],
+        },
+    ];
+
+    if include_password {
+        attributes.push(FilterAttribute {
+            attr_type: LdapString(Cow::Owned("userPassword".to_string())),
+            attr_vals: vec![AttributeValue(Cow::Owned(b"secret".to_vec()))],
+        });
+    }
+
+    attributes
 }
 
 #[tokio::test]
@@ -389,16 +422,7 @@ async fn add_success_persists_entry() {
 
     let request = AddRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
-        attributes: vec![
-            FilterAttribute {
-                attr_type: LdapString(Cow::Owned("cn".to_string())),
-                attr_vals: vec![AttributeValue(Cow::Owned(b"Alice".to_vec()))],
-            },
-            FilterAttribute {
-                attr_type: LdapString(Cow::Owned("userPassword".to_string())),
-                attr_vals: vec![AttributeValue(Cow::Owned(b"secret".to_vec()))],
-            },
-        ],
+        attributes: person_add_attributes(true),
     };
 
     let (mut server_stream, mut client_stream) = connected_stream_pair().await;
@@ -428,7 +452,7 @@ async fn add_existing_entry_returns_error() {
 
     let request = AddRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
-        attributes: Vec::new(),
+        attributes: person_add_attributes(false),
     };
 
     let (mut server_stream, mut client_stream) = connected_stream_pair().await;

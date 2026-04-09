@@ -17,6 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
 };
+use crate::ber_decoder_fsm::BerDecoderFsmImpl;
+use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
 use crate::parser::{
     encode_bind_response, encode_result_response, encode_search_entry, ResponseOp,
 };
@@ -53,6 +55,30 @@ impl From<std::io::Error> for ServerError {
 impl From<EncodeError> for ServerError {
     fn from(err: EncodeError) -> Self {
         ServerError::Encode(err)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConnectionSession {
+    bound_dn: Option<String>,
+}
+
+impl ConnectionSession {
+    fn bind(&mut self, dn: String) {
+        self.bound_dn = Some(dn);
+    }
+
+    fn clear(&mut self) {
+        self.bound_dn = None;
+    }
+
+    fn is_authenticated(&self) -> bool {
+        self.bound_dn.is_some()
+    }
+
+    #[cfg(test)]
+    fn bound_dn(&self) -> Option<&str> {
+        self.bound_dn.as_deref()
     }
 }
 
@@ -97,42 +123,65 @@ pub async fn handle_client(
     backend: Arc<dyn DirectoryBackend>,
     schema: Arc<LdapSchema>,
 ) {
-    let mut buffer = vec![0; 4096];
+    let mut read_buffer = vec![0; 8192];
+    let mut decoder = BerDecoderFsmImpl::new();
+    let mut session = ConnectionSession::default();
 
     loop {
-        match socket.read(&mut buffer).await {
+        match socket.read(&mut read_buffer).await {
             Ok(0) => break,
             Ok(n) => {
-                let payload = &buffer[..n];
-                match parse_ldap_messages(payload) {
-                    Ok((_, messages)) => {
-                        for message in messages {
-                            if let Err(err) = process_message(
+                let decoded_messages =
+                    match decode_messages(&mut decoder, read_buffer[..n].to_vec()).await {
+                        Ok(messages) => messages,
+                        Err(err) => {
+                            error!("Failed to decode BER message: {}", err);
+                            if let Err(write_err) = send_bind_response(
                                 &mut socket,
-                                backend.as_ref(),
-                                schema.as_ref(),
-                                message,
+                                0,
+                                ResultCode::ProtocolError,
+                                "invalid message",
                             )
                             .await
                             {
-                                error!("Failed to process message: {}", err);
-                                return;
+                                error!("Failed to write error response: {}", write_err);
+                            }
+                            return;
+                        }
+                    };
+
+                for message_bytes in decoded_messages {
+                    match parse_ldap_messages(&message_bytes) {
+                        Ok((_, messages)) => {
+                            for message in messages {
+                                if let Err(err) = process_message_with_session(
+                                    &mut socket,
+                                    backend.as_ref(),
+                                    schema.as_ref(),
+                                    &mut session,
+                                    message,
+                                )
+                                .await
+                                {
+                                    error!("Failed to process message: {}", err);
+                                    return;
+                                }
                             }
                         }
-                    }
-                    Err(err) => {
-                        error!("Failed to parse LDAP message: {:?}", err);
-                        if let Err(write_err) = send_bind_response(
-                            &mut socket,
-                            0,
-                            ResultCode::ProtocolError,
-                            "invalid message",
-                        )
-                        .await
-                        {
-                            error!("Failed to write error response: {}", write_err);
+                        Err(err) => {
+                            error!("Failed to parse LDAP message: {:?}", err);
+                            if let Err(write_err) = send_bind_response(
+                                &mut socket,
+                                0,
+                                ResultCode::ProtocolError,
+                                "invalid message",
+                            )
+                            .await
+                            {
+                                error!("Failed to write error response: {}", write_err);
+                            }
+                            return;
                         }
-                        return;
                     }
                 }
             }
@@ -144,31 +193,117 @@ pub async fn handle_client(
     }
 }
 
+async fn decode_messages(
+    decoder: &mut BerDecoderFsmImpl,
+    input: Vec<u8>,
+) -> Result<Vec<Vec<u8>>, crate::ber_decoder_fsm::BerDecoderError> {
+    let mut messages = Vec::new();
+    let mut pending_input = Some(input);
+
+    loop {
+        let mut made_progress = false;
+        let next_input = pending_input.take().unwrap_or_default();
+
+        if let Some(message) = decoder
+            .handle_event(BerDecoderEvent::DataReceived(next_input))
+            .await?
+        {
+            messages.push(message);
+            made_progress = true;
+        }
+
+        while let Some(message) = decoder.extract_message() {
+            messages.push(message);
+            made_progress = true;
+        }
+
+        if !made_progress {
+            break;
+        }
+    }
+
+    Ok(messages)
+}
+
 pub async fn process_message(
     socket: &mut TcpStream,
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
     message: ldap_parser::ldap::LdapMessage<'_>,
 ) -> Result<(), ServerError> {
+    let mut session = ConnectionSession::default();
+    process_message_with_session(socket, backend, schema, &mut session, message).await
+}
+
+async fn process_message_with_session(
+    socket: &mut TcpStream,
+    backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
+    session: &mut ConnectionSession,
+    message: ldap_parser::ldap::LdapMessage<'_>,
+) -> Result<(), ServerError> {
     let message_id = message.message_id.0;
 
     match message.protocol_op {
         ProtocolOp::BindRequest(bind_request) => {
-            handle_bind_request(socket, backend, message_id, bind_request).await?;
+            handle_bind_request_with_session(socket, backend, message_id, bind_request, session)
+                .await?;
         }
         ProtocolOp::SearchRequest(search_request) => {
             handle_search_request(socket, backend, message_id, search_request).await?;
         }
         ProtocolOp::ModifyRequest(modify_request) => {
+            let dn = modify_request.object.0.as_ref().trim().to_owned();
+            if !ensure_authenticated_for_mutation(
+                socket,
+                message_id,
+                session,
+                ResponseOp::Modify,
+                &dn,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             handle_modify_request(socket, backend, message_id, modify_request).await?;
         }
         ProtocolOp::AddRequest(add_request) => {
+            let dn = add_request.entry.0.as_ref().trim().to_owned();
+            if !ensure_authenticated_for_mutation(socket, message_id, session, ResponseOp::Add, &dn)
+                .await?
+            {
+                return Ok(());
+            }
             handle_add_request(socket, backend, schema, message_id, add_request).await?;
         }
         ProtocolOp::DelRequest(delete_request) => {
+            let dn = delete_request.0.as_ref().trim().to_owned();
+            if !ensure_authenticated_for_mutation(
+                socket,
+                message_id,
+                session,
+                ResponseOp::Delete,
+                &dn,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             handle_delete_request(socket, backend, message_id, delete_request).await?;
         }
         ProtocolOp::ModDnRequest(rename_request) => {
+            let dn = rename_request.entry.0.as_ref().trim().to_owned();
+            if !ensure_authenticated_for_mutation(
+                socket,
+                message_id,
+                session,
+                ResponseOp::ModifyDn,
+                &dn,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             handle_moddn_request(socket, backend, message_id, rename_request).await?;
         }
         ProtocolOp::CompareRequest(compare_request) => {
@@ -176,6 +311,7 @@ pub async fn process_message(
         }
         ProtocolOp::UnbindRequest => {
             info!("Received unbind request");
+            session.clear();
             return Ok(());
         }
         ProtocolOp::AbandonRequest(request_id) => {
@@ -198,7 +334,19 @@ pub async fn handle_bind_request(
     message_id: u32,
     request: BindRequest<'_>,
 ) -> Result<(), ServerError> {
+    let mut session = ConnectionSession::default();
+    handle_bind_request_with_session(socket, backend, message_id, request, &mut session).await
+}
+
+async fn handle_bind_request_with_session(
+    socket: &mut TcpStream,
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    request: BindRequest<'_>,
+    session: &mut ConnectionSession,
+) -> Result<(), ServerError> {
     if request.version != 3 {
+        session.clear();
         send_bind_response(
             socket,
             message_id,
@@ -212,9 +360,19 @@ pub async fn handle_bind_request(
     match request.authentication {
         AuthenticationChoice::Simple(password) => {
             let dn = request.name.0.as_ref().trim().to_owned();
+            if dn.is_empty() && password.as_ref().is_empty() {
+                session.clear();
+                send_bind_success(socket, message_id).await?;
+                return Ok(());
+            }
+
             match backend.authenticate(&dn, password.as_ref()).await {
-                Ok(true) => send_bind_success(socket, message_id).await?,
+                Ok(true) => {
+                    session.bind(dn);
+                    send_bind_success(socket, message_id).await?;
+                }
                 Ok(false) => {
+                    session.clear();
                     send_bind_response(
                         socket,
                         message_id,
@@ -224,6 +382,7 @@ pub async fn handle_bind_request(
                     .await?;
                 }
                 Err(err) => {
+                    session.clear();
                     error!("Backend authentication error for {}: {}", dn, err);
                     send_bind_response(
                         socket,
@@ -236,6 +395,7 @@ pub async fn handle_bind_request(
             }
         }
         AuthenticationChoice::Sasl(_) => {
+            session.clear();
             send_bind_response(
                 socket,
                 message_id,
@@ -247,6 +407,30 @@ pub async fn handle_bind_request(
     }
 
     Ok(())
+}
+
+async fn ensure_authenticated_for_mutation(
+    socket: &mut TcpStream,
+    message_id: u32,
+    session: &ConnectionSession,
+    op: ResponseOp,
+    target_dn: &str,
+) -> Result<bool, ServerError> {
+    if session.is_authenticated() {
+        return Ok(true);
+    }
+
+    send_result(
+        socket,
+        message_id,
+        op,
+        ResultCode::InsufficientAccessRights,
+        target_dn,
+        "bind required before mutating directory data",
+    )
+    .await?;
+
+    Ok(false)
 }
 
 async fn send_bind_success(socket: &mut TcpStream, message_id: u32) -> Result<(), ServerError> {
@@ -971,13 +1155,44 @@ fn bytes_to_string(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::MockBackend;
     use ldap_parser::filter::{
         Attribute as FilterAttribute, AttributeValue, AttributeValueAssertion, Filter,
         PartialAttribute,
     };
     use ldap_parser::ldap::LdapString;
+    use ldap_parser::ldap::{
+        AuthenticationChoice, BindRequest, LdapDN, ResultCode as ParserResultCode,
+    };
     use ldap_parser::ldap::{Change, Operation};
+    use rasn::der;
+    use rasn_ldap::{AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest};
     use std::borrow::Cow;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{timeout, Duration};
+
+    async fn connected_stream_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = client.await.unwrap();
+
+        (server_stream, client_stream)
+    }
+
+    async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        let len = timeout(Duration::from_millis(200), stream.read(&mut buf))
+            .await
+            .expect("response timeout")
+            .expect("failed to read response");
+        buf.truncate(len);
+        buf
+    }
 
     #[test]
     fn convert_modifications_translates_operations_and_values() {
@@ -1067,5 +1282,109 @@ mod tests {
 
         let missing_filter = Filter::Present(LdapString(Cow::Owned("mail".to_string())));
         assert!(!entry_matches_filter(&entry, &missing_filter));
+    }
+
+    #[tokio::test]
+    async fn successful_bind_updates_connection_session() {
+        let backend = MockBackend::from_credentials([(
+            String::from("cn=admin,dc=example,dc=org"),
+            b"secret".to_vec(),
+        )]);
+        let mut session = ConnectionSession::default();
+        let request = BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned("cn=admin,dc=example,dc=org".to_string())),
+            authentication: AuthenticationChoice::Simple(Cow::Owned(b"secret".to_vec())),
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_bind_request_with_session(&mut server_stream, &backend, 1, request, &mut session)
+            .await
+            .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(session.bound_dn(), Some("cn=admin,dc=example,dc=org"));
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_mutation_is_rejected() {
+        let session = ConnectionSession::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let allowed = ensure_authenticated_for_mutation(
+            &mut server_stream,
+            7,
+            &session,
+            ResponseOp::Add,
+            "cn=Alice,dc=example,dc=org",
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert!(!allowed);
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::AddResponse(add_response) => {
+                assert_eq!(
+                    add_response.result_code,
+                    ParserResultCode::InsufficientAccessRights
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_client_accepts_fragmented_bind_request() {
+        let backend = Arc::new(MockBackend::from_credentials([(
+            String::from("cn=admin,dc=example,dc=org"),
+            b"secret".to_vec(),
+        )]));
+        let schema = Arc::new(LdapSchema::with_core_schema());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let server_task = tokio::spawn(async move {
+            handle_client(server_stream, backend, schema).await;
+        });
+
+        let bind_request = RasnBindRequest::new(
+            3,
+            b"cn=admin,dc=example,dc=org".to_vec().into(),
+            RasnAuthChoice::Simple(b"secret".to_vec().into()),
+        );
+        let message =
+            rasn_ldap::LdapMessage::new(1, rasn_ldap::ProtocolOp::BindRequest(bind_request));
+        let encoded = der::encode(&message).unwrap();
+        let split_at = encoded.len() / 2;
+
+        client_stream.write_all(&encoded[..split_at]).await.unwrap();
+        client_stream.write_all(&encoded[split_at..]).await.unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
     }
 }

@@ -30,19 +30,22 @@
 //! # Example Usage
 //!
 //! ```no_run
+//! use opendr::change_observer::{ChangeObserver, ChangeObserverImpl};
 //! use opendr::real_time_propagation::{RealTimePropagationEngine, PropagationConfig};
-//! use opendr::change_observer::ChangeObserverImpl;
-//! use opendr::push_manager::PushManager;
+//! use opendr::push_manager::{PushManager, PushManagerConfig};
 //! use std::sync::Arc;
 //! use tokio::sync::RwLock;
 //!
 //! # async fn example() -> Result<(), String> {
-//! let observer = Arc::new(ChangeObserverImpl::new());
-//! let push_manager = Arc::new(RwLock::new(PushManager::new(/* ... */)));
+//! let observer: Arc<dyn ChangeObserver> = Arc::new(ChangeObserverImpl::new());
+//! let push_manager = Arc::new(RwLock::new(PushManager::new(
+//!     observer.clone(),
+//!     PushManagerConfig::default(),
+//! )));
 //! let config = PropagationConfig::default();
 //!
 //! let engine = RealTimePropagationEngine::new(
-//!     observer.clone(),
+//!     observer,
 //!     push_manager,
 //!     config
 //! );

@@ -13,7 +13,8 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use opendr::change_observer::{ChangeObserver, ChangeObserverImpl, ChangeCallback};
+//! use async_trait::async_trait;
+//! use opendr::change_observer::{ChangeCallback, ChangeObserver, ChangeObserverImpl};
 //! use opendr::replication_provider_fsm::ChangelogEntry;
 //! use std::sync::Arc;
 //!
@@ -22,6 +23,7 @@
 //!
 //! // Register callback
 //! struct MyCallback;
+//! #[async_trait]
 //! impl ChangeCallback for MyCallback {
 //!     async fn on_change(&self, change: &ChangelogEntry) -> Result<(), String> {
 //!         println!("Change detected: {}", change.dn);
@@ -119,7 +121,7 @@ impl ChangeObserverImpl {
     ///
     /// # Example
     /// ```
-    /// use opendr::change_observer::ChangeObserverImpl;
+    /// use opendr::change_observer::{ChangeObserver, ChangeObserverImpl};
     ///
     /// let observer = ChangeObserverImpl::new();
     /// assert_eq!(observer.callback_count(), 0);

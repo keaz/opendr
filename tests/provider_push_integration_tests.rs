@@ -3,15 +3,17 @@
 //! This test suite validates Task 2.2: Integration with Provider FSM
 //! Testing refreshAndPersist mode support and push-based replication.
 
+use opendr::backend::{DirectoryBackend, MockBackend};
 use opendr::change_observer::ChangeObserverImpl;
-use opendr::provider_push_integration::{
-    CoordinatorStats, ProviderPushConfig, ProviderPushCoordinator,
-};
+use opendr::provider_push_integration::{ProviderPushConfig, ProviderPushCoordinator};
 use opendr::push_manager::{PushManager, PushManagerConfig};
 use opendr::replication_provider_fsm::{ConsumerConnection, SyncMode};
+use opendr::server;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 // ================================================================================================
@@ -22,7 +24,8 @@ async fn create_test_coordinator() -> ProviderPushCoordinator {
     let observer = Arc::new(ChangeObserverImpl::new());
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer, push_config)));
-    let config = ProviderPushConfig::default();
+    let mut config = ProviderPushConfig::default();
+    config.connect_on_registration = false;
     ProviderPushCoordinator::new(push_manager, config)
 }
 
@@ -30,11 +33,49 @@ async fn create_coordinator_with_config(config: ProviderPushConfig) -> ProviderP
     let observer = Arc::new(ChangeObserverImpl::new());
     let push_config = PushManagerConfig::default();
     let push_manager = Arc::new(RwLock::new(PushManager::new(observer, push_config)));
+    let mut config = config;
+    config.connect_on_registration = false;
     ProviderPushCoordinator::new(push_manager, config)
 }
 
 fn create_test_connection(address: String, sync_mode: SyncMode) -> ConsumerConnection {
     ConsumerConnection::with_sync_mode(address, sync_mode)
+}
+
+struct TestLdapServer {
+    url: String,
+    shutdown_tx: broadcast::Sender<()>,
+    handle: JoinHandle<()>,
+}
+
+impl TestLdapServer {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let backend: Arc<dyn DirectoryBackend> = Arc::new(MockBackend::new());
+        let bind_addr = addr.to_string();
+        let handle = tokio::spawn(async move {
+            if let Err(err) = server::run(&bind_addr, backend, shutdown_rx).await {
+                panic!("test LDAP server failed: {}", err);
+            }
+        });
+
+        sleep(Duration::from_millis(25)).await;
+
+        Self {
+            url: format!("ldap://{}", addr),
+            shutdown_tx,
+            handle,
+        }
+    }
+
+    async fn stop(self) {
+        let _ = self.shutdown_tx.send(());
+        self.handle.await.unwrap();
+    }
 }
 
 // ================================================================================================
@@ -99,13 +140,11 @@ async fn test_coordinator_multiple_start_stop_cycles() {
 async fn test_register_single_persistent_consumer() {
     println!("\n=== Test: Register Single Persistent Consumer ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     let consumer_id = "consumer-1".to_string();
-    let connection = create_test_connection(
-        "ldap://consumer1.example.com:389".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let connection = create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
     let result = coordinator
         .register_persistent_consumer(
@@ -133,21 +172,21 @@ async fn test_register_single_persistent_consumer() {
     println!("✅ Consumer registered successfully: {}", consumer_id);
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
 async fn test_register_multiple_persistent_consumers() {
     println!("\n=== Test: Register Multiple Persistent Consumers ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     let consumer_count = 5;
     for i in 1..=consumer_count {
         let consumer_id = format!("consumer-{}", i);
-        let connection = create_test_connection(
-            format!("ldap://consumer{}.example.com:389", i),
-            SyncMode::RefreshAndPersist,
-        );
+        let connection =
+            create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
         let result = coordinator
             .register_persistent_consumer(
@@ -182,19 +221,18 @@ async fn test_register_multiple_persistent_consumers() {
     );
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
 async fn test_register_consumer_with_filter() {
     println!("\n=== Test: Register Consumer with Filter ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     let consumer_id = "consumer-filtered".to_string();
-    let connection = create_test_connection(
-        "ldap://consumer.example.com:389".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let connection = create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
     let filter = Some("(objectClass=person)".to_string());
 
     let result = coordinator
@@ -216,19 +254,18 @@ async fn test_register_consumer_with_filter() {
     println!("✅ Consumer with filter registered successfully");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
 async fn test_unregister_persistent_consumer() {
     println!("\n=== Test: Unregister Persistent Consumer ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     let consumer_id = "consumer-1".to_string();
-    let connection = create_test_connection(
-        "ldap://consumer1.example.com:389".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let connection = create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
     // Register
     coordinator
@@ -263,6 +300,7 @@ async fn test_unregister_persistent_consumer() {
     println!("✅ Consumer unregistered successfully");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
@@ -295,15 +333,14 @@ async fn test_max_persistent_consumers_limit() {
     config.max_persistent_consumers = 3;
 
     let coordinator = create_coordinator_with_config(config).await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     // Register up to limit (should succeed)
     for i in 1..=3 {
         let consumer_id = format!("consumer-{}", i);
-        let connection = create_test_connection(
-            format!("ldap://consumer{}.example.com:389", i),
-            SyncMode::RefreshAndPersist,
-        );
+        let connection =
+            create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
         let result = coordinator
             .register_persistent_consumer(
@@ -321,10 +358,7 @@ async fn test_max_persistent_consumers_limit() {
 
     // Try to register beyond limit (should fail)
     let consumer_id = "consumer-4".to_string();
-    let connection = create_test_connection(
-        "ldap://consumer4.example.com:389".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let connection = create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
     let result = coordinator
         .register_persistent_consumer(
@@ -344,6 +378,7 @@ async fn test_max_persistent_consumers_limit() {
     println!("✅ Max consumer limit enforced correctly");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
@@ -356,17 +391,16 @@ async fn test_custom_configuration() {
         max_persistent_consumers: 50,
         enable_auto_cleanup: false,
         cleanup_interval: Duration::from_secs(120),
+        connect_on_registration: false,
     };
 
     let coordinator = create_coordinator_with_config(config.clone()).await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     // Register a consumer to verify config is used
     let consumer_id = "consumer-1".to_string();
-    let connection = create_test_connection(
-        "ldap://consumer1.example.com:389".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let connection = create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
     let result = coordinator
         .register_persistent_consumer(
@@ -383,6 +417,7 @@ async fn test_custom_configuration() {
     println!("✅ Custom configuration applied successfully");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 // ================================================================================================
@@ -393,13 +428,11 @@ async fn test_custom_configuration() {
 async fn test_update_consumer_cookie() {
     println!("\n=== Test: Update Consumer Cookie ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     let consumer_id = "consumer-1".to_string();
-    let connection = create_test_connection(
-        "ldap://consumer1.example.com:389".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let connection = create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
     let initial_cookie = "csn-20251008000000000000#001#000001#000000".to_string();
 
     // Register
@@ -434,6 +467,7 @@ async fn test_update_consumer_cookie() {
     println!("✅ Consumer cookie updated successfully");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
@@ -465,10 +499,11 @@ async fn test_update_cookie_for_nonexistent_consumer() {
 async fn test_get_consumer_info() {
     println!("\n=== Test: Get Consumer Info ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     let consumer_id = "consumer-1".to_string();
-    let address = "ldap://consumer1.example.com:389".to_string();
+    let address = test_server.url.clone();
     let connection = create_test_connection(address.clone(), SyncMode::RefreshAndPersist);
     let cookie = "csn-20251008000000000000#001#000001#000000".to_string();
 
@@ -497,22 +532,22 @@ async fn test_get_consumer_info() {
     println!("✅ Consumer info retrieved successfully");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
 async fn test_get_persistent_consumer_ids() {
     println!("\n=== Test: Get Persistent Consumer IDs ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     // Register multiple consumers
     let expected_ids: Vec<String> = (1..=3).map(|i| format!("consumer-{}", i)).collect();
 
     for id in &expected_ids {
-        let connection = create_test_connection(
-            format!("ldap://{}.example.com:389", id),
-            SyncMode::RefreshAndPersist,
-        );
+        let connection =
+            create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
         coordinator
             .register_persistent_consumer(
@@ -542,12 +577,14 @@ async fn test_get_persistent_consumer_ids() {
     println!("✅ All consumer IDs retrieved correctly");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
 async fn test_is_consumer_registered() {
     println!("\n=== Test: Is Consumer Registered ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     let consumer_id = "consumer-1".to_string();
@@ -557,10 +594,7 @@ async fn test_is_consumer_registered() {
     println!("  ✓ Consumer not registered initially");
 
     // Register
-    let connection = create_test_connection(
-        "ldap://consumer1.example.com:389".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let connection = create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
     coordinator
         .register_persistent_consumer(
@@ -590,6 +624,7 @@ async fn test_is_consumer_registered() {
     println!("✅ Consumer registration status tracked correctly");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 // ================================================================================================
@@ -600,6 +635,7 @@ async fn test_is_consumer_registered() {
 async fn test_coordinator_statistics_tracking() {
     println!("\n=== Test: Coordinator Statistics Tracking ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     // Initial stats
@@ -612,10 +648,8 @@ async fn test_coordinator_statistics_tracking() {
     // Register 3 consumers
     for i in 1..=3 {
         let consumer_id = format!("consumer-{}", i);
-        let connection = create_test_connection(
-            format!("ldap://consumer{}.example.com:389", i),
-            SyncMode::RefreshAndPersist,
-        );
+        let connection =
+            create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
         coordinator
             .register_persistent_consumer(
@@ -652,6 +686,7 @@ async fn test_coordinator_statistics_tracking() {
     println!("✅ Statistics tracked correctly throughout lifecycle");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 // ================================================================================================
@@ -662,13 +697,11 @@ async fn test_coordinator_statistics_tracking() {
 async fn test_full_registration_lifecycle() {
     println!("\n=== Test: Full Registration Lifecycle ===");
     let coordinator = create_test_coordinator().await;
+    let test_server = TestLdapServer::start().await;
     coordinator.start().await.unwrap();
 
     let consumer_id = "consumer-lifecycle".to_string();
-    let connection = create_test_connection(
-        "ldap://consumer.example.com:389".to_string(),
-        SyncMode::RefreshAndPersist,
-    );
+    let connection = create_test_connection(test_server.url.clone(), SyncMode::RefreshAndPersist);
 
     // 1. Register
     println!("  Step 1: Register consumer");
@@ -712,12 +745,15 @@ async fn test_full_registration_lifecycle() {
     println!("✅ Full lifecycle completed successfully");
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 #[tokio::test]
 async fn test_concurrent_consumer_operations() {
     println!("\n=== Test: Concurrent Consumer Operations ===");
     let coordinator = Arc::new(create_test_coordinator().await);
+    let test_server = TestLdapServer::start().await;
+    let consumer_url = test_server.url.clone();
     coordinator.start().await.unwrap();
 
     let consumer_count = 10;
@@ -726,12 +762,10 @@ async fn test_concurrent_consumer_operations() {
     // Spawn concurrent registration tasks
     for i in 1..=consumer_count {
         let coord = coordinator.clone();
+        let consumer_url = consumer_url.clone();
         let handle = tokio::spawn(async move {
             let consumer_id = format!("consumer-{}", i);
-            let connection = create_test_connection(
-                format!("ldap://consumer{}.example.com:389", i),
-                SyncMode::RefreshAndPersist,
-            );
+            let connection = create_test_connection(consumer_url, SyncMode::RefreshAndPersist);
 
             coord
                 .register_persistent_consumer(
@@ -760,6 +794,7 @@ async fn test_concurrent_consumer_operations() {
     println!("✅ {} concurrent registrations completed", consumer_count);
 
     coordinator.stop().await.unwrap();
+    test_server.stop().await;
 }
 
 // ================================================================================================

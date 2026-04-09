@@ -36,6 +36,46 @@ use crate::persistent_connection::PersistentConsumer;
 use crate::push_manager::PushManager;
 use crate::replication_provider_fsm::{ConsumerConnection, SyncMode};
 
+#[async_trait]
+trait PersistentConsumerFactory: Send + Sync {
+    async fn create(
+        &self,
+        consumer_id: String,
+        consumer_url: String,
+        base_dn: String,
+        filter: Option<String>,
+        heartbeat_interval: Duration,
+    ) -> Result<PersistentConsumer, String>;
+}
+
+struct DefaultPersistentConsumerFactory;
+
+#[async_trait]
+impl PersistentConsumerFactory for DefaultPersistentConsumerFactory {
+    async fn create(
+        &self,
+        consumer_id: String,
+        consumer_url: String,
+        base_dn: String,
+        filter: Option<String>,
+        heartbeat_interval: Duration,
+    ) -> Result<PersistentConsumer, String> {
+        if let Some(filter) = filter {
+            PersistentConsumer::with_filter(
+                consumer_id,
+                consumer_url,
+                base_dn,
+                filter,
+                vec!["*".to_string(), "+".to_string()],
+                heartbeat_interval,
+            )
+            .await
+        } else {
+            PersistentConsumer::new(consumer_id, consumer_url, base_dn, heartbeat_interval).await
+        }
+    }
+}
+
 /// Configuration for Provider-Push integration
 #[derive(Debug, Clone)]
 pub struct ProviderPushConfig {
@@ -53,6 +93,12 @@ pub struct ProviderPushConfig {
 
     /// Cleanup check interval
     pub cleanup_interval: Duration,
+
+    /// Establish the consumer network connection during registration.
+    ///
+    /// When disabled, registration stores the consumer immediately and the
+    /// first delivery attempt reconnects on demand.
+    pub connect_on_registration: bool,
 }
 
 impl Default for ProviderPushConfig {
@@ -63,6 +109,7 @@ impl Default for ProviderPushConfig {
             max_persistent_consumers: 100,
             enable_auto_cleanup: true,
             cleanup_interval: Duration::from_secs(60),
+            connect_on_registration: true,
         }
     }
 }
@@ -80,6 +127,9 @@ pub struct ProviderPushCoordinator {
 
     /// Statistics
     stats: Arc<RwLock<CoordinatorStats>>,
+
+    /// Factory for creating persistent consumer connections
+    consumer_factory: Arc<dyn PersistentConsumerFactory>,
 }
 
 /// Information about a persistent consumer
@@ -158,6 +208,22 @@ impl ProviderPushCoordinator {
             persistent_consumers: Arc::new(RwLock::new(HashMap::new())),
             config,
             stats: Arc::new(RwLock::new(CoordinatorStats::new())),
+            consumer_factory: Arc::new(DefaultPersistentConsumerFactory),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_consumer_factory(
+        push_manager: Arc<RwLock<PushManager>>,
+        config: ProviderPushConfig,
+        consumer_factory: Arc<dyn PersistentConsumerFactory>,
+    ) -> Self {
+        Self {
+            push_manager,
+            persistent_consumers: Arc::new(RwLock::new(HashMap::new())),
+            config,
+            stats: Arc::new(RwLock::new(CoordinatorStats::new())),
+            consumer_factory,
         }
     }
 
@@ -247,13 +313,33 @@ impl ProviderPushCoordinator {
         }
 
         // Create persistent consumer connection
-        let persistent_consumer = PersistentConsumer::new(
-            consumer_id.clone(),
-            connection.address.clone(),
-            base_dn,
-            self.config.heartbeat_interval,
-        )
-        .await?;
+        let persistent_consumer = if self.config.connect_on_registration {
+            self.consumer_factory
+                .create(
+                    consumer_id.clone(),
+                    connection.address.clone(),
+                    base_dn.clone(),
+                    filter.clone(),
+                    self.config.heartbeat_interval,
+                )
+                .await?
+        } else if let Some(filter) = filter.clone() {
+            PersistentConsumer::with_filter_lazy(
+                consumer_id.clone(),
+                connection.address.clone(),
+                base_dn,
+                filter,
+                vec!["*".to_string(), "+".to_string()],
+                self.config.heartbeat_interval,
+            )
+        } else {
+            PersistentConsumer::new_lazy(
+                consumer_id.clone(),
+                connection.address.clone(),
+                base_dn,
+                self.config.heartbeat_interval,
+            )
+        };
 
         // Register with push manager first (push_manager takes ownership)
         let mut push_manager = self.push_manager.write().await;
@@ -534,6 +620,7 @@ impl Clone for ProviderPushCoordinator {
             persistent_consumers: self.persistent_consumers.clone(),
             config: self.config.clone(),
             stats: self.stats.clone(),
+            consumer_factory: self.consumer_factory.clone(),
         }
     }
 }
@@ -603,14 +690,40 @@ impl<T: ReplicationProviderFsm> ProviderFsmPushExtension for T {}
 mod tests {
     use super::*;
     use crate::change_observer::ChangeObserverImpl;
+    use crate::persistent_connection::PersistentConsumer;
     use crate::push_manager::PushManagerConfig;
+
+    struct TestPersistentConsumerFactory;
+
+    #[async_trait]
+    impl PersistentConsumerFactory for TestPersistentConsumerFactory {
+        async fn create(
+            &self,
+            consumer_id: String,
+            consumer_url: String,
+            base_dn: String,
+            _filter: Option<String>,
+            heartbeat_interval: Duration,
+        ) -> Result<PersistentConsumer, String> {
+            Ok(PersistentConsumer::new_disconnected_for_test(
+                consumer_id,
+                consumer_url,
+                base_dn,
+                heartbeat_interval,
+            ))
+        }
+    }
 
     async fn create_test_coordinator() -> ProviderPushCoordinator {
         let observer = Arc::new(ChangeObserverImpl::new());
         let push_config = PushManagerConfig::default();
         let push_manager = Arc::new(RwLock::new(PushManager::new(observer, push_config)));
         let config = ProviderPushConfig::default();
-        ProviderPushCoordinator::new(push_manager, config)
+        ProviderPushCoordinator::with_consumer_factory(
+            push_manager,
+            config,
+            Arc::new(TestPersistentConsumerFactory),
+        )
     }
 
     fn create_test_connection(address: String, sync_mode: SyncMode) -> ConsumerConnection {
@@ -830,7 +943,11 @@ mod tests {
         let mut config = ProviderPushConfig::default();
         config.max_persistent_consumers = 2; // Set limit to 2
 
-        let coordinator = ProviderPushCoordinator::new(push_manager, config);
+        let coordinator = ProviderPushCoordinator::with_consumer_factory(
+            push_manager,
+            config,
+            Arc::new(TestPersistentConsumerFactory),
+        );
         coordinator.start().await.unwrap();
 
         // Register 2 consumers (should succeed)

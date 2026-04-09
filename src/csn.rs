@@ -7,7 +7,7 @@
 //! # CSN Format
 //!
 //! A CSN consists of four components:
-//! - **Timestamp**: Time when the change occurred (YYYYMMDDHHMMSSµs format)
+//! - **Timestamp**: Microseconds since the UNIX epoch
 //! - **Replica ID**: Unique identifier for the server that made the change
 //! - **Sequence Number**: Monotonically increasing counter within the same microsecond
 //! - **Modification Number**: Sub-modification counter for complex operations
@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! CSN Format: <timestamp>#<replica-id>#<sequence>#<mod-number>
-//! Example: 20251007123456789012#001#000001#000000
+//! Example: 1696680896789012#001#000001#000000
 //! ```
 //!
 //! # RFC 4533 Compliance
@@ -82,12 +82,7 @@ impl Csn {
     ///
     /// # Returns
     /// * New CSN with specified values
-    pub fn with_values(
-        timestamp_us: u64,
-        replica_id: u16,
-        sequence: u32,
-        mod_number: u16,
-    ) -> Self {
+    pub fn with_values(timestamp_us: u64, replica_id: u16, sequence: u32, mod_number: u16) -> Self {
         Self {
             timestamp_us,
             replica_id,
@@ -120,7 +115,7 @@ impl Csn {
     ///
     /// ```
     /// use opendr::csn::Csn;
-    /// let csn = Csn::parse("20251007123456789012#001#000001#000000").unwrap();
+    /// let csn = Csn::parse("1696680896789012#001#000001#000000").unwrap();
     /// assert_eq!(csn.replica_id(), 1);
     /// assert_eq!(csn.sequence(), 1);
     /// ```
@@ -292,7 +287,10 @@ impl CsnGenerator {
                 Err(_) => {
                     // Another thread updated the timestamp, increment sequence
                     let seq = self.sequence_counter.fetch_add(1, AtomicOrdering::AcqRel);
-                    let use_ts = self.last_timestamp_us.load(AtomicOrdering::Acquire).max(current_ts);
+                    let use_ts = self
+                        .last_timestamp_us
+                        .load(AtomicOrdering::Acquire)
+                        .max(current_ts);
                     Csn::with_values(use_ts, self.replica_id, seq as u32, 0)
                 }
             }
@@ -455,7 +453,9 @@ mod tests {
             assert!(
                 csns[i] > csns[i - 1],
                 "CSN at index {} ({}) should be greater than previous ({})",
-                i, csns[i], csns[i - 1]
+                i,
+                csns[i],
+                csns[i - 1]
             );
         }
     }

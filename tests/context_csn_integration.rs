@@ -76,9 +76,9 @@ async fn test_context_csn_with_generator() {
     // Generate some CSNs
     let csn1 = generator.generate();
     backend.set_context_csn(csn1.clone()).await.unwrap();
-    
+
     std::thread::sleep(std::time::Duration::from_millis(1));
-    
+
     let csn2 = generator.generate();
     backend.set_context_csn(csn2.clone()).await.unwrap();
 
@@ -86,7 +86,7 @@ async fn test_context_csn_with_generator() {
     let retrieved = backend.get_context_csn().await.unwrap();
     assert!(retrieved.is_some());
     let retrieved_csn = retrieved.unwrap();
-    
+
     // Should be csn2 (the later one)
     assert_eq!(retrieved_csn, csn2);
     assert!(retrieved_csn > csn1);
@@ -126,16 +126,16 @@ async fn test_context_csn_with_concurrent_updates() {
     for i in 0..10 {
         let backend_clone = backend.clone();
         let generator_clone = generator.clone();
-        
+
         let handle = tokio::spawn(async move {
             // Small delay to spread out updates
             tokio::time::sleep(tokio::time::Duration::from_micros(i * 10)).await;
-            
+
             let csn = generator_clone.generate();
             backend_clone.set_context_csn(csn.clone()).await.unwrap();
             csn
         });
-        
+
         handles.push(handle);
     }
 
@@ -151,7 +151,7 @@ async fn test_context_csn_with_concurrent_updates() {
     // Final contextCSN should be one of the generated CSNs
     let final_csn = backend.get_context_csn().await.unwrap();
     assert!(final_csn.is_some());
-    
+
     // Final CSN should be less than or equal to max
     assert!(final_csn.unwrap() <= *max_csn);
 }
@@ -200,13 +200,13 @@ async fn test_context_csn_empty_database() {
     let dir = tempdir().unwrap();
     let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
 
-    // Add some entries but don't set contextCSN
+    // Adding an entry should advance contextCSN automatically.
     let mut attributes = HashMap::new();
     attributes.insert("cn".to_string(), vec!["test".to_string()]);
     let entry = DirectoryEntry::new("cn=test,dc=example,dc=org", attributes);
     backend.add_entry(entry, vec![]).await.unwrap();
 
-    // contextCSN should still be None (not automatically set yet)
+    // contextCSN should now reflect the write.
     let csn = backend.get_context_csn().await.unwrap();
-    assert!(csn.is_none());
+    assert!(csn.is_some());
 }

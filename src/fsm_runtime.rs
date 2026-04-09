@@ -21,18 +21,89 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+use async_trait::async_trait;
 use tokio::net::TcpStream;
 
-use crate::backend::DirectoryBackend;
-use crate::auth_fsm::AuthFsmImpl;
+use crate::auth_fsm::{AuthFsmImpl, AuthUserInfo, AuthenticationBackend};
+use crate::backend::{DirectoryBackend, DirectoryEntry};
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
+use crate::compare_fsm::CompareFsmImpl;
 use crate::connection_fsm::{ConnectionFsmImpl, TlsHandler};
+use crate::extended_op_fsm::ExtendedOpFsmImpl;
+use crate::fsm::{AuthState, SaslFsm, StateMachine, TimeoutFsm};
 use crate::sasl_fsm::SaslFsmImpl;
 use crate::search_fsm::SearchFsmImpl;
-use crate::write_fsm::{WriteFsmImpl, SchemaValidator};
-use crate::compare_fsm::CompareFsmImpl;
-use crate::extended_op_fsm::ExtendedOpFsmImpl;
-use crate::fsm::{StateMachine, AuthState, SaslFsm, TimeoutFsm};
+use crate::write_fsm::{SchemaValidator, WriteFsmImpl};
+
+struct DirectoryAuthenticationBackend {
+    backend: Arc<dyn DirectoryBackend>,
+}
+
+impl DirectoryAuthenticationBackend {
+    fn new(backend: Arc<dyn DirectoryBackend>) -> Self {
+        Self { backend }
+    }
+}
+
+fn first_attribute_value(entry: &DirectoryEntry, attribute: &str) -> Option<String> {
+    entry
+        .attributes
+        .get(attribute)
+        .and_then(|values| values.first())
+        .cloned()
+}
+
+#[async_trait]
+impl AuthenticationBackend for DirectoryAuthenticationBackend {
+    async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, String> {
+        self.backend
+            .authenticate(dn, password)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn dn_exists(&self, dn: &str) -> Result<bool, String> {
+        self.backend
+            .get_entry(dn)
+            .await
+            .map(|entry| entry.is_some())
+            .map_err(|e| e.to_string())
+    }
+
+    fn validate_dn(&self, dn: &str) -> Result<(), String> {
+        let normalized = dn.trim();
+        if normalized.is_empty() {
+            return Err("DN must not be empty".to_string());
+        }
+        if !normalized.contains('=') {
+            return Err(format!("Invalid DN format: {normalized}"));
+        }
+        Ok(())
+    }
+
+    async fn get_user_info(&self, dn: &str) -> Result<AuthUserInfo, String> {
+        let entry = self
+            .backend
+            .get_entry(dn)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("DN not found: {dn}"))?;
+
+        Ok(AuthUserInfo {
+            dn: entry.dn.clone(),
+            display_name: first_attribute_value(&entry, "displayname")
+                .or_else(|| first_attribute_value(&entry, "cn")),
+            email: first_attribute_value(&entry, "mail"),
+            groups: entry
+                .attributes
+                .get("memberof")
+                .cloned()
+                .unwrap_or_default(),
+            last_login: Some(Instant::now()),
+        })
+    }
+}
 
 /// Represents the authentication FSM, which can be either Simple or SASL
 pub enum AuthenticationFsm {
@@ -46,12 +117,10 @@ impl AuthenticationFsm {
     /// Get the authenticated DN if the user is authenticated
     pub fn authenticated_dn(&self) -> Option<&str> {
         match self {
-            AuthenticationFsm::Simple(auth) => {
-                match auth.current_state() {
-                    AuthState::SimpleBound { dn } => Some(dn.as_str()),
-                    _ => None,
-                }
-            }
+            AuthenticationFsm::Simple(auth) => match auth.current_state() {
+                AuthState::SimpleBound { dn } => Some(dn.as_str()),
+                _ => None,
+            },
             AuthenticationFsm::Sasl(sasl) => sasl.authenticated_identity(),
         }
     }
@@ -192,7 +261,9 @@ impl ConnectionFsmSet {
         let decoder = BerDecoderFsmImpl::new();
 
         // Start with simple authentication (anonymous)
-        let auth = AuthenticationFsm::Simple(AuthFsmImpl::new());
+        let auth = AuthenticationFsm::Simple(AuthFsmImpl::new().with_backend(Box::new(
+            DirectoryAuthenticationBackend::new(backend.clone()),
+        )));
 
         // Use provided schema validator or create default one
         let schema_validator = schema_validator.unwrap_or_else(|| {
@@ -368,7 +439,10 @@ impl ConnectionFsmSet {
     ///
     /// # Returns
     /// Number of operations that were removed due to timeout
-    pub fn cleanup_timed_out_operations(&mut self, max_operation_age: std::time::Duration) -> usize {
+    pub fn cleanup_timed_out_operations(
+        &mut self,
+        max_operation_age: std::time::Duration,
+    ) -> usize {
         let now = Instant::now();
         let timed_out_ids: Vec<i32> = self
             .operation_info
@@ -415,6 +489,8 @@ impl ConnectionFsmSet {
 mod tests {
     use super::*;
     use crate::backend::MockBackend;
+    use crate::fsm::AuthEvent;
+    use crate::fsm::StateMachine;
 
     #[test]
     fn test_authentication_fsm_anonymous() {
@@ -481,11 +557,52 @@ mod tests {
         let fsm_set = ConnectionFsmSet::new(stream, backend, None);
 
         // Verify backend access
-        assert!(fsm_set.backend().authenticate("cn=admin,dc=example,dc=org", b"secret").await.unwrap());
+        assert!(fsm_set
+            .backend()
+            .authenticate("cn=admin,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
 
         // Verify connection and decoder FSMs are accessible
         assert!(!fsm_set.connection().is_terminal());
         assert!(!fsm_set.decoder().is_terminal());
+    }
+
+    #[tokio::test]
+    async fn test_connection_fsm_set_simple_bind_uses_directory_backend() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let backend = Arc::new(MockBackend::default());
+        let mut fsm_set = ConnectionFsmSet::new(stream, backend, None);
+
+        match fsm_set.auth_mut() {
+            AuthenticationFsm::Simple(auth) => {
+                let result = auth
+                    .handle_event(AuthEvent::BindRequest {
+                        dn: "cn=admin,dc=example,dc=org".to_string(),
+                        password: b"secret".to_vec(),
+                    })
+                    .await
+                    .unwrap();
+
+                assert!(result.is_some());
+            }
+            AuthenticationFsm::Sasl(_) => panic!("expected simple auth FSM"),
+        }
+
+        assert!(fsm_set.is_authenticated());
+        assert_eq!(
+            fsm_set.authenticated_dn(),
+            Some("cn=admin,dc=example,dc=org")
+        );
     }
 
     #[test]
@@ -499,17 +616,23 @@ mod tests {
         let old_time = now - Duration::from_secs(120); // 2 minutes ago
         let recent_time = now - Duration::from_secs(30); // 30 seconds ago
 
-        info_map.insert(1, OperationInfo {
-            message_id: 1,
-            created_at: old_time,
-            operation_type: OperationType::Search,
-        });
+        info_map.insert(
+            1,
+            OperationInfo {
+                message_id: 1,
+                created_at: old_time,
+                operation_type: OperationType::Search,
+            },
+        );
 
-        info_map.insert(2, OperationInfo {
-            message_id: 2,
-            created_at: recent_time,
-            operation_type: OperationType::Search,
-        });
+        info_map.insert(
+            2,
+            OperationInfo {
+                message_id: 2,
+                created_at: recent_time,
+                operation_type: OperationType::Search,
+            },
+        );
 
         // Test that old operations are identified for cleanup
         let max_age = Duration::from_secs(60);

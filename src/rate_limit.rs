@@ -158,11 +158,11 @@ impl Default for RateLimitConfig {
             burst_size: 50,
             window_duration: Duration::from_secs(1),
             adaptive_enabled: true,
-            adaptive_threshold: 0.8, // 80% of global limit
+            adaptive_threshold: 0.8,  // 80% of global limit
             adaptive_multiplier: 0.5, // Reduce limits to 50%
             blacklist: Vec::new(),
             whitelist: Vec::new(),
-            auto_ban_threshold: 100, // 100 violations
+            auto_ban_threshold: 100,                     // 100 violations
             auto_ban_duration: Duration::from_secs(300), // 5 minutes
         }
     }
@@ -234,7 +234,8 @@ impl ClientState {
     /// Clean old requests outside the window
     fn clean_old_requests(&mut self, window: Duration) {
         let now = Instant::now();
-        self.requests.retain(|req| now.duration_since(req.timestamp) < window);
+        self.requests
+            .retain(|req| now.duration_since(req.timestamp) < window);
     }
 
     /// Add a request
@@ -259,9 +260,7 @@ impl ClientState {
         let now = Instant::now();
         self.requests
             .iter()
-            .filter(|req| {
-                req.operation == operation && now.duration_since(req.timestamp) < window
-            })
+            .filter(|req| req.operation == operation && now.duration_since(req.timestamp) < window)
             .count()
     }
 }
@@ -333,11 +332,7 @@ impl RateLimiter {
             None => return true, // Unknown operation type - allow
         };
 
-        // Update statistics
-        {
-            let mut stats = self.stats.write().await;
-            stats.total_requests += 1;
-        }
+        self.record_total_request().await;
 
         // Check whitelist
         let config = self.config.read().await;
@@ -355,7 +350,9 @@ impl RateLimiter {
 
         // Get or create client state
         let mut clients = self.clients.write().await;
-        let client = clients.entry(client_ip).or_insert_with(|| ClientState::new(client_ip));
+        let client = clients
+            .entry(client_ip)
+            .or_insert_with(|| ClientState::new(client_ip));
 
         // Check if client is banned
         if client.is_banned() {
@@ -377,7 +374,8 @@ impl RateLimiter {
 
         // Check per-client rate limit
         let current_multiplier = *self.adaptive_multiplier.read().await;
-        let adjusted_limit = (config.per_client_requests_per_second as f64 * current_multiplier) as u32;
+        let adjusted_limit =
+            (config.per_client_requests_per_second as f64 * current_multiplier) as u32;
 
         if client.count_requests(config.window_duration) >= adjusted_limit as usize {
             client.record_violation();
@@ -389,7 +387,9 @@ impl RateLimiter {
         // Check operation-specific limit
         if let Some(&op_limit) = config.operation_limits.get(&op) {
             let adjusted_op_limit = (op_limit as f64 * current_multiplier) as u32;
-            if client.count_operation_requests(op, config.window_duration) >= adjusted_op_limit as usize {
+            if client.count_operation_requests(op, config.window_duration)
+                >= adjusted_op_limit as usize
+            {
                 client.record_violation();
                 self.check_auto_ban(client, &config).await;
                 self.record_blocked().await;
@@ -400,9 +400,11 @@ impl RateLimiter {
         // Record the request
         client.add_request(op);
 
-        // Record global request
-        let mut global = self.global_requests.write().await;
-        global.push(Instant::now());
+        // Record the accepted request before recomputing adaptive limits.
+        {
+            let mut global = self.global_requests.write().await;
+            global.push(Instant::now());
+        }
 
         // Update adaptive limiting
         if config.adaptive_enabled {
@@ -435,7 +437,8 @@ impl RateLimiter {
             .filter(|&&ts| now.duration_since(ts) < config.window_duration)
             .count();
 
-        let threshold = (config.global_requests_per_second as f64 * config.adaptive_threshold) as usize;
+        let threshold =
+            (config.global_requests_per_second as f64 * config.adaptive_threshold) as usize;
 
         let mut multiplier = self.adaptive_multiplier.write().await;
         let mut stats = self.stats.write().await;
@@ -455,12 +458,18 @@ impl RateLimiter {
 
     /// Check if client should be auto-banned
     async fn check_auto_ban(&self, client: &mut ClientState, config: &RateLimitConfig) {
-        if client.violations >= config.auto_ban_threshold {
+        if client.violations >= config.auto_ban_threshold && !client.is_banned() {
             client.ban(config.auto_ban_duration);
 
             let mut stats = self.stats.write().await;
             stats.banned_clients += 1;
         }
+    }
+
+    /// Record a seen request before classification.
+    async fn record_total_request(&self) {
+        let mut stats = self.stats.write().await;
+        stats.total_requests += 1;
     }
 
     /// Record an allowed request
@@ -507,20 +516,26 @@ impl RateLimiter {
     pub async fn ban_client(&self, ip: IpAddr, duration: Duration) {
         let mut clients = self.clients.write().await;
         let client = clients.entry(ip).or_insert_with(|| ClientState::new(ip));
+        let was_banned = client.is_banned();
         client.ban(duration);
 
-        let mut stats = self.stats.write().await;
-        stats.banned_clients += 1;
+        if !was_banned {
+            let mut stats = self.stats.write().await;
+            stats.banned_clients += 1;
+        }
     }
 
     /// Manually unban a client
     pub async fn unban_client(&self, ip: IpAddr) {
         let mut clients = self.clients.write().await;
         if let Some(client) = clients.get_mut(&ip) {
+            let was_banned = client.is_banned();
             client.unban();
 
-            let mut stats = self.stats.write().await;
-            stats.banned_clients = stats.banned_clients.saturating_sub(1);
+            if was_banned {
+                let mut stats = self.stats.write().await;
+                stats.banned_clients = stats.banned_clients.saturating_sub(1);
+            }
         }
     }
 
@@ -580,11 +595,6 @@ mod tests {
     use super::*;
     use tokio::time::sleep;
 
-    // NOTE: Rate limit tests are currently slow due to sleep() calls and potential lock contention.
-    // To run these tests, use: cargo test --lib rate_limit::tests -- --ignored --test-threads=1
-    // TODO: Refactor to use tokio::time::pause() and advance() for faster, deterministic time testing
-
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_basic_rate_limit() {
         let config = RateLimitConfig {
@@ -611,7 +621,6 @@ mod tests {
         assert!(limiter.check_rate_limit(client_ip, "search").await);
     }
 
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_operation_specific_limit() {
         let mut operation_limits = HashMap::new();
@@ -638,7 +647,6 @@ mod tests {
         assert!(limiter.check_rate_limit(client_ip, "search").await);
     }
 
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_whitelist() {
         let config = RateLimitConfig {
@@ -661,7 +669,6 @@ mod tests {
         assert!(!limiter.check_rate_limit(normal_ip, "search").await);
     }
 
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_blacklist() {
         let config = RateLimitConfig {
@@ -676,7 +683,6 @@ mod tests {
         assert!(!limiter.check_rate_limit(blacklisted_ip, "search").await);
     }
 
-    #[ignore = "Slow test with sleep() - run with --ignored"]
     #[tokio::test]
     async fn test_auto_ban() {
         let config = RateLimitConfig {
@@ -714,7 +720,6 @@ mod tests {
         assert!(limiter.check_rate_limit(client_ip, "search").await);
     }
 
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_manual_ban_unban() {
         let limiter = RateLimiter::new(RateLimitConfig::default());
@@ -733,7 +738,6 @@ mod tests {
         assert!(limiter.check_rate_limit(client_ip, "search").await);
     }
 
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_statistics() {
         let limiter = RateLimiter::new(RateLimitConfig::default());
@@ -749,7 +753,6 @@ mod tests {
         assert_eq!(stats.requests_blocked, 0);
     }
 
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_global_rate_limit() {
         let config = RateLimitConfig {
@@ -775,14 +778,13 @@ mod tests {
         assert!(allowed <= 11); // Allow some tolerance
     }
 
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_adaptive_rate_limiting() {
         let config = RateLimitConfig {
             global_requests_per_second: 10,
             per_client_requests_per_second: 10,
             adaptive_enabled: true,
-            adaptive_threshold: 0.5, // 50%
+            adaptive_threshold: 0.5,  // 50%
             adaptive_multiplier: 0.5, // Reduce to 50%
             ..Default::default()
         };
@@ -800,15 +802,55 @@ mod tests {
         assert_eq!(stats.current_multiplier, 0.5);
     }
 
-    #[ignore = "Hangs due to lock contention - see docs/TEST_FAILURE_ANALYSIS.md"]
     #[tokio::test]
     async fn test_operation_type_conversion() {
         assert_eq!(OperationType::from_str("bind"), Some(OperationType::Bind));
-        assert_eq!(OperationType::from_str("SEARCH"), Some(OperationType::Search));
-        assert_eq!(OperationType::from_str("ModifyDN"), Some(OperationType::ModifyDN));
+        assert_eq!(
+            OperationType::from_str("SEARCH"),
+            Some(OperationType::Search)
+        );
+        assert_eq!(
+            OperationType::from_str("ModifyDN"),
+            Some(OperationType::ModifyDN)
+        );
         assert_eq!(OperationType::from_str("invalid"), None);
 
         assert_eq!(OperationType::Bind.as_str(), "bind");
         assert_eq!(OperationType::Search.as_str(), "search");
+    }
+
+    #[tokio::test]
+    async fn test_adaptive_enabled_request_path_does_not_deadlock() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            adaptive_enabled: true,
+            ..Default::default()
+        });
+        let client_ip: IpAddr = "192.168.1.100".parse().unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            limiter.check_rate_limit(client_ip, "search"),
+        )
+        .await;
+
+        assert_eq!(result, Ok(true));
+    }
+
+    #[tokio::test]
+    async fn test_manual_ban_is_idempotent_for_banned_stats() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+        let client_ip: IpAddr = "192.168.1.100".parse().unwrap();
+
+        limiter.ban_client(client_ip, Duration::from_secs(10)).await;
+        limiter.ban_client(client_ip, Duration::from_secs(10)).await;
+
+        let stats = limiter.get_stats().await;
+        assert_eq!(stats.banned_clients, 1);
+
+        limiter.unban_client(client_ip).await;
+        limiter.unban_client(client_ip).await;
+
+        let stats = limiter.get_stats().await;
+        assert_eq!(stats.banned_clients, 0);
     }
 }

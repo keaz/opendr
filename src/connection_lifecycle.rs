@@ -47,6 +47,9 @@
 //!     reconnect_max_delay: Duration::from_secs(60),
 //!     max_reconnect_attempts: 5,
 //!     enable_exponential_backoff: true,
+//!     backoff_multiplier: 2.0,
+//!     enable_jitter: true,
+//!     max_jitter_percent: 0.25,
 //! };
 //!
 //! // Create lifecycle manager

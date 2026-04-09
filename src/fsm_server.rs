@@ -23,18 +23,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ldap_parser::ldap::{ProtocolOp, LdapMessage};
+use ldap_parser::ldap::{LdapMessage, ProtocolOp};
 use ldap_parser::parse_ldap_messages;
-use log::{error, info, warn, debug};
+use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
 use crate::backend::DirectoryBackend;
 use crate::connection_pool::{ConnectionPool, ResourceLimits};
-use crate::fsm_runtime::{ConnectionFsmSet, OperationFsm, OperationType};
-use crate::fsm::{StateMachine, BerDecoderEvent, ConnectionEvent, ConnectionFsm, BerDecoderFsm};
-use crate::rate_limit::{RateLimiter, RateLimitConfig};
+use crate::fsm::{BerDecoderEvent, ConnectionEvent, ConnectionFsm, StateMachine};
+use crate::fsm_runtime::ConnectionFsmSet;
+use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::server::ServerError;
 use crate::shutdown::ShutdownCoordinator;
 
@@ -269,8 +269,9 @@ async fn send_connection_rejected(mut socket: TcpStream) -> Result<(), std::io::
         ResponseOp::SearchDone,
         ResultCode::Unavailable,
         "",
-        "Server resource limits exceeded"
-    ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+        "Server resource limits exceeded",
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
 
     socket.write_all(&response).await?;
     socket.shutdown().await?;
@@ -288,8 +289,9 @@ async fn send_shutdown_in_progress(mut socket: TcpStream) -> Result<(), std::io:
         ResponseOp::SearchDone,
         ResultCode::Unavailable,
         "",
-        "Server is shutting down"
-    ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+        "Server is shutting down",
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
 
     socket.write_all(&response).await?;
     socket.shutdown().await?;
@@ -338,17 +340,13 @@ async fn handle_connection(
         }
 
         // Read from socket
-        let stream = fsm_set.connection_mut().stream_mut()
-            .ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No active stream"
-            ))?;
+        let stream = fsm_set.connection_mut().stream_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "No active stream")
+        })?;
 
         // Try to read with a timeout so we can periodically clean up
-        let read_result = tokio::time::timeout(
-            cleanup_interval,
-            stream.read(&mut read_buffer)
-        ).await;
+        let read_result =
+            tokio::time::timeout(cleanup_interval, stream.read(&mut read_buffer)).await;
 
         match read_result {
             Ok(Ok(0)) => {
@@ -367,18 +365,25 @@ async fn handle_connection(
                 // Track memory usage for received data
                 pool.update_memory_usage(conn_id, data.len() as isize).await;
 
-                // Feed data to BER decoder FSM
-                let decoder_event = BerDecoderEvent::DataReceived(data.to_vec());
-                if let Err(e) = fsm_set.decoder_mut().handle_event(decoder_event).await {
-                    error!("BER decoder error: {}", e);
-                    break;
-                }
+                // Feed data to the decoder and drain every complete frame already present in its
+                // internal buffer so coalesced reads are processed exactly once.
+                let decoded_messages =
+                    match decode_ready_messages(&mut fsm_set, data.to_vec()).await {
+                        Ok(messages) => messages,
+                        Err(e) => {
+                            error!("BER decoder error: {}", e);
+                            pool.update_memory_usage(conn_id, -(data.len() as isize))
+                                .await;
+                            break;
+                        }
+                    };
 
-                // Extract complete messages from decoder
-                while let Some(message_bytes) = fsm_set.decoder_mut().extract_message() {
-                    // Release memory for the raw buffer
-                    pool.update_memory_usage(conn_id, -(data.len() as isize)).await;
+                // Release the temporary read-buffer accounting after the decoder has consumed the
+                // received bytes into its own state.
+                pool.update_memory_usage(conn_id, -(data.len() as isize))
+                    .await;
 
+                for message_bytes in decoded_messages {
                     // Parse LDAP message
                     match parse_ldap_messages(&message_bytes) {
                         Ok((_, messages)) => {
@@ -391,7 +396,9 @@ async fn handle_connection(
                                     conn_id,
                                     &rate_limiter,
                                     client_ip,
-                                ).await {
+                                )
+                                .await
+                                {
                                     error!("Failed to process LDAP message: {}", e);
                                     // Don't break, try to continue with next message
                                 }
@@ -419,6 +426,23 @@ async fn handle_connection(
     Ok(())
 }
 
+async fn decode_ready_messages(
+    fsm_set: &mut ConnectionFsmSet,
+    initial_data: Vec<u8>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut messages = Vec::new();
+    let mut next_chunk = Some(initial_data);
+
+    loop {
+        let decoder_event = BerDecoderEvent::DataReceived(next_chunk.take().unwrap_or_default());
+        match fsm_set.decoder_mut().handle_event(decoder_event).await {
+            Ok(Some(message)) => messages.push(message),
+            Ok(None) => return Ok(messages),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
 /// Process a parsed LDAP message using FSM architecture
 async fn process_ldap_message(
     fsm_set: &mut ConnectionFsmSet,
@@ -431,7 +455,10 @@ async fn process_ldap_message(
 ) -> Result<(), String> {
     let message_id = message.message_id.0 as i32;
 
-    debug!("Processing LDAP message ID {} type {:?}", message_id, message.protocol_op);
+    debug!(
+        "Processing LDAP message ID {} type {:?}",
+        message_id, message.protocol_op
+    );
 
     // Determine operation type for rate limiting
     let operation_type = match &message.protocol_op {
@@ -466,8 +493,11 @@ async fn process_ldap_message(
         ProtocolOp::UnbindRequest => {
             info!("Received unbind request");
             // Trigger connection close
-            if let Err(e) = fsm_set.connection_mut()
-                .handle_event(ConnectionEvent::Close).await {
+            if let Err(e) = fsm_set
+                .connection_mut()
+                .handle_event(ConnectionEvent::Close)
+                .await
+            {
                 warn!("Error closing connection: {}", e);
             }
         }
@@ -583,9 +613,9 @@ async fn handle_bind_with_fsm(
     message_id: i32,
     bind_req: ldap_parser::ldap::BindRequest<'_>,
 ) -> Result<(), String> {
-    use ldap_parser::ldap::AuthenticationChoice;
     use crate::fsm::{AuthEvent, StateMachine};
     use crate::fsm_runtime::AuthenticationFsm;
+    use ldap_parser::ldap::AuthenticationChoice;
 
     // Check LDAP version
     if bind_req.version != 3 {
@@ -612,12 +642,14 @@ async fn handle_bind_with_fsm(
                             if fsm_set.is_authenticated() {
                                 send_bind_success(fsm_set, message_id as u32).await?;
                             } else {
-                                send_bind_error(fsm_set, message_id as u32, "invalid credentials").await?;
+                                send_bind_error(fsm_set, message_id as u32, "invalid credentials")
+                                    .await?;
                             }
                         }
                         Err(e) => {
                             error!("Auth FSM error: {}", e);
-                            send_bind_error(fsm_set, message_id as u32, "authentication failed").await?;
+                            send_bind_error(fsm_set, message_id as u32, "authentication failed")
+                                .await?;
                         }
                     }
                 }
@@ -642,10 +674,14 @@ async fn send_bind_success(fsm_set: &mut ConnectionFsmSet, message_id: u32) -> R
     let response = encode_bind_response(message_id, ResultCode::Success, "", "")
         .map_err(|e| format!("Encode error: {:?}", e))?;
 
-    let stream = fsm_set.connection_mut().stream_mut()
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
         .ok_or("No active stream")?;
 
-    stream.write_all(&response).await
+    stream
+        .write_all(&response)
+        .await
         .map_err(|e| format!("Write error: {}", e))?;
 
     Ok(())
@@ -660,17 +696,17 @@ async fn send_bind_error(
     use crate::parser::encode_bind_response;
     use rasn_ldap::ResultCode;
 
-    let response = encode_bind_response(
-        message_id,
-        ResultCode::InvalidCredentials,
-        "",
-        diagnostic
-    ).map_err(|e| format!("Encode error: {:?}", e))?;
+    let response = encode_bind_response(message_id, ResultCode::InvalidCredentials, "", diagnostic)
+        .map_err(|e| format!("Encode error: {:?}", e))?;
 
-    let stream = fsm_set.connection_mut().stream_mut()
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
         .ok_or("No active stream")?;
 
-    stream.write_all(&response).await
+    stream
+        .write_all(&response)
+        .await
         .map_err(|e| format!("Write error: {}", e))?;
 
     Ok(())
@@ -692,13 +728,18 @@ async fn send_not_implemented_response(
         ResponseOp::SearchDone, // Generic response type
         ResultCode::Other,
         "",
-        "FSM operation handler not yet implemented"
-    ).map_err(|e| format!("Encode error: {:?}", e))?;
+        "FSM operation handler not yet implemented",
+    )
+    .map_err(|e| format!("Encode error: {:?}", e))?;
 
-    let stream = fsm_set.connection_mut().stream_mut()
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
         .ok_or("No active stream")?;
 
-    stream.write_all(&response).await
+    stream
+        .write_all(&response)
+        .await
         .map_err(|e| format!("Write error: {}", e))?;
 
     Ok(())
@@ -720,13 +761,18 @@ async fn send_busy_response(
         ResponseOp::SearchDone, // Generic response type
         ResultCode::Busy,
         "",
-        "Server is busy - operation limit exceeded"
-    ).map_err(|e| format!("Encode error: {:?}", e))?;
+        "Server is busy - operation limit exceeded",
+    )
+    .map_err(|e| format!("Encode error: {:?}", e))?;
 
-    let stream = fsm_set.connection_mut().stream_mut()
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
         .ok_or("No active stream")?;
 
-    stream.write_all(&response).await
+    stream
+        .write_all(&response)
+        .await
         .map_err(|e| format!("Write error: {}", e))?;
 
     Ok(())
@@ -747,13 +793,18 @@ async fn send_rate_limit_exceeded(
         ResponseOp::SearchDone, // Generic response type
         ResultCode::Busy,
         "",
-        "Rate limit exceeded - please slow down"
-    ).map_err(|e| format!("Encode error: {:?}", e))?;
+        "Rate limit exceeded - please slow down",
+    )
+    .map_err(|e| format!("Encode error: {:?}", e))?;
 
-    let stream = fsm_set.connection_mut().stream_mut()
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
         .ok_or("No active stream")?;
 
-    stream.write_all(&response).await
+    stream
+        .write_all(&response)
+        .await
         .map_err(|e| format!("Write error: {}", e))?;
 
     Ok(())
@@ -763,6 +814,86 @@ async fn send_rate_limit_exceeded(
 mod tests {
     use super::*;
     use crate::backend::MockBackend;
+    use ldap_parser::ldap::{ProtocolOp, ResultCode as ParserResultCode};
+    use ldap_parser::parse_ldap_messages;
+    use rasn::der;
+    use rasn_ldap::{AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest};
+    use tokio::time::timeout;
+
+    async fn connected_stream_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = client.await.unwrap();
+
+        (server_stream, client_stream)
+    }
+
+    fn encode_bind_request(message_id: u32) -> Vec<u8> {
+        let bind_request = RasnBindRequest::new(
+            3,
+            b"cn=admin,dc=example,dc=org".to_vec().into(),
+            RasnAuthChoice::Simple(b"secret".to_vec().into()),
+        );
+        let message = rasn_ldap::LdapMessage::new(
+            message_id,
+            rasn_ldap::ProtocolOp::BindRequest(bind_request),
+        );
+        der::encode(&message).unwrap()
+    }
+
+    async fn read_ldap_payload(stream: &mut TcpStream, expected_messages: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        loop {
+            let mut chunk = vec![0u8; 4096];
+            let len = timeout(Duration::from_millis(200), stream.read(&mut chunk))
+                .await
+                .expect("response timeout")
+                .expect("failed to read response");
+            assert!(len > 0, "connection closed before receiving response");
+            buf.extend_from_slice(&chunk[..len]);
+
+            if let Ok((remaining, messages)) = parse_ldap_messages(&buf) {
+                if remaining.is_empty() && messages.len() >= expected_messages {
+                    return buf;
+                }
+            }
+        }
+    }
+
+    async fn spawn_test_connection(
+        backend: Arc<MockBackend>,
+    ) -> (tokio::task::JoinHandle<()>, TcpStream) {
+        let config = FsmServerConfig {
+            cleanup_interval: Duration::from_millis(50),
+            ..FsmServerConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config.resource_limits.clone()));
+        let (server_stream, client_stream) = connected_stream_pair().await;
+        let conn_id = pool
+            .acquire_connection(server_stream.peer_addr().unwrap())
+            .await
+            .unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let _ = handle_connection(
+                server_stream,
+                backend,
+                config,
+                pool.clone(),
+                conn_id,
+                None,
+                None,
+            )
+            .await;
+            pool.release_connection(conn_id).await;
+        });
+
+        (server_task, client_stream)
+    }
 
     #[test]
     fn test_fsm_server_config_default() {
@@ -790,7 +921,8 @@ mod tests {
             let conn_id = pool.acquire_connection(client_addr).await.unwrap();
 
             // Should handle connection without panicking
-            let _ = handle_connection(socket, backend, config, pool.clone(), conn_id, None, None).await;
+            let _ =
+                handle_connection(socket, backend, config, pool.clone(), conn_id, None, None).await;
             pool.release_connection(conn_id).await;
         });
 
@@ -799,5 +931,85 @@ mod tests {
 
         // Give it time to process
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_single_ber_frame_from_single_read() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        let encoded = encode_bind_request(1);
+        client_stream.write_all(&encoded).await.unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_fragmented_ber_frame_once() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        let encoded = encode_bind_request(7);
+        let split_at = encoded.len() / 2;
+
+        client_stream.write_all(&encoded[..split_at]).await.unwrap();
+        client_stream.write_all(&encoded[split_at..]).await.unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 7);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_multiple_ber_frames_from_one_read() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        let mut encoded = encode_bind_request(3);
+        encoded.extend_from_slice(&encode_bind_request(4));
+        client_stream.write_all(&encoded).await.unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].message_id.0, 3);
+        assert_eq!(messages[1].message_id.0, 4);
+
+        for message in &messages {
+            match &message.protocol_op {
+                ProtocolOp::BindResponse(bind_response) => {
+                    assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+                }
+                other => panic!("unexpected response: {:?}", other),
+            }
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
     }
 }
