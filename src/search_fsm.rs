@@ -43,7 +43,7 @@
 //! ```rust,no_run
 //! use opendr::search_fsm::*;
 //! use opendr::fsm::{StateMachine, SearchState, SearchEvent};
-//! 
+//!
 //! # struct MockSearchBackend;
 //! # #[async_trait::async_trait]
 //! # impl SearchBackend for MockSearchBackend {
@@ -75,9 +75,9 @@
 //! let backend = Box::new(MockSearchBackend);
 //! let filter_matcher = Box::new(MockFilterMatcher);
 //! let entry_formatter = Box::new(MockEntryFormatter);
-//! 
+//!
 //! let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-//! 
+//!
 //! // Start search operation
 //! let result = fsm.handle_event(SearchEvent::StartSearch {
 //!     base_dn: "dc=example,dc=org".to_string(),
@@ -91,9 +91,12 @@
 //! # }
 //! ```
 
-use crate::fsm::{StateMachine, SearchFsm, SearchState, SearchEvent, SearchResultCode, SearchParams, AbandonableFsm, TimeoutFsm};
+use crate::fsm::{
+    AbandonableFsm, SearchEvent, SearchFsm, SearchParams, SearchResultCode, SearchState,
+    StateMachine, TimeoutFsm,
+};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -102,31 +105,31 @@ use thiserror::Error;
 pub enum SearchFsmError {
     #[error("Invalid search parameters: {message}")]
     InvalidParameters { message: String },
-    
+
     #[error("Search backend error: {message}")]
     BackendError { message: String },
-    
+
     #[error("Filter evaluation error: {message}")]
     FilterError { message: String },
-    
+
     #[error("Entry formatting error: {message}")]
     FormattingError { message: String },
-    
+
     #[error("Search operation abandoned")]
     Abandoned,
-    
+
     #[error("Search time limit exceeded")]
     TimeLimitExceeded,
-    
+
     #[error("Search size limit exceeded")]
     SizeLimitExceeded,
-    
+
     #[error("Invalid state transition from {from:?} to {to:?}")]
     InvalidStateTransition { from: SearchState, to: SearchState },
-    
+
     #[error("No active search session")]
     NoActiveSearch,
-    
+
     #[error("Generic search error: {message}")]
     Generic { message: String },
 }
@@ -144,10 +147,10 @@ pub struct SearchEntry {
 
 impl SearchEntry {
     /// Create a new search entry
-    /// 
+    ///
     /// # Arguments
     /// * `dn` - Distinguished name of the entry
-    /// 
+    ///
     /// # Returns
     /// * New SearchEntry instance
     pub fn new(dn: String) -> Self {
@@ -157,82 +160,93 @@ impl SearchEntry {
             object_classes: Vec::new(),
         }
     }
-    
+
     /// Add an attribute to the entry
-    /// 
+    ///
     /// # Arguments
     /// * `name` - Attribute name
     /// * `values` - Attribute values
     pub fn add_attribute(&mut self, name: String, values: Vec<String>) {
         self.attributes.insert(name, values);
     }
-    
+
     /// Set object classes for the entry
-    /// 
+    ///
     /// # Arguments
     /// * `object_classes` - List of object class names
     pub fn set_object_classes(&mut self, object_classes: Vec<String>) {
         self.object_classes = object_classes;
     }
-    
+
     /// Get attribute values by name
-    /// 
+    ///
     /// # Arguments
     /// * `name` - Attribute name
-    /// 
+    ///
     /// # Returns
     /// * Option containing attribute values if found
     pub fn get_attribute(&self, name: &str) -> Option<&Vec<String>> {
         self.attributes.get(name)
     }
-    
+
     /// Check if entry has a specific object class
-    /// 
+    ///
     /// # Arguments
     /// * `object_class` - Object class name to check
-    /// 
+    ///
     /// # Returns
     /// * true if entry has the object class
     pub fn has_object_class(&self, object_class: &str) -> bool {
-        self.object_classes.iter().any(|oc| oc.eq_ignore_ascii_case(object_class))
+        self.object_classes
+            .iter()
+            .any(|oc| oc.eq_ignore_ascii_case(object_class))
     }
 }
 
 /// Trait for backend search operations
-/// 
+///
 /// This trait abstracts the directory backend, allowing different
 /// storage implementations to be used with the Search FSM.
 #[async_trait]
 pub trait SearchBackend: Send + Sync {
     /// Find candidate entries for a search operation
-    /// 
+    ///
     /// # Arguments
     /// * `base_dn` - Base DN for search
     /// * `scope` - Search scope (0=base, 1=onelevel, 2=subtree)
     /// * `filter` - LDAP filter string
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Vec<String>)` - List of candidate entry DNs
     /// * `Err(String)` - Error message if operation fails
-    async fn find_candidates(&self, base_dn: &str, scope: i32, filter: &str) -> Result<Vec<String>, String>;
-    
+    async fn find_candidates(
+        &self,
+        base_dn: &str,
+        scope: i32,
+        filter: &str,
+    ) -> Result<Vec<String>, String>;
+
     /// Retrieve a specific entry with requested attributes
-    /// 
+    ///
     /// # Arguments
     /// * `dn` - Distinguished name of entry to retrieve
     /// * `attributes` - List of attributes to include (empty = all attributes)
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Some(SearchEntry))` - Entry if found
     /// * `Ok(None)` - Entry not found
     /// * `Err(String)` - Error message if operation fails
-    async fn get_entry(&self, dn: &str, attributes: &[String]) -> Result<Option<SearchEntry>, String>;
-    
+    async fn get_entry(
+        &self,
+        dn: &str,
+        attributes: &[String],
+    ) -> Result<Option<SearchEntry>, String>;
+
     /// Check if an entry exists
-    /// 
+    ///
     /// # Arguments
     /// * `dn` - Distinguished name to check
-    /// 
+    ///
     /// # Returns
     /// * `Ok(true)` - Entry exists
     /// * `Ok(false)` - Entry does not exist
@@ -243,12 +257,12 @@ pub trait SearchBackend: Send + Sync {
             None => Ok(false),
         }
     }
-    
+
     /// Get search statistics (for optimization)
-    /// 
+    ///
     /// # Arguments
     /// * `base_dn` - Base DN for statistics
-    /// 
+    ///
     /// # Returns
     /// * (estimated_entries, estimated_depth)
     async fn get_search_stats(&self, base_dn: &str) -> Result<(usize, usize), String> {
@@ -258,28 +272,28 @@ pub trait SearchBackend: Send + Sync {
 }
 
 /// Trait for LDAP filter evaluation
-/// 
+///
 /// This trait abstracts filter matching logic, allowing different
 /// filter implementations and optimizations.
 #[async_trait]
 pub trait FilterMatcher: Send + Sync {
     /// Evaluate if an entry matches an LDAP filter
-    /// 
+    ///
     /// # Arguments
     /// * `entry` - Entry to evaluate
     /// * `filter` - LDAP filter string
-    /// 
+    ///
     /// # Returns
     /// * `Ok(true)` - Entry matches filter
     /// * `Ok(false)` - Entry does not match filter
     /// * `Err(String)` - Error message if evaluation fails
     async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String>;
-    
+
     /// Validate filter syntax
-    /// 
+    ///
     /// # Arguments
     /// * `filter` - LDAP filter string to validate
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` - Filter is valid
     /// * `Err(String)` - Error message if filter is invalid
@@ -287,12 +301,12 @@ pub trait FilterMatcher: Send + Sync {
         // Default implementation accepts all filters
         Ok(())
     }
-    
+
     /// Extract indexed attributes from filter (for optimization)
-    /// 
+    ///
     /// # Arguments
     /// * `filter` - LDAP filter string
-    /// 
+    ///
     /// # Returns
     /// * List of attribute names that could benefit from indexing
     fn extract_indexed_attributes(&self, _filter: &str) -> Vec<String> {
@@ -302,34 +316,42 @@ pub trait FilterMatcher: Send + Sync {
 }
 
 /// Trait for formatting search result entries
-/// 
+///
 /// This trait abstracts entry encoding and attribute projection,
 /// allowing different output formats and attribute handling.
 #[async_trait]
 pub trait EntryFormatter: Send + Sync {
     /// Format an entry for transmission to client
-    /// 
+    ///
     /// # Arguments
     /// * `entry` - Entry to format
     /// * `requested_attributes` - Attributes requested by client
-    /// 
+    ///
     /// # Returns
     /// * `Ok(Vec<u8>)` - Encoded entry data
     /// * `Err(String)` - Error message if formatting fails
-    async fn format_entry(&self, entry: &SearchEntry, requested_attributes: &[String]) -> Result<Vec<u8>, String>;
-    
+    async fn format_entry(
+        &self,
+        entry: &SearchEntry,
+        requested_attributes: &[String],
+    ) -> Result<Vec<u8>, String>;
+
     /// Calculate formatted entry size (for size limit checks)
-    /// 
+    ///
     /// # Arguments
     /// * `entry` - Entry to measure
     /// * `requested_attributes` - Attributes that would be included
-    /// 
+    ///
     /// # Returns
     /// * Estimated size in bytes
-    async fn calculate_entry_size(&self, entry: &SearchEntry, requested_attributes: &[String]) -> Result<usize, String> {
+    async fn calculate_entry_size(
+        &self,
+        entry: &SearchEntry,
+        requested_attributes: &[String],
+    ) -> Result<usize, String> {
         // Default implementation estimates based on attribute count and values
         let mut size = entry.dn.len() + 50; // DN + overhead
-        
+
         for (name, values) in &entry.attributes {
             if requested_attributes.is_empty() || requested_attributes.contains(name) {
                 size += name.len() + 10; // Attribute name + overhead
@@ -338,48 +360,53 @@ pub trait EntryFormatter: Send + Sync {
                 }
             }
         }
-        
+
         Ok(size)
     }
 }
 
 /// Trait for search metrics and monitoring
-/// 
+///
 /// This trait provides hooks for performance monitoring,
 /// statistics collection, and operational insights.
 pub trait SearchMetrics: Send + Sync {
     /// Record search operation start
-    /// 
+    ///
     /// # Arguments
     /// * `params` - Search parameters
     fn record_search_start(&self, params: &SearchParams);
-    
+
     /// Record candidates found
-    /// 
+    ///
     /// # Arguments
     /// * `count` - Number of candidates found
     fn record_candidates_found(&self, count: usize);
-    
+
     /// Record entry processed
-    /// 
+    ///
     /// # Arguments
     /// * `dn` - Entry DN that was processed
     /// * `matched` - Whether entry matched filter
     fn record_entry_processed(&self, dn: &str, matched: bool);
-    
+
     /// Record search completion
-    /// 
+    ///
     /// # Arguments
     /// * `result_code` - Final result code
     /// * `entries_sent` - Number of entries sent to client
     /// * `duration` - Total search duration
-    fn record_search_complete(&self, result_code: &SearchResultCode, entries_sent: usize, duration: Duration);
-    
+    fn record_search_complete(
+        &self,
+        result_code: &SearchResultCode,
+        entries_sent: usize,
+        duration: Duration,
+    );
+
     /// Record search abandonment
     fn record_search_abandoned(&self);
-    
+
     /// Get search statistics
-    /// 
+    ///
     /// # Returns
     /// * (total_searches, avg_duration_ms, avg_entries_per_search)
     fn get_stats(&self) -> (u64, u64, f64) {
@@ -438,18 +465,18 @@ pub struct SearchSession {
     pub candidates_found: usize,
     /// Number of entries processed
     pub entries_processed: usize,
-    /// Current batch of entries being processed
-    pub current_batch: Vec<SearchEntry>,
+    /// Current batch of candidate DNs being processed
+    pub current_batch: VecDeque<String>,
     /// Whether search has been abandoned
     pub is_abandoned: bool,
 }
 
 impl SearchSession {
     /// Create a new search session
-    /// 
+    ///
     /// # Arguments
     /// * `params` - Search parameters
-    /// 
+    ///
     /// # Returns
     /// * New SearchSession instance
     pub fn new(params: SearchParams) -> Self {
@@ -461,66 +488,76 @@ impl SearchSession {
             entries_sent: 0,
             candidates_found: 0,
             entries_processed: 0,
-            current_batch: Vec::new(),
+            current_batch: VecDeque::new(),
             is_abandoned: false,
         }
     }
-    
+
     /// Check if all candidates have been processed
-    /// 
+    ///
     /// # Returns
     /// * true if all candidates processed
     pub fn has_more_candidates(&self) -> bool {
-        self.candidate_index < self.candidates.len()
+        !self.current_batch.is_empty() || self.candidate_index < self.candidates.len()
     }
-    
+
     /// Get next batch of candidates to process
-    /// 
+    ///
     /// # Arguments
     /// * `batch_size` - Maximum batch size
-    /// 
+    ///
     /// # Returns
     /// * Vector of candidate DNs
     pub fn get_next_candidate_batch(&mut self, batch_size: usize) -> Vec<String> {
         let start = self.candidate_index;
         let end = std::cmp::min(start + batch_size, self.candidates.len());
-        
+
         if start >= end {
             return Vec::new();
         }
-        
+
         let batch = self.candidates[start..end].to_vec();
         self.candidate_index = end;
         batch
     }
-    
+
+    /// Return the next candidate DN, refilling the in-flight batch if needed.
+    pub fn next_candidate(&mut self, batch_size: usize) -> Option<String> {
+        if self.current_batch.is_empty() {
+            let batch_size = batch_size.max(1);
+            self.current_batch = self.get_next_candidate_batch(batch_size).into();
+        }
+
+        self.current_batch.pop_front()
+    }
+
     /// Check if size limit would be exceeded
-    /// 
+    ///
     /// # Arguments
     /// * `additional_entries` - Number of additional entries to consider
-    /// 
+    ///
     /// # Returns
     /// * true if size limit would be exceeded
     pub fn would_exceed_size_limit(&self, additional_entries: usize) -> bool {
         (self.entries_sent + additional_entries) as u32 > self.params.size_limit
     }
-    
+
     /// Check if time limit has been exceeded
-    /// 
+    ///
     /// # Returns
     /// * true if time limit exceeded
     pub fn is_time_limit_exceeded(&self) -> bool {
         if self.params.time_limit == 0 {
             return false; // No time limit
         }
-        
+
         let elapsed = self.start_time.elapsed().as_secs() as u32;
         elapsed > self.params.time_limit
     }
 }
 
 /// Search FSM Implementation
-/// 
+///
 /// This FSM manages the complete search operation lifecycle including:
 /// - Parameter validation and initialization
 /// - Candidate finding and iteration
@@ -531,25 +568,25 @@ impl SearchSession {
 pub struct SearchFsmImpl {
     /// Current FSM state
     state: SearchState,
-    
+
     /// Current search session (if active)
     session: Option<SearchSession>,
-    
+
     /// Search backend for entry retrieval
     backend: Box<dyn SearchBackend>,
-    
+
     /// Filter matcher for entry evaluation
     filter_matcher: Box<dyn FilterMatcher>,
-    
+
     /// Entry formatter for result encoding
     entry_formatter: Box<dyn EntryFormatter>,
-    
+
     /// Metrics collector (optional)
     metrics: Option<Box<dyn SearchMetrics>>,
-    
+
     /// FSM configuration
     config: SearchFsmConfig,
-    
+
     /// Statistics tracking
     total_searches: u64,
     total_entries_sent: u64,
@@ -558,12 +595,12 @@ pub struct SearchFsmImpl {
 
 impl SearchFsmImpl {
     /// Create a new Search FSM instance
-    /// 
+    ///
     /// # Arguments
     /// * `backend` - Search backend implementation
     /// * `filter_matcher` - Filter evaluation implementation
     /// * `entry_formatter` - Entry formatting implementation
-    /// 
+    ///
     /// # Returns
     /// * New Search FSM instance
     pub fn new(
@@ -584,15 +621,15 @@ impl SearchFsmImpl {
             total_candidates_processed: 0,
         }
     }
-    
+
     /// Create a Search FSM with custom configuration
-    /// 
+    ///
     /// # Arguments
     /// * `backend` - Search backend implementation
     /// * `filter_matcher` - Filter evaluation implementation  
     /// * `entry_formatter` - Entry formatting implementation
     /// * `config` - FSM configuration
-    /// 
+    ///
     /// # Returns
     /// * New Search FSM instance with custom configuration
     pub fn with_config(
@@ -614,32 +651,152 @@ impl SearchFsmImpl {
             total_candidates_processed: 0,
         }
     }
-    
+
     /// Set metrics collector
-    /// 
+    ///
     /// # Arguments
     /// * `metrics` - Metrics implementation
-    /// 
+    ///
     /// # Returns
     /// * Updated Search FSM instance
     pub fn with_metrics(mut self, metrics: Box<dyn SearchMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
     }
-    
+
     /// Get search statistics
-    /// 
+    ///
     /// # Returns
     /// * (total_searches, total_entries_sent, total_candidates_processed)
     pub fn stats(&self) -> (u64, u64, u64) {
-        (self.total_searches, self.total_entries_sent, self.total_candidates_processed)
+        (
+            self.total_searches,
+            self.total_entries_sent,
+            self.total_candidates_processed,
+        )
     }
-    
+
+    fn record_search_complete_metric(&self, result_code: &SearchResultCode) {
+        if let (Some(metrics), Some(session)) = (&self.metrics, &self.session) {
+            metrics.record_search_complete(
+                result_code,
+                session.entries_sent,
+                session.start_time.elapsed(),
+            );
+        }
+    }
+
+    fn complete_search(&mut self, result_code: SearchResultCode) {
+        let entries_sent = self.session.as_ref().map(|s| s.entries_sent).unwrap_or(0);
+        self.state = SearchState::Completed {
+            entries_sent,
+            result_code: result_code.clone(),
+        };
+        self.record_search_complete_metric(&result_code);
+    }
+
+    fn fail_search(&mut self, error: SearchFsmError) -> SearchFsmError {
+        self.complete_search(SearchResultCode::Other(1));
+        error
+    }
+
+    async fn emit_next_matching_entry(&mut self) -> Result<Option<Vec<u8>>, SearchFsmError> {
+        loop {
+            let (candidate_dn, filter, attributes, candidates_found, entries_sent) = {
+                let session = self
+                    .session
+                    .as_mut()
+                    .ok_or(SearchFsmError::NoActiveSearch)?;
+
+                if session.is_time_limit_exceeded() {
+                    self.state = SearchState::TimeLimitExceeded;
+                    self.record_search_complete_metric(&SearchResultCode::TimeLimitExceeded);
+                    return Err(SearchFsmError::TimeLimitExceeded);
+                }
+
+                if !session.has_more_candidates() {
+                    self.complete_search(SearchResultCode::Success);
+                    return Ok(None);
+                }
+
+                let candidate_dn = session
+                    .next_candidate(self.config.candidate_batch_size)
+                    .expect("candidate availability checked before dequeue");
+                session.entries_processed += 1;
+                self.total_candidates_processed += 1;
+
+                (
+                    candidate_dn,
+                    session.params.filter.clone(),
+                    session.params.attributes.clone(),
+                    session.candidates_found,
+                    session.entries_sent,
+                )
+            };
+
+            self.state = SearchState::Iterating {
+                candidates_found,
+                entries_sent,
+            };
+
+            let entry = match self.backend.get_entry(&candidate_dn, &attributes).await {
+                Ok(entry) => entry,
+                Err(message) => {
+                    return Err(self.fail_search(SearchFsmError::BackendError { message }));
+                }
+            };
+
+            let Some(entry) = entry else {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_entry_processed(&candidate_dn, false);
+                }
+                continue;
+            };
+
+            let matches = match self.filter_matcher.matches_filter(&entry, &filter).await {
+                Ok(matches) => matches,
+                Err(message) => {
+                    return Err(self.fail_search(SearchFsmError::FilterError { message }));
+                }
+            };
+
+            if let Some(metrics) = &self.metrics {
+                metrics.record_entry_processed(&candidate_dn, matches);
+            }
+
+            if !matches {
+                continue;
+            }
+
+            let would_exceed_size_limit = self
+                .session
+                .as_ref()
+                .map(|session| session.would_exceed_size_limit(1))
+                .unwrap_or(false);
+            if would_exceed_size_limit {
+                self.state = SearchState::SizeLimitExceeded;
+                self.record_search_complete_metric(&SearchResultCode::SizeLimitExceeded);
+                return Err(SearchFsmError::SizeLimitExceeded);
+            }
+
+            let formatted_entry = match self.entry_formatter.format_entry(&entry, &attributes).await
+            {
+                Ok(formatted_entry) => formatted_entry,
+                Err(message) => {
+                    return Err(self.fail_search(SearchFsmError::FormattingError { message }));
+                }
+            };
+
+            self.state = SearchState::EmittingEntries;
+            return Ok(Some(formatted_entry));
+        }
+    }
+
     /// Validate search parameters
-    /// 
+    ///
     /// # Arguments
     /// * `params` - Search parameters to validate
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` if parameters are valid
     /// * `Err(SearchFsmError)` if validation fails
@@ -650,42 +807,48 @@ impl SearchFsmImpl {
                 message: "Base DN cannot be empty".to_string(),
             });
         }
-        
+
         // Validate scope
         if params.scope < 0 || params.scope > 2 {
             return Err(SearchFsmError::InvalidParameters {
                 message: format!("Invalid search scope: {}", params.scope),
             });
         }
-        
+
         // Validate filter
         if params.filter.is_empty() {
             return Err(SearchFsmError::InvalidParameters {
                 message: "Search filter cannot be empty".to_string(),
             });
         }
-        
+
         // Validate limits
         if params.size_limit > self.config.max_size_limit {
             return Err(SearchFsmError::InvalidParameters {
-                message: format!("Size limit {} exceeds maximum {}", params.size_limit, self.config.max_size_limit),
+                message: format!(
+                    "Size limit {} exceeds maximum {}",
+                    params.size_limit, self.config.max_size_limit
+                ),
             });
         }
-        
+
         if params.time_limit > self.config.max_time_limit {
             return Err(SearchFsmError::InvalidParameters {
-                message: format!("Time limit {} exceeds maximum {}", params.time_limit, self.config.max_time_limit),
+                message: format!(
+                    "Time limit {} exceeds maximum {}",
+                    params.time_limit, self.config.max_time_limit
+                ),
             });
         }
-        
+
         Ok(())
     }
-    
+
     /// Apply default limits to search parameters
-    /// 
+    ///
     /// # Arguments
     /// * `params` - Search parameters to update
-    /// 
+    ///
     /// # Returns
     /// * Updated search parameters
     fn apply_default_limits(&self, mut params: SearchParams) -> SearchParams {
@@ -694,16 +857,16 @@ impl SearchFsmImpl {
         if params.size_limit == 0 {
             params.size_limit = self.config.default_size_limit;
         }
-        
+
         if params.time_limit == 0 {
             params.time_limit = self.config.default_time_limit;
         }
-        
+
         params
     }
-    
+
     /// Handle search start event
-    /// 
+    ///
     /// # Arguments
     /// * `base_dn` - Base DN for search
     /// * `scope` - Search scope
@@ -711,7 +874,7 @@ impl SearchFsmImpl {
     /// * `attributes` - Requested attributes
     /// * `size_limit` - Size limit
     /// * `time_limit` - Time limit
-    /// 
+    ///
     /// # Returns
     /// * Result indicating success or error
     async fn handle_start_search(
@@ -731,37 +894,69 @@ impl SearchFsmImpl {
             size_limit,
             time_limit,
         };
-        
+
         // Apply default limits
         params = self.apply_default_limits(params);
-        
+
         // Validate parameters
         self.validate_search_params(&params)?;
-        
+
         // Validate filter syntax
-        self.filter_matcher.validate_filter(&params.filter).await
+        self.filter_matcher
+            .validate_filter(&params.filter)
+            .await
             .map_err(|e| SearchFsmError::FilterError { message: e })?;
-        
+
         // Create new session
         let session = SearchSession::new(params.clone());
-        
+
         // Record metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_search_start(&params);
         }
-        
+
         self.session = Some(session);
         self.state = SearchState::FindingCandidates;
         self.total_searches += 1;
-        
-        Ok(None)
+
+        let mut candidates = match self
+            .backend
+            .find_candidates(&params.base_dn, params.scope, &params.filter)
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(message) => {
+                return Err(self.fail_search(SearchFsmError::BackendError { message }));
+            }
+        };
+
+        if candidates.len() > self.config.max_candidates {
+            candidates.truncate(self.config.max_candidates);
+        }
+
+        if let Some(session) = &mut self.session {
+            session.candidates_found = candidates.len();
+            session.candidates = candidates;
+            session.current_batch.clear();
+        }
+
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_candidates_found(
+                self.session
+                    .as_ref()
+                    .map(|session| session.candidates_found)
+                    .unwrap_or(0),
+            );
+        }
+
+        self.emit_next_matching_entry().await
     }
-    
+
     /// Handle candidates found event
-    /// 
+    ///
     /// # Arguments
     /// * `candidate_count` - Number of candidates found
-    /// 
+    ///
     /// # Returns
     /// * Result indicating success or error
     async fn handle_candidates_found(
@@ -770,12 +965,12 @@ impl SearchFsmImpl {
     ) -> Result<Option<Vec<u8>>, SearchFsmError> {
         if let Some(session) = &mut self.session {
             session.candidates_found = candidate_count;
-            
+
             // Record metrics
             if let Some(ref metrics) = self.metrics {
                 metrics.record_candidates_found(candidate_count);
             }
-            
+
             // Check if we have candidates to process
             if candidate_count > 0 {
                 self.state = SearchState::Iterating {
@@ -788,7 +983,7 @@ impl SearchFsmImpl {
                     entries_sent: 0,
                     result_code: SearchResultCode::Success,
                 };
-                
+
                 if let Some(ref metrics) = self.metrics {
                     metrics.record_search_complete(
                         &SearchResultCode::Success,
@@ -797,18 +992,18 @@ impl SearchFsmImpl {
                     );
                 }
             }
-            
+
             Ok(None)
         } else {
             Err(SearchFsmError::NoActiveSearch)
         }
     }
-    
+
     /// Handle entry found event
-    /// 
+    ///
     /// # Arguments
     /// * `entry_data` - Encoded entry data
-    /// 
+    ///
     /// # Returns
     /// * Result containing formatted entry for emission
     async fn handle_entry_found(
@@ -819,7 +1014,7 @@ impl SearchFsmImpl {
             // Check time limit
             if session.is_time_limit_exceeded() {
                 self.state = SearchState::TimeLimitExceeded;
-                
+
                 if let Some(ref metrics) = self.metrics {
                     metrics.record_search_complete(
                         &SearchResultCode::TimeLimitExceeded,
@@ -827,14 +1022,14 @@ impl SearchFsmImpl {
                         session.start_time.elapsed(),
                     );
                 }
-                
+
                 return Err(SearchFsmError::TimeLimitExceeded);
             }
-            
+
             // Check size limit
             if session.would_exceed_size_limit(1) {
                 self.state = SearchState::SizeLimitExceeded;
-                
+
                 if let Some(ref metrics) = self.metrics {
                     metrics.record_search_complete(
                         &SearchResultCode::SizeLimitExceeded,
@@ -842,56 +1037,34 @@ impl SearchFsmImpl {
                         session.start_time.elapsed(),
                     );
                 }
-                
+
                 return Err(SearchFsmError::SizeLimitExceeded);
             }
-            
+
             self.state = SearchState::EmittingEntries;
             Ok(Some(entry_data))
         } else {
             Err(SearchFsmError::NoActiveSearch)
         }
     }
-    
+
     /// Handle entry emitted event
-    /// 
+    ///
     /// # Returns
     /// * Result indicating success or error
     async fn handle_entry_emitted(&mut self) -> Result<Option<Vec<u8>>, SearchFsmError> {
         if let Some(session) = &mut self.session {
             session.entries_sent += 1;
             self.total_entries_sent += 1;
-            
-            // Check if we have more candidates to process
-            if session.has_more_candidates() {
-                self.state = SearchState::Iterating {
-                    candidates_found: session.candidates_found,
-                    entries_sent: session.entries_sent,
-                };
-            } else {
-                // All candidates processed - complete search
-                self.state = SearchState::Completed {
-                    entries_sent: session.entries_sent,
-                    result_code: SearchResultCode::Success,
-                };
-                
-                if let Some(ref metrics) = self.metrics {
-                    metrics.record_search_complete(
-                        &SearchResultCode::Success,
-                        session.entries_sent,
-                        session.start_time.elapsed(),
-                    );
-                }
-            }
-            
-            Ok(None)
         } else {
-            Err(SearchFsmError::NoActiveSearch)
+            return Err(SearchFsmError::NoActiveSearch);
         }
+
+        self.emit_next_matching_entry().await
     }
-    
+
     /// Handle search complete event
-    /// 
+    ///
     /// # Returns
     /// * Result indicating success
     async fn handle_search_complete(&mut self) -> Result<Option<Vec<u8>>, SearchFsmError> {
@@ -900,7 +1073,7 @@ impl SearchFsmImpl {
                 entries_sent: session.entries_sent,
                 result_code: SearchResultCode::Success,
             };
-            
+
             if let Some(ref metrics) = self.metrics {
                 metrics.record_search_complete(
                     &SearchResultCode::Success,
@@ -908,40 +1081,40 @@ impl SearchFsmImpl {
                     session.start_time.elapsed(),
                 );
             }
-            
+
             Ok(None)
         } else {
             Err(SearchFsmError::NoActiveSearch)
         }
     }
-    
+
     /// Handle search abandon event
-    /// 
+    ///
     /// # Returns
     /// * Result indicating abandonment
     async fn handle_abandon(&mut self) -> Result<Option<Vec<u8>>, SearchFsmError> {
         if let Some(session) = &mut self.session {
             session.is_abandoned = true;
             self.state = SearchState::Abandoned;
-            
+
             if let Some(ref metrics) = self.metrics {
                 metrics.record_search_abandoned();
             }
-            
+
             Err(SearchFsmError::Abandoned)
         } else {
             Err(SearchFsmError::NoActiveSearch)
         }
     }
-    
+
     /// Handle time limit exceeded
-    /// 
+    ///
     /// # Returns
     /// * Result indicating time limit exceeded
     async fn handle_time_limit(&mut self) -> Result<Option<Vec<u8>>, SearchFsmError> {
         if let Some(session) = &self.session {
             self.state = SearchState::TimeLimitExceeded;
-            
+
             if let Some(ref metrics) = self.metrics {
                 metrics.record_search_complete(
                     &SearchResultCode::TimeLimitExceeded,
@@ -949,21 +1122,21 @@ impl SearchFsmImpl {
                     session.start_time.elapsed(),
                 );
             }
-            
+
             Err(SearchFsmError::TimeLimitExceeded)
         } else {
             Err(SearchFsmError::NoActiveSearch)
         }
     }
-    
+
     /// Handle size limit exceeded
-    /// 
+    ///
     /// # Returns
     /// * Result indicating size limit exceeded
     async fn handle_size_limit(&mut self) -> Result<Option<Vec<u8>>, SearchFsmError> {
         if let Some(session) = &self.session {
             self.state = SearchState::SizeLimitExceeded;
-            
+
             if let Some(ref metrics) = self.metrics {
                 metrics.record_search_complete(
                     &SearchResultCode::SizeLimitExceeded,
@@ -971,27 +1144,32 @@ impl SearchFsmImpl {
                     session.start_time.elapsed(),
                 );
             }
-            
+
             Err(SearchFsmError::SizeLimitExceeded)
         } else {
             Err(SearchFsmError::NoActiveSearch)
         }
     }
-    
+
     /// Handle error event
-    /// 
+    ///
     /// # Arguments
     /// * `error_message` - Error description
-    /// 
+    ///
     /// # Returns
     /// * Result containing error
-    async fn handle_error(&mut self, error_message: String) -> Result<Option<Vec<u8>>, SearchFsmError> {
+    async fn handle_error(
+        &mut self,
+        error_message: String,
+    ) -> Result<Option<Vec<u8>>, SearchFsmError> {
         self.state = SearchState::Completed {
             entries_sent: self.session.as_ref().map(|s| s.entries_sent).unwrap_or(0),
             result_code: SearchResultCode::Other(1), // Generic error
         };
-        
-        Err(SearchFsmError::Generic { message: error_message })
+
+        Err(SearchFsmError::Generic {
+            message: error_message,
+        })
     }
 }
 
@@ -1001,53 +1179,48 @@ impl StateMachine for SearchFsmImpl {
     type Event = SearchEvent;
     type Error = SearchFsmError;
     type Output = Vec<u8>; // Encoded entry data
-    
+
     fn current_state(&self) -> &Self::State {
         &self.state
     }
-    
-    async fn handle_event(&mut self, event: Self::Event) -> Result<Option<Self::Output>, Self::Error> {
+
+    async fn handle_event(
+        &mut self,
+        event: Self::Event,
+    ) -> Result<Option<Self::Output>, Self::Error> {
         match event {
-            SearchEvent::StartSearch { base_dn, scope, filter, attributes, size_limit, time_limit } => {
-                self.handle_start_search(base_dn, scope, filter, attributes, size_limit, time_limit).await
-            },
-            SearchEvent::CandidatesFound(count) => {
-                self.handle_candidates_found(count).await
-            },
-            SearchEvent::EntryFound(entry_data) => {
-                self.handle_entry_found(entry_data).await
-            },
-            SearchEvent::EntryEmitted => {
-                self.handle_entry_emitted().await
-            },
-            SearchEvent::SearchComplete => {
-                self.handle_search_complete().await
-            },
-            SearchEvent::Abandon => {
-                self.handle_abandon().await
-            },
-            SearchEvent::TimeLimit => {
-                self.handle_time_limit().await
-            },
-            SearchEvent::SizeLimit => {
-                self.handle_size_limit().await
-            },
-            SearchEvent::Error(error_message) => {
-                self.handle_error(error_message).await
-            },
+            SearchEvent::StartSearch {
+                base_dn,
+                scope,
+                filter,
+                attributes,
+                size_limit,
+                time_limit,
+            } => {
+                self.handle_start_search(base_dn, scope, filter, attributes, size_limit, time_limit)
+                    .await
+            }
+            SearchEvent::CandidatesFound(count) => self.handle_candidates_found(count).await,
+            SearchEvent::EntryFound(entry_data) => self.handle_entry_found(entry_data).await,
+            SearchEvent::EntryEmitted => self.handle_entry_emitted().await,
+            SearchEvent::SearchComplete => self.handle_search_complete().await,
+            SearchEvent::Abandon => self.handle_abandon().await,
+            SearchEvent::TimeLimit => self.handle_time_limit().await,
+            SearchEvent::SizeLimit => self.handle_size_limit().await,
+            SearchEvent::Error(error_message) => self.handle_error(error_message).await,
         }
     }
-    
+
     fn is_terminal(&self) -> bool {
         matches!(
             self.state,
-            SearchState::Completed { .. } 
-            | SearchState::Abandoned 
-            | SearchState::TimeLimitExceeded 
-            | SearchState::SizeLimitExceeded
+            SearchState::Completed { .. }
+                | SearchState::Abandoned
+                | SearchState::TimeLimitExceeded
+                | SearchState::SizeLimitExceeded
         )
     }
-    
+
     async fn reset(&mut self) -> Result<(), Self::Error> {
         self.state = SearchState::Initializing;
         self.session = None;
@@ -1061,30 +1234,38 @@ impl AbandonableFsm for SearchFsmImpl {
         if let Some(session) = &mut self.session {
             session.is_abandoned = true;
             self.state = SearchState::Abandoned;
-            
+
             if let Some(ref metrics) = self.metrics {
                 metrics.record_search_abandoned();
             }
-            
+
             Ok(())
         } else {
             Err(SearchFsmError::NoActiveSearch)
         }
     }
-    
+
     fn is_abandoned(&self) -> bool {
-        self.session.as_ref().map(|s| s.is_abandoned).unwrap_or(false) 
+        self.session
+            .as_ref()
+            .map(|s| s.is_abandoned)
+            .unwrap_or(false)
             || matches!(self.state, SearchState::Abandoned)
     }
 }
 
 impl TimeoutFsm for SearchFsmImpl {
     fn timeout(&self) -> Option<Duration> {
-        self.session.as_ref().map(|s| Duration::from_secs(s.params.time_limit as u64))
+        self.session
+            .as_ref()
+            .map(|s| Duration::from_secs(s.params.time_limit as u64))
     }
-    
+
     fn start_time(&self) -> Instant {
-        self.session.as_ref().map(|s| s.start_time).unwrap_or_else(Instant::now)
+        self.session
+            .as_ref()
+            .map(|s| s.start_time)
+            .unwrap_or_else(Instant::now)
     }
 }
 
@@ -1093,15 +1274,18 @@ impl SearchFsm for SearchFsmImpl {
     fn search_params(&self) -> Option<&SearchParams> {
         self.session.as_ref().map(|s| &s.params)
     }
-    
+
     fn entries_sent(&self) -> usize {
         self.session.as_ref().map(|s| s.entries_sent).unwrap_or(0)
     }
-    
+
     fn size_limit(&self) -> u32 {
-        self.session.as_ref().map(|s| s.params.size_limit).unwrap_or(self.config.default_size_limit)
+        self.session
+            .as_ref()
+            .map(|s| s.params.size_limit)
+            .unwrap_or(self.config.default_size_limit)
     }
-    
+
     fn would_exceed_size_limit(&self) -> bool {
         if let Some(session) = &self.session {
             session.would_exceed_size_limit(1)
@@ -1114,6 +1298,7 @@ impl SearchFsm for SearchFsmImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use tokio;
 
@@ -1129,20 +1314,20 @@ mod tests {
     impl MockSearchBackend {
         pub fn new() -> Self {
             let mut entries = HashMap::new();
-            
+
             // Add test entries
             let mut entry1 = SearchEntry::new("cn=john,dc=example,dc=org".to_string());
             entry1.add_attribute("cn".to_string(), vec!["john".to_string()]);
             entry1.add_attribute("mail".to_string(), vec!["john@example.org".to_string()]);
             entry1.set_object_classes(vec!["person".to_string(), "inetOrgPerson".to_string()]);
             entries.insert(entry1.dn.clone(), entry1);
-            
+
             let mut entry2 = SearchEntry::new("cn=jane,dc=example,dc=org".to_string());
             entry2.add_attribute("cn".to_string(), vec!["jane".to_string()]);
             entry2.add_attribute("mail".to_string(), vec!["jane@example.org".to_string()]);
             entry2.set_object_classes(vec!["person".to_string(), "inetOrgPerson".to_string()]);
             entries.insert(entry2.dn.clone(), entry2);
-            
+
             Self {
                 candidates: vec![
                     "cn=john,dc=example,dc=org".to_string(),
@@ -1172,26 +1357,38 @@ mod tests {
 
     #[async_trait]
     impl SearchBackend for MockSearchBackend {
-        async fn find_candidates(&self, base_dn: &str, scope: i32, filter: &str) -> Result<Vec<String>, String> {
+        async fn find_candidates(
+            &self,
+            base_dn: &str,
+            scope: i32,
+            filter: &str,
+        ) -> Result<Vec<String>, String> {
             self.call_log.lock().unwrap().push(format!(
-                "find_candidates({}, {}, {})", 
+                "find_candidates({}, {}, {})",
                 base_dn, scope, filter
             ));
-            
+
             if self.should_fail {
                 return Err("Mock backend failure".to_string());
             }
-            
+
             Ok(self.candidates.clone())
         }
 
-        async fn get_entry(&self, dn: &str, _attributes: &[String]) -> Result<Option<SearchEntry>, String> {
-            self.call_log.lock().unwrap().push(format!("get_entry({})", dn));
-            
+        async fn get_entry(
+            &self,
+            dn: &str,
+            _attributes: &[String],
+        ) -> Result<Option<SearchEntry>, String> {
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("get_entry({})", dn));
+
             if self.should_fail {
                 return Err("Mock backend failure".to_string());
             }
-            
+
             Ok(self.entries.get(dn).cloned())
         }
     }
@@ -1201,6 +1398,7 @@ mod tests {
     pub struct MockFilterMatcher {
         pub should_match: bool,
         pub should_fail: bool,
+        pub match_plan: Arc<Mutex<VecDeque<bool>>>,
         pub call_log: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1209,6 +1407,7 @@ mod tests {
             Self {
                 should_match: true,
                 should_fail: false,
+                match_plan: Arc::new(Mutex::new(VecDeque::new())),
                 call_log: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -1223,6 +1422,14 @@ mod tests {
             self
         }
 
+        pub fn with_match_plan<I>(mut self, match_plan: I) -> Self
+        where
+            I: IntoIterator<Item = bool>,
+        {
+            self.match_plan = Arc::new(Mutex::new(match_plan.into_iter().collect()));
+            self
+        }
+
         pub fn call_log(&self) -> Vec<String> {
             self.call_log.lock().unwrap().clone()
         }
@@ -1231,16 +1438,20 @@ mod tests {
     #[async_trait]
     impl FilterMatcher for MockFilterMatcher {
         async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String> {
-            self.call_log.lock().unwrap().push(format!(
-                "matches_filter({}, {})", 
-                entry.dn, filter
-            ));
-            
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("matches_filter({}, {})", entry.dn, filter));
+
             if self.should_fail {
                 return Err("Mock filter matcher failure".to_string());
             }
-            
-            Ok(self.should_match)
+
+            if let Some(next_match) = self.match_plan.lock().unwrap().pop_front() {
+                Ok(next_match)
+            } else {
+                Ok(self.should_match)
+            }
         }
     }
 
@@ -1271,16 +1482,20 @@ mod tests {
 
     #[async_trait]
     impl EntryFormatter for MockEntryFormatter {
-        async fn format_entry(&self, entry: &SearchEntry, attributes: &[String]) -> Result<Vec<u8>, String> {
-            self.call_log.lock().unwrap().push(format!(
-                "format_entry({}, {:?})", 
-                entry.dn, attributes
-            ));
-            
+        async fn format_entry(
+            &self,
+            entry: &SearchEntry,
+            attributes: &[String],
+        ) -> Result<Vec<u8>, String> {
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("format_entry({}, {:?})", entry.dn, attributes));
+
             if self.should_fail {
                 return Err("Mock entry formatter failure".to_string());
             }
-            
+
             // Return a simple encoded representation
             let encoded = format!("dn: {}\n", entry.dn);
             Ok(encoded.into_bytes())
@@ -1307,32 +1522,43 @@ mod tests {
 
     impl SearchMetrics for MockSearchMetrics {
         fn record_search_start(&self, params: &SearchParams) {
-            self.call_log.lock().unwrap().push(format!(
-                "record_search_start(base_dn: {})", 
-                params.base_dn
-            ));
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("record_search_start(base_dn: {})", params.base_dn));
         }
 
         fn record_candidates_found(&self, count: usize) {
-            self.call_log.lock().unwrap().push(format!("record_candidates_found({})", count));
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("record_candidates_found({})", count));
         }
 
         fn record_entry_processed(&self, dn: &str, matched: bool) {
-            self.call_log.lock().unwrap().push(format!(
-                "record_entry_processed({}, {})", 
-                dn, matched
-            ));
+            self.call_log
+                .lock()
+                .unwrap()
+                .push(format!("record_entry_processed({}, {})", dn, matched));
         }
 
-        fn record_search_complete(&self, result_code: &SearchResultCode, entries_sent: usize, duration: Duration) {
+        fn record_search_complete(
+            &self,
+            result_code: &SearchResultCode,
+            entries_sent: usize,
+            duration: Duration,
+        ) {
             self.call_log.lock().unwrap().push(format!(
-                "record_search_complete({:?}, {}, {:?})", 
+                "record_search_complete({:?}, {}, {:?})",
                 result_code, entries_sent, duration
             ));
         }
 
         fn record_search_abandoned(&self) {
-            self.call_log.lock().unwrap().push("record_search_abandoned".to_string());
+            self.call_log
+                .lock()
+                .unwrap()
+                .push("record_search_abandoned".to_string());
         }
     }
 
@@ -1341,9 +1567,9 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
+
         assert_eq!(fsm.current_state(), &SearchState::Initializing);
         assert_eq!(fsm.entries_sent(), 0);
         assert!(!fsm.is_abandoned());
@@ -1356,7 +1582,7 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let config = SearchFsmConfig {
             default_size_limit: 50,
             default_time_limit: 60,
@@ -1366,9 +1592,9 @@ mod tests {
             candidate_batch_size: 50,
             enable_caching: true,
         };
-        
+
         let fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);
-        
+
         assert_eq!(fsm.current_state(), &SearchState::Initializing);
         assert_eq!(fsm.config.default_size_limit, 50);
         assert_eq!(fsm.config.default_time_limit, 60);
@@ -1381,32 +1607,39 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
-        let result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string(), "mail".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await;
-        
+
+        let result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string(), "mail".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await;
+
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), None);
-        assert_eq!(fsm.current_state(), &SearchState::FindingCandidates);
+        assert_eq!(
+            result.unwrap(),
+            Some(b"dn: cn=john,dc=example,dc=org\n".to_vec())
+        );
+        assert_eq!(fsm.current_state(), &SearchState::EmittingEntries);
         assert!(fsm.search_params().is_some());
-        
+
         let params = fsm.search_params().unwrap();
         assert_eq!(params.base_dn, "dc=example,dc=org");
         assert_eq!(params.scope, 2);
         assert_eq!(params.filter, "(objectClass=person)");
         assert_eq!(params.size_limit, 100);
         assert_eq!(params.time_limit, 30);
-        
+
         let (total_searches, _, _) = fsm.stats();
         assert_eq!(total_searches, 1);
+        assert_eq!(fsm.session.as_ref().unwrap().candidates_found, 2);
+        assert_eq!(fsm.session.as_ref().unwrap().entries_processed, 1);
     }
 
     #[tokio::test]
@@ -1414,146 +1647,188 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
+
         // Test empty base DN
-        let result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec![],
-            size_limit: 100,
-            time_limit: 30,
-        }).await;
-        
+        let result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec![],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await;
+
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SearchFsmError::InvalidParameters { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchFsmError::InvalidParameters { .. }
+        ));
         assert_eq!(fsm.current_state(), &SearchState::Initializing);
-        
+
         // Test invalid scope
-        let result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 5, // Invalid scope
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec![],
-            size_limit: 100,
-            time_limit: 30,
-        }).await;
-        
+        let result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 5, // Invalid scope
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec![],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await;
+
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SearchFsmError::InvalidParameters { .. }));
-        
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchFsmError::InvalidParameters { .. }
+        ));
+
         // Test empty filter
-        let result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "".to_string(),
-            attributes: vec![],
-            size_limit: 100,
-            time_limit: 30,
-        }).await;
-        
+        let result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "".to_string(),
+                attributes: vec![],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await;
+
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SearchFsmError::InvalidParameters { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchFsmError::InvalidParameters { .. }
+        ));
     }
 
     #[tokio::test]
-    async fn test_candidates_found_success() {
-        let backend = Box::new(MockSearchBackend::new());
+    async fn test_start_search_with_no_candidates_completes_immediately() {
+        let backend = Box::new(MockSearchBackend::new().with_empty_results());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
-        let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
-        // Start search first
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
-        // Handle candidates found
-        let result = fsm.handle_event(SearchEvent::CandidatesFound(2)).await;
-        
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), None);
-        assert_eq!(fsm.current_state(), &SearchState::Iterating {
-            candidates_found: 2,
-            entries_sent: 0,
-        });
-    }
 
-    #[tokio::test]
-    async fn test_candidates_found_no_candidates() {
-        let backend = Box::new(MockSearchBackend::new());
-        let filter_matcher = Box::new(MockFilterMatcher::new());
-        let entry_formatter = Box::new(MockEntryFormatter::new());
-        
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
-        // Start search first
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
-        // Handle no candidates found
-        let result = fsm.handle_event(SearchEvent::CandidatesFound(0)).await;
-        
+
+        let result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await;
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
-        assert_eq!(fsm.current_state(), &SearchState::Completed {
-            entries_sent: 0,
-            result_code: SearchResultCode::Success,
-        });
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Completed {
+                entries_sent: 0,
+                result_code: SearchResultCode::Success,
+            }
+        );
+        assert_eq!(fsm.stats(), (1, 0, 0));
         assert!(fsm.is_terminal());
     }
 
     #[tokio::test]
-    async fn test_entry_found_and_emitted() {
+    async fn test_entry_emitted_fetches_remaining_matching_entries_in_order() {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
-        let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
-        // Start search and find candidates
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
-        let _result = fsm.handle_event(SearchEvent::CandidatesFound(1)).await.unwrap();
-        
-        // Handle entry found
-        let entry_data = b"dn: cn=test,dc=example,dc=org\ncn: test\n".to_vec();
-        let result = fsm.handle_event(SearchEvent::EntryFound(entry_data.clone())).await;
-        
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(entry_data));
+
+        let config = SearchFsmConfig {
+            candidate_batch_size: 1,
+            ..SearchFsmConfig::default()
+        };
+        let mut fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);
+
+        let first_result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first_result,
+            Some(b"dn: cn=john,dc=example,dc=org\n".to_vec())
+        );
         assert_eq!(fsm.current_state(), &SearchState::EmittingEntries);
-        
-        // Handle entry emitted
-        let result = fsm.handle_event(SearchEvent::EntryEmitted).await;
-        
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), None);
-        assert_eq!(fsm.entries_sent(), 1);
-        
-        let (_, total_entries_sent, _) = fsm.stats();
-        assert_eq!(total_entries_sent, 1);
+        assert_eq!(fsm.session.as_ref().unwrap().entries_processed, 1);
+
+        let second_result = fsm.handle_event(SearchEvent::EntryEmitted).await.unwrap();
+        assert_eq!(
+            second_result,
+            Some(b"dn: cn=jane,dc=example,dc=org\n".to_vec())
+        );
+        assert_eq!(fsm.current_state(), &SearchState::EmittingEntries);
+
+        let completion = fsm.handle_event(SearchEvent::EntryEmitted).await.unwrap();
+        assert_eq!(completion, None);
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Completed {
+                entries_sent: 2,
+                result_code: SearchResultCode::Success,
+            }
+        );
+        assert_eq!(fsm.stats(), (1, 2, 2));
+        assert_eq!(fsm.entries_sent(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_non_matching_candidates_are_skipped() {
+        let backend = Box::new(MockSearchBackend::new());
+        let filter_matcher = Box::new(MockFilterMatcher::new().with_match_plan([false, true]));
+        let entry_formatter = Box::new(MockEntryFormatter::new());
+
+        let config = SearchFsmConfig {
+            candidate_batch_size: 1,
+            ..SearchFsmConfig::default()
+        };
+        let mut fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);
+
+        let first_result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first_result,
+            Some(b"dn: cn=jane,dc=example,dc=org\n".to_vec())
+        );
+        assert_eq!(fsm.stats(), (1, 0, 2));
+
+        let completion = fsm.handle_event(SearchEvent::EntryEmitted).await.unwrap();
+        assert_eq!(completion, None);
+        assert_eq!(fsm.stats(), (1, 1, 2));
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Completed {
+                entries_sent: 1,
+                result_code: SearchResultCode::Success,
+            }
+        );
     }
 
     #[tokio::test]
@@ -1561,22 +1836,25 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
+
         // Start search
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
+        let _result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
         // Abandon search
         let result = fsm.handle_event(SearchEvent::Abandon).await;
-        
+
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), SearchFsmError::Abandoned));
         assert_eq!(fsm.current_state(), &SearchState::Abandoned);
@@ -1585,42 +1863,181 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_size_limit_exceeded() {
+    async fn test_size_limit_exceeded_during_iteration() {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
-        // Start search with very low size limit
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 1, // Allow only 1 entry
-            time_limit: 30,
-        }).await.unwrap();
-        
-        let _result = fsm.handle_event(SearchEvent::CandidatesFound(2)).await.unwrap();
-        
-        // Emit first entry - should succeed
-        let entry_data1 = b"dn: cn=test1,dc=example,dc=org\n".to_vec();
-        let result = fsm.handle_event(SearchEvent::EntryFound(entry_data1.clone())).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(entry_data1));
-        
-        let _result = fsm.handle_event(SearchEvent::EntryEmitted).await.unwrap();
-        assert_eq!(fsm.entries_sent(), 1);
-        
-        // Try to find second entry - should trigger size limit
-        let entry_data2 = b"dn: cn=test2,dc=example,dc=org\n".to_vec();
-        let result = fsm.handle_event(SearchEvent::EntryFound(entry_data2)).await;
-        
+
+        let first_result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 1,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first_result,
+            Some(b"dn: cn=john,dc=example,dc=org\n".to_vec())
+        );
+
+        let result = fsm.handle_event(SearchEvent::EntryEmitted).await;
+
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SearchFsmError::SizeLimitExceeded));
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchFsmError::SizeLimitExceeded
+        ));
         assert_eq!(fsm.current_state(), &SearchState::SizeLimitExceeded);
+        assert_eq!(fsm.stats(), (1, 1, 2));
         assert!(fsm.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn test_start_search_applies_max_candidates_limit() {
+        let backend = Box::new(MockSearchBackend::new());
+        let filter_matcher = Box::new(MockFilterMatcher::new());
+        let entry_formatter = Box::new(MockEntryFormatter::new());
+
+        let config = SearchFsmConfig {
+            max_candidates: 1,
+            candidate_batch_size: 1,
+            ..SearchFsmConfig::default()
+        };
+        let mut fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);
+
+        let first_result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first_result,
+            Some(b"dn: cn=john,dc=example,dc=org\n".to_vec())
+        );
+        assert_eq!(fsm.session.as_ref().unwrap().candidates_found, 1);
+
+        let completion = fsm.handle_event(SearchEvent::EntryEmitted).await.unwrap();
+        assert_eq!(completion, None);
+        assert_eq!(fsm.stats(), (1, 1, 1));
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Completed {
+                entries_sent: 1,
+                result_code: SearchResultCode::Success,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backend_failure_during_candidate_lookup_returns_backend_error() {
+        let backend = Box::new(MockSearchBackend::new().with_failure());
+        let filter_matcher = Box::new(MockFilterMatcher::new());
+        let entry_formatter = Box::new(MockEntryFormatter::new());
+
+        let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
+
+        let result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SearchFsmError::BackendError { message }) if message == "Mock backend failure"
+        ));
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Completed {
+                entries_sent: 0,
+                result_code: SearchResultCode::Other(1),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filter_failure_during_iteration_returns_filter_error() {
+        let backend = Box::new(MockSearchBackend::new());
+        let filter_matcher = Box::new(MockFilterMatcher::new().with_failure());
+        let entry_formatter = Box::new(MockEntryFormatter::new());
+
+        let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
+
+        let result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SearchFsmError::FilterError { message }) if message == "Mock filter matcher failure"
+        ));
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Completed {
+                entries_sent: 0,
+                result_code: SearchResultCode::Other(1),
+            }
+        );
+        assert_eq!(fsm.stats(), (1, 0, 1));
+    }
+
+    #[tokio::test]
+    async fn test_formatter_failure_during_iteration_returns_formatting_error() {
+        let backend = Box::new(MockSearchBackend::new());
+        let filter_matcher = Box::new(MockFilterMatcher::new());
+        let entry_formatter = Box::new(MockEntryFormatter::new().with_failure());
+
+        let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
+
+        let result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SearchFsmError::FormattingError { message }) if message == "Mock entry formatter failure"
+        ));
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Completed {
+                entries_sent: 0,
+                result_code: SearchResultCode::Other(1),
+            }
+        );
+        assert_eq!(fsm.stats(), (1, 0, 1));
     }
 
     #[tokio::test]
@@ -1628,30 +2045,39 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
+
         let result = fsm.handle_event(SearchEvent::TimeLimit).await;
-        
+
         // Should fail without active search
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SearchFsmError::NoActiveSearch));
-        
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchFsmError::NoActiveSearch
+        ));
+
         // Start search first
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 1, // 1 second
-        }).await.unwrap();
-        
+        let _result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 1, // 1 second
+            })
+            .await
+            .unwrap();
+
         // Trigger time limit
         let result = fsm.handle_event(SearchEvent::TimeLimit).await;
-        
+
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SearchFsmError::TimeLimitExceeded));
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchFsmError::TimeLimitExceeded
+        ));
         assert_eq!(fsm.current_state(), &SearchState::TimeLimitExceeded);
         assert!(fsm.is_terminal());
     }
@@ -1661,28 +2087,34 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
+
         // Start search
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
+        let _result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
         // Complete search
         let result = fsm.handle_event(SearchEvent::SearchComplete).await;
-        
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
-        assert_eq!(fsm.current_state(), &SearchState::Completed {
-            entries_sent: 0,
-            result_code: SearchResultCode::Success,
-        });
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Completed {
+                entries_sent: 0,
+                result_code: SearchResultCode::Success,
+            }
+        );
         assert!(fsm.is_terminal());
     }
 
@@ -1691,25 +2123,28 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
+
         // Start search
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
-        assert_eq!(fsm.current_state(), &SearchState::FindingCandidates);
+        let _result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(fsm.current_state(), &SearchState::EmittingEntries);
         assert!(fsm.search_params().is_some());
-        
+
         // Reset FSM
         let result = fsm.reset().await;
-        
+
         assert!(result.is_ok());
         assert_eq!(fsm.current_state(), &SearchState::Initializing);
         assert!(fsm.search_params().is_none());
@@ -1723,23 +2158,52 @@ mod tests {
         let entry_formatter = Box::new(MockEntryFormatter::new());
         let metrics = Box::new(MockSearchMetrics::new());
         let metrics_log = metrics.call_log.clone();
-        
-        let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter)
-            .with_metrics(metrics);
-        
-        // Start search
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
-        // Check metrics were called
+
+        let mut fsm =
+            SearchFsmImpl::new(backend, filter_matcher, entry_formatter).with_metrics(metrics);
+
+        let first_result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first_result,
+            Some(b"dn: cn=john,dc=example,dc=org\n".to_vec())
+        );
+
+        let second_result = fsm.handle_event(SearchEvent::EntryEmitted).await.unwrap();
+        assert_eq!(
+            second_result,
+            Some(b"dn: cn=jane,dc=example,dc=org\n".to_vec())
+        );
+
+        let completion = fsm.handle_event(SearchEvent::EntryEmitted).await.unwrap();
+        assert_eq!(completion, None);
+
         let calls = metrics_log.lock().unwrap();
-        assert!(calls.iter().any(|call| call.contains("record_search_start")));
+        assert!(calls
+            .iter()
+            .any(|call| call.contains("record_search_start")));
+        assert!(calls
+            .iter()
+            .any(|call| call == "record_candidates_found(2)"));
+        assert!(calls
+            .iter()
+            .any(|call| call == "record_entry_processed(cn=john,dc=example,dc=org, true)"));
+        assert!(calls
+            .iter()
+            .any(|call| call == "record_entry_processed(cn=jane,dc=example,dc=org, true)"));
+        assert!(calls
+            .iter()
+            .any(|call| { call.contains("record_search_complete(Success, 2,") }));
     }
 
     #[tokio::test]
@@ -1747,24 +2211,27 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
+
         // Start search
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
+        let _result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
         assert!(!fsm.is_abandoned());
-        
+
         // Abandon via trait method
         let result = fsm.abandon().await;
-        
+
         assert!(result.is_ok());
         assert!(fsm.is_abandoned());
         assert_eq!(fsm.current_state(), &SearchState::Abandoned);
@@ -1775,22 +2242,25 @@ mod tests {
         let backend = Box::new(MockSearchBackend::new());
         let filter_matcher = Box::new(MockFilterMatcher::new());
         let entry_formatter = Box::new(MockEntryFormatter::new());
-        
+
         let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
-        
+
         // No timeout without active search
         assert!(fsm.timeout().is_none());
-        
+
         // Start search
-        let _result = fsm.handle_event(SearchEvent::StartSearch {
-            base_dn: "dc=example,dc=org".to_string(),
-            scope: 2,
-            filter: "(objectClass=person)".to_string(),
-            attributes: vec!["cn".to_string()],
-            size_limit: 100,
-            time_limit: 30,
-        }).await.unwrap();
-        
+        let _result = fsm
+            .handle_event(SearchEvent::StartSearch {
+                base_dn: "dc=example,dc=org".to_string(),
+                scope: 2,
+                filter: "(objectClass=person)".to_string(),
+                attributes: vec!["cn".to_string()],
+                size_limit: 100,
+                time_limit: 30,
+            })
+            .await
+            .unwrap();
+
         // Should have timeout now
         assert_eq!(fsm.timeout(), Some(Duration::from_secs(30)));
         assert!(!fsm.is_timed_out()); // Should not be timed out immediately
@@ -1799,19 +2269,22 @@ mod tests {
     #[tokio::test]
     async fn test_search_entry_methods() {
         let mut entry = SearchEntry::new("cn=test,dc=example,dc=org".to_string());
-        
+
         assert_eq!(entry.dn, "cn=test,dc=example,dc=org");
         assert!(entry.attributes.is_empty());
         assert!(entry.object_classes.is_empty());
-        
+
         entry.add_attribute("cn".to_string(), vec!["test".to_string()]);
         entry.add_attribute("mail".to_string(), vec!["test@example.org".to_string()]);
         entry.set_object_classes(vec!["person".to_string(), "inetOrgPerson".to_string()]);
-        
+
         assert_eq!(entry.get_attribute("cn"), Some(&vec!["test".to_string()]));
-        assert_eq!(entry.get_attribute("mail"), Some(&vec!["test@example.org".to_string()]));
+        assert_eq!(
+            entry.get_attribute("mail"),
+            Some(&vec!["test@example.org".to_string()])
+        );
         assert_eq!(entry.get_attribute("nonexistent"), None);
-        
+
         assert!(entry.has_object_class("person"));
         assert!(entry.has_object_class("inetOrgPerson"));
         assert!(entry.has_object_class("PERSON")); // Case insensitive
@@ -1828,41 +2301,41 @@ mod tests {
             size_limit: 10,
             time_limit: 30,
         };
-        
+
         let mut session = SearchSession::new(params);
-        
+
         assert_eq!(session.entries_sent, 0);
         assert_eq!(session.candidates_found, 0);
         assert!(!session.is_abandoned);
-        
+
         session.candidates = vec![
             "cn=user1,dc=example,dc=org".to_string(),
             "cn=user2,dc=example,dc=org".to_string(),
             "cn=user3,dc=example,dc=org".to_string(),
         ];
-        
+
         assert!(session.has_more_candidates());
-        
+
         let batch = session.get_next_candidate_batch(2);
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], "cn=user1,dc=example,dc=org");
         assert_eq!(batch[1], "cn=user2,dc=example,dc=org");
-        
+
         let batch = session.get_next_candidate_batch(2);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0], "cn=user3,dc=example,dc=org");
-        
+
         assert!(!session.has_more_candidates());
-        
+
         let batch = session.get_next_candidate_batch(2);
         assert!(batch.is_empty());
-        
+
         // Test size limit checking
         session.entries_sent = 8;
         assert!(!session.would_exceed_size_limit(1));
         assert!(!session.would_exceed_size_limit(2));
         assert!(session.would_exceed_size_limit(3));
-        
+
         // Test time limit (should not be exceeded immediately)
         assert!(!session.is_time_limit_exceeded());
     }
