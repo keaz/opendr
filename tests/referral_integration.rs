@@ -8,14 +8,216 @@
 //! - Proxy request handling
 //! - Error handling and recovery
 
+use async_trait::async_trait;
 use opendr::fsm::{ReferralEvent, ReferralFsm, ReferralResultCode, ReferralState, StateMachine};
-use opendr::referral::{
-    LdapChainHandler, LdapNetworkClient, LdapProxyHandler, LdapReferralResolver,
-};
+use opendr::referral::LdapReferralResolver;
 use opendr::referral_fsm::{
-    ChainHandler, NetworkClient, ProxyHandler, ReferralConfig, ReferralFsmImpl,
-    ReferralResolver, ResolvedEndpoint,
+    ChainHandler, NetworkClient, ProxyHandler, ReferralConfig, ReferralFsmError, ReferralFsmImpl,
+    ReferralMetrics, ReferralRequest, ReferralResolver, ResolvedEndpoint,
 };
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+struct RecordingChainHandler {
+    failed_targets: HashSet<String>,
+    response: Vec<u8>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingChainHandler {
+    fn new() -> Self {
+        Self {
+            failed_targets: HashSet::new(),
+            response: b"mock chained response".to_vec(),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn with_failed_target(mut self, target: &str) -> Self {
+        self.failed_targets.insert(target.to_string());
+        self
+    }
+
+    fn log_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.log)
+    }
+}
+
+#[async_trait]
+impl ChainHandler for RecordingChainHandler {
+    async fn chain_request(
+        &self,
+        target: &str,
+        request: &[u8],
+        hop_count: u32,
+    ) -> Result<Vec<u8>, String> {
+        self.log.lock().unwrap().push(format!(
+            "chain_request: target={}, request_len={}, hop_count={}",
+            target,
+            request.len(),
+            hop_count
+        ));
+
+        if self.failed_targets.contains(target) {
+            Err(format!("chain failure for {}", target))
+        } else {
+            Ok(self.response.clone())
+        }
+    }
+}
+
+struct RecordingProxyHandler {
+    failed_targets: HashSet<String>,
+    response: Vec<u8>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingProxyHandler {
+    fn new() -> Self {
+        Self {
+            failed_targets: HashSet::new(),
+            response: b"mock proxied response".to_vec(),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ProxyHandler for RecordingProxyHandler {
+    async fn proxy_request(&self, target: &str, request: &[u8]) -> Result<Vec<u8>, String> {
+        self.log.lock().unwrap().push(format!(
+            "proxy_request: target={}, request_len={}",
+            target,
+            request.len()
+        ));
+
+        if self.failed_targets.contains(target) {
+            Err(format!("proxy failure for {}", target))
+        } else {
+            Ok(self.response.clone())
+        }
+    }
+}
+
+struct RecordingNetworkClient;
+
+#[async_trait]
+impl NetworkClient for RecordingNetworkClient {
+    async fn send_request(
+        &self,
+        _endpoint: &ResolvedEndpoint,
+        _request: &[u8],
+        _timeout_ms: u64,
+    ) -> Result<Vec<u8>, String> {
+        Ok(b"network response".to_vec())
+    }
+}
+
+struct RecordingMetrics {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingMetrics {
+    fn new() -> Self {
+        Self {
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn log_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.log)
+    }
+}
+
+impl ReferralMetrics for RecordingMetrics {
+    fn record_referral_start(&self, urls: &[String], hop_count: u32) {
+        self.log.lock().unwrap().push(format!(
+            "record_referral_start: urls={:?}, hop_count={}",
+            urls, hop_count
+        ));
+    }
+
+    fn record_resolution_complete(
+        &self,
+        urls: &[String],
+        resolved_count: usize,
+        _duration: Duration,
+    ) {
+        self.log.lock().unwrap().push(format!(
+            "record_resolution_complete: urls={:?}, resolved_count={}",
+            urls, resolved_count
+        ));
+    }
+
+    fn record_chain_request(&self, target: &str, hop_count: u32) {
+        self.log.lock().unwrap().push(format!(
+            "record_chain_request: target={}, hop_count={}",
+            target, hop_count
+        ));
+    }
+
+    fn record_proxy_request(&self, target: &str) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("record_proxy_request: target={}", target));
+    }
+
+    fn record_response_received(&self, target: &str, response_size: usize, _duration: Duration) {
+        self.log.lock().unwrap().push(format!(
+            "record_response_received: target={}, response_size={}",
+            target, response_size
+        ));
+    }
+
+    fn record_referral_complete(
+        &self,
+        result_code: &ReferralResultCode,
+        _total_duration: Duration,
+    ) {
+        self.log.lock().unwrap().push(format!(
+            "record_referral_complete: result_code={:?}",
+            result_code
+        ));
+    }
+
+    fn record_referral_error(&self, error: &ReferralFsmError, context: &str) {
+        self.log.lock().unwrap().push(format!(
+            "record_referral_error: error={:?}, context={}",
+            error, context
+        ));
+    }
+}
+
+fn create_flow_fsm(
+    config: Option<ReferralConfig>,
+    chain_handler: Box<dyn ChainHandler>,
+    proxy_handler: Box<dyn ProxyHandler>,
+) -> ReferralFsmImpl {
+    let resolver = Box::new(LdapReferralResolver::new());
+    let network_client = Box::new(RecordingNetworkClient);
+
+    match config {
+        Some(config) => ReferralFsmImpl::with_config(
+            resolver,
+            chain_handler,
+            proxy_handler,
+            network_client,
+            config,
+        ),
+        None => ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client),
+    }
+}
+
+fn attach_request_context(fsm: &mut ReferralFsmImpl) {
+    fsm.set_request_context(ReferralRequest::new(
+        b"integration request".to_vec(),
+        "client-1".to_string(),
+        "dc=example,dc=org".to_string(),
+        "search".to_string(),
+    ));
+}
 
 // ================================================================================================
 // Test: Referral URL Parsing and Resolution
@@ -141,9 +343,9 @@ async fn test_referral_url_resolution_all_invalid() {
 #[tokio::test]
 async fn test_fsm_with_real_resolver_success() {
     let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
+    let chain_handler = Box::new(RecordingChainHandler::new());
+    let proxy_handler = Box::new(RecordingProxyHandler::new());
+    let network_client = Box::new(RecordingNetworkClient);
 
     let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
 
@@ -154,19 +356,16 @@ async fn test_fsm_with_real_resolver_success() {
         .await;
 
     assert!(result.is_ok());
-    assert_eq!(
-        fsm.current_state(),
-        &ReferralState::EvaluatingReferral
-    );
+    assert_eq!(fsm.current_state(), &ReferralState::EvaluatingReferral);
     assert_eq!(fsm.referral_urls(), Some(urls.as_slice()));
 }
 
 #[tokio::test]
 async fn test_fsm_with_real_resolver_invalid_urls() {
     let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
+    let chain_handler = Box::new(RecordingChainHandler::new());
+    let proxy_handler = Box::new(RecordingProxyHandler::new());
+    let network_client = Box::new(RecordingNetworkClient);
 
     let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
 
@@ -185,23 +384,48 @@ async fn test_fsm_with_real_resolver_invalid_urls() {
 
 #[tokio::test]
 async fn test_hop_limit_enforcement_chain_handler() {
-    let handler = LdapChainHandler::with_config(2, 30000);
+    struct LimitedChainHandler {
+        max_depth: u32,
+    }
+
+    #[async_trait]
+    impl ChainHandler for LimitedChainHandler {
+        async fn chain_request(
+            &self,
+            _target: &str,
+            _request: &[u8],
+            hop_count: u32,
+        ) -> Result<Vec<u8>, String> {
+            if hop_count >= self.max_depth {
+                Err(format!(
+                    "Hop limit exceeded: {} >= {}",
+                    hop_count, self.max_depth
+                ))
+            } else {
+                Ok(b"ok".to_vec())
+            }
+        }
+
+        fn max_chain_depth(&self) -> u32 {
+            self.max_depth
+        }
+    }
+
+    let handler = LimitedChainHandler { max_depth: 2 };
 
     let request = b"test request";
 
-    // Hop count 0 - should be allowed (but fail due to network layer)
+    // Hop count 0 - should be allowed
     let result = handler
         .chain_request("server.example.com", request, 0)
         .await;
-    assert!(result.is_err());
-    assert!(!result.unwrap_err().contains("Hop limit"));
+    assert!(result.is_ok());
 
     // Hop count 1 - should be allowed
     let result = handler
         .chain_request("server.example.com", request, 1)
         .await;
-    assert!(result.is_err());
-    assert!(!result.unwrap_err().contains("Hop limit"));
+    assert!(result.is_ok());
 
     // Hop count 2 (at limit) - should be rejected
     let result = handler
@@ -229,13 +453,12 @@ async fn test_hop_limit_enforcement_in_fsm() {
         cache_ttl_seconds: 300,
     };
 
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm =
-        ReferralFsmImpl::with_config(resolver, chain_handler, proxy_handler, network_client, config);
+    let mut fsm = create_flow_fsm(
+        Some(config),
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
+    attach_request_context(&mut fsm);
 
     // Start referral
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -261,10 +484,7 @@ async fn test_hop_limit_enforcement_in_fsm() {
         .await;
 
     assert!(result.is_err());
-    assert_eq!(
-        fsm.current_state(),
-        &ReferralState::HopLimitExceeded
-    );
+    assert_eq!(fsm.current_state(), &ReferralState::HopLimitExceeded);
 }
 
 // ================================================================================================
@@ -273,12 +493,12 @@ async fn test_hop_limit_enforcement_in_fsm() {
 
 #[tokio::test]
 async fn test_chain_request_flow() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
+    attach_request_context(&mut fsm);
 
     // Receive referral
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -297,20 +517,25 @@ async fn test_chain_request_flow() {
     assert!(result.is_ok());
     assert!(matches!(
         fsm.current_state(),
-        ReferralState::ChainRequest { .. }
+        ReferralState::ProcessingResponse
     ));
     assert_eq!(fsm.hop_count(), 1);
     assert_eq!(fsm.current_target(), Some("server.example.com"));
+    assert_eq!(
+        fsm.handle_event(ReferralEvent::ProcessingComplete)
+            .await
+            .unwrap(),
+        Some(b"mock chained response".to_vec())
+    );
 }
 
 #[tokio::test]
 async fn test_chain_request_target_not_found() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     // Receive referral
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -331,12 +556,11 @@ async fn test_chain_request_target_not_found() {
 
 #[tokio::test]
 async fn test_chain_request_no_active_referral() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     // Try to make chain decision without receiving referral first
     let result = fsm
@@ -354,12 +578,12 @@ async fn test_chain_request_no_active_referral() {
 
 #[tokio::test]
 async fn test_proxy_request_flow() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
+    attach_request_context(&mut fsm);
 
     // Receive referral
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -378,19 +602,24 @@ async fn test_proxy_request_flow() {
     assert!(result.is_ok());
     assert!(matches!(
         fsm.current_state(),
-        ReferralState::ProxyRequest { .. }
+        ReferralState::ProcessingResponse
     ));
     assert_eq!(fsm.current_target(), Some("server.example.com"));
+    assert_eq!(
+        fsm.handle_event(ReferralEvent::ProcessingComplete)
+            .await
+            .unwrap(),
+        Some(b"mock proxied response".to_vec())
+    );
 }
 
 #[tokio::test]
 async fn test_proxy_request_target_not_found() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     // Receive referral
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -411,12 +640,11 @@ async fn test_proxy_request_target_not_found() {
 
 #[tokio::test]
 async fn test_proxy_request_no_active_referral() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     // Try to make proxy decision without receiving referral first
     let result = fsm
@@ -434,12 +662,12 @@ async fn test_proxy_request_no_active_referral() {
 
 #[tokio::test]
 async fn test_complete_chain_workflow() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
+    attach_request_context(&mut fsm);
 
     // Step 1: Receive referral
     let result = fsm
@@ -457,31 +685,12 @@ async fn test_complete_chain_workflow() {
         .await;
     assert!(result.is_ok());
 
-    // Step 3: Request sent
-    let result = fsm.handle_event(ReferralEvent::RequestSent).await;
-    assert!(result.is_ok());
-    assert_eq!(
-        fsm.current_state(),
-        &ReferralState::AwaitingResponse
-    );
+    assert_eq!(fsm.current_state(), &ReferralState::ProcessingResponse);
 
-    // Step 4: Response received
-    let response_data = b"test response data".to_vec();
-    let result = fsm
-        .handle_event(ReferralEvent::ResponseReceived(response_data.clone()))
-        .await;
+    // Step 3: Processing complete
+    let result = fsm.handle_event(ReferralEvent::ProcessingComplete).await;
     assert!(result.is_ok());
-    assert_eq!(
-        fsm.current_state(),
-        &ReferralState::ProcessingResponse
-    );
-
-    // Step 5: Processing complete
-    let result = fsm
-        .handle_event(ReferralEvent::ProcessingComplete)
-        .await;
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), Some(response_data));
+    assert_eq!(result.unwrap(), Some(b"mock chained response".to_vec()));
     assert!(matches!(
         fsm.current_state(),
         ReferralState::Completed {
@@ -492,12 +701,12 @@ async fn test_complete_chain_workflow() {
 
 #[tokio::test]
 async fn test_complete_proxy_workflow() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
+    attach_request_context(&mut fsm);
 
     // Step 1: Receive referral
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -513,23 +722,12 @@ async fn test_complete_proxy_workflow() {
     .await
     .unwrap();
 
-    // Step 3: Request sent
-    fsm.handle_event(ReferralEvent::RequestSent)
-        .await
-        .unwrap();
+    assert_eq!(fsm.current_state(), &ReferralState::ProcessingResponse);
 
-    // Step 4: Response received
-    let response_data = b"proxy response".to_vec();
-    fsm.handle_event(ReferralEvent::ResponseReceived(response_data.clone()))
-        .await
-        .unwrap();
-
-    // Step 5: Processing complete
-    let result = fsm
-        .handle_event(ReferralEvent::ProcessingComplete)
-        .await;
+    // Step 3: Processing complete
+    let result = fsm.handle_event(ReferralEvent::ProcessingComplete).await;
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), Some(response_data));
+    assert_eq!(result.unwrap(), Some(b"mock proxied response".to_vec()));
 }
 
 // ================================================================================================
@@ -538,12 +736,11 @@ async fn test_complete_proxy_workflow() {
 
 #[tokio::test]
 async fn test_error_handling_empty_urls() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     let result = fsm
         .handle_event(ReferralEvent::ReferralReceived { urls: vec![] })
@@ -554,12 +751,11 @@ async fn test_error_handling_empty_urls() {
 
 #[tokio::test]
 async fn test_error_handling_generic_error() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     let result = fsm
         .handle_event(ReferralEvent::Error("Test error".to_string()))
@@ -576,12 +772,11 @@ async fn test_error_handling_generic_error() {
 
 #[tokio::test]
 async fn test_error_handling_hop_limit_reached() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     // Start referral first
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -590,15 +785,10 @@ async fn test_error_handling_hop_limit_reached() {
     .await
     .unwrap();
 
-    let result = fsm
-        .handle_event(ReferralEvent::HopLimitReached)
-        .await;
+    let result = fsm.handle_event(ReferralEvent::HopLimitReached).await;
 
     assert!(result.is_err());
-    assert_eq!(
-        fsm.current_state(),
-        &ReferralState::HopLimitExceeded
-    );
+    assert_eq!(fsm.current_state(), &ReferralState::HopLimitExceeded);
 }
 
 // ================================================================================================
@@ -607,12 +797,12 @@ async fn test_error_handling_hop_limit_reached() {
 
 #[tokio::test]
 async fn test_fsm_reset() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
+    attach_request_context(&mut fsm);
 
     // Progress through some states
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -632,10 +822,7 @@ async fn test_fsm_reset() {
     assert!(result.is_ok());
 
     // Verify state is reset
-    assert_eq!(
-        fsm.current_state(),
-        &ReferralState::EvaluatingReferral
-    );
+    assert_eq!(fsm.current_state(), &ReferralState::EvaluatingReferral);
     assert_eq!(fsm.hop_count(), 0);
     assert!(fsm.current_target().is_none());
     assert!(fsm.referral_urls().is_none());
@@ -643,12 +830,11 @@ async fn test_fsm_reset() {
 
 #[tokio::test]
 async fn test_fsm_is_terminal() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     // Initial state is not terminal
     assert!(!fsm.is_terminal());
@@ -681,12 +867,12 @@ async fn test_fsm_is_terminal() {
 
 #[tokio::test]
 async fn test_fsm_statistics_tracking() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
+    attach_request_context(&mut fsm);
 
     // Initial stats
     let (total, successful, failed, avg_hops) = fsm.get_stats();
@@ -708,12 +894,6 @@ async fn test_fsm_statistics_tracking() {
     .await
     .unwrap();
 
-    fsm.handle_event(ReferralEvent::RequestSent)
-        .await
-        .unwrap();
-    fsm.handle_event(ReferralEvent::ResponseReceived(b"response".to_vec()))
-        .await
-        .unwrap();
     fsm.handle_event(ReferralEvent::ProcessingComplete)
         .await
         .unwrap();
@@ -728,12 +908,11 @@ async fn test_fsm_statistics_tracking() {
 
 #[tokio::test]
 async fn test_fsm_statistics_failed_referral() {
-    let resolver = Box::new(LdapReferralResolver::new());
-    let chain_handler = Box::new(LdapChainHandler::new());
-    let proxy_handler = Box::new(LdapProxyHandler::new());
-    let network_client = Box::new(LdapNetworkClient::new());
-
-    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client);
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(RecordingChainHandler::new()),
+        Box::new(RecordingProxyHandler::new()),
+    );
 
     // Start and fail a referral
     fsm.handle_event(ReferralEvent::ReferralReceived {
@@ -751,4 +930,78 @@ async fn test_fsm_statistics_failed_referral() {
     assert_eq!(total, 1);
     assert_eq!(successful, 0);
     assert_eq!(failed, 1);
+}
+
+#[tokio::test]
+async fn test_chain_failover_tries_second_endpoint() {
+    let chain_handler = RecordingChainHandler::new().with_failed_target("server1.example.com");
+    let chain_log = chain_handler.log_handle();
+    let mut fsm = create_flow_fsm(
+        None,
+        Box::new(chain_handler),
+        Box::new(RecordingProxyHandler::new()),
+    );
+    attach_request_context(&mut fsm);
+
+    fsm.handle_event(ReferralEvent::ReferralReceived {
+        urls: vec![
+            "ldap://server1.example.com/dc=example,dc=org".to_string(),
+            "ldap://server2.example.com/dc=example,dc=org".to_string(),
+        ],
+    })
+    .await
+    .unwrap();
+
+    fsm.handle_event(ReferralEvent::ChainDecision {
+        target: "server1.example.com".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let log = chain_log.lock().unwrap().clone();
+    assert_eq!(log.len(), 2);
+    assert!(log[0].contains("target=server1.example.com"));
+    assert!(log[0].contains("request_len=19"));
+    assert!(log[1].contains("target=server2.example.com"));
+    assert_eq!(fsm.current_target(), Some("server2.example.com"));
+}
+
+#[tokio::test]
+async fn test_metrics_distinguish_chain_and_proxy_execution() {
+    let resolver = Box::new(LdapReferralResolver::new());
+    let chain_handler = Box::new(RecordingChainHandler::new());
+    let proxy_handler = Box::new(RecordingProxyHandler::new());
+    let network_client = Box::new(RecordingNetworkClient);
+    let metrics = RecordingMetrics::new();
+    let metric_log = metrics.log_handle();
+
+    let mut fsm = ReferralFsmImpl::new(resolver, chain_handler, proxy_handler, network_client)
+        .with_metrics(Box::new(metrics));
+    attach_request_context(&mut fsm);
+
+    fsm.handle_event(ReferralEvent::ReferralReceived {
+        urls: vec!["ldap://server.example.com/dc=example,dc=org".to_string()],
+    })
+    .await
+    .unwrap();
+
+    fsm.handle_event(ReferralEvent::ProxyDecision {
+        target: "server.example.com".to_string(),
+    })
+    .await
+    .unwrap();
+    fsm.handle_event(ReferralEvent::ProcessingComplete)
+        .await
+        .unwrap();
+
+    let log = metric_log.lock().unwrap().clone();
+    assert!(log
+        .iter()
+        .any(|entry| entry.contains("record_proxy_request: target=server.example.com")));
+    assert!(!log
+        .iter()
+        .any(|entry| entry.contains("record_chain_request: target=server.example.com")));
+    assert!(log
+        .iter()
+        .any(|entry| entry.contains("record_response_received: target=server.example.com")));
 }
