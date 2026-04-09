@@ -18,6 +18,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Validate configuration
     config.validate()?;
+    let root_password = config.resolved_root_password()?;
 
     // Create shutdown coordinator
     let shutdown_config = ShutdownConfig::default();
@@ -55,7 +56,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     Ok(None) | Err(_) => {
                         println!("Initializing base directory structure...");
-                        initialize_lmdb_base_structure(&mut backend, &config).await?;
+                        initialize_lmdb_base_structure(&mut backend, &config, &root_password)
+                            .await?;
                     }
                 }
 
@@ -68,13 +70,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let mut backend = MockBackend::from_credentials_with_replica_id(
                     [(
                         &format!("{},{}", config.server.root_user_dn, config.server.base_dn),
-                        config.server.root_password.as_bytes().to_vec(),
+                        root_password.as_bytes().to_vec(),
                     )],
                     config.server.replica_id,
                 );
 
                 // Add base structure entries
-                initialize_base_structure(&mut backend, &config).await?;
+                initialize_base_structure(&mut backend, &config, &root_password).await?;
 
                 Arc::new(backend)
             }
@@ -167,6 +169,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn initialize_base_structure(
     backend: &mut dyn DirectoryBackend,
     config: &ServerConfig,
+    root_password: &str,
 ) -> Result<(), Box<dyn Error>> {
     // Add root DN entry
     let base_dn_entry = DirectoryEntry::new(
@@ -210,10 +213,7 @@ async fn initialize_base_structure(
         ]),
     );
     backend
-        .add_entry(
-            root_user_entry,
-            config.server.root_password.as_bytes().to_vec(),
-        )
+        .add_entry(root_user_entry, root_password.as_bytes().to_vec())
         .await?;
 
     // Add organizational units
@@ -273,6 +273,7 @@ async fn initialize_base_structure(
 async fn initialize_lmdb_base_structure(
     backend: &mut LmdbBackend,
     config: &ServerConfig,
+    root_password: &str,
 ) -> Result<(), Box<dyn Error>> {
     // Add root DN entry
     let base_dn_entry = DirectoryEntry::new(
@@ -320,7 +321,7 @@ async fn initialize_lmdb_base_structure(
 
     // Set the pre-hashed password from config
     backend
-        .set_prehashed_password(&root_dn, &config.server.root_password)
+        .set_prehashed_password(&root_dn, root_password)
         .await?;
 
     // Add organizational units
@@ -379,6 +380,8 @@ async fn initialize_lmdb_base_structure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -391,7 +394,7 @@ mod tests {
         config.backend.backend_type = "memory".to_string();
 
         let mut backend = MockBackend::new();
-        initialize_base_structure(&mut backend, &config)
+        initialize_base_structure(&mut backend, &config, "secret")
             .await
             .unwrap();
 
@@ -450,7 +453,7 @@ mod tests {
         config.backend.data_directory = temp_dir.path().to_path_buf();
 
         let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
-        initialize_base_structure(&mut backend, &config)
+        initialize_base_structure(&mut backend, &config, "AdminPass123")
             .await
             .unwrap();
 
@@ -493,6 +496,35 @@ mod tests {
             .unwrap());
         assert!(!backend
             .authenticate("cn=admin,dc=test,dc=local", b"wrong")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_base_structure_inmemory_with_root_password_file() {
+        let mut secret_file = NamedTempFile::new().unwrap();
+        writeln!(secret_file, "file-backed-secret").unwrap();
+
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.server.root_user_dn = "cn=manager".to_string();
+        config.server.root_password.clear();
+        config.server.root_password_file = Some(secret_file.path().to_path_buf());
+        config.server.organization_name = "Example Org".to_string();
+        config.backend.backend_type = "memory".to_string();
+
+        let mut backend = MockBackend::new();
+        let root_password = config.resolved_root_password().unwrap();
+        initialize_base_structure(&mut backend, &config, &root_password)
+            .await
+            .unwrap();
+
+        assert!(backend
+            .authenticate("cn=manager,dc=example,dc=org", b"file-backed-secret")
+            .await
+            .unwrap());
+        assert!(!backend
+            .authenticate("cn=manager,dc=example,dc=org", b"wrong")
             .await
             .unwrap());
     }

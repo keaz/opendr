@@ -140,7 +140,7 @@ ldap_port = 1389
 replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
-root_password = "{SSHA512}<generated-hash>"
+root_password_file = "/run/secrets/opendr-provider-root-password-hash"
 organization_name = "Example Org"
 
 [backend]
@@ -167,7 +167,7 @@ ldap_port = 2389
 replica_id = 2
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
-root_password = "{SSHA512}<generated-hash>"
+root_password_file = "/run/secrets/opendr-consumer-root-password-hash"
 organization_name = "Example Org Replica"
 
 [backend]
@@ -181,7 +181,7 @@ enabled = true
 mode = "consumer"
 provider_url = "ldap://provider-server:1389"
 bind_dn = "cn=manager,dc=example,dc=com"
-bind_password = "replication_password"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
 sync_interval_secs = 3600
 max_retry_attempts = 3
 retry_delay_secs = 5
@@ -190,7 +190,7 @@ heartbeat_interval_secs = 60
 state_storage_path = "./data/replication_state"
 ```
 
-`bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` are still accepted as aliases. In production, point them at a dedicated read-only replication account on the provider. `replica_id` must be unique per replicated node so CSNs remain globally ordered.
+`bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` are still accepted as aliases. In production, point them at a dedicated read-only replication account on the provider and inject the actual secret with `bind_password_env` or `bind_password_file`. `replica_id` must be unique per replicated node so CSNs remain globally ordered.
 
 ### 4. Start Both Servers
 
@@ -202,7 +202,7 @@ cd /srv/opendr-provider && opendr
 cd /srv/opendr-consumer && opendr
 ```
 
-For LMDB-backed instances, generate the `{SSHA512}` root password with `opendr-setup` or reuse the generated hash from an existing server config.
+For LMDB-backed instances, generate the `{SSHA512}` root password with `opendr-setup` or reuse the generated hash from an existing server config, then mount it through `root_password_file` or export it via `root_password_env`.
 
 ### 5. Verify Listener-Based Replication
 

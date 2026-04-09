@@ -67,7 +67,7 @@ enabled = true
 mode = "consumer"
 provider_url = "ldap://provider.example.com:1389"
 bind_dn = "cn=replication,dc=example,dc=com"
-bind_password = "replication_password"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
 sync_interval_secs = 3600
 max_retry_attempts = 3
 retry_delay_secs = 5
@@ -76,7 +76,7 @@ heartbeat_interval_secs = 60
 state_storage_path = "./data/replication_state"
 ```
 
-`bind_dn` and `bind_password` are the canonical runtime keys. `provider_bind_dn` and `provider_bind_password` remain accepted as aliases. In production, point them at a dedicated read-only replication account on the provider.
+`bind_dn` and `bind_password` are the canonical runtime keys. `provider_bind_dn` and `provider_bind_password` remain accepted as aliases. In production, point them at a dedicated read-only replication account on the provider and inject the secret through `bind_password_env` or `bind_password_file`.
 
 ## Recommended Runtime Layout
 
@@ -112,7 +112,7 @@ bind_address = "0.0.0.0"
 ldap_port = 1389
 base_dn = "dc=company,dc=com"
 root_user_dn = "cn=manager"
-root_password = "{SSHA512}<generated-hash>"
+root_password_file = "/run/secrets/opendr-provider-root-password-hash"
 organization_name = "Company Directory"
 
 [backend]
@@ -138,7 +138,7 @@ bind_address = "0.0.0.0"
 ldap_port = 2389
 base_dn = "dc=company,dc=com"
 root_user_dn = "cn=manager"
-root_password = "{SSHA512}<generated-hash>"
+root_password_file = "/run/secrets/opendr-consumer-root-password-hash"
 organization_name = "Company Directory Replica"
 
 [backend]
@@ -152,7 +152,7 @@ enabled = true
 mode = "consumer"
 provider_url = "ldap://10.0.1.100:1389"
 bind_dn = "cn=replication,dc=company,dc=com"
-bind_password = "replication_password"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
 sync_interval_secs = 3600
 max_retry_attempts = 5
 retry_delay_secs = 5

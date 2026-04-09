@@ -88,7 +88,7 @@ hostname = "localhost"               # Server hostname
 replica_id = 1                       # Unique CSN replica ID for this server
 base_dn = "dc=example,dc=com"        # Base DN for directory
 root_user_dn = "cn=admin"            # Admin user DN
-root_password = "secret"             # Admin password (hashed on first use)
+root_password_file = "/run/secrets/opendr-root-password" # Admin secret source
 organization_name = "Example Org"    # Organization name
 read_buffer_size = 4096             # Socket read buffer size (bytes)
 operation_timeout_secs = 300        # Operation timeout (seconds)
@@ -100,7 +100,8 @@ max_concurrent_operations = 100     # Max operations per connection
 - `ldap_port` and `ldaps_port` must be different
 - `replica_id` must be non-zero, and must be unique per replicated node
 - `base_dn` cannot be empty
-- `root_password` is hashed using SSHA512 on first use
+- `root_password_env` and `root_password_file` let you inject the admin secret without storing it inline
+- `root_password` is still supported for local development, but production deployments should avoid committing it
 
 ### 2. Backend Settings
 
@@ -213,7 +214,7 @@ enabled = false                                 # Enable replication
 mode = "provider"                               # Mode: "provider", "consumer", "both"
 provider_url = "ldap://provider.example.com"    # Provider URL (consumer mode)
 bind_dn = "cn=replicator,dc=example,dc=com"     # Canonical consumer bind key
-bind_password = "secret"                        # Canonical consumer bind secret
+bind_password_file = "/run/secrets/opendr-replication-bind-password" # Canonical consumer bind secret source
 changelog_capacity = 10000                      # Provider changelog size
 sync_interval_secs = 3600                       # Refresh/reconnect cadence (consumer mode)
 max_retry_attempts = 3                          # Consumer retry attempts
@@ -231,6 +232,7 @@ state_storage_path = "./data/replication_state" # Consumer cookie/state storage
 **Consumer Configuration:**
 - Requires `provider_url`; `bind_dn` and `bind_password` are optional
 - `bind_dn` / `bind_password` are the canonical keys; `provider_bind_dn` / `provider_bind_password` are accepted as aliases
+- `bind_password_env` and `bind_password_file` let you inject consumer credentials without storing them inline
 - `server.replica_id` must be unique per replicated node so generated CSNs do not collide
 - `sync_interval_secs` controls refresh and reconnect cadence; it is not the steady-state live update latency when listening is enabled
 - `enable_change_listening` keeps a long-lived LDAP search open for live updates after refresh
@@ -366,7 +368,7 @@ Error: provider_url required for consumer mode
 ```toml
 [server]
 base_dn = "dc=myorg,dc=com"
-root_password = "MySecurePassword123!"
+root_password_env = "OPENDR_ROOT_PASSWORD"
 ```
 
 All other settings use defaults.
@@ -378,7 +380,7 @@ All other settings use defaults.
 bind_address = "127.0.0.1"
 ldap_port = 1389
 base_dn = "dc=dev,dc=local"
-root_password = "dev"
+root_password_env = "OPENDR_DEV_ROOT_PASSWORD"
 
 [backend]
 backend_type = "memory"
@@ -402,7 +404,7 @@ ldaps_port = 636
 hostname = "ldap.example.com"
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=admin,dc=example,dc=com"
-root_password = "VerySecurePassword!"
+root_password_file = "/run/secrets/opendr-root-password"
 
 [backend]
 backend_type = "lmdb"
@@ -466,7 +468,7 @@ enabled = true
 mode = "consumer"
 provider_url = "ldap://provider.example.com:389"
 bind_dn = "cn=replicator,dc=example,dc=com"
-bind_password = "ReplicationSecret"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
 sync_interval_secs = 30
 enable_change_listening = true
 max_retry_attempts = 3
@@ -478,7 +480,7 @@ state_storage_path = "/var/lib/opendr/replication_state"
 
 ### Security
 
-1. **Use Strong Passwords**: Set a strong `root_password`
+1. **Use Strong Passwords**: Use a strong admin secret and inject it through `root_password_env` or `root_password_file`
 2. **Enable TLS**: Use TLS 1.3 for encrypted connections
 3. **Enable Rate Limiting**: Protect against DoS attacks
 4. **Enable Audit Logging**: Track security events
@@ -503,7 +505,7 @@ state_storage_path = "/var/lib/opendr/replication_state"
 
 ### Operations
 
-1. **Use Environment Variables**: For secrets and environment-specific settings
+1. **Use Environment Variables or Secret Files**: Prefer `*_env` or `*_file` for credentials and keep the committed TOML secret-free
 2. **Version Control**: Keep configuration in version control
 3. **Test Changes**: Validate configuration before deployment
 4. **Monitor Logs**: Check audit and application logs regularly

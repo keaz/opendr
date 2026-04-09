@@ -7,8 +7,10 @@ use opendr::backend::MockBackend;
 use opendr::config::ServerConfig;
 use opendr::replication_service::ReplicationService;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
+use tempfile::NamedTempFile;
 use tokio::time::sleep;
 
 /// Helper function to create a test configuration for consumer mode
@@ -214,6 +216,29 @@ async fn test_consumer_credentials_configuration() {
         consumer_cfg.provider_bind_password,
         Some("repl_password".to_string())
     );
+}
+
+#[tokio::test]
+async fn test_consumer_credentials_configuration_from_secret_file() {
+    let mut secret_file = NamedTempFile::new().unwrap();
+    writeln!(secret_file, "file-backed-repl-password").unwrap();
+
+    let mut config = create_consumer_config();
+    config.replication.bind_password = None;
+    config.replication.bind_password_file = Some(secret_file.path().to_path_buf());
+    let backend = Arc::new(MockBackend::new());
+
+    let service = ReplicationService::from_config(&config, backend).unwrap();
+
+    let consumer_cfg = service.consumer_config().unwrap();
+    assert_eq!(
+        consumer_cfg.provider_bind_password,
+        Some("file-backed-repl-password".to_string())
+    );
+
+    let debug_output = format!("{consumer_cfg:?}");
+    assert!(!debug_output.contains("file-backed-repl-password"));
+    assert!(debug_output.contains("<redacted>"));
 }
 
 #[tokio::test]

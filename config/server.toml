@@ -8,7 +8,8 @@ ldap_port = 1388
 replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
-root_password = "{SSHA512}GVw27ifx2yVPhVoKPEVtGdCFHylNp2fsdqQuXi9Pmz5B3XXGQxLOtL3VjRU2PRL91J5Y70haXx9issnnZmL3q5wzS9EYSeMRWmeYSQCoyA0="
+# For LMDB, the referenced secret should contain the full {SSHA512} hash value.
+root_password_file = "/run/secrets/opendr-root-password-hash"
 
 [backend]
 backend_type = "lmdb"
@@ -21,7 +22,7 @@ enabled = true
 mode = "consumer"
 provider_url = "ldap://localhost:1389"
 bind_dn = "cn=manager,dc=example,dc=com"
-bind_password = "Admin@123"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
 sync_interval_secs = 15
 max_retry_attempts = 3
 retry_delay_secs = 5

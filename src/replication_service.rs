@@ -36,6 +36,7 @@
 //! ```
 
 use log::{error, info};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -96,7 +97,7 @@ pub struct ProviderServiceConfig {
 }
 
 /// Consumer service configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConsumerServiceConfig {
     pub provider_url: String,
     pub base_dn: String,
@@ -108,6 +109,30 @@ pub struct ConsumerServiceConfig {
     pub enable_change_listening: bool,
     pub heartbeat_interval_secs: u64,
     pub state_storage_path: String,
+}
+
+impl fmt::Debug for ConsumerServiceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConsumerServiceConfig")
+            .field("provider_url", &self.provider_url)
+            .field("base_dn", &self.base_dn)
+            .field("provider_bind_dn", &self.provider_bind_dn)
+            .field(
+                "provider_bind_password",
+                &self
+                    .provider_bind_password
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("<unset>"),
+            )
+            .field("sync_interval_secs", &self.sync_interval_secs)
+            .field("max_retry_attempts", &self.max_retry_attempts)
+            .field("retry_delay_secs", &self.retry_delay_secs)
+            .field("enable_change_listening", &self.enable_change_listening)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("state_storage_path", &self.state_storage_path)
+            .finish()
+    }
 }
 
 impl ReplicationService {
@@ -205,12 +230,15 @@ impl ReplicationService {
                 .provider_url
                 .as_ref()
                 .ok_or_else(|| "provider_url required for consumer mode".to_string())?;
+            let provider_bind_password = config
+                .resolved_replication_bind_password()
+                .map_err(|err| err.to_string())?;
 
             Some(ConsumerServiceConfig {
                 provider_url: provider_url.clone(),
                 base_dn: config.server.base_dn.clone(),
                 provider_bind_dn: config.replication.bind_dn.clone(),
-                provider_bind_password: config.replication.bind_password.clone(),
+                provider_bind_password,
                 sync_interval_secs: config.replication.sync_interval_secs,
                 max_retry_attempts: config.replication.max_retry_attempts,
                 retry_delay_secs: config.replication.retry_delay_secs,
@@ -609,6 +637,8 @@ impl ReplicationService {
 mod tests {
     use super::*;
     use crate::backend::MockBackend;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     fn create_test_config() -> ServerConfig {
         let mut config = ServerConfig::default();
@@ -829,6 +859,30 @@ mod tests {
             consumer_cfg.provider_bind_dn,
             Some("cn=admin,dc=example,dc=com".to_string())
         );
+    }
+
+    #[test]
+    fn test_consumer_config_resolves_bind_password_from_file() {
+        let mut secret_file = NamedTempFile::new().unwrap();
+        writeln!(secret_file, "file-backed-bind-password").unwrap();
+
+        let mut config = create_test_config();
+        config.replication.mode = "consumer".to_string();
+        config.replication.provider_url = Some("ldap://provider:389".to_string());
+        config.replication.bind_password_file = Some(secret_file.path().to_path_buf());
+        let backend = Arc::new(MockBackend::new());
+
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let consumer_cfg = service.consumer_config().unwrap();
+
+        assert_eq!(
+            consumer_cfg.provider_bind_password,
+            Some("file-backed-bind-password".to_string())
+        );
+
+        let debug_output = format!("{consumer_cfg:?}");
+        assert!(!debug_output.contains("file-backed-bind-password"));
+        assert!(debug_output.contains("<redacted>"));
     }
 
     #[test]

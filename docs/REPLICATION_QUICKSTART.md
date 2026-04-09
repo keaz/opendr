@@ -61,7 +61,7 @@ bind_address = "0.0.0.0"
 ldap_port = 2389
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
-root_password = "{SSHA512}<generated-hash>"
+root_password_file = "/run/secrets/opendr-consumer-root-password-hash"
 organization_name = "Example Org Replica"
 
 [backend]
@@ -75,7 +75,7 @@ enabled = true
 mode = "consumer"
 provider_url = "ldap://provider.example.com:1389"
 bind_dn = "cn=manager,dc=example,dc=com"
-bind_password = "replication_password"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
 sync_interval_secs = 3600
 max_retry_attempts = 5
 retry_delay_secs = 1
@@ -84,7 +84,7 @@ heartbeat_interval_secs = 60
 state_storage_path = "./data/replication_state"
 ```
 
-`bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` remain supported as aliases. In production, use a dedicated read-only replication account on the provider.
+`bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` remain supported as aliases. In production, use a dedicated read-only replication account on the provider and inject the secret through `bind_password_env` or `bind_password_file`.
 
 ## 3. Start Both Servers
 

@@ -28,6 +28,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -94,7 +95,7 @@ pub struct ServerConfig {
 }
 
 /// Server settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServerSettings {
     /// LDAP bind address
     #[serde(default = "default_bind_address")]
@@ -125,8 +126,19 @@ pub struct ServerSettings {
     pub root_user_dn: String,
 
     /// Root password (hashed)
-    #[serde(default = "default_root_password")]
+    #[serde(
+        default = "default_root_password",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub root_password: String,
+
+    /// Environment variable containing the root password
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_password_env: Option<String>,
+
+    /// File containing the root password
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_password_file: Option<PathBuf>,
 
     /// Organization name
     #[serde(default = "default_organization_name")]
@@ -311,7 +323,7 @@ pub struct OperationLimits {
 }
 
 /// Replication settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ReplicationSettings {
     /// Enable replication
     #[serde(default)]
@@ -332,10 +344,29 @@ pub struct ReplicationSettings {
     /// Replication bind password
     #[serde(
         default,
+        skip_serializing_if = "Option::is_none",
         alias = "provider_bind_password",
         alias = "replication_bind_password"
     )]
     pub bind_password: Option<String>,
+
+    /// Environment variable containing the replication bind password
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "provider_bind_password_env",
+        alias = "replication_bind_password_env"
+    )]
+    pub bind_password_env: Option<String>,
+
+    /// File containing the replication bind password
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "provider_bind_password_file",
+        alias = "replication_bind_password_file"
+    )]
+    pub bind_password_file: Option<PathBuf>,
 
     /// Changelog capacity
     #[serde(default = "default_changelog_capacity")]
@@ -696,6 +727,8 @@ impl Default for ServerSettings {
             base_dn: default_base_dn(),
             root_user_dn: default_root_user_dn(),
             root_password: default_root_password(),
+            root_password_env: None,
+            root_password_file: None,
             organization_name: default_organization_name(),
             read_buffer_size: default_read_buffer_size(),
             operation_timeout_secs: default_operation_timeout_secs(),
@@ -772,6 +805,8 @@ impl Default for ReplicationSettings {
             provider_url: None,
             bind_dn: None,
             bind_password: None,
+            bind_password_env: None,
+            bind_password_file: None,
             changelog_capacity: default_changelog_capacity(),
             sync_interval_secs: default_sync_interval_secs(),
             max_retry_attempts: default_max_retry_attempts(),
@@ -850,7 +885,174 @@ impl Default for ServerConfig {
     }
 }
 
+fn trim_secret_value(secret: String) -> String {
+    secret.trim_end_matches(['\n', '\r']).to_string()
+}
+
+fn resolve_secret_source(
+    field_name: &str,
+    inline_secret: Option<&str>,
+    env_var: Option<&str>,
+    file_path: Option<&std::path::Path>,
+) -> Result<Option<String>, ConfigError> {
+    let inline_secret = inline_secret.filter(|secret| !secret.is_empty());
+    let configured_sources = usize::from(inline_secret.is_some())
+        + usize::from(env_var.is_some())
+        + usize::from(file_path.is_some());
+
+    if configured_sources > 1 {
+        return Err(ConfigError::ValidationError(format!(
+            "{field_name} may only be configured with one of the inline value, *_env, or *_file options"
+        )));
+    }
+
+    if let Some(secret) = inline_secret {
+        return Ok(Some(secret.to_string()));
+    }
+
+    if let Some(env_var) = env_var {
+        let secret = std::env::var(env_var).map_err(|_| {
+            ConfigError::ValidationError(format!(
+                "{field_name}_env references missing environment variable {env_var}"
+            ))
+        })?;
+        let secret = trim_secret_value(secret);
+        if secret.is_empty() {
+            return Err(ConfigError::ValidationError(format!(
+                "{field_name}_env resolved to an empty value"
+            )));
+        }
+        return Ok(Some(secret));
+    }
+
+    if let Some(file_path) = file_path {
+        let secret = std::fs::read_to_string(file_path).map_err(|err| {
+            ConfigError::ValidationError(format!(
+                "{field_name}_file could not be read from {}: {err}",
+                file_path.display()
+            ))
+        })?;
+        let secret = trim_secret_value(secret);
+        if secret.is_empty() {
+            return Err(ConfigError::ValidationError(format!(
+                "{field_name}_file resolved to an empty value"
+            )));
+        }
+        return Ok(Some(secret));
+    }
+
+    Ok(None)
+}
+
+fn redacted_secret_display(
+    inline_secret: Option<&str>,
+    env_var: Option<&str>,
+    file_path: Option<&std::path::Path>,
+) -> String {
+    if inline_secret.is_some_and(|secret| !secret.is_empty()) {
+        "<redacted>".to_string()
+    } else if let Some(env_var) = env_var {
+        format!("<redacted via env:{env_var}>")
+    } else if let Some(file_path) = file_path {
+        format!("<redacted via file:{}>", file_path.display())
+    } else {
+        "<unset>".to_string()
+    }
+}
+
+impl fmt::Debug for ServerSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerSettings")
+            .field("bind_address", &self.bind_address)
+            .field("ldap_port", &self.ldap_port)
+            .field("ldaps_port", &self.ldaps_port)
+            .field("hostname", &self.hostname)
+            .field("replica_id", &self.replica_id)
+            .field("base_dn", &self.base_dn)
+            .field("root_user_dn", &self.root_user_dn)
+            .field(
+                "root_password",
+                &redacted_secret_display(
+                    Some(&self.root_password),
+                    self.root_password_env.as_deref(),
+                    self.root_password_file.as_deref(),
+                ),
+            )
+            .field("root_password_env", &self.root_password_env)
+            .field("root_password_file", &self.root_password_file)
+            .field("organization_name", &self.organization_name)
+            .field("read_buffer_size", &self.read_buffer_size)
+            .field("operation_timeout_secs", &self.operation_timeout_secs)
+            .field("cleanup_interval_secs", &self.cleanup_interval_secs)
+            .field("max_concurrent_operations", &self.max_concurrent_operations)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ReplicationSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplicationSettings")
+            .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
+            .field("provider_url", &self.provider_url)
+            .field("bind_dn", &self.bind_dn)
+            .field(
+                "bind_password",
+                &redacted_secret_display(
+                    self.bind_password.as_deref(),
+                    self.bind_password_env.as_deref(),
+                    self.bind_password_file.as_deref(),
+                ),
+            )
+            .field("bind_password_env", &self.bind_password_env)
+            .field("bind_password_file", &self.bind_password_file)
+            .field("changelog_capacity", &self.changelog_capacity)
+            .field("sync_interval_secs", &self.sync_interval_secs)
+            .field("max_retry_attempts", &self.max_retry_attempts)
+            .field("retry_delay_secs", &self.retry_delay_secs)
+            .field("enable_change_listening", &self.enable_change_listening)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("state_storage_path", &self.state_storage_path)
+            .field("stream_port", &self.stream_port)
+            .finish()
+    }
+}
+
 impl ServerConfig {
+    fn normalize_secret_placeholders(&mut self) {
+        let uses_external_root_secret =
+            self.server.root_password_env.is_some() || self.server.root_password_file.is_some();
+        if uses_external_root_secret && self.server.root_password == default_root_password() {
+            self.server.root_password.clear();
+        }
+    }
+
+    /// Resolve the configured root password without serializing it back into config files.
+    pub fn resolved_root_password(&self) -> Result<String, ConfigError> {
+        resolve_secret_source(
+            "server.root_password",
+            Some(&self.server.root_password),
+            self.server.root_password_env.as_deref(),
+            self.server.root_password_file.as_deref(),
+        )?
+        .ok_or_else(|| {
+            ConfigError::ValidationError(
+                "server.root_password requires an inline value, *_env, or *_file source"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// Resolve the configured replication bind password if one is configured.
+    pub fn resolved_replication_bind_password(&self) -> Result<Option<String>, ConfigError> {
+        resolve_secret_source(
+            "replication.bind_password",
+            self.replication.bind_password.as_deref(),
+            self.replication.bind_password_env.as_deref(),
+            self.replication.bind_password_file.as_deref(),
+        )
+    }
+
     /// Convert ServerConfig to FsmServerConfig for FSM server usage
     pub fn to_fsm_server_config(&self) -> crate::fsm_server::FsmServerConfig {
         use crate::connection_pool::ResourceLimits;
@@ -959,14 +1161,19 @@ impl ServerConfig {
             .build()
             .map_err(|e| ConfigError::LoadError(e.to_string()))?;
 
-        config
+        let mut config: Self = config
             .try_deserialize()
-            .map_err(|e| ConfigError::ParseError(e.to_string()))
+            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        config.normalize_secret_placeholders();
+        Ok(config)
     }
 
     /// Load configuration from TOML string
     pub fn from_toml_str(toml: &str) -> Result<Self, ConfigError> {
-        toml::from_str(toml).map_err(|e| ConfigError::ParseError(e.to_string()))
+        let mut config: Self =
+            toml::from_str(toml).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        config.normalize_secret_placeholders();
+        Ok(config)
     }
 
     /// Validate configuration values
@@ -994,6 +1201,7 @@ impl ServerConfig {
                 "Base DN cannot be empty".to_string(),
             ));
         }
+        let _ = self.resolved_root_password()?;
         if self.server.replica_id == 0 {
             return Err(ConfigError::ValidationError(
                 "replica_id must be between 1 and 65535".to_string(),
@@ -1085,6 +1293,7 @@ impl ServerConfig {
                         "provider_url required for consumer mode".to_string(),
                     ));
                 }
+                let _ = self.resolved_replication_bind_password()?;
             }
             if self.replication.sync_interval_secs == 0 {
                 return Err(ConfigError::ValidationError(
@@ -1191,6 +1400,14 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::NamedTempFile;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_default_config() {
@@ -1289,6 +1506,83 @@ backend_type = "memory"
         assert_eq!(config.server.replica_id, 7);
         assert_eq!(config.server.base_dn, "dc=test,dc=org");
         assert_eq!(config.backend.backend_type, "memory");
+    }
+
+    #[test]
+    fn test_root_password_file_resolution_and_serialization() {
+        let mut secret_file = NamedTempFile::new().unwrap();
+        writeln!(secret_file, "{{SSHA512}}file-backed-secret").unwrap();
+
+        let toml = format!(
+            r#"
+[server]
+root_password_file = "{}"
+"#,
+            secret_file.path().display()
+        );
+
+        let config = ServerConfig::from_toml_str(&toml).unwrap();
+        assert_eq!(config.server.root_password, "");
+        assert_eq!(
+            config.resolved_root_password().unwrap(),
+            "{SSHA512}file-backed-secret"
+        );
+        assert!(config.validate().is_ok());
+
+        let serialized = config.to_toml_string().unwrap();
+        assert!(serialized.contains("root_password_file"));
+        assert!(!serialized.contains("file-backed-secret"));
+
+        let debug_output = format!("{config:?}");
+        assert!(!debug_output.contains("file-backed-secret"));
+        assert!(debug_output.contains("<redacted via file:"));
+    }
+
+    #[test]
+    fn test_replication_bind_password_env_resolution_and_debug_redaction() {
+        let _guard = env_lock().lock().unwrap();
+        let env_name = format!("OPENDR_TEST_BIND_PASSWORD_{}", std::process::id());
+        unsafe {
+            std::env::set_var(&env_name, "env-backed-secret");
+        }
+
+        let toml = format!(
+            r#"
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:389"
+bind_password_env = "{env_name}"
+"#
+        );
+
+        let config = ServerConfig::from_toml_str(&toml).unwrap();
+        assert_eq!(
+            config.resolved_replication_bind_password().unwrap(),
+            Some("env-backed-secret".to_string())
+        );
+        assert!(config.validate().is_ok());
+
+        let debug_output = format!("{config:?}");
+        assert!(!debug_output.contains("env-backed-secret"));
+        assert!(debug_output.contains(&format!("<redacted via env:{env_name}>")));
+
+        unsafe {
+            std::env::remove_var(&env_name);
+        }
+    }
+
+    #[test]
+    fn test_validation_rejects_multiple_root_password_sources() {
+        let toml = r#"
+[server]
+root_password = "inline-secret"
+root_password_env = "OPENDR_TEST_ROOT_PASSWORD"
+"#;
+
+        let config = ServerConfig::from_toml_str(toml).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("server.root_password may only be configured"));
     }
 
     #[test]
