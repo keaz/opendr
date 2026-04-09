@@ -5,7 +5,7 @@
 
 use opendr::backend::{BackendError, DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::fsm::{
-    ReplicationConsumerEvent, ReplicationConsumerFsm, ReplicationConsumerState,
+    ReplicationConsumerEvent, ReplicationConsumerFsm, ReplicationConsumerState, ReplicationPhase,
     ReplicationProviderEvent, ReplicationProviderFsm, ReplicationProviderState, StateMachine,
 };
 use opendr::replication::*;
@@ -249,7 +249,10 @@ async fn test_provider_fsm_complete_refresh_phase() {
 
     // Complete refresh phase
     let result = fsm
-        .handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
+        .handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
         .await;
 
     assert!(result.is_ok());
@@ -277,13 +280,17 @@ async fn test_provider_fsm_complete_present_phase() {
     .await
     .unwrap();
 
-    fsm.handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
-        .await
-        .unwrap();
+    fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+        consumer_id: "consumer1".to_string(),
+        entries_sent: 2,
+    })
+    .await
+    .unwrap();
 
     // Complete present phase
     let result = fsm
         .handle_event(ReplicationProviderEvent::PresentComplete {
+            consumer_id: "consumer1".to_string(),
             entries_streamed: 0,
         })
         .await;
@@ -313,9 +320,12 @@ async fn test_provider_fsm_stream_changelog_entries() {
     .await
     .unwrap();
 
-    fsm.handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
-        .await
-        .unwrap();
+    fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+        consumer_id: "consumer1".to_string(),
+        entries_sent: 2,
+    })
+    .await
+    .unwrap();
 
     // Stream a changelog entry with CSN
     let csn_gen = opendr::csn::CsnGenerator::new(1);
@@ -572,6 +582,7 @@ async fn test_end_to_end_replication_flow() {
     // Provider: Complete refresh
     provider_fsm
         .handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
             entries_sent: entry_count,
         })
         .await
@@ -580,6 +591,7 @@ async fn test_end_to_end_replication_flow() {
     // Provider: Complete present
     provider_fsm
         .handle_event(ReplicationProviderEvent::PresentComplete {
+            consumer_id: "consumer1".to_string(),
             entries_streamed: 2,
         })
         .await
@@ -692,13 +704,16 @@ async fn test_replication_error_handling() {
 
     // Try to complete refresh without starting sync
     let result = fsm
-        .handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
+        .handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
         .await;
 
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
-        ReplicationProviderError::InvalidStateTransition { .. }
+        ReplicationProviderError::ConsumerNotFound { .. }
     ));
 }
 
@@ -728,6 +743,127 @@ async fn test_consumer_registry() {
 
     // Should no longer be connected
     assert!(!registry.is_consumer_connected("consumer1").await.unwrap());
+}
+
+#[tokio::test]
+async fn test_provider_fsm_isolates_concurrent_consumer_lifecycle() {
+    let backend = Arc::new(create_test_backend().await);
+    let mut fsm = create_provider_fsm(backend);
+
+    for (consumer_id, cookie) in [("consumer1", "resume-1"), ("consumer2", "resume-2")] {
+        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+            consumer_id: consumer_id.to_string(),
+            cookie: Some(cookie.to_string()),
+        })
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(fsm.active_consumers(), 2);
+    assert_eq!(
+        fsm.get_session("consumer1")
+            .and_then(|session| session.sync_request.as_ref())
+            .and_then(|request| request.cookie.as_deref()),
+        Some("resume-1")
+    );
+    assert_eq!(
+        fsm.get_session("consumer2")
+            .and_then(|session| session.sync_request.as_ref())
+            .and_then(|request| request.cookie.as_deref()),
+        Some("resume-2")
+    );
+
+    fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+        consumer_id: "consumer1".to_string(),
+        entries_sent: 2,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fsm.get_session("consumer1")
+            .map(|session| &session.current_phase),
+        Some(&ReplicationPhase::Present)
+    );
+    assert_eq!(
+        fsm.get_session("consumer2")
+            .map(|session| &session.current_phase),
+        Some(&ReplicationPhase::Refresh)
+    );
+
+    fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+        consumer_id: "consumer2".to_string(),
+        entries_sent: 2,
+    })
+    .await
+    .unwrap();
+    fsm.handle_event(ReplicationProviderEvent::PresentComplete {
+        consumer_id: "consumer1".to_string(),
+        entries_streamed: 1,
+    })
+    .await
+    .unwrap();
+    fsm.handle_event(ReplicationProviderEvent::PresentComplete {
+        consumer_id: "consumer2".to_string(),
+        entries_streamed: 0,
+    })
+    .await
+    .unwrap();
+
+    fsm.handle_event(ReplicationProviderEvent::CookiePersisted {
+        consumer_id: "consumer1".to_string(),
+        new_cookie: "persisted-1".to_string(),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fsm.get_session("consumer1")
+            .and_then(|session| session.last_cookie.as_deref()),
+        Some("persisted-1")
+    );
+    assert_eq!(
+        fsm.get_session("consumer1")
+            .map(|session| &session.current_phase),
+        Some(&ReplicationPhase::Stream)
+    );
+    assert_eq!(
+        fsm.get_session("consumer2")
+            .map(|session| &session.current_phase),
+        Some(&ReplicationPhase::Persist)
+    );
+
+    fsm.handle_event(ReplicationProviderEvent::ConsumerDisconnected {
+        consumer_id: "consumer1".to_string(),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(fsm.active_consumers(), 1);
+    assert!(fsm.get_session("consumer1").is_none());
+    assert_eq!(
+        fsm.get_session("consumer2")
+            .and_then(|session| session.last_cookie.as_deref()),
+        Some("csn-empty")
+    );
+
+    fsm.handle_event(ReplicationProviderEvent::CookiePersisted {
+        consumer_id: "consumer2".to_string(),
+        new_cookie: "persisted-2".to_string(),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fsm.get_session("consumer2")
+            .and_then(|session| session.last_cookie.as_deref()),
+        Some("persisted-2")
+    );
+    assert_eq!(
+        fsm.get_session("consumer2")
+            .map(|session| &session.current_phase),
+        Some(&ReplicationPhase::Stream)
+    );
 }
 
 #[tokio::test]

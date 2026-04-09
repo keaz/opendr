@@ -595,9 +595,15 @@ pub enum ReplicationProviderEvent {
         cookie: Option<String>,
     },
     /// Refresh phase completed, ready to stream changes
-    RefreshComplete { entries_sent: usize },
+    RefreshComplete {
+        consumer_id: String,
+        entries_sent: usize,
+    },
     /// Present phase completed, ready to persist
-    PresentComplete { entries_streamed: usize },
+    PresentComplete {
+        consumer_id: String,
+        entries_streamed: usize,
+    },
     /// New changelog entry available for streaming (CSN-based)
     ChangelogEntry {
         entry: Vec<u8>,
@@ -608,7 +614,10 @@ pub enum ReplicationProviderEvent {
     /// Consumer disconnected
     ConsumerDisconnected { consumer_id: String },
     /// Cookie updated/persisted
-    CookiePersisted { new_cookie: String },
+    CookiePersisted {
+        consumer_id: String,
+        new_cookie: String,
+    },
     /// Error occurred
     Error(String),
 }
@@ -617,10 +626,12 @@ pub enum ReplicationProviderEvent {
 pub trait ReplicationProviderFsm:
     StateMachine<State = ReplicationProviderState, Event = ReplicationProviderEvent>
 {
-    /// Get primary consumer identifier (for single consumer)
+    /// Get the representative consumer identifier for the current summary state.
+    /// Returns `None` when multiple active sessions would make that ambiguous.
     fn consumer_id(&self) -> Option<&str>;
 
-    /// Get current replication cookie
+    /// Get the representative replication cookie for the current summary state.
+    /// Returns `None` when multiple active sessions would make that ambiguous.
     fn cookie(&self) -> Option<&str>;
 
     /// Get entries sent count during refresh phase
@@ -635,7 +646,7 @@ pub trait ReplicationProviderFsm:
     /// Get active consumer count
     fn active_consumers(&self) -> usize;
 
-    /// Get current replication phase
+    /// Get the summary replication phase across active sessions
     fn current_phase(&self) -> ReplicationPhase;
 
     /// Get sync replication statistics

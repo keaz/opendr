@@ -1023,6 +1023,8 @@ pub struct ReplicationSession {
     pub last_cookie: Option<String>,
     /// Entries sent during refresh phase
     pub refresh_entries_sent: usize,
+    /// Total entries scheduled for this consumer's refresh phase
+    pub refresh_total_entries: usize,
     /// Entries streamed during present phase
     pub present_entries_sent: usize,
     /// Total bytes sent to consumer
@@ -1053,6 +1055,7 @@ impl ReplicationSession {
             sync_request: None,
             last_cookie: None,
             refresh_entries_sent: 0,
+            refresh_total_entries: 0,
             present_entries_sent: 0,
             total_bytes_sent: 0,
             last_activity: now,
@@ -1282,6 +1285,66 @@ impl ReplicationProviderFsmImpl {
         self.sessions.get(consumer_id)
     }
 
+    fn phase_rank(phase: &ReplicationPhase) -> u8 {
+        match phase {
+            ReplicationPhase::Initialize => 0,
+            ReplicationPhase::Refresh => 1,
+            ReplicationPhase::Present => 2,
+            ReplicationPhase::Persist => 3,
+            ReplicationPhase::Stream => 4,
+            ReplicationPhase::Complete => 5,
+            ReplicationPhase::Error => 6,
+        }
+    }
+
+    fn session_state(
+        session: &ReplicationSession,
+        active_consumers: usize,
+    ) -> ReplicationProviderState {
+        match session.current_phase {
+            ReplicationPhase::Initialize => ReplicationProviderState::Initializing,
+            ReplicationPhase::Refresh => ReplicationProviderState::Refresh {
+                entries_sent: session.refresh_entries_sent,
+                total_entries: session.refresh_total_entries,
+            },
+            ReplicationPhase::Present => ReplicationProviderState::Present {
+                entries_streamed: session.present_entries_sent,
+            },
+            ReplicationPhase::Persist => ReplicationProviderState::Persist {
+                cookie: session.last_cookie.clone().unwrap_or_default(),
+            },
+            ReplicationPhase::Stream => ReplicationProviderState::Streaming { active_consumers },
+            ReplicationPhase::Complete => ReplicationProviderState::Completed,
+            ReplicationPhase::Error => ReplicationProviderState::Error {
+                message: "session error".to_string(),
+            },
+        }
+    }
+
+    fn representative_session(&self) -> Option<&ReplicationSession> {
+        self.sessions.values().min_by_key(|session| {
+            (
+                Self::phase_rank(&session.current_phase),
+                session.last_activity,
+            )
+        })
+    }
+
+    fn update_summary_state(&mut self) {
+        if self.sessions.is_empty() {
+            self.state = if self.total_sessions == 0 {
+                ReplicationProviderState::Initializing
+            } else {
+                ReplicationProviderState::Completed
+            };
+            return;
+        }
+
+        if let Some(session) = self.representative_session() {
+            self.state = Self::session_state(session, self.sessions.len());
+        }
+    }
+
     /// Handle sync replication start event
     ///
     /// # Arguments
@@ -1295,8 +1358,7 @@ impl ReplicationProviderFsmImpl {
         consumer_id: String,
         cookie: Option<String>,
     ) -> Result<Option<usize>, ReplicationProviderError> {
-        // Validate current state - should be Initializing
-        if !matches!(self.state, ReplicationProviderState::Initializing) {
+        if matches!(self.state, ReplicationProviderState::Error { .. }) {
             return Err(ReplicationProviderError::InvalidStateTransition {
                 from: self.state.clone(),
                 to: ReplicationProviderState::Refresh {
@@ -1313,6 +1375,12 @@ impl ReplicationProviderFsmImpl {
                     "Maximum consumer limit ({}) reached",
                     self.config.max_concurrent_consumers
                 ),
+            });
+        }
+
+        if self.sessions.contains_key(&consumer_id) {
+            return Err(ReplicationProviderError::Generic {
+                message: format!("Consumer already syncing: {consumer_id}"),
             });
         }
 
@@ -1355,6 +1423,7 @@ impl ReplicationProviderFsmImpl {
             .map_err(|e| ReplicationProviderError::ChangelogError { message: e })?;
 
         let total_entries = entries.len();
+        session.refresh_total_entries = total_entries;
 
         // Store session
         self.sessions.insert(consumer_id.clone(), session);
@@ -1362,11 +1431,7 @@ impl ReplicationProviderFsmImpl {
         // Update statistics
         self.total_sessions += 1;
 
-        // Update state to refresh phase
-        self.state = ReplicationProviderState::Refresh {
-            entries_sent: 0,
-            total_entries,
-        };
+        self.update_summary_state();
 
         // Record metrics
         if let Some(ref metrics) = self.metrics {
@@ -1385,49 +1450,39 @@ impl ReplicationProviderFsmImpl {
     /// * Result indicating success or error
     async fn handle_refresh_complete(
         &mut self,
+        consumer_id: String,
         entries_sent: usize,
     ) -> Result<Option<usize>, ReplicationProviderError> {
-        // Validate current state
-        if !matches!(self.state, ReplicationProviderState::Refresh { .. }) {
-            return Err(ReplicationProviderError::InvalidStateTransition {
-                from: self.state.clone(),
-                to: ReplicationProviderState::Present {
-                    entries_streamed: 0,
-                },
-            });
-        }
+        let active_consumers = self.sessions.len();
+        let phase_duration = {
+            let session = self.sessions.get_mut(&consumer_id).ok_or_else(|| {
+                ReplicationProviderError::ConsumerNotFound {
+                    consumer_id: consumer_id.clone(),
+                }
+            })?;
 
-        // Update statistics
-        self.total_entries_sent += entries_sent as u64;
+            if session.current_phase != ReplicationPhase::Refresh {
+                return Err(ReplicationProviderError::InvalidStateTransition {
+                    from: Self::session_state(session, active_consumers),
+                    to: ReplicationProviderState::Present {
+                        entries_streamed: 0,
+                    },
+                });
+            }
 
-        // Get first active session (simplified for single consumer)
-        let consumer_id = self
-            .sessions
-            .keys()
-            .next()
-            .ok_or(ReplicationProviderError::NoActiveConsumer)?
-            .clone();
-
-        // Update session
-        if let Some(session) = self.sessions.get_mut(&consumer_id) {
             session.refresh_entries_sent = entries_sent;
             session.current_phase = ReplicationPhase::Present;
+            session.update_activity();
+            session.session_duration()
+        };
 
-            // Record metrics
-            if let Some(ref metrics) = self.metrics {
-                metrics.record_phase_complete(
-                    &consumer_id,
-                    "refresh",
-                    entries_sent,
-                    session.session_duration(),
-                );
-            }
+        self.total_entries_sent += entries_sent as u64;
+
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_phase_complete(&consumer_id, "refresh", entries_sent, phase_duration);
         }
 
-        // Transition to present phase
-        self.state = ReplicationProviderState::Present {
-            entries_streamed: 0,
-        };
+        self.update_summary_state();
 
         Ok(Some(entries_sent))
     }
@@ -1441,25 +1496,26 @@ impl ReplicationProviderFsmImpl {
     /// * Result indicating success or error
     async fn handle_present_complete(
         &mut self,
+        consumer_id: String,
         entries_streamed: usize,
     ) -> Result<Option<usize>, ReplicationProviderError> {
-        // Validate current state
-        if !matches!(self.state, ReplicationProviderState::Present { .. }) {
-            return Err(ReplicationProviderError::InvalidStateTransition {
-                from: self.state.clone(),
-                to: ReplicationProviderState::Persist {
-                    cookie: String::new(),
-                },
-            });
-        }
+        let active_consumers = self.sessions.len();
+        {
+            let session = self.sessions.get(&consumer_id).ok_or_else(|| {
+                ReplicationProviderError::ConsumerNotFound {
+                    consumer_id: consumer_id.clone(),
+                }
+            })?;
 
-        // Get first active session (simplified for single consumer)
-        let consumer_id = self
-            .sessions
-            .keys()
-            .next()
-            .ok_or(ReplicationProviderError::NoActiveConsumer)?
-            .clone();
+            if session.current_phase != ReplicationPhase::Present {
+                return Err(ReplicationProviderError::InvalidStateTransition {
+                    from: Self::session_state(session, active_consumers),
+                    to: ReplicationProviderState::Persist {
+                        cookie: String::new(),
+                    },
+                });
+            }
+        }
 
         // Get contextCSN and generate new replication cookie
         let context_csn = self
@@ -1478,28 +1534,32 @@ impl ReplicationProviderFsmImpl {
             "csn-empty".to_string()
         };
 
-        // Update session
-        if let Some(session) = self.sessions.get_mut(&consumer_id) {
+        let phase_duration = {
+            let session = self.sessions.get_mut(&consumer_id).ok_or_else(|| {
+                ReplicationProviderError::ConsumerNotFound {
+                    consumer_id: consumer_id.clone(),
+                }
+            })?;
+
             session.present_entries_sent = entries_streamed;
             session.last_cookie = Some(new_cookie.clone());
             session.current_phase = ReplicationPhase::Persist;
+            session.update_activity();
+            session.session_duration()
+        };
 
-            // Record metrics
-            if let Some(ref metrics) = self.metrics {
-                metrics.record_phase_complete(
-                    &consumer_id,
-                    "present",
-                    entries_streamed,
-                    session.session_duration(),
-                );
-            }
-        }
-
-        // Update statistics
         self.total_entries_sent += entries_streamed as u64;
 
-        // Transition to persist phase
-        self.state = ReplicationProviderState::Persist { cookie: new_cookie };
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_phase_complete(
+                &consumer_id,
+                "present",
+                entries_streamed,
+                phase_duration,
+            );
+        }
+
+        self.update_summary_state();
 
         Ok(Some(entries_streamed))
     }
@@ -1517,24 +1577,28 @@ impl ReplicationProviderFsmImpl {
         entry: Vec<u8>,
         csn: crate::csn::Csn,
     ) -> Result<Option<usize>, ReplicationProviderError> {
-        // Validate we're in streaming-capable state
-        if !matches!(
-            self.state,
-            ReplicationProviderState::Present { .. } | ReplicationProviderState::Streaming { .. }
-        ) {
+        if self.sessions.is_empty() {
+            return Err(ReplicationProviderError::NoActiveConsumer);
+        }
+
+        let consumer_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter_map(|(consumer_id, session)| match session.current_phase {
+                ReplicationPhase::Present
+                | ReplicationPhase::Persist
+                | ReplicationPhase::Stream => Some(consumer_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        if consumer_ids.is_empty() {
             return Err(ReplicationProviderError::InvalidStateTransition {
                 from: self.state.clone(),
                 to: ReplicationProviderState::Streaming {
-                    active_consumers: 1,
+                    active_consumers: self.sessions.len(),
                 },
             });
-        }
-
-        // Get active consumers
-        let consumer_ids: Vec<String> = self.sessions.keys().cloned().collect();
-
-        if consumer_ids.is_empty() {
-            return Err(ReplicationProviderError::NoActiveConsumer);
         }
 
         // Create changelog entry with CSN
@@ -1550,6 +1614,35 @@ impl ReplicationProviderFsmImpl {
 
         // Stream to all active consumers
         for consumer_id in &consumer_ids {
+            let (needs_stream_start, start_cookie) = self
+                .sessions
+                .get(consumer_id)
+                .map(|session| {
+                    (
+                        session.current_phase != ReplicationPhase::Stream,
+                        session.last_cookie.clone(),
+                    )
+                })
+                .unwrap_or((false, None));
+
+            if needs_stream_start {
+                if let Err(e) = self
+                    .streaming_manager
+                    .start_streaming(consumer_id, start_cookie.as_deref())
+                    .await
+                {
+                    if let Some(session) = self.sessions.get_mut(consumer_id) {
+                        session.record_error();
+                    }
+
+                    if let Some(ref metrics) = self.metrics {
+                        metrics.record_replication_error(consumer_id, "stream_start", &e);
+                    }
+
+                    continue;
+                }
+            }
+
             match self
                 .streaming_manager
                 .send_entry(consumer_id, &changelog_entry)
@@ -1561,6 +1654,7 @@ impl ReplicationProviderFsmImpl {
                     // Update session
                     if let Some(session) = self.sessions.get_mut(consumer_id) {
                         session.record_present_entry(entry_size);
+                        session.current_phase = ReplicationPhase::Stream;
                     }
 
                     // Record metrics
@@ -1589,12 +1683,7 @@ impl ReplicationProviderFsmImpl {
         self.total_entries_sent += successful_streams;
         self.total_bytes_sent += (entry_size * successful_streams as usize) as u64;
 
-        // Update state if necessary
-        if matches!(self.state, ReplicationProviderState::Present { .. }) {
-            self.state = ReplicationProviderState::Streaming {
-                active_consumers: self.sessions.len(),
-            };
-        }
+        self.update_summary_state();
 
         Ok(Some(successful_streams as usize))
     }
@@ -1658,19 +1747,11 @@ impl ReplicationProviderFsmImpl {
 
             // Update session statistics
             self.successful_sessions += 1;
+        } else {
+            return Err(ReplicationProviderError::ConsumerNotFound { consumer_id });
         }
 
-        // Update state if no more consumers
-        if self.sessions.is_empty() {
-            self.state = ReplicationProviderState::Completed;
-        } else {
-            // Update streaming state with current consumer count
-            if matches!(self.state, ReplicationProviderState::Streaming { .. }) {
-                self.state = ReplicationProviderState::Streaming {
-                    active_consumers: self.sessions.len(),
-                };
-            }
-        }
+        self.update_summary_state();
 
         Ok(Some(self.sessions.len()))
     }
@@ -1684,22 +1765,47 @@ impl ReplicationProviderFsmImpl {
     /// * Result indicating success or error
     async fn handle_cookie_persisted(
         &mut self,
+        consumer_id: String,
         new_cookie: String,
     ) -> Result<Option<usize>, ReplicationProviderError> {
-        // Update state if in persist phase
-        if matches!(self.state, ReplicationProviderState::Persist { .. }) {
-            self.state = ReplicationProviderState::Persist {
-                cookie: new_cookie.clone(),
-            };
+        let active_sessions = self.sessions.len();
+        {
+            let session = self.sessions.get(&consumer_id).ok_or_else(|| {
+                ReplicationProviderError::ConsumerNotFound {
+                    consumer_id: consumer_id.clone(),
+                }
+            })?;
+
+            if session.current_phase != ReplicationPhase::Persist {
+                return Err(ReplicationProviderError::InvalidStateTransition {
+                    from: Self::session_state(session, active_sessions),
+                    to: ReplicationProviderState::Persist {
+                        cookie: new_cookie.clone(),
+                    },
+                });
+            }
         }
 
-        // Update all sessions with new cookie
-        for session in self.sessions.values_mut() {
-            session.last_cookie = Some(new_cookie.clone());
+        self.consumer_registry
+            .update_consumer_cookie(&consumer_id, new_cookie.clone())
+            .await
+            .map_err(|e| ReplicationProviderError::RegistryError { message: e })?;
+
+        {
+            let session = self.sessions.get_mut(&consumer_id).ok_or_else(|| {
+                ReplicationProviderError::ConsumerNotFound {
+                    consumer_id: consumer_id.clone(),
+                }
+            })?;
+
+            session.last_cookie = Some(new_cookie);
+            session.current_phase = ReplicationPhase::Stream;
             session.update_activity();
-        }
+        };
 
-        Ok(Some(self.sessions.len()))
+        self.update_summary_state();
+
+        Ok(Some(active_sessions))
     }
 
     /// Handle FSM error
@@ -1771,11 +1877,19 @@ impl StateMachine for ReplicationProviderFsmImpl {
                 self.handle_start_sync_replication(consumer_id, cookie)
                     .await
             }
-            ReplicationProviderEvent::RefreshComplete { entries_sent } => {
-                self.handle_refresh_complete(entries_sent).await
+            ReplicationProviderEvent::RefreshComplete {
+                consumer_id,
+                entries_sent,
+            } => {
+                self.handle_refresh_complete(consumer_id, entries_sent)
+                    .await
             }
-            ReplicationProviderEvent::PresentComplete { entries_streamed } => {
-                self.handle_present_complete(entries_streamed).await
+            ReplicationProviderEvent::PresentComplete {
+                consumer_id,
+                entries_streamed,
+            } => {
+                self.handle_present_complete(consumer_id, entries_streamed)
+                    .await
             }
             ReplicationProviderEvent::ChangelogEntry { entry, csn } => {
                 self.handle_changelog_entry(entry, csn).await
@@ -1786,9 +1900,10 @@ impl StateMachine for ReplicationProviderFsmImpl {
             ReplicationProviderEvent::ConsumerDisconnected { consumer_id } => {
                 self.handle_consumer_disconnected(consumer_id).await
             }
-            ReplicationProviderEvent::CookiePersisted { new_cookie } => {
-                self.handle_cookie_persisted(new_cookie).await
-            }
+            ReplicationProviderEvent::CookiePersisted {
+                consumer_id,
+                new_cookie,
+            } => self.handle_cookie_persisted(consumer_id, new_cookie).await,
             ReplicationProviderEvent::Error(message) => self.handle_error(message).await,
         }
     }
@@ -1822,20 +1937,20 @@ impl StateMachine for ReplicationProviderFsmImpl {
 #[async_trait]
 impl ReplicationProviderFsm for ReplicationProviderFsmImpl {
     fn consumer_id(&self) -> Option<&str> {
-        // Return first active consumer (simplified for single consumer case)
-        self.sessions.keys().next().map(|s| s.as_str())
+        if self.sessions.len() == 1 {
+            self.representative_session()
+                .map(|session| session.consumer_id.as_str())
+        } else {
+            None
+        }
     }
 
     fn cookie(&self) -> Option<&str> {
-        match &self.state {
-            ReplicationProviderState::Persist { cookie } => Some(cookie),
-            _ => {
-                // Try to get cookie from active session
-                self.sessions
-                    .values()
-                    .next()
-                    .and_then(|session| session.last_cookie.as_deref())
-            }
+        if self.sessions.len() == 1 {
+            self.representative_session()
+                .and_then(|session| session.last_cookie.as_deref())
+        } else {
+            None
         }
     }
 
@@ -1866,25 +1981,28 @@ impl ReplicationProviderFsm for ReplicationProviderFsmImpl {
     }
 
     fn is_streaming(&self) -> bool {
-        matches!(self.state, ReplicationProviderState::Streaming { .. })
+        self.sessions
+            .values()
+            .any(|session| session.current_phase == ReplicationPhase::Stream)
     }
 
     fn active_consumers(&self) -> usize {
-        match &self.state {
-            ReplicationProviderState::Streaming { active_consumers } => *active_consumers,
-            _ => self.sessions.len(),
-        }
+        self.sessions.len()
     }
 
     fn current_phase(&self) -> ReplicationPhase {
-        match &self.state {
-            ReplicationProviderState::Initializing => ReplicationPhase::Initialize,
-            ReplicationProviderState::Refresh { .. } => ReplicationPhase::Refresh,
-            ReplicationProviderState::Present { .. } => ReplicationPhase::Present,
-            ReplicationProviderState::Persist { .. } => ReplicationPhase::Persist,
-            ReplicationProviderState::Streaming { .. } => ReplicationPhase::Stream,
-            ReplicationProviderState::Completed => ReplicationPhase::Complete,
-            ReplicationProviderState::Error { .. } => ReplicationPhase::Error,
+        if let Some(session) = self.representative_session() {
+            session.current_phase.clone()
+        } else {
+            match &self.state {
+                ReplicationProviderState::Initializing => ReplicationPhase::Initialize,
+                ReplicationProviderState::Completed => ReplicationPhase::Complete,
+                ReplicationProviderState::Error { .. } => ReplicationPhase::Error,
+                ReplicationProviderState::Refresh { .. } => ReplicationPhase::Refresh,
+                ReplicationProviderState::Present { .. } => ReplicationPhase::Present,
+                ReplicationProviderState::Persist { .. } => ReplicationPhase::Persist,
+                ReplicationProviderState::Streaming { .. } => ReplicationPhase::Stream,
+            }
         }
     }
 
@@ -2432,7 +2550,10 @@ pub mod tests {
 
         // Then complete refresh phase
         let result = fsm
-            .handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
+            .handle_event(ReplicationProviderEvent::RefreshComplete {
+                consumer_id: "consumer1".to_string(),
+                entries_sent: 2,
+            })
             .await;
 
         assert!(result.is_ok());
@@ -2451,18 +2572,21 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_refresh_complete_invalid_state() {
+    async fn test_refresh_complete_missing_consumer() {
         let mut fsm = create_test_fsm();
 
         // Try to complete refresh without starting sync replication
         let result = fsm
-            .handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
+            .handle_event(ReplicationProviderEvent::RefreshComplete {
+                consumer_id: "consumer1".to_string(),
+                entries_sent: 2,
+            })
             .await;
 
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ReplicationProviderError::InvalidStateTransition { .. }
+            ReplicationProviderError::ConsumerNotFound { .. }
         ));
     }
 
@@ -2478,13 +2602,17 @@ pub mod tests {
         .await
         .unwrap();
 
-        fsm.handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
-            .await
-            .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
+        .await
+        .unwrap();
 
         // Complete present phase
         let result = fsm
             .handle_event(ReplicationProviderEvent::PresentComplete {
+                consumer_id: "consumer1".to_string(),
                 entries_streamed: 1,
             })
             .await;
@@ -2500,12 +2628,13 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_present_complete_invalid_state() {
+    async fn test_present_complete_missing_consumer() {
         let mut fsm = create_test_fsm();
 
         // Try to complete present without being in present state
         let result = fsm
             .handle_event(ReplicationProviderEvent::PresentComplete {
+                consumer_id: "consumer1".to_string(),
                 entries_streamed: 1,
             })
             .await;
@@ -2513,7 +2642,7 @@ pub mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ReplicationProviderError::InvalidStateTransition { .. }
+            ReplicationProviderError::ConsumerNotFound { .. }
         ));
     }
 
@@ -2529,9 +2658,12 @@ pub mod tests {
         .await
         .unwrap();
 
-        fsm.handle_event(ReplicationProviderEvent::RefreshComplete { entries_sent: 2 })
-            .await
-            .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
+        .await
+        .unwrap();
 
         // Stream changelog entry with CSN
         let csn = crate::csn::Csn::new(1);
@@ -2657,27 +2789,46 @@ pub mod tests {
     async fn test_cookie_persisted() {
         let mut fsm = create_test_fsm();
 
-        // Set to persist state
-        fsm.state = ReplicationProviderState::Persist {
-            cookie: "old-cookie".to_string(),
-        };
+        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+            consumer_id: "consumer1".to_string(),
+            cookie: Some("old-cookie".to_string()),
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::PresentComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_streamed: 1,
+        })
+        .await
+        .unwrap();
 
         let result = fsm
             .handle_event(ReplicationProviderEvent::CookiePersisted {
+                consumer_id: "consumer1".to_string(),
                 new_cookie: "new-cookie-456".to_string(),
             })
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(0)); // 0 active sessions in this test
+        assert_eq!(result.unwrap(), Some(1));
         assert!(matches!(
             fsm.current_state(),
-            ReplicationProviderState::Persist { .. }
+            ReplicationProviderState::Streaming {
+                active_consumers: 1
+            }
         ));
-
-        if let ReplicationProviderState::Persist { cookie } = fsm.current_state() {
-            assert_eq!(cookie, "new-cookie-456");
-        }
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .and_then(|session| session.last_cookie.as_deref()),
+            Some("new-cookie-456")
+        );
+        assert_eq!(fsm.current_phase(), ReplicationPhase::Stream);
     }
 
     #[tokio::test]
@@ -2781,6 +2932,174 @@ pub mod tests {
         assert!(matches!(
             fsm.current_state(),
             ReplicationProviderState::Refresh { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_start_sync_replication_isolates_consumer_requests() {
+        let mut fsm = create_test_fsm();
+
+        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+            consumer_id: "consumer1".to_string(),
+            cookie: Some("cookie-1".to_string()),
+        })
+        .await
+        .unwrap();
+
+        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+            consumer_id: "consumer2".to_string(),
+            cookie: Some("cookie-2".to_string()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(fsm.active_consumers(), 2);
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .and_then(|session| session.sync_request.as_ref())
+                .and_then(|request| request.cookie.as_deref()),
+            Some("cookie-1")
+        );
+        assert_eq!(
+            fsm.get_session("consumer2")
+                .and_then(|session| session.sync_request.as_ref())
+                .and_then(|request| request.cookie.as_deref()),
+            Some("cookie-2")
+        );
+        assert_eq!(fsm.consumer_id(), None);
+        assert_eq!(fsm.cookie(), None);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_completion_updates_only_target_consumer() {
+        let mut fsm = create_test_fsm();
+
+        for consumer_id in ["consumer1", "consumer2"] {
+            fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+                consumer_id: consumer_id.to_string(),
+                cookie: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .map(|session| &session.current_phase),
+            Some(&ReplicationPhase::Present)
+        );
+        assert_eq!(
+            fsm.get_session("consumer2")
+                .map(|session| &session.current_phase),
+            Some(&ReplicationPhase::Refresh)
+        );
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .map(|session| session.refresh_entries_sent),
+            Some(2)
+        );
+        assert_eq!(
+            fsm.get_session("consumer2")
+                .map(|session| session.refresh_entries_sent),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cookie_persistence_is_scoped_to_target_consumer() {
+        let mut fsm = create_test_fsm();
+
+        for consumer_id in ["consumer1", "consumer2"] {
+            fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+                consumer_id: consumer_id.to_string(),
+                cookie: None,
+            })
+            .await
+            .unwrap();
+            fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+                consumer_id: consumer_id.to_string(),
+                entries_sent: 2,
+            })
+            .await
+            .unwrap();
+            fsm.handle_event(ReplicationProviderEvent::PresentComplete {
+                consumer_id: consumer_id.to_string(),
+                entries_streamed: 1,
+            })
+            .await
+            .unwrap();
+        }
+
+        let consumer2_cookie_before = fsm
+            .get_session("consumer2")
+            .and_then(|session| session.last_cookie.clone())
+            .expect("consumer2 generated cookie");
+
+        fsm.handle_event(ReplicationProviderEvent::CookiePersisted {
+            consumer_id: "consumer1".to_string(),
+            new_cookie: "cookie-final-1".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .and_then(|session| session.last_cookie.as_deref()),
+            Some("cookie-final-1")
+        );
+        assert_eq!(
+            fsm.get_session("consumer1")
+                .map(|session| &session.current_phase),
+            Some(&ReplicationPhase::Stream)
+        );
+        assert_eq!(
+            fsm.get_session("consumer2")
+                .map(|session| &session.current_phase),
+            Some(&ReplicationPhase::Persist)
+        );
+        assert_eq!(
+            fsm.get_session("consumer2")
+                .and_then(|session| session.last_cookie.as_deref()),
+            Some(consumer2_cookie_before.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disconnecting_one_consumer_keeps_other_session_active() {
+        let mut fsm = create_test_fsm();
+
+        for consumer_id in ["consumer1", "consumer2"] {
+            fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+                consumer_id: consumer_id.to_string(),
+                cookie: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        fsm.handle_event(ReplicationProviderEvent::ConsumerDisconnected {
+            consumer_id: "consumer1".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(fsm.active_consumers(), 1);
+        assert!(fsm.get_session("consumer1").is_none());
+        assert!(fsm.get_session("consumer2").is_some());
+        assert_eq!(fsm.consumer_id(), Some("consumer2"));
+        assert!(matches!(
+            fsm.current_state(),
+            ReplicationProviderState::Refresh {
+                entries_sent: 0,
+                total_entries: 2,
+            }
         ));
     }
 
