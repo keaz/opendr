@@ -121,6 +121,7 @@ async fn demo_tls_setup() {
     let tls_config = TlsConfig {
         cert_path: "certs/server.crt".to_string(),
         key_path: "certs/server.key".to_string(),
+        ca_file: None,
         min_tls_version: TlsVersion::Tls12,
         max_tls_version: TlsVersion::Tls13,
         require_client_cert: false,

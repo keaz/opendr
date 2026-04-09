@@ -746,7 +746,8 @@ async fn extended_request_returns_protocol_error() {
         request_value: None,
     };
 
-    let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+    let (server_stream, mut client_stream) = connected_stream_pair().await;
+    let mut server_stream = server::ConnectionStream::Plain(server_stream);
 
     server::handle_extended_request(&mut server_stream, 25, request)
         .await

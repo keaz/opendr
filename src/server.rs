@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use ldap_parser::filter::{Filter, Substring, SubstringFilter};
@@ -13,8 +15,9 @@ use ldap_parser::parse_ldap_messages;
 use log::{error, info, warn};
 use rasn::error::EncodeError;
 use rasn_ldap::ResultCode;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::server::TlsStream;
 
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
@@ -34,6 +37,7 @@ use crate::replication::{
     REPLICATION_STREAM_ATTRIBUTE,
 };
 use crate::schema::LdapSchema;
+use crate::tls::RustlsTlsHandler;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -143,6 +147,114 @@ enum RejectionResponse {
     Extended,
 }
 
+pub enum ConnectionStream {
+    Plain(TcpStream),
+    Tls(TlsStream<TcpStream>),
+    Closed,
+}
+
+impl ConnectionStream {
+    fn plain(stream: TcpStream) -> Self {
+        Self::Plain(stream)
+    }
+
+    fn tls(stream: TlsStream<TcpStream>) -> Self {
+        Self::Tls(stream)
+    }
+
+    fn is_secure(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+
+    async fn upgrade_in_place(&mut self, tls_handler: &RustlsTlsHandler) -> Result<(), ServerError> {
+        if self.is_secure() {
+            return Err(ServerError::Io(std::io::Error::other(
+                "connection already uses TLS",
+            )));
+        }
+
+        let plain_stream = match std::mem::replace(self, Self::Closed) {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) => {
+                *self = Self::Tls(stream);
+                return Err(ServerError::Io(std::io::Error::other(
+                    "connection already uses TLS",
+                )));
+            }
+            Self::Closed => {
+                return Err(ServerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "connection is closed",
+                )));
+            }
+        };
+
+        match tls_handler.accept(plain_stream).await {
+            Ok(stream) => {
+                *self = Self::Tls(stream);
+                Ok(())
+            }
+            Err(err) => {
+                *self = Self::Closed;
+                Err(ServerError::Io(std::io::Error::other(err)))
+            }
+        }
+    }
+}
+
+impl AsyncRead for ConnectionStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Closed => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection is closed",
+            ))),
+        }
+    }
+}
+
+impl AsyncWrite for ConnectionStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Closed => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection is closed",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Closed => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection is closed",
+            ))),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Closed => Poll::Ready(Ok(())),
+        }
+    }
+}
+
 pub async fn run(
     addr: &str,
     backend: Arc<dyn DirectoryBackend>,
@@ -164,12 +276,13 @@ pub async fn run_with_metrics(
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     metrics: Option<Arc<MetricsCollector>>,
 ) -> Result<(), ServerError> {
-    run_with_metrics_and_config(
+    run_with_metrics_and_config_with_tls(
         addr,
         backend,
         shutdown_rx,
         metrics,
         LegacyServerConfig::default(),
+        None,
     )
     .await
 }
@@ -177,9 +290,47 @@ pub async fn run_with_metrics(
 pub async fn run_with_metrics_and_config(
     addr: &str,
     backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+) -> Result<(), ServerError> {
+    run_with_metrics_and_config_with_tls(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        runtime_config,
+        None,
+    )
+    .await
+}
+
+pub async fn run_with_metrics_and_config_with_tls(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+    tls_handler: Option<Arc<RustlsTlsHandler>>,
+) -> Result<(), ServerError> {
+    run_plain_listener(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        runtime_config,
+        tls_handler,
+    )
+    .await
+}
+
+async fn run_plain_listener(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     metrics: Option<Arc<MetricsCollector>>,
     runtime_config: LegacyServerConfig,
+    tls_handler: Option<Arc<RustlsTlsHandler>>,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAP server listening on {}", addr);
@@ -228,6 +379,7 @@ pub async fn run_with_metrics_and_config(
                 let schema = schema.clone();
                 let metrics = metrics.clone();
                 let pool = pool.clone();
+                let tls_handler = tls_handler.clone();
                 let controls = ConnectionControls {
                     conn_id,
                     client_ip: addr.ip(),
@@ -241,10 +393,11 @@ pub async fn run_with_metrics_and_config(
                 }
 
                 tokio::spawn(async move {
-                    handle_client_with_metrics(
-                        socket,
+                    handle_client_with_metrics_and_tls(
+                        ConnectionStream::plain(socket),
                         backend,
                         schema,
+                        tls_handler,
                         metrics.clone(),
                         Some(controls),
                     )
@@ -267,18 +420,149 @@ pub async fn run_with_metrics_and_config(
     Ok(())
 }
 
+pub async fn run_tls_with_metrics_and_config(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+    tls_handler: Arc<RustlsTlsHandler>,
+) -> Result<(), ServerError> {
+    let listener = TcpListener::bind(addr).await?;
+    info!("LDAPS server listening on {}", addr);
+
+    let schema = Arc::new(LdapSchema::with_core_schema());
+    let pool = Arc::new(ConnectionPool::new(runtime_config.resource_limits.clone()));
+    let rate_limiter = if runtime_config.rate_limiting_enabled {
+        Some(Arc::new(RateLimiter::new(
+            runtime_config.rate_limit_config.clone(),
+        )))
+    } else {
+        None
+    };
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (socket, addr) = match result {
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_connection_failed();
+                        }
+                        return Err(err.into());
+                    }
+                };
+
+                let conn_id = match pool.acquire_connection(addr).await {
+                    Some(conn_id) => conn_id,
+                    None => {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_connection_failed();
+                        }
+                        warn!("LDAPS connection from {:?} rejected due to resource limits", addr);
+                        continue;
+                    }
+                };
+
+                let tls_stream = match tls_handler.accept(socket).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_connection_failed();
+                        }
+                        pool.release_connection(conn_id).await;
+                        warn!("LDAPS handshake failed for {:?}: {}", addr, err);
+                        continue;
+                    }
+                };
+
+                info!("Accepted LDAPS connection from {:?} (conn_id={})", addr, conn_id);
+
+                let backend = backend.clone();
+                let schema = schema.clone();
+                let metrics = metrics.clone();
+                let pool = pool.clone();
+                let tls_handler = tls_handler.clone();
+                let controls = ConnectionControls {
+                    conn_id,
+                    client_ip: addr.ip(),
+                    idle_timeout: runtime_config.resource_limits.connection_idle_timeout,
+                    pool: pool.clone(),
+                    rate_limiter: rate_limiter.clone(),
+                };
+
+                if let Some(metrics) = metrics.as_ref() {
+                    metrics.record_connection_accepted();
+                }
+
+                tokio::spawn(async move {
+                    handle_client_with_metrics_and_tls(
+                        ConnectionStream::tls(tls_stream),
+                        backend,
+                        schema,
+                        Some(tls_handler),
+                        metrics.clone(),
+                        Some(controls),
+                    )
+                    .await;
+                    pool.release_connection(conn_id).await;
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_connection_closed();
+                    }
+                    info!("LDAPS connection {:?} (conn_id={}) closed", addr, conn_id);
+                });
+            }
+            _ = shutdown_rx.recv() => {
+                info!("LDAPS server received shutdown signal, stopping accept loop");
+                break;
+            }
+        }
+    }
+
+    info!("LDAPS server stopped accepting new connections");
+    Ok(())
+}
+
 pub async fn handle_client(
     socket: TcpStream,
     backend: Arc<dyn DirectoryBackend>,
     schema: Arc<LdapSchema>,
 ) {
-    handle_client_with_metrics(socket, backend, schema, None, None).await;
+    handle_client_with_metrics_and_tls(
+        ConnectionStream::plain(socket),
+        backend,
+        schema,
+        None,
+        None,
+        None,
+    )
+    .await;
 }
 
 async fn handle_client_with_metrics(
-    mut socket: TcpStream,
+    socket: TcpStream,
     backend: Arc<dyn DirectoryBackend>,
     schema: Arc<LdapSchema>,
+    metrics: Option<Arc<MetricsCollector>>,
+    controls: Option<ConnectionControls>,
+) {
+    handle_client_with_metrics_and_tls(
+        ConnectionStream::plain(socket),
+        backend,
+        schema,
+        None,
+        metrics,
+        controls,
+    )
+    .await;
+}
+
+async fn handle_client_with_metrics_and_tls(
+    mut socket: ConnectionStream,
+    backend: Arc<dyn DirectoryBackend>,
+    schema: Arc<LdapSchema>,
+    tls_handler: Option<Arc<RustlsTlsHandler>>,
     metrics: Option<Arc<MetricsCollector>>,
     controls: Option<ConnectionControls>,
 ) {
@@ -455,6 +739,7 @@ async fn handle_client_with_metrics(
                                     schema.as_ref(),
                                     &mut session,
                                     message,
+                                    tls_handler.as_deref(),
                                 )
                                 .await;
 
@@ -550,7 +835,9 @@ fn rejection_response_for_protocol(protocol_op: &ProtocolOp<'_>) -> Option<Rejec
     }
 }
 
-async fn send_connection_rejected(socket: &mut TcpStream) -> Result<(), ServerError> {
+async fn send_connection_rejected(
+    socket: &mut (impl AsyncWrite + Unpin),
+) -> Result<(), ServerError> {
     send_result(
         socket,
         0,
@@ -565,7 +852,7 @@ async fn send_connection_rejected(socket: &mut TcpStream) -> Result<(), ServerEr
 }
 
 async fn send_rejection_response(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
     response_kind: Option<RejectionResponse>,
     result_code: ResultCode,
@@ -699,21 +986,22 @@ async fn decode_messages(
 }
 
 pub async fn process_message(
-    socket: &mut TcpStream,
+    socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
     message: ldap_parser::ldap::LdapMessage<'_>,
 ) -> Result<(), ServerError> {
     let mut session = ConnectionSession::default();
-    process_message_with_session(socket, backend, schema, &mut session, message).await
+    process_message_with_session(socket, backend, schema, &mut session, message, None).await
 }
 
 async fn process_message_with_session(
-    socket: &mut TcpStream,
+    socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
     session: &mut ConnectionSession,
     message: ldap_parser::ldap::LdapMessage<'_>,
+    tls_handler: Option<&RustlsTlsHandler>,
 ) -> Result<(), ServerError> {
     let message_id = message.message_id.0;
 
@@ -791,7 +1079,14 @@ async fn process_message_with_session(
             handle_abandon_request(request_id);
         }
         ProtocolOp::ExtendedRequest(request) => {
-            handle_extended_request(socket, message_id, request).await?;
+            handle_extended_request_with_session(
+                socket,
+                message_id,
+                request,
+                session,
+                tls_handler,
+            )
+            .await?;
         }
         op => {
             warn!("Unsupported operation received: {:?}", op);
@@ -802,7 +1097,7 @@ async fn process_message_with_session(
 }
 
 pub async fn handle_bind_request(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: BindRequest<'_>,
@@ -812,7 +1107,7 @@ pub async fn handle_bind_request(
 }
 
 async fn handle_bind_request_with_session(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: BindRequest<'_>,
@@ -883,7 +1178,7 @@ async fn handle_bind_request_with_session(
 }
 
 async fn ensure_authenticated_for_mutation(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
     session: &ConnectionSession,
     op: ResponseOp,
@@ -906,12 +1201,15 @@ async fn ensure_authenticated_for_mutation(
     Ok(false)
 }
 
-async fn send_bind_success(socket: &mut TcpStream, message_id: u32) -> Result<(), ServerError> {
+async fn send_bind_success(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+) -> Result<(), ServerError> {
     send_bind_response(socket, message_id, ResultCode::Success, "").await
 }
 
 async fn send_bind_response(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
     result_code: ResultCode,
     diagnostic_message: impl Into<String>,
@@ -922,7 +1220,7 @@ async fn send_bind_response(
 }
 
 async fn send_result(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
     op: ResponseOp,
     result_code: ResultCode,
@@ -952,7 +1250,7 @@ fn diagnostic_for_error(err: &BackendError) -> &'static str {
 }
 
 pub async fn handle_search_request(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: SearchRequest<'_>,
@@ -1052,7 +1350,7 @@ fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
 }
 
 async fn handle_replication_stream_request(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     base_dn: &str,
@@ -1115,14 +1413,14 @@ async fn handle_replication_stream_request(
     Ok(())
 }
 
-struct ProviderOwnedReplicationSession<'a> {
-    socket: &'a mut TcpStream,
+struct ProviderOwnedReplicationSession<'a, S> {
+    socket: &'a mut S,
     message_id: u32,
     base_dn: &'a str,
 }
 
-impl<'a> ProviderOwnedReplicationSession<'a> {
-    fn new(socket: &'a mut TcpStream, message_id: u32, base_dn: &'a str) -> Self {
+impl<'a, S: AsyncWrite + Unpin> ProviderOwnedReplicationSession<'a, S> {
+    fn new(socket: &'a mut S, message_id: u32, base_dn: &'a str) -> Self {
         Self {
             socket,
             message_id,
@@ -1167,7 +1465,7 @@ impl<'a> ProviderOwnedReplicationSession<'a> {
 }
 
 pub async fn handle_modify_request(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: ModifyRequest<'_>,
@@ -1205,7 +1503,7 @@ pub async fn handle_modify_request(
 }
 
 pub async fn handle_add_request(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
     message_id: u32,
@@ -1259,7 +1557,7 @@ pub async fn handle_add_request(
 }
 
 pub async fn handle_delete_request(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     dn: ldap_parser::ldap::LdapDN<'_>,
@@ -1296,7 +1594,7 @@ pub async fn handle_delete_request(
 }
 
 pub async fn handle_moddn_request(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: ModDnRequest<'_>,
@@ -1342,7 +1640,7 @@ pub async fn handle_moddn_request(
 }
 
 pub async fn handle_compare_request(
-    socket: &mut TcpStream,
+    socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: CompareRequest<'_>,
@@ -1396,14 +1694,64 @@ fn handle_abandon_request(request_id: ldap_parser::ldap::MessageID) {
 }
 
 pub async fn handle_extended_request(
-    socket: &mut TcpStream,
+    socket: &mut ConnectionStream,
     message_id: u32,
     request: ExtendedRequest<'_>,
+ ) -> Result<(), ServerError> {
+    let mut session = ConnectionSession::default();
+    handle_extended_request_with_session(socket, message_id, request, &mut session, None).await
+}
+
+async fn handle_extended_request_with_session(
+    socket: &mut ConnectionStream,
+    message_id: u32,
+    request: ExtendedRequest<'_>,
+    session: &mut ConnectionSession,
+    tls_handler: Option<&RustlsTlsHandler>,
 ) -> Result<(), ServerError> {
-    warn!(
-        "Unsupported extended operation requested: {}",
-        request.request_name.0.as_ref()
-    );
+    const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
+    let oid = request.request_name.0.as_ref();
+
+    if oid == START_TLS_OID {
+        if socket.is_secure() {
+            return send_result(
+                socket,
+                message_id,
+                ResponseOp::Extended,
+                ResultCode::OperationsError,
+                "",
+                "connection already uses TLS",
+            )
+            .await;
+        }
+
+        let Some(tls_handler) = tls_handler else {
+            return send_result(
+                socket,
+                message_id,
+                ResponseOp::Extended,
+                ResultCode::Unavailable,
+                "",
+                "StartTLS is not available",
+            )
+            .await;
+        };
+
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::Extended,
+            ResultCode::Success,
+            "",
+            "",
+        )
+        .await?;
+        socket.upgrade_in_place(tls_handler).await?;
+        session.clear();
+        return Ok(());
+    }
+
+    warn!("Unsupported extended operation requested: {}", oid);
 
     send_result(
         socket,

@@ -10,6 +10,7 @@ use opendr::monitoring_runtime::{spawn_monitoring_server, ComponentStatus, Runti
 use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
+use opendr::tls::{RustlsTlsHandler, TlsConfig as RuntimeTlsConfig, TlsVersion};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -255,23 +256,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let bind_addr = config.ldap_bind_address();
+    let ldaps_bind_addr = config.ldaps_bind_address();
     println!("Starting LDAP server on {}", bind_addr);
     let legacy_server_config = server::LegacyServerConfig::from_server_config(&config);
+    let tls_handler = if config.tls.enabled {
+        let min_tls_version = match config.tls.min_tls_version.as_str() {
+            "1.2" => TlsVersion::Tls12,
+            "1.3" => TlsVersion::Tls13,
+            other => {
+                return Err(format!("unsupported TLS version configured: {}", other).into());
+            }
+        };
+
+        let runtime_tls_config = RuntimeTlsConfig {
+            cert_path: config.tls.cert_file.display().to_string(),
+            key_path: config.tls.key_file.display().to_string(),
+            ca_file: config.tls.ca_file.as_ref().map(|path| path.display().to_string()),
+            min_tls_version,
+            max_tls_version: TlsVersion::Tls13,
+            require_client_cert: config.tls.require_client_cert,
+        };
+
+        Some(Arc::new(RustlsTlsHandler::new(&runtime_tls_config)?))
+    } else {
+        None
+    };
 
     // Create a channel for server shutdown
-    let shutdown_rx = shutdown_clone.subscribe();
+    let ldap_shutdown_rx = shutdown_clone.subscribe();
+    let ldaps_shutdown_rx = shutdown_clone.subscribe();
 
     // Run server with shutdown support
     let selected_runtime = config.server.runtime.clone();
-    let server_task = tokio::spawn(async move {
+    let ldap_backend = backend.clone();
+    let ldap_metrics = monitoring_metrics.clone();
+    let ldap_runtime_config = legacy_server_config.clone();
+    let ldap_tls_handler = tls_handler.clone();
+    let ldap_server_task = tokio::spawn(async move {
         let result = match selected_runtime.as_str() {
             "legacy" => {
-                server::run_with_metrics_and_config(
+                server::run_with_metrics_and_config_with_tls(
                     &bind_addr,
-                    backend,
-                    shutdown_rx,
-                    monitoring_metrics,
-                    legacy_server_config,
+                    ldap_backend,
+                    ldap_shutdown_rx,
+                    ldap_metrics,
+                    ldap_runtime_config,
+                    ldap_tls_handler,
                 )
                 .await
             }
@@ -287,6 +317,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    let ldaps_server_task = if let Some(tls_handler) = tls_handler.clone() {
+        let ldaps_backend = backend.clone();
+        let ldaps_metrics = monitoring_metrics.clone();
+        let ldaps_runtime_config = legacy_server_config.clone();
+        println!("Starting LDAPS server on {}", ldaps_bind_addr);
+        Some(tokio::spawn(async move {
+            if let Err(e) = server::run_tls_with_metrics_and_config(
+                &ldaps_bind_addr,
+                ldaps_backend,
+                ldaps_shutdown_rx,
+                ldaps_metrics,
+                ldaps_runtime_config,
+                tls_handler,
+            )
+            .await
+            {
+                eprintln!("LDAPS server error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Wait for shutdown signal
     let mut shutdown_signal_rx = shutdown_clone.subscribe();
     let _ = shutdown_signal_rx.recv().await;
@@ -298,9 +351,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     shutdown_clone.complete_shutdown().await;
 
     // Wait for server task to finish
-    match server_task.await {
-        Ok(()) => println!("Server shutdown complete"),
-        Err(e) => eprintln!("Server task error: {}", e),
+    match ldap_server_task.await {
+        Ok(()) => println!("LDAP server shutdown complete"),
+        Err(e) => eprintln!("LDAP server task error: {}", e),
+    }
+
+    if let Some(handle) = ldaps_server_task {
+        match handle.await {
+            Ok(()) => println!("LDAPS server shutdown complete"),
+            Err(e) => eprintln!("LDAPS server task error: {}", e),
+        }
     }
 
     if let Some(handle) = monitoring_handle {
