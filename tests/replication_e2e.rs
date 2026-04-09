@@ -25,7 +25,7 @@ use ldap_parser::parse_ldap_messages;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -37,6 +37,7 @@ fn create_provider_config() -> ServerConfig {
     config.replication.enabled = true;
     config.replication.mode = "provider".to_string();
     config.replication.changelog_capacity = 1000;
+    config.replication.state_storage_path = unique_replication_state_path("provider");
     config.server.base_dn = "dc=test,dc=org".to_string();
     config
 }
@@ -48,8 +49,20 @@ fn create_consumer_config() -> ServerConfig {
     config.replication.mode = "consumer".to_string();
     config.replication.provider_url = Some("ldap://provider:389".to_string());
     config.replication.sync_interval_secs = 1;
+    config.replication.state_storage_path = unique_replication_state_path("consumer");
     config.server.base_dn = "dc=test,dc=org".to_string();
     config
+}
+
+fn unique_replication_state_path(prefix: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "opendr-repl-e2e-{prefix}-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 /// Helper function to create a test entry

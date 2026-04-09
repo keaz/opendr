@@ -43,6 +43,7 @@ use crate::fsm::{
     StateMachine,
 };
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -509,7 +510,7 @@ impl ChangelogEntry {
 }
 
 /// Types of directory changes in changelog
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeType {
     /// Entry was added
     Add,
@@ -916,6 +917,8 @@ pub enum ReplicationProviderError {
     ConsumerNotFound { consumer_id: String },
     /// Invalid replication cookie
     InvalidCookie { cookie: String },
+    /// Consumer must perform a full refresh because its cookie is older than retained history
+    FullRefreshRequired { cookie: String },
     /// Changelog access error
     ChangelogError { message: String },
     /// Consumer registry error
@@ -942,6 +945,13 @@ impl std::fmt::Display for ReplicationProviderError {
             }
             ReplicationProviderError::InvalidCookie { cookie } => {
                 write!(f, "Invalid replication cookie: {}", cookie)
+            }
+            ReplicationProviderError::FullRefreshRequired { cookie } => {
+                write!(
+                    f,
+                    "Replication cookie is stale and requires a full refresh: {}",
+                    cookie
+                )
             }
             ReplicationProviderError::ChangelogError { message } => {
                 write!(f, "Changelog error: {}", message)
@@ -1366,16 +1376,21 @@ impl ReplicationProviderFsmImpl {
         request: &SyncRequest,
     ) -> Result<(), ReplicationProviderError> {
         if let Some(cookie) = request.cookie.as_deref() {
-            let is_valid = self
-                .changelog_provider
-                .validate_cookie(cookie)
-                .await
-                .map_err(|message| ReplicationProviderError::ChangelogError { message })?;
-
-            if !is_valid {
-                return Err(ReplicationProviderError::InvalidCookie {
-                    cookie: cookie.to_string(),
-                });
+            match self.changelog_provider.validate_cookie(cookie).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ReplicationProviderError::InvalidCookie {
+                        cookie: cookie.to_string(),
+                    });
+                }
+                Err(message) if message.contains("Stale replication cookie") => {
+                    return Err(ReplicationProviderError::FullRefreshRequired {
+                        cookie: cookie.to_string(),
+                    });
+                }
+                Err(message) => {
+                    return Err(ReplicationProviderError::ChangelogError { message });
+                }
             }
         }
 
@@ -1398,7 +1413,11 @@ impl ReplicationProviderFsmImpl {
             .get_changelog_since(Some(cookie), self.config.changelog_batch_size)
             .await
             .map_err(|message| {
-                if message.contains("cookie") {
+                if message.contains("Stale replication cookie") {
+                    ReplicationProviderError::FullRefreshRequired {
+                        cookie: cookie.to_string(),
+                    }
+                } else if message.contains("cookie") {
                     ReplicationProviderError::InvalidCookie {
                         cookie: cookie.to_string(),
                     }
@@ -2130,6 +2149,7 @@ pub mod tests {
         entries: Vec<DirectoryEntry>,
         changelog: Vec<ChangelogEntry>,
         invalid_cookies: HashSet<String>,
+        stale_cookies: HashSet<String>,
     }
 
     impl MockChangelogProvider {
@@ -2147,6 +2167,7 @@ pub mod tests {
                     b"entry data".to_vec(),
                 )],
                 invalid_cookies: HashSet::new(),
+                stale_cookies: HashSet::new(),
             }
         }
 
@@ -2167,6 +2188,11 @@ pub mod tests {
 
         pub fn with_invalid_cookie(mut self, cookie: &str) -> Self {
             self.invalid_cookies.insert(cookie.to_string());
+            self
+        }
+
+        pub fn with_stale_cookie(mut self, cookie: &str) -> Self {
+            self.stale_cookies.insert(cookie.to_string());
             self
         }
     }
@@ -2218,6 +2244,8 @@ pub mod tests {
         async fn validate_cookie(&self, cookie: &str) -> Result<bool, String> {
             if self.should_fail {
                 Err("Mock cookie validation failure".to_string())
+            } else if self.stale_cookies.contains(cookie) {
+                Err(format!("Stale replication cookie: {}", cookie))
             } else {
                 Ok(!self.invalid_cookies.contains(cookie))
             }
@@ -3304,6 +3332,38 @@ pub mod tests {
         assert!(matches!(
             result.unwrap_err(),
             ReplicationProviderError::InvalidCookie { .. }
+        ));
+        assert_eq!(fsm.active_consumers(), 0);
+        assert!(fsm.get_session("consumer1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_start_sync_replication_requires_full_refresh_for_stale_cookie() {
+        let changelog_provider =
+            Box::new(MockChangelogProvider::new().with_stale_cookie("stale-cookie"));
+        let consumer_registry = Box::new(MockConsumerRegistry::new());
+        let streaming_manager = Box::new(MockStreamingManager::new());
+        let sync_request_handler = Box::new(MockSyncRequestHandler::new());
+
+        let mut fsm = ReplicationProviderFsmImpl::new(
+            changelog_provider,
+            consumer_registry,
+            streaming_manager,
+            sync_request_handler,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationProviderEvent::StartSyncReplication {
+                request: default_sync_request("consumer1")
+                    .with_cookie("stale-cookie".to_string())
+                    .with_sync_mode(SyncMode::PresentOnly),
+            })
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            ReplicationProviderError::FullRefreshRequired { cookie }
+            if cookie == "stale-cookie"
         ));
         assert_eq!(fsm.active_consumers(), 0);
         assert!(fsm.get_session("consumer1").is_none());

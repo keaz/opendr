@@ -1230,7 +1230,49 @@ async fn test_provider_fsm_rejects_stale_cookie_explicitly() {
 
     assert!(matches!(
         err,
-        ReplicationProviderError::InvalidCookie { cookie: invalid }
+        ReplicationProviderError::FullRefreshRequired { cookie: invalid }
+        if invalid == cookie
+    ));
+    assert!(fsm.get_session("consumer1").is_none());
+    assert_eq!(fsm.active_consumers(), 0);
+}
+
+#[tokio::test]
+async fn test_provider_fsm_rejects_stale_cookie_after_tracker_restart() {
+    let backend = Arc::new(create_test_backend().await);
+    let state_dir = tempfile::tempdir().unwrap();
+    let tracker = ChangelogTracker::with_capacity_replica_and_storage(2, 1, state_dir.path());
+    let stale_csn = tracker.record_change(
+        ChangeType::Add,
+        "cn=stale,dc=example,dc=org".to_string(),
+        b"stale".to_vec(),
+    );
+    tracker.record_change(
+        ChangeType::Modify,
+        "cn=current1,dc=example,dc=org".to_string(),
+        b"current-1".to_vec(),
+    );
+    tracker.record_change(
+        ChangeType::Delete,
+        "cn=current2,dc=example,dc=org".to_string(),
+        b"current-2".to_vec(),
+    );
+
+    let reloaded = ChangelogTracker::with_capacity_replica_and_storage(2, 1, state_dir.path());
+    let mut fsm = create_provider_fsm_with_tracker(backend, reloaded);
+    let cookie = format!("csn-{stale_csn}");
+    let err = fsm
+        .handle_event(ReplicationProviderEvent::StartSyncReplication {
+            request: default_provider_request("consumer1")
+                .with_sync_mode(SyncMode::PresentOnly)
+                .with_cookie(cookie.clone()),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ReplicationProviderError::FullRefreshRequired { cookie: invalid }
         if invalid == cookie
     ));
     assert!(fsm.get_session("consumer1").is_none());

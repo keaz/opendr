@@ -12,6 +12,7 @@ use opendr::replication_service::ReplicationService;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn create_test_entry(dn: &str, cn: &str) -> DirectoryEntry {
     let mut attributes = HashMap::new();
@@ -20,11 +21,25 @@ fn create_test_entry(dn: &str, cn: &str) -> DirectoryEntry {
     DirectoryEntry::new(dn, attributes)
 }
 
-#[tokio::test]
-async fn test_replication_service_provider_initialization() {
+fn create_provider_config() -> ServerConfig {
     let mut config = ServerConfig::default();
     config.replication.enabled = true;
     config.replication.mode = "provider".to_string();
+    config.replication.state_storage_path = unique_replication_state_path("provider-integration");
+    config
+}
+
+fn unique_replication_state_path(prefix: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("opendr-{prefix}-{}-{nanos}", std::process::id()))
+}
+
+#[tokio::test]
+async fn test_replication_service_provider_initialization() {
+    let mut config = create_provider_config();
     config.replication.changelog_capacity = 1000;
 
     let backend = Arc::new(MockBackend::new());
@@ -37,9 +52,7 @@ async fn test_replication_service_provider_initialization() {
 
 #[tokio::test]
 async fn test_replication_service_uses_configured_replica_id() {
-    let mut config = ServerConfig::default();
-    config.replication.enabled = true;
-    config.replication.mode = "provider".to_string();
+    let mut config = create_provider_config();
     config.server.replica_id = 42;
 
     let backend = Arc::new(MockBackend::with_replica_id(config.server.replica_id));
@@ -57,9 +70,7 @@ async fn test_replication_service_uses_configured_replica_id() {
 
 #[tokio::test]
 async fn test_replication_service_provider_with_shutdown() {
-    let mut config = ServerConfig::default();
-    config.replication.enabled = true;
-    config.replication.mode = "provider".to_string();
+    let config = create_provider_config();
 
     let backend = Arc::new(MockBackend::new());
     let service = ReplicationService::from_config(&config, backend).unwrap();
@@ -74,7 +85,7 @@ async fn test_replication_service_provider_with_shutdown() {
 
 #[tokio::test]
 async fn test_replication_service_disabled_provider() {
-    let mut config = ServerConfig::default();
+    let mut config = create_provider_config();
     config.replication.enabled = false;
 
     let backend = Arc::new(MockBackend::new());
@@ -90,8 +101,7 @@ async fn test_replication_service_disabled_provider() {
 
 #[tokio::test]
 async fn test_replication_service_consumer_mode_no_provider() {
-    let mut config = ServerConfig::default();
-    config.replication.enabled = true;
+    let mut config = create_provider_config();
     config.replication.mode = "consumer".to_string();
     config.replication.provider_url = Some("ldap://provider:389".to_string());
 
@@ -127,9 +137,7 @@ async fn test_backend_wrapper_with_changelog() {
 
 #[tokio::test]
 async fn test_replication_service_backend_wrapper() {
-    let mut config = ServerConfig::default();
-    config.replication.enabled = true;
-    config.replication.mode = "provider".to_string();
+    let config = create_provider_config();
 
     let backend = Arc::new(MockBackend::new());
     let service = ReplicationService::from_config(&config, backend.clone()).unwrap();
@@ -149,9 +157,7 @@ async fn test_replication_service_backend_wrapper() {
 
 #[tokio::test]
 async fn test_replication_service_multiple_operations() {
-    let mut config = ServerConfig::default();
-    config.replication.enabled = true;
-    config.replication.mode = "provider".to_string();
+    let config = create_provider_config();
 
     let backend = Arc::new(MockBackend::new());
     let service = ReplicationService::from_config(&config, backend).unwrap();
@@ -175,9 +181,7 @@ async fn test_replication_service_multiple_operations() {
 
 #[tokio::test]
 async fn test_replication_service_changelog_capacity() {
-    let mut config = ServerConfig::default();
-    config.replication.enabled = true;
-    config.replication.mode = "provider".to_string();
+    let mut config = create_provider_config();
     config.replication.changelog_capacity = 3; // Small capacity
 
     let backend = Arc::new(MockBackend::new());
@@ -203,8 +207,7 @@ async fn test_replication_service_changelog_capacity() {
 
 #[tokio::test]
 async fn test_replication_service_both_mode() {
-    let mut config = ServerConfig::default();
-    config.replication.enabled = true;
+    let mut config = create_provider_config();
     config.replication.mode = "both".to_string();
     config.replication.provider_url = Some("ldap://other:389".to_string());
 

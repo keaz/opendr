@@ -157,10 +157,13 @@ impl ReplicationService {
                 .as_ref()
                 .map(|c| c.changelog_capacity)
                 .unwrap_or(10000);
-            Some(Arc::new(ChangelogTracker::with_capacity_and_replica(
-                capacity,
-                config.server.replica_id,
-            )))
+            Some(Arc::new(
+                ChangelogTracker::with_capacity_replica_and_storage(
+                    capacity,
+                    config.server.replica_id,
+                    config.replication.state_storage_path.clone(),
+                ),
+            ))
         } else {
             None
         };
@@ -637,8 +640,9 @@ impl ReplicationService {
 mod tests {
     use super::*;
     use crate::backend::MockBackend;
+    use crate::replication_provider_fsm::ChangeType;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
 
     fn create_test_config() -> ServerConfig {
         let mut config = ServerConfig::default();
@@ -750,6 +754,36 @@ mod tests {
 
         assert!(service.changelog().is_some());
         // Changelog created with specified capacity
+    }
+
+    #[test]
+    fn test_replication_service_reloads_persisted_changelog_from_state_path() {
+        let state_dir = tempdir().unwrap();
+        let backend = Arc::new(MockBackend::new());
+        let mut config = create_test_config();
+        config.replication.state_storage_path = state_dir.path().to_path_buf();
+
+        let service = ReplicationService::from_config(&config, backend.clone()).unwrap();
+        let changelog = service.changelog().unwrap();
+        let first_csn = changelog.record_change(
+            ChangeType::Add,
+            "cn=first,dc=example,dc=org".to_string(),
+            b"first".to_vec(),
+        );
+        let second_csn = changelog.record_change(
+            ChangeType::Modify,
+            "cn=second,dc=example,dc=org".to_string(),
+            b"second".to_vec(),
+        );
+
+        let restarted = ReplicationService::from_config(&config, backend).unwrap();
+        let restarted_changelog = restarted.changelog().unwrap();
+        let changes = restarted_changelog.get_all();
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].csn, first_csn);
+        assert_eq!(changes[1].csn, second_csn);
+        assert_eq!(restarted_changelog.get_context_csn(), Some(second_csn));
     }
 
     #[tokio::test]

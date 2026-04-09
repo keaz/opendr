@@ -6,9 +6,12 @@
 //! 3. Cookie files are properly created and managed
 //! 4. Incremental sync works with persisted cookies
 
-use opendr::replication::StateManagerImpl;
+use opendr::backend::MockBackend;
+use opendr::replication::{ChangelogProviderImpl, ChangelogTracker, StateManagerImpl};
 use opendr::replication_consumer_fsm::StateManager;
+use opendr::replication_provider_fsm::{ChangeType, ChangelogProvider};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 /// Helper to create a temporary state manager for testing
@@ -275,3 +278,60 @@ async fn test_save_cookie_fails_when_storage_path_is_a_file() {
 // Note: Concurrent cookie operations test removed
 // The StateManager is not designed for concurrent writes from multiple threads
 // In production, only the replication consumer writes cookies, so this is not a concern
+
+#[test]
+fn test_provider_changelog_persistence_across_instances() {
+    let temp_dir = TempDir::new().unwrap();
+    let tracker = ChangelogTracker::with_capacity_replica_and_storage(4, 7, temp_dir.path());
+    let first_csn = tracker.record_change(
+        ChangeType::Add,
+        "cn=one,dc=example,dc=org".to_string(),
+        b"one".to_vec(),
+    );
+    let second_csn = tracker.record_change(
+        ChangeType::Modify,
+        "cn=two,dc=example,dc=org".to_string(),
+        b"two".to_vec(),
+    );
+
+    let reloaded = ChangelogTracker::with_capacity_replica_and_storage(4, 7, temp_dir.path());
+    let changes = reloaded.get_all();
+
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].csn, first_csn);
+    assert_eq!(changes[1].csn, second_csn);
+    assert_eq!(reloaded.get_oldest_csn(), Some(first_csn));
+    assert_eq!(reloaded.get_context_csn(), Some(second_csn));
+}
+
+#[tokio::test]
+async fn test_provider_changelog_retention_bounds_survive_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let tracker = ChangelogTracker::with_capacity_replica_and_storage(2, 9, temp_dir.path());
+    let stale_csn = tracker.record_change(
+        ChangeType::Add,
+        "cn=stale,dc=example,dc=org".to_string(),
+        b"stale".to_vec(),
+    );
+    tracker.record_change(
+        ChangeType::Modify,
+        "cn=current1,dc=example,dc=org".to_string(),
+        b"current-1".to_vec(),
+    );
+    let latest_csn = tracker.record_change(
+        ChangeType::Delete,
+        "cn=current2,dc=example,dc=org".to_string(),
+        b"current-2".to_vec(),
+    );
+
+    let reloaded = ChangelogTracker::with_capacity_replica_and_storage(2, 9, temp_dir.path());
+    let provider = ChangelogProviderImpl::new(reloaded.clone(), Arc::new(MockBackend::new()));
+
+    let stale_cookie = reloaded.generate_cookie_from_csn(&stale_csn);
+    let err = provider
+        .get_changelog_since(Some(&stale_cookie), 10)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Stale replication cookie"));
+    assert_eq!(reloaded.get_context_csn(), Some(latest_csn));
+}

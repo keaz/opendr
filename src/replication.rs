@@ -50,6 +50,7 @@ use ldap3::{LdapConnAsync, LdapConnSettings};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
@@ -80,6 +81,44 @@ pub struct ChangelogTracker {
     max_entries: usize,
     /// Most recent CSN (for contextCSN)
     latest_csn: Arc<Mutex<Option<Csn>>>,
+    /// Optional directory used for durable changelog persistence
+    storage_dir: Option<PathBuf>,
+}
+
+const PROVIDER_CHANGELOG_FILE: &str = "provider_changelog.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedChangelogSnapshot {
+    entries: Vec<PersistedChangelogEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedChangelogEntry {
+    csn: Csn,
+    change_type: ChangeType,
+    dn: String,
+    change_data: Vec<u8>,
+    originator: Option<String>,
+}
+
+impl From<&ChangelogEntry> for PersistedChangelogEntry {
+    fn from(entry: &ChangelogEntry) -> Self {
+        Self {
+            csn: entry.csn.clone(),
+            change_type: entry.change_type.clone(),
+            dn: entry.dn.clone(),
+            change_data: entry.change_data.clone(),
+            originator: entry.originator.clone(),
+        }
+    }
+}
+
+impl PersistedChangelogEntry {
+    fn into_runtime(self) -> ChangelogEntry {
+        let mut entry = ChangelogEntry::new(self.csn, self.change_type, self.dn, self.change_data);
+        entry.originator = self.originator;
+        entry
+    }
 }
 
 impl ChangelogTracker {
@@ -100,12 +139,114 @@ impl ChangelogTracker {
 
     /// Create new changelog tracker with specific capacity and replica ID
     pub fn with_capacity_and_replica(max_entries: usize, replica_id: u16) -> Self {
-        Self {
+        Self::new_with_storage(max_entries, replica_id, None)
+    }
+
+    /// Create a changelog tracker backed by durable storage in the given directory.
+    pub fn with_capacity_replica_and_storage(
+        max_entries: usize,
+        replica_id: u16,
+        storage_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self::new_with_storage(max_entries, replica_id, Some(storage_dir.into()))
+    }
+
+    fn new_with_storage(max_entries: usize, replica_id: u16, storage_dir: Option<PathBuf>) -> Self {
+        let tracker = Self {
             csn_generator: Arc::new(CsnGenerator::new(replica_id)),
             entries: Arc::new(Mutex::new(HashMap::new())),
             max_entries,
             latest_csn: Arc::new(Mutex::new(None)),
+            storage_dir,
+        };
+        tracker.load_persisted_snapshot();
+        tracker
+    }
+
+    fn snapshot_path(&self) -> Option<PathBuf> {
+        self.storage_dir
+            .as_ref()
+            .map(|dir| dir.join(PROVIDER_CHANGELOG_FILE))
+    }
+
+    fn load_persisted_snapshot(&self) {
+        let Some(path) = self.snapshot_path() else {
+            return;
+        };
+
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                warn!(
+                    "Failed to read persisted changelog {}: {}",
+                    path.display(),
+                    err
+                );
+                return;
+            }
+        };
+
+        let snapshot = match serde_json::from_slice::<PersistedChangelogSnapshot>(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warn!(
+                    "Failed to deserialize persisted changelog {}: {}",
+                    path.display(),
+                    err
+                );
+                return;
+            }
+        };
+
+        let retained_entries = if snapshot.entries.len() > self.max_entries {
+            snapshot
+                .entries
+                .into_iter()
+                .rev()
+                .take(self.max_entries)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+        } else {
+            snapshot.entries
+        };
+
+        let latest_csn = retained_entries.last().map(|entry| entry.csn.clone());
+        let mut entries = self.entries.lock().unwrap();
+        entries.clear();
+        for entry in retained_entries {
+            let runtime_entry = entry.into_runtime();
+            entries.insert(runtime_entry.csn.to_string(), runtime_entry);
         }
+        drop(entries);
+        *self.latest_csn.lock().unwrap() = latest_csn;
+    }
+
+    fn persist_snapshot(&self) -> Result<(), std::io::Error> {
+        let Some(path) = self.snapshot_path() else {
+            return Ok(());
+        };
+
+        let snapshot = {
+            let mut entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
+            entries.sort_by(|a, b| a.csn.cmp(&b.csn));
+            PersistedChangelogSnapshot {
+                entries: entries.iter().map(PersistedChangelogEntry::from).collect(),
+            }
+        };
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = path.with_extension("tmp");
+        let payload = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        std::fs::write(&temp_path, payload)?;
+        std::fs::rename(&temp_path, &path)?;
+        Ok(())
     }
 
     /// Record a directory change
@@ -140,6 +281,12 @@ impl ChangelogTracker {
             for csn_key in csn_list.iter().take(to_remove) {
                 entries.remove(csn_key);
             }
+        }
+        drop(latest);
+        drop(entries);
+
+        if let Err(err) = self.persist_snapshot() {
+            warn!("Failed to persist provider changelog: {}", err);
         }
 
         csn
@@ -206,6 +353,38 @@ impl ChangelogTracker {
             "csn-empty".to_string()
         }
     }
+
+    fn classify_cookie(&self, cookie: &str) -> ChangelogCookieStatus {
+        if cookie == "csn-empty" {
+            return ChangelogCookieStatus::Valid(None);
+        }
+
+        let Some(csn) = self.parse_cookie(cookie) else {
+            return ChangelogCookieStatus::Invalid;
+        };
+
+        let Some(latest_csn) = self.get_context_csn() else {
+            return ChangelogCookieStatus::Valid(Some(csn));
+        };
+
+        if let Some(oldest_csn) = self.get_oldest_csn() {
+            if csn < oldest_csn {
+                return ChangelogCookieStatus::Stale;
+            }
+        }
+
+        if csn > latest_csn {
+            return ChangelogCookieStatus::Invalid;
+        }
+
+        ChangelogCookieStatus::Valid(Some(csn))
+    }
+}
+
+enum ChangelogCookieStatus {
+    Valid(Option<Csn>),
+    Stale,
+    Invalid,
 }
 
 pub const REPLICATION_STREAM_ATTRIBUTE: &str = "opendrReplicationStream";
@@ -415,26 +594,15 @@ impl ChangelogProvider for ChangelogProviderImpl {
         limit: usize,
     ) -> Result<Vec<ChangelogEntry>, String> {
         let entries = if let Some(cookie_str) = cookie {
-            // Parse cookie to get starting CSN
-            if cookie_str == "csn-empty" {
-                // Empty state - return all entries
-                self.tracker.get_all()
-            } else if let Some(csn) = self.tracker.parse_cookie(cookie_str) {
-                if let Some(oldest_csn) = self.tracker.get_oldest_csn() {
-                    if csn < oldest_csn {
-                        return Err(format!("Stale replication cookie: {}", cookie_str));
-                    }
+            match self.tracker.classify_cookie(cookie_str) {
+                ChangelogCookieStatus::Valid(None) => self.tracker.get_all(),
+                ChangelogCookieStatus::Valid(Some(csn)) => self.tracker.get_since_csn(&csn),
+                ChangelogCookieStatus::Stale => {
+                    return Err(format!("Stale replication cookie: {}", cookie_str));
                 }
-                if let Some(latest_csn) = self.tracker.get_context_csn() {
-                    if csn > latest_csn {
-                        return Err(format!("Invalid replication cookie: {}", cookie_str));
-                    }
+                ChangelogCookieStatus::Invalid => {
+                    return Err(format!("Invalid replication cookie: {}", cookie_str));
                 }
-                // Get entries since this CSN
-                self.tracker.get_since_csn(&csn)
-            } else {
-                // Invalid cookie - return empty
-                return Err(format!("Invalid replication cookie: {}", cookie_str));
             }
         } else {
             // No cookie - return all entries (full refresh)
@@ -456,22 +624,10 @@ impl ChangelogProvider for ChangelogProviderImpl {
     }
 
     async fn validate_cookie(&self, cookie: &str) -> Result<bool, String> {
-        if cookie == "csn-empty" {
-            Ok(true)
-        } else if let Some(csn) = self.tracker.parse_cookie(cookie) {
-            if let Some(oldest_csn) = self.tracker.get_oldest_csn() {
-                if csn < oldest_csn {
-                    return Ok(false);
-                }
-            }
-            if let Some(latest_csn) = self.tracker.get_context_csn() {
-                if csn > latest_csn {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        } else {
-            Ok(false)
+        match self.tracker.classify_cookie(cookie) {
+            ChangelogCookieStatus::Valid(_) => Ok(true),
+            ChangelogCookieStatus::Stale => Err(format!("Stale replication cookie: {}", cookie)),
+            ChangelogCookieStatus::Invalid => Ok(false),
         }
     }
 }
