@@ -1053,6 +1053,13 @@ impl SearchFsmImpl {
     /// # Returns
     /// * Result indicating success or error
     async fn handle_entry_emitted(&mut self) -> Result<Option<Vec<u8>>, SearchFsmError> {
+        if !matches!(self.state, SearchState::EmittingEntries) {
+            return Err(SearchFsmError::InvalidStateTransition {
+                from: self.state.clone(),
+                to: SearchState::EmittingEntries,
+            });
+        }
+
         if let Some(session) = &mut self.session {
             session.entries_sent += 1;
             self.total_entries_sent += 1;
@@ -1897,6 +1904,51 @@ mod tests {
         assert_eq!(fsm.current_state(), &SearchState::SizeLimitExceeded);
         assert_eq!(fsm.stats(), (1, 1, 2));
         assert!(fsm.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn test_entry_emitted_before_entry_found_is_rejected_without_mutation() {
+        let backend = Box::new(MockSearchBackend::new());
+        let filter_matcher = Box::new(MockFilterMatcher::new());
+        let entry_formatter = Box::new(MockEntryFormatter::new());
+
+        let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
+        fsm.session = Some(SearchSession::new(SearchParams {
+            base_dn: "dc=example,dc=org".to_string(),
+            scope: 2,
+            filter: "(objectClass=person)".to_string(),
+            attributes: vec!["cn".to_string()],
+            size_limit: 100,
+            time_limit: 30,
+        }));
+        fsm.state = SearchState::Iterating {
+            candidates_found: 0,
+            entries_sent: 0,
+        };
+
+        let stats_before = fsm.stats();
+        let result = fsm.handle_event(SearchEvent::EntryEmitted).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchFsmError::InvalidStateTransition {
+                from: SearchState::Iterating {
+                    candidates_found: 0,
+                    entries_sent: 0,
+                },
+                to: SearchState::EmittingEntries,
+            }
+        ));
+        assert_eq!(
+            fsm.current_state(),
+            &SearchState::Iterating {
+                candidates_found: 0,
+                entries_sent: 0,
+            }
+        );
+        assert_eq!(fsm.stats(), stats_before);
+        assert_eq!(fsm.entries_sent(), 0);
+        assert_eq!(fsm.session.as_ref().unwrap().entries_sent, 0);
     }
 
     #[tokio::test]

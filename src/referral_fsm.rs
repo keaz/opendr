@@ -2148,6 +2148,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_sent_before_routing_decision_is_rejected_without_mutation() {
+        let mut fsm = create_test_fsm();
+        fsm.handle_event(ReferralEvent::ReferralReceived {
+            urls: vec!["ldap://test-server.example.com/dc=example,dc=org".to_string()],
+        })
+        .await
+        .unwrap();
+
+        let stats_before = fsm.get_stats();
+        let result = fsm.handle_event(ReferralEvent::RequestSent).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            ReferralFsmError::InvalidStateTransition {
+                from: ReferralState::EvaluatingReferral,
+                to: ReferralState::AwaitingResponse,
+            }
+        ));
+        assert_eq!(fsm.current_state(), &ReferralState::EvaluatingReferral);
+        assert_eq!(fsm.get_stats(), stats_before);
+        assert!(fsm.current_target().is_none());
+    }
+
+    #[tokio::test]
     async fn test_request_sent_no_active_referral() {
         let mut fsm = create_test_fsm();
 

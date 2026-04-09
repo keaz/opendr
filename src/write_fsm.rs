@@ -1546,6 +1546,13 @@ impl WriteFsmImpl {
             Err(WriteFsmError::NoActiveOperation)
         } else if matches!(self.state, WriteState::Completed { .. }) {
             Ok(None)
+        } else if !matches!(self.state, WriteState::Committing) || self.transaction_id().is_none() {
+            Err(WriteFsmError::InvalidStateTransition {
+                from: self.state.clone(),
+                to: WriteState::Completed {
+                    result_code: WriteResultCode::Success,
+                },
+            })
         } else {
             self.record_success();
             Ok(None)
@@ -2511,6 +2518,38 @@ mod tests {
             call.contains("record_write_complete(Add { dn: \"cn=test,dc=example,dc=org\"")
                 && call.contains("Success")
         }));
+    }
+
+    #[tokio::test]
+    async fn test_commit_complete_before_transaction_start_is_rejected_without_mutation() {
+        let backend = Box::new(MockWriteBackend::new());
+        let schema_validator = Box::new(MockSchemaValidator::new());
+        let aci_checker = Box::new(MockAciChecker::new());
+
+        let mut fsm = WriteFsmImpl::new(backend, schema_validator, aci_checker);
+        fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+            dn: "cn=test,dc=example,dc=org".to_string(),
+            entry: b"test entry".to_vec(),
+        }))
+        .await
+        .unwrap();
+
+        let stats_before = fsm.stats();
+        let state_before = fsm.current_state().clone();
+        let result = fsm.handle_event(WriteEvent::CommitComplete).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            WriteFsmError::InvalidStateTransition {
+                from: WriteState::Validating,
+                to: WriteState::Completed {
+                    result_code: WriteResultCode::Success,
+                },
+            }
+        ));
+        assert_eq!(fsm.current_state(), &state_before);
+        assert_eq!(fsm.stats(), stats_before);
+        assert!(fsm.transaction_id().is_none());
     }
 
     #[tokio::test]

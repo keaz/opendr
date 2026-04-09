@@ -681,9 +681,15 @@ impl CompareFsmImpl {
         }
 
         let (entry, dn, attribute, value) = {
-            let session = self.session.as_ref().ok_or(CompareFsmError::NoActiveCompare)?;
+            let session = self
+                .session
+                .as_ref()
+                .ok_or(CompareFsmError::NoActiveCompare)?;
             (
-                session.entry.clone().ok_or(CompareFsmError::NoActiveCompare)?,
+                session
+                    .entry
+                    .clone()
+                    .ok_or(CompareFsmError::NoActiveCompare)?,
                 session.params.dn.clone(),
                 session.params.attribute.clone(),
                 session.params.value.clone(),
@@ -828,6 +834,17 @@ impl CompareFsmImpl {
         attribute: String,
         value: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, CompareFsmError> {
+        if self.session.is_some() && !self.is_terminal() {
+            return Err(self.invalid_transition(CompareState::Reading));
+        }
+
+        if !matches!(
+            self.state,
+            CompareState::Reading | CompareState::Completed { .. }
+        ) {
+            return Err(self.invalid_transition(CompareState::Reading));
+        }
+
         let params = CompareParams {
             dn,
             attribute,
@@ -878,7 +895,10 @@ impl CompareFsmImpl {
         }
 
         let (dn, attribute) = {
-            let session = self.session.as_ref().ok_or(CompareFsmError::NoActiveCompare)?;
+            let session = self
+                .session
+                .as_ref()
+                .ok_or(CompareFsmError::NoActiveCompare)?;
             (session.params.dn.clone(), session.params.attribute.clone())
         };
 
@@ -1476,13 +1496,48 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
-        assert_eq!(fsm.current_state(), &CompareState::Emitting { result: true });
+        assert_eq!(
+            fsm.current_state(),
+            &CompareState::Emitting { result: true }
+        );
         assert_eq!(fsm.result(), Some(true));
         assert!(comparator_log
             .lock()
             .unwrap()
             .iter()
             .any(|call| call.contains("compare_attribute")));
+    }
+
+    #[tokio::test]
+    async fn test_comparison_complete_before_entry_read_is_rejected_without_mutation() {
+        let backend = Box::new(MockCompareBackend::new());
+        let comparator = Box::new(MockAttributeComparator::new());
+        let access_control = Box::new(MockCompareAccessControl::new());
+
+        let mut fsm = CompareFsmImpl::new(backend, comparator, access_control);
+        fsm.handle_event(CompareEvent::StartCompare {
+            dn: "cn=john,dc=example,dc=org".to_string(),
+            attribute: "mail".to_string(),
+            value: b"john@example.org".to_vec(),
+        })
+        .await
+        .unwrap();
+
+        let stats_before = fsm.stats();
+        let result = fsm
+            .handle_event(CompareEvent::ComparisonComplete(true))
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            CompareFsmError::InvalidStateTransition {
+                from: CompareState::Reading,
+                to: CompareState::Emitting { result: true },
+            }
+        ));
+        assert_eq!(fsm.current_state(), &CompareState::Reading);
+        assert_eq!(fsm.stats(), stats_before);
+        assert_eq!(fsm.result(), None);
     }
 
     #[tokio::test]
@@ -1765,14 +1820,12 @@ mod tests {
     async fn test_with_user_dn_affects_access_control() {
         let backend = Box::new(MockCompareBackend::new());
         let comparator = Box::new(MockAttributeComparator::new());
-        let access_control = MockCompareAccessControl::new().requiring_user_dn(
-            "cn=admin,dc=example,dc=org",
-        );
+        let access_control =
+            MockCompareAccessControl::new().requiring_user_dn("cn=admin,dc=example,dc=org");
         let access_log = access_control.call_log.clone();
 
-        let mut allowed_fsm =
-            CompareFsmImpl::new(backend, comparator, Box::new(access_control))
-                .with_user_dn("cn=admin,dc=example,dc=org".to_string());
+        let mut allowed_fsm = CompareFsmImpl::new(backend, comparator, Box::new(access_control))
+            .with_user_dn("cn=admin,dc=example,dc=org".to_string());
 
         let allowed = allowed_fsm
             .handle_event(CompareEvent::StartCompare {
@@ -1794,9 +1847,8 @@ mod tests {
         let access_control = Box::new(
             MockCompareAccessControl::new().requiring_user_dn("cn=admin,dc=example,dc=org"),
         );
-        let mut denied_fsm =
-            CompareFsmImpl::new(backend, comparator, access_control)
-                .with_user_dn("cn=hacker,dc=example,dc=org".to_string());
+        let mut denied_fsm = CompareFsmImpl::new(backend, comparator, access_control)
+            .with_user_dn("cn=hacker,dc=example,dc=org".to_string());
 
         let denied = denied_fsm
             .handle_event(CompareEvent::StartCompare {
