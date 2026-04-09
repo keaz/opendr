@@ -277,6 +277,34 @@ impl LdapSchema {
         self.object_classes.get(&name.to_lowercase())
     }
 
+    /// Return unique attribute types keyed by OID, sorted for stable publication.
+    pub fn attribute_types_unique_sorted(&self) -> Vec<AttributeType> {
+        let mut by_oid = HashMap::new();
+        for attribute in self.attribute_types.values() {
+            by_oid
+                .entry(attribute.oid.clone())
+                .or_insert_with(|| attribute.clone());
+        }
+
+        let mut attributes = by_oid.into_values().collect::<Vec<_>>();
+        attributes.sort_by(|left, right| left.oid.cmp(&right.oid));
+        attributes
+    }
+
+    /// Return unique object classes keyed by OID, sorted for stable publication.
+    pub fn object_classes_unique_sorted(&self) -> Vec<ObjectClass> {
+        let mut by_oid = HashMap::new();
+        for object_class in self.object_classes.values() {
+            by_oid
+                .entry(object_class.oid.clone())
+                .or_insert_with(|| object_class.clone());
+        }
+
+        let mut object_classes = by_oid.into_values().collect::<Vec<_>>();
+        object_classes.sort_by(|left, right| left.oid.cmp(&right.oid));
+        object_classes
+    }
+
     /// Validate an entry against the schema
     pub fn validate_entry(
         &self,
@@ -429,6 +457,83 @@ impl LdapSchema {
             }
         }
     }
+}
+
+impl AttributeType {
+    pub fn to_schema_description(&self) -> String {
+        let mut parts = vec![format!("( {}", self.oid)];
+
+        if !self.names.is_empty() {
+            parts.push(format!("NAME {}", format_name_list(&self.names)));
+        }
+        if let Some(description) = &self.description {
+            parts.push(format!("DESC '{}'", escape_schema_value(description)));
+        }
+        if let Some(equality) = &self.equality {
+            parts.push(format!("EQUALITY {}", equality));
+        }
+        parts.push(format!("SYNTAX {}", self.syntax));
+        if self.single_value {
+            parts.push("SINGLE-VALUE".to_string());
+        }
+
+        parts.push(")".to_string());
+        parts.join(" ")
+    }
+}
+
+impl ObjectClass {
+    pub fn to_schema_description(&self) -> String {
+        let mut parts = vec![format!("( {}", self.oid)];
+
+        if !self.names.is_empty() {
+            parts.push(format!("NAME {}", format_name_list(&self.names)));
+        }
+        if !self.sup.is_empty() {
+            parts.push(format!("SUP {}", format_schema_list(&self.sup)));
+        }
+        parts.push(match self.kind {
+            ObjectClassKind::Abstract => "ABSTRACT".to_string(),
+            ObjectClassKind::Structural => "STRUCTURAL".to_string(),
+            ObjectClassKind::Auxiliary => "AUXILIARY".to_string(),
+        });
+        if !self.must.is_empty() {
+            parts.push(format!("MUST {}", format_schema_list(&self.must)));
+        }
+        if !self.may.is_empty() {
+            parts.push(format!("MAY {}", format_schema_list(&self.may)));
+        }
+
+        parts.push(")".to_string());
+        parts.join(" ")
+    }
+}
+
+fn format_name_list(values: &[String]) -> String {
+    if values.len() == 1 {
+        format!("'{}'", escape_schema_value(&values[0]))
+    } else {
+        format!(
+            "( {} )",
+            values
+                .iter()
+                .map(|value| format!("'{}'", escape_schema_value(value)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+}
+
+fn format_schema_list(values: &[String]) -> String {
+    if values.len() == 1 {
+        values[0].clone()
+    } else {
+        format!("( {} )", values.join(" $ "))
+    }
+}
+
+fn escape_schema_value(value: &str) -> String {
+    value.replace('\'', "\\27")
 }
 
 impl Default for LdapSchema {
@@ -657,5 +762,54 @@ mod tests {
             result,
             Err(SchemaError::MissingRequiredAttribute(_))
         ));
+    }
+
+    #[test]
+    fn unique_schema_views_deduplicate_aliases() {
+        let schema = LdapSchema::with_core_schema();
+
+        let attribute_oids = schema
+            .attribute_types_unique_sorted()
+            .into_iter()
+            .map(|attribute| attribute.oid)
+            .collect::<Vec<_>>();
+        let object_class_oids = schema
+            .object_classes_unique_sorted()
+            .into_iter()
+            .map(|object_class| object_class.oid)
+            .collect::<Vec<_>>();
+
+        assert_eq!(attribute_oids.len(), 10);
+        assert_eq!(object_class_oids.len(), 6);
+        assert!(attribute_oids.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(object_class_oids.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn attribute_type_schema_description_uses_rfc_style_format() {
+        let schema = LdapSchema::with_core_schema();
+        let description = schema
+            .get_attribute_type("cn")
+            .unwrap()
+            .to_schema_description();
+
+        assert_eq!(
+            description,
+            "( 2.5.4.3 NAME ( 'cn' 'commonName' ) DESC 'Common name' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )"
+        );
+    }
+
+    #[test]
+    fn object_class_schema_description_uses_rfc_style_format() {
+        let schema = LdapSchema::with_core_schema();
+        let description = schema
+            .get_object_class("inetOrgPerson")
+            .unwrap()
+            .to_schema_description();
+
+        assert_eq!(
+            description,
+            "( 2.16.840.1.113730.3.2.2 NAME 'inetOrgPerson' SUP organizationalPerson STRUCTURAL MAY ( uid $ givenName $ mail ) )"
+        );
     }
 }

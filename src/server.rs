@@ -95,11 +95,17 @@ impl ConnectionSession {
     }
 }
 
+const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
+const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
+const SUBSCHEMA_DN: &str = "cn=Subschema";
+
 #[derive(Debug, Clone)]
 pub struct LegacyServerConfig {
     pub resource_limits: ResourceLimits,
     pub rate_limit_config: RateLimitConfig,
     pub rate_limiting_enabled: bool,
+    pub naming_contexts: Vec<String>,
+    pub subschema_dn: String,
 }
 
 impl Default for LegacyServerConfig {
@@ -108,6 +114,8 @@ impl Default for LegacyServerConfig {
             resource_limits: ResourceLimits::default(),
             rate_limit_config: RateLimitConfig::default(),
             rate_limiting_enabled: true,
+            naming_contexts: Vec::new(),
+            subschema_dn: SUBSCHEMA_DN.to_string(),
         }
     }
 }
@@ -125,6 +133,8 @@ impl LegacyServerConfig {
             },
             rate_limit_config: config.to_rate_limit_config(),
             rate_limiting_enabled: config.rate_limit.enabled,
+            naming_contexts: vec![config.server.base_dn.clone()],
+            subschema_dn: SUBSCHEMA_DN.to_string(),
         }
     }
 }
@@ -445,6 +455,7 @@ async fn run_plain_listener(
                 let schema = schema.clone();
                 let metrics = metrics.clone();
                 let pool = pool.clone();
+                let connection_runtime_config = runtime_config.clone();
                 let tls_handler = tls_handler.clone();
                 let security = security.clone();
                 let controls = ConnectionControls {
@@ -483,6 +494,7 @@ async fn run_plain_listener(
                         ConnectionStream::plain(socket),
                         backend,
                         schema,
+                        connection_runtime_config,
                         tls_handler,
                         metrics.clone(),
                         Some(controls),
@@ -603,6 +615,7 @@ pub async fn run_tls_with_metrics_and_config_and_security(
                 let schema = schema.clone();
                 let metrics = metrics.clone();
                 let pool = pool.clone();
+                let connection_runtime_config = runtime_config.clone();
                 let tls_handler = tls_handler.clone();
                 let security = security.clone();
                 let controls = ConnectionControls {
@@ -641,6 +654,7 @@ pub async fn run_tls_with_metrics_and_config_and_security(
                         ConnectionStream::tls(tls_stream),
                         backend,
                         schema,
+                        connection_runtime_config,
                         Some(tls_handler),
                         metrics.clone(),
                         Some(controls),
@@ -686,6 +700,7 @@ pub async fn handle_client(
         ConnectionStream::plain(socket),
         backend,
         schema,
+        LegacyServerConfig::default(),
         None,
         None,
         None,
@@ -698,6 +713,7 @@ async fn handle_client_with_metrics_and_tls(
     mut socket: ConnectionStream,
     backend: Arc<dyn DirectoryBackend>,
     schema: Arc<LdapSchema>,
+    runtime_config: LegacyServerConfig,
     tls_handler: Option<Arc<RustlsTlsHandler>>,
     metrics: Option<Arc<MetricsCollector>>,
     controls: Option<ConnectionControls>,
@@ -874,6 +890,7 @@ async fn handle_client_with_metrics_and_tls(
                                     &mut socket,
                                     backend.as_ref(),
                                     schema.as_ref(),
+                                    &runtime_config,
                                     &mut session,
                                     message,
                                     tls_handler.as_deref(),
@@ -1130,10 +1147,12 @@ pub async fn process_message(
     message: ldap_parser::ldap::LdapMessage<'_>,
 ) -> Result<(), ServerError> {
     let mut session = ConnectionSession::default();
+    let runtime_config = LegacyServerConfig::default();
     process_message_with_session(
         socket,
         backend,
         schema,
+        &runtime_config,
         &mut session,
         message,
         None,
@@ -1146,6 +1165,7 @@ async fn process_message_with_session(
     socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
+    runtime_config: &LegacyServerConfig,
     session: &mut ConnectionSession,
     message: ldap_parser::ldap::LdapMessage<'_>,
     tls_handler: Option<&RustlsTlsHandler>,
@@ -1185,11 +1205,15 @@ async fn process_message_with_session(
             handle_search_request_with_context(
                 socket,
                 backend,
+                schema,
+                runtime_config,
                 message_id,
                 search_request,
                 session,
                 request_context,
                 &request_controls,
+                socket.is_secure(),
+                tls_handler.is_some(),
             )
             .await?;
         }
@@ -2162,6 +2186,235 @@ async fn send_search_entry_with_controls(
     Ok(())
 }
 
+async fn try_handle_virtual_search_request(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
+    runtime_config: &LegacyServerConfig,
+    message_id: u32,
+    base_dn: &str,
+    scope: ldap_parser::ldap::SearchScope,
+    requested_attributes: &[String],
+    types_only: bool,
+    connection_is_secure: bool,
+    starttls_available: bool,
+) -> Result<bool, ServerError> {
+    if scope != ldap_parser::ldap::SearchScope::BaseObject {
+        return Ok(false);
+    }
+
+    if base_dn.is_empty() {
+        let attributes = match build_root_dse_attributes(
+            backend,
+            runtime_config,
+            connection_is_secure,
+            starttls_available,
+        )
+        .await
+        {
+            Ok(attributes) => attributes,
+            Err(err) => {
+                send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::SearchDone,
+                    map_backend_error(&err),
+                    base_dn,
+                    diagnostic_for_error(&err),
+                )
+                .await?;
+                return Ok(true);
+            }
+        };
+        send_virtual_search_entry(
+            socket,
+            message_id,
+            "",
+            &attributes,
+            requested_attributes,
+            types_only,
+        )
+        .await?;
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::SearchDone,
+            ResultCode::Success,
+            "",
+            "",
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    if base_dn.eq_ignore_ascii_case(&runtime_config.subschema_dn) {
+        let attributes = build_subschema_attributes(schema);
+        send_virtual_search_entry(
+            socket,
+            message_id,
+            &runtime_config.subschema_dn,
+            &attributes,
+            requested_attributes,
+            types_only,
+        )
+        .await?;
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::SearchDone,
+            ResultCode::Success,
+            &runtime_config.subschema_dn,
+            "",
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+async fn build_root_dse_attributes(
+    backend: &dyn DirectoryBackend,
+    runtime_config: &LegacyServerConfig,
+    connection_is_secure: bool,
+    starttls_available: bool,
+) -> Result<Vec<(String, Vec<String>)>, BackendError> {
+    let mut attributes = vec![("supportedLDAPVersion".to_string(), vec!["3".to_string()])];
+
+    if !runtime_config.naming_contexts.is_empty() {
+        attributes.push((
+            "namingContexts".to_string(),
+            runtime_config.naming_contexts.clone(),
+        ));
+    }
+
+    attributes.push((
+        "subschemaSubentry".to_string(),
+        vec![runtime_config.subschema_dn.clone()],
+    ));
+
+    let supported_extensions =
+        active_runtime_supported_extensions(connection_is_secure, starttls_available);
+    if !supported_extensions.is_empty() {
+        attributes.push(("supportedExtension".to_string(), supported_extensions));
+    }
+
+    let supported_controls = active_runtime_control_registry().supported_control_oids();
+    if !supported_controls.is_empty() {
+        attributes.push(("supportedControl".to_string(), supported_controls));
+    }
+
+    let supported_sasl = active_runtime_supported_sasl_mechanisms();
+    if !supported_sasl.is_empty() {
+        attributes.push(("supportedSASLMechanisms".to_string(), supported_sasl));
+    }
+
+    if let Some(context_csn) = backend.get_context_csn().await? {
+        attributes.push(("contextCSN".to_string(), vec![context_csn.to_ldap_string()]));
+    }
+
+    Ok(attributes)
+}
+
+fn build_subschema_attributes(schema: &LdapSchema) -> Vec<(String, Vec<String>)> {
+    let mut attributes = vec![
+        (
+            "objectClass".to_string(),
+            vec![
+                "top".to_string(),
+                "subentry".to_string(),
+                "subschema".to_string(),
+            ],
+        ),
+        ("cn".to_string(), vec!["Subschema".to_string()]),
+    ];
+
+    let attribute_types = schema
+        .attribute_types_unique_sorted()
+        .into_iter()
+        .map(|attribute| attribute.to_schema_description())
+        .collect::<Vec<_>>();
+    if !attribute_types.is_empty() {
+        attributes.push(("attributeTypes".to_string(), attribute_types));
+    }
+
+    let object_classes = schema
+        .object_classes_unique_sorted()
+        .into_iter()
+        .map(|object_class| object_class.to_schema_description())
+        .collect::<Vec<_>>();
+    if !object_classes.is_empty() {
+        attributes.push(("objectClasses".to_string(), object_classes));
+    }
+
+    attributes
+}
+
+fn active_runtime_supported_extensions(
+    connection_is_secure: bool,
+    starttls_available: bool,
+) -> Vec<String> {
+    let mut supported = Vec::new();
+    if starttls_available && !connection_is_secure {
+        supported.push(START_TLS_OID.to_string());
+    }
+    supported.push(WHO_AM_I_OID.to_string());
+    supported
+}
+
+fn active_runtime_supported_sasl_mechanisms() -> Vec<String> {
+    vec!["PLAIN".to_string()]
+}
+
+async fn send_virtual_search_entry(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    dn: &str,
+    available_attributes: &[(String, Vec<String>)],
+    requested_attributes: &[String],
+    types_only: bool,
+) -> Result<(), ServerError> {
+    let synthetic_entry = DirectoryEntry::new(dn, HashMap::new());
+    let selected_attributes = select_virtual_attributes(available_attributes, requested_attributes);
+    send_search_entry_with_controls(
+        socket,
+        message_id,
+        &synthetic_entry,
+        &selected_attributes,
+        types_only,
+        &[],
+    )
+    .await
+}
+
+fn select_virtual_attributes(
+    available_attributes: &[(String, Vec<String>)],
+    requested_attributes: &[String],
+) -> Vec<(String, Vec<String>)> {
+    if requested_attributes
+        .iter()
+        .any(|attribute| attribute.eq_ignore_ascii_case("1.1"))
+    {
+        return Vec::new();
+    }
+
+    let include_all = requested_attributes.is_empty()
+        || requested_attributes
+            .iter()
+            .any(|attribute| attribute == "*" || attribute == "+");
+
+    available_attributes
+        .iter()
+        .filter(|(name, _)| {
+            include_all
+                || requested_attributes
+                    .iter()
+                    .any(|attribute| attribute.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect()
+}
+
 fn map_backend_error(err: &BackendError) -> ResultCode {
     match err {
         BackendError::AlreadyExists => ResultCode::EntryAlreadyExists,
@@ -2199,15 +2452,21 @@ pub async fn handle_search_request(
     request: SearchRequest<'_>,
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
+    let schema = LdapSchema::default();
+    let runtime_config = LegacyServerConfig::default();
     let request_controls = RequestControls::default();
     handle_search_request_with_context(
         socket,
         backend,
+        &schema,
+        &runtime_config,
         message_id,
         request,
         &session,
         &RequestContext::default(),
         &request_controls,
+        false,
+        false,
     )
     .await
 }
@@ -2215,11 +2474,15 @@ pub async fn handle_search_request(
 async fn handle_search_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
+    runtime_config: &LegacyServerConfig,
     message_id: u32,
     request: SearchRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
     _request_controls: &RequestControls,
+    connection_is_secure: bool,
+    starttls_available: bool,
 ) -> Result<(), ServerError> {
     let base_dn = request.base_object.0.as_ref().trim().to_owned();
     let attribute_selection: Vec<String> = request
@@ -2227,6 +2490,24 @@ async fn handle_search_request_with_context(
         .iter()
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
+
+    if try_handle_virtual_search_request(
+        socket,
+        backend,
+        schema,
+        runtime_config,
+        message_id,
+        &base_dn,
+        request.scope,
+        &attribute_selection,
+        request.types_only,
+        connection_is_secure,
+        starttls_available,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     if !authorize_operation(
         socket,
@@ -3218,8 +3499,6 @@ async fn handle_extended_request_with_session(
     request_context: &RequestContext,
     _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
-    const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
-    const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
     let oid = request.request_name.0.as_ref();
 
     if oid == START_TLS_OID {
@@ -3594,6 +3873,17 @@ mod tests {
             .expect("response timeout")
             .expect("failed to read response");
         buf.truncate(len);
+
+        loop {
+            let mut chunk = vec![0u8; 4096];
+            match timeout(Duration::from_millis(20), stream.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(len)) => buf.extend_from_slice(&chunk[..len]),
+                Ok(Err(err)) => panic!("failed to read response: {err}"),
+                Err(_) => break,
+            }
+        }
+
         buf
     }
 
@@ -3617,6 +3907,41 @@ mod tests {
             message.controls = Some(controls.into_iter().collect());
         }
         der::encode(&message).unwrap()
+    }
+
+    fn search_request_for_base(base_dn: &str, attributes: &[&str]) -> SearchRequest<'static> {
+        SearchRequest {
+            base_object: LdapDN(Cow::Owned(base_dn.to_string())),
+            scope: SearchScope::BaseObject,
+            deref_aliases: DerefAliases(0),
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter: Filter::Present(LdapString(Cow::Owned("objectClass".to_string()))),
+            attributes: attributes
+                .iter()
+                .map(|attribute| LdapString(Cow::Owned((*attribute).to_string())))
+                .collect(),
+        }
+    }
+
+    fn search_entry_attribute_map(
+        entry: &ldap_parser::ldap::SearchResultEntry<'_>,
+    ) -> HashMap<String, Vec<String>> {
+        entry
+            .attributes
+            .iter()
+            .map(|attribute| {
+                (
+                    attribute.attr_type.0.as_ref().to_string(),
+                    attribute
+                        .attr_vals
+                        .iter()
+                        .map(|value| bytes_to_string(value.0.as_ref()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
     }
 
     fn replication_stream_request() -> SearchRequest<'static> {
@@ -4391,6 +4716,180 @@ mod tests {
                 .as_ref(),
             "1.2.840.113556.1.4.319"
         );
+    }
+
+    #[tokio::test]
+    async fn root_dse_search_returns_truthful_capabilities_and_context_csn() {
+        let backend = MockBackend::new();
+        backend
+            .set_context_csn(crate::csn::Csn::with_values(1696680896789012, 1, 1, 0))
+            .await
+            .unwrap();
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+        let request_controls = RequestControls::default();
+        let request = search_request_for_base("", &[]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_search_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            14,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        let attributes = match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "");
+                search_entry_attribute_map(entry)
+            }
+            other => panic!("unexpected response: {:?}", other),
+        };
+
+        assert_eq!(
+            attributes.get("supportedLDAPVersion").unwrap(),
+            &vec!["3".to_string()]
+        );
+        assert_eq!(
+            attributes.get("namingContexts").unwrap(),
+            &vec!["dc=example,dc=org".to_string()]
+        );
+        assert_eq!(
+            attributes.get("subschemaSubentry").unwrap(),
+            &vec!["cn=Subschema".to_string()]
+        );
+        assert_eq!(
+            attributes.get("supportedSASLMechanisms").unwrap(),
+            &vec!["PLAIN".to_string()]
+        );
+        assert_eq!(
+            attributes.get("contextCSN").unwrap(),
+            &vec!["1696680896789012#001#000001#000000".to_string()]
+        );
+        assert_eq!(
+            attributes.get("supportedExtension").unwrap(),
+            &vec![START_TLS_OID.to_string(), WHO_AM_I_OID.to_string()]
+        );
+        assert!(!attributes.contains_key("supportedControl"));
+
+        match &messages[1].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected completion: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn secure_root_dse_search_omits_starttls_extension() {
+        let backend = MockBackend::new();
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+        let request_controls = RequestControls::default();
+        let request = search_request_for_base("", &["supportedExtension"]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_search_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            15,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        let attributes = match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => search_entry_attribute_map(entry),
+            other => panic!("unexpected response: {:?}", other),
+        };
+
+        assert_eq!(
+            attributes.get("supportedExtension").unwrap(),
+            &vec![WHO_AM_I_OID.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn subschema_search_returns_attribute_types_and_object_classes() {
+        let backend = MockBackend::new();
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+        let request_controls = RequestControls::default();
+        let request = search_request_for_base("cn=Subschema", &[]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_search_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            16,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        let attributes = match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "cn=Subschema");
+                search_entry_attribute_map(entry)
+            }
+            other => panic!("unexpected response: {:?}", other),
+        };
+
+        assert_eq!(
+            attributes.get("cn").unwrap(),
+            &vec!["Subschema".to_string()]
+        );
+        assert!(attributes
+            .get("attributeTypes")
+            .unwrap()
+            .iter()
+            .any(|value| value.contains("2.5.4.3") && value.contains("commonName")));
+        assert!(attributes
+            .get("objectClasses")
+            .unwrap()
+            .iter()
+            .any(|value| value.contains("2.16.840.1.113730.3.2.2")
+                && value.contains("inetOrgPerson")));
     }
 
     #[tokio::test]
