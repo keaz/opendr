@@ -1,6 +1,7 @@
 use rasn::der;
 use rasn::error::EncodeError;
-use rasn::types::SetOf;
+use rasn::types::{OctetString, SetOf};
+use rasn::{AsnType, Decode, Encode};
 use rasn_ldap::{ResultCode, SearchResultEntry};
 
 use crate::backend::DirectoryEntry;
@@ -14,6 +15,43 @@ pub enum ResponseOp {
     ModifyDn,
     Compare,
     Extended,
+}
+
+#[derive(AsnType, Encode, Decode, Debug, Clone, Copy, PartialEq, Eq)]
+#[rasn(enumerated)]
+pub enum CustomResultCode {
+    Success = 0,
+    ProtocolError = 2,
+    Busy = 51,
+    Unavailable = 52,
+    UnwillingToPerform = 53,
+    Other = 80,
+    Canceled = 118,
+    NoSuchOperation = 119,
+    TooLate = 120,
+    CannotCancel = 121,
+}
+
+#[derive(AsnType, Encode, Decode)]
+struct CustomLdapResult {
+    result_code: CustomResultCode,
+    matched_dn: OctetString,
+    diagnostic_message: OctetString,
+}
+
+#[derive(AsnType, Encode, Decode)]
+#[rasn(choice)]
+enum CustomProtocolOp {
+    #[rasn(tag(application, 5))]
+    SearchResultDone(CustomLdapResult),
+    #[rasn(tag(application, 24))]
+    ExtendedResponse(CustomLdapResult),
+}
+
+#[derive(AsnType, Encode, Decode)]
+struct CustomLdapMessage {
+    message_id: i32,
+    protocol_op: CustomProtocolOp,
 }
 
 pub fn encode_bind_response(
@@ -226,6 +264,40 @@ pub fn encode_intermediate_response(
     )
 }
 
+pub fn encode_custom_search_result_done(
+    message_id: u32,
+    result_code: CustomResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+) -> Result<Vec<u8>, EncodeError> {
+    let result = CustomLdapResult {
+        result_code,
+        matched_dn: matched_dn.into().into_bytes().into(),
+        diagnostic_message: diagnostic_message.into().into_bytes().into(),
+    };
+    der::encode(&CustomLdapMessage {
+        message_id: message_id as i32,
+        protocol_op: CustomProtocolOp::SearchResultDone(result),
+    })
+}
+
+pub fn encode_custom_extended_response(
+    message_id: u32,
+    result_code: CustomResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+) -> Result<Vec<u8>, EncodeError> {
+    let result = CustomLdapResult {
+        result_code,
+        matched_dn: matched_dn.into().into_bytes().into(),
+        diagnostic_message: diagnostic_message.into().into_bytes().into(),
+    };
+    der::encode(&CustomLdapMessage {
+        message_id: message_id as i32,
+        protocol_op: CustomProtocolOp::ExtendedResponse(result),
+    })
+}
+
 fn encode_message(
     message_id: u32,
     protocol_op: rasn_ldap::ProtocolOp,
@@ -248,7 +320,7 @@ fn encode_message(
 mod tests {
     use super::*;
     use crate::ldap_controls::LdapControl;
-    use ldap_parser::ldap::ProtocolOp as ParserProtocolOp;
+    use ldap_parser::ldap::{ProtocolOp as ParserProtocolOp, ResultCode as ParserResultCode};
     use ldap_parser::parse_ldap_messages;
     use std::collections::HashMap;
 
@@ -331,5 +403,48 @@ mod tests {
             messages[0].protocol_op,
             ParserProtocolOp::IntermediateResponse(_)
         ));
+    }
+
+    #[test]
+    fn encode_custom_extended_response_supports_cancel_result_codes() {
+        let encoded = encode_custom_extended_response(
+            41,
+            CustomResultCode::NoSuchOperation,
+            "",
+            "no such operation",
+        )
+        .unwrap();
+        let (_, messages) = parse_ldap_messages(&encoded).unwrap();
+
+        match &messages[0].protocol_op {
+            ParserProtocolOp::ExtendedResponse(response) => {
+                assert_eq!(response.result.result_code, ParserResultCode(119));
+                assert_eq!(
+                    response.result.diagnostic_message.0.as_ref(),
+                    "no such operation"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn encode_custom_search_result_done_supports_canceled_result_code() {
+        let encoded = encode_custom_search_result_done(
+            42,
+            CustomResultCode::Canceled,
+            "",
+            "operation canceled",
+        )
+        .unwrap();
+        let (_, messages) = parse_ldap_messages(&encoded).unwrap();
+
+        match &messages[0].protocol_op {
+            ParserProtocolOp::SearchResultDone(response) => {
+                assert_eq!(response.result_code, ParserResultCode(118));
+                assert_eq!(response.diagnostic_message.0.as_ref(), "operation canceled");
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
     }
 }

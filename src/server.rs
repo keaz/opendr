@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use ldap_parser::filter::Filter;
 use ldap_parser::ldap::{
     AddRequest, AuthenticationChoice, BindRequest, Change, CompareRequest, ExtendedRequest,
-    ModDnRequest, ModifyRequest, ProtocolOp, SearchRequest,
+    MessageID, ModDnRequest, ModifyRequest, ProtocolOp, SearchRequest,
 };
 use ldap_parser::parse_ldap_messages;
 use log::{error, info, warn};
 use rand::distributions::{Alphanumeric, DistString};
 use rasn::error::EncodeError;
-use rasn_ldap::ResultCode;
+use rasn_ldap::{LdapMessage as RasnLdapMessage, ProtocolOp as RasnProtocolOp, ResultCode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
@@ -29,14 +29,16 @@ use crate::backend::{
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
 use crate::extended_ops::{
-    encode_password_modify_response_value, oids, parse_password_modify_request_value,
+    encode_password_modify_response_value, oids, parse_cancel_request_value,
+    parse_password_modify_request_value,
 };
 use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
 use crate::ldap_controls::{ControlRegistry, ControlValidationError, LdapControl, RequestControls};
 use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
-    encode_bind_response, encode_extended_response_with_controls,
-    encode_result_response_with_controls, encode_search_entry_with_controls, ResponseOp,
+    encode_bind_response, encode_custom_extended_response, encode_custom_search_result_done,
+    encode_extended_response_with_controls, encode_result_response_with_controls,
+    encode_search_entry_with_controls, CustomResultCode, ResponseOp,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::real_time_propagation::is_dn_in_scope;
@@ -100,9 +102,105 @@ impl ConnectionSession {
 }
 
 const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
+const CANCEL_OID: &str = oids::CANCEL;
 const PASSWORD_MODIFY_OID: &str = oids::PASSWORD_MODIFY;
 const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
 const SUBSCHEMA_DN: &str = "cn=Subschema";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionOperationKind {
+    Search,
+    ReplicationStream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveOperationState {
+    Running,
+    CancelRequested,
+    AbandonRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishedOperationState {
+    Completed,
+    Canceled,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelRequestOutcome {
+    Accepted,
+    NoSuchOperation,
+    TooLate,
+    CannotCancel,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegisteredOperation {
+    kind: ConnectionOperationKind,
+    cancellable: bool,
+    state: ActiveOperationState,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionOperationRegistry {
+    active: HashMap<u32, RegisteredOperation>,
+    finished: HashMap<u32, FinishedOperationState>,
+}
+
+impl ConnectionOperationRegistry {
+    fn register(&mut self, message_id: u32, kind: ConnectionOperationKind, cancellable: bool) {
+        self.finished.remove(&message_id);
+        self.active.insert(
+            message_id,
+            RegisteredOperation {
+                kind,
+                cancellable,
+                state: ActiveOperationState::Running,
+            },
+        );
+    }
+
+    fn request_cancel(&mut self, message_id: u32) -> CancelRequestOutcome {
+        if let Some(operation) = self.active.get_mut(&message_id) {
+            if !operation.cancellable {
+                return CancelRequestOutcome::CannotCancel;
+            }
+            if operation.kind != ConnectionOperationKind::Search
+                && operation.kind != ConnectionOperationKind::ReplicationStream
+            {
+                return CancelRequestOutcome::CannotCancel;
+            }
+            if operation.state != ActiveOperationState::Running {
+                return CancelRequestOutcome::CannotCancel;
+            }
+            operation.state = ActiveOperationState::CancelRequested;
+            return CancelRequestOutcome::Accepted;
+        }
+
+        if self.finished.contains_key(&message_id) {
+            return CancelRequestOutcome::TooLate;
+        }
+
+        CancelRequestOutcome::NoSuchOperation
+    }
+
+    fn request_abandon(&mut self, message_id: u32) -> bool {
+        let Some(operation) = self.active.get_mut(&message_id) else {
+            return false;
+        };
+        if !operation.cancellable || operation.state != ActiveOperationState::Running {
+            return false;
+        }
+        operation.state = ActiveOperationState::AbandonRequested;
+        true
+    }
+
+    fn finish(&mut self, message_id: u32, outcome: FinishedOperationState) {
+        self.active.remove(&message_id);
+        self.finished.insert(message_id, outcome);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LegacyServerConfig {
@@ -727,6 +825,7 @@ async fn handle_client_with_metrics_and_tls(
     let mut read_buffer = vec![0; 8192];
     let mut decoder = BerDecoderFsmImpl::new();
     let mut session = ConnectionSession::default();
+    let mut operation_registry = ConnectionOperationRegistry::default();
 
     loop {
         let read_result = match controls.as_ref() {
@@ -808,70 +907,53 @@ async fn handle_client_with_metrics_and_tls(
                 }
 
                 for message_bytes in decoded_messages {
-                    match parse_ldap_messages(&message_bytes) {
-                        Ok((_, messages)) => {
-                            for message in messages {
-                                let operation_type =
-                                    operation_type_for_protocol(&message.protocol_op);
-                                let response_kind =
-                                    rejection_response_for_protocol(&message.protocol_op);
-                                let started_at = Instant::now();
-                                if let Some(metrics) = metrics.as_ref() {
-                                    if let Some(operation_type) = operation_type {
-                                        metrics.record_operation_start(operation_type, "");
-                                    }
+                    let parsed_messages = match parse_ldap_messages(&message_bytes) {
+                        Ok((_, messages)) => messages,
+                        Err(err) => {
+                            if let Some(message) = parse_abandon_message_fallback(&message_bytes) {
+                                vec![message]
+                            } else {
+                                error!("Failed to parse LDAP message: {:?}", err);
+                                if let Err(write_err) = send_bind_response(
+                                    &mut socket,
+                                    0,
+                                    ResultCode::ProtocolError,
+                                    "invalid message",
+                                )
+                                .await
+                                {
+                                    error!("Failed to write error response: {}", write_err);
                                 }
+                                return;
+                            }
+                        }
+                    };
 
-                                if let Some(controls) = controls.as_ref() {
-                                    if let Some(operation_name) =
-                                        rate_limited_operation_name_for_protocol(
-                                            &message.protocol_op,
-                                        )
+                    for message in parsed_messages {
+                        let operation_type = operation_type_for_protocol(&message.protocol_op);
+                        let response_kind = rejection_response_for_protocol(&message.protocol_op);
+                        let started_at = Instant::now();
+                        if let Some(metrics) = metrics.as_ref() {
+                            if let Some(operation_type) = operation_type {
+                                metrics.record_operation_start(operation_type, "");
+                            }
+                        }
+
+                        if let Some(controls) = controls.as_ref() {
+                            if let Some(operation_name) =
+                                rate_limited_operation_name_for_protocol(&message.protocol_op)
+                            {
+                                if let Some(rate_limiter) = controls.rate_limiter.as_ref() {
+                                    if !rate_limiter
+                                        .check_rate_limit(controls.client_ip, operation_name)
+                                        .await
                                     {
-                                        if let Some(rate_limiter) = controls.rate_limiter.as_ref() {
-                                            if !rate_limiter
-                                                .check_rate_limit(
-                                                    controls.client_ip,
-                                                    operation_name,
-                                                )
-                                                .await
-                                            {
-                                                let result = send_rejection_response(
-                                                    &mut socket,
-                                                    message.message_id.0,
-                                                    response_kind,
-                                                    ResultCode::Busy,
-                                                    "Rate limit exceeded - please slow down",
-                                                )
-                                                .await;
-                                                if let Some(metrics) = metrics.as_ref() {
-                                                    if let Some(operation_type) = operation_type {
-                                                        metrics.record_operation_complete(
-                                                            operation_type,
-                                                            started_at.elapsed(),
-                                                            false,
-                                                        );
-                                                    }
-                                                }
-                                                if let Err(err) = result {
-                                                    error!(
-                                                        "Failed to send rate-limit response: {}",
-                                                        err
-                                                    );
-                                                    return;
-                                                }
-                                                continue;
-                                            }
-                                        }
-                                    }
-
-                                    if !controls.pool.start_operation(controls.conn_id).await {
                                         let result = send_rejection_response(
                                             &mut socket,
                                             message.message_id.0,
                                             response_kind,
                                             ResultCode::Busy,
-                                            "Server is busy - operation limit exceeded",
+                                            "Rate limit exceeded - please slow down",
                                         )
                                         .await;
                                         if let Some(metrics) = metrics.as_ref() {
@@ -884,57 +966,69 @@ async fn handle_client_with_metrics_and_tls(
                                             }
                                         }
                                         if let Err(err) = result {
-                                            error!("Failed to send busy response: {}", err);
+                                            error!("Failed to send rate-limit response: {}", err);
                                             return;
                                         }
                                         continue;
                                     }
                                 }
+                            }
 
-                                let result = process_message_with_session(
+                            if !controls.pool.start_operation(controls.conn_id).await {
+                                let result = send_rejection_response(
                                     &mut socket,
-                                    backend.as_ref(),
-                                    schema.as_ref(),
-                                    &runtime_config,
-                                    &mut session,
-                                    message,
-                                    tls_handler.as_deref(),
-                                    &request_context,
+                                    message.message_id.0,
+                                    response_kind,
+                                    ResultCode::Busy,
+                                    "Server is busy - operation limit exceeded",
                                 )
                                 .await;
-
-                                if let Some(controls) = controls.as_ref() {
-                                    controls.pool.end_operation(controls.conn_id).await;
-                                }
-
                                 if let Some(metrics) = metrics.as_ref() {
                                     if let Some(operation_type) = operation_type {
                                         metrics.record_operation_complete(
                                             operation_type,
                                             started_at.elapsed(),
-                                            result.is_ok(),
+                                            false,
                                         );
                                     }
                                 }
-
                                 if let Err(err) = result {
-                                    error!("Failed to process message: {}", err);
+                                    error!("Failed to send busy response: {}", err);
                                     return;
                                 }
+                                continue;
                             }
                         }
-                        Err(err) => {
-                            error!("Failed to parse LDAP message: {:?}", err);
-                            if let Err(write_err) = send_bind_response(
-                                &mut socket,
-                                0,
-                                ResultCode::ProtocolError,
-                                "invalid message",
-                            )
-                            .await
-                            {
-                                error!("Failed to write error response: {}", write_err);
+
+                        let result = process_message_with_session(
+                            &mut socket,
+                            backend.as_ref(),
+                            schema.as_ref(),
+                            &runtime_config,
+                            &mut session,
+                            &mut operation_registry,
+                            message,
+                            tls_handler.as_deref(),
+                            &request_context,
+                        )
+                        .await;
+
+                        if let Some(controls) = controls.as_ref() {
+                            controls.pool.end_operation(controls.conn_id).await;
+                        }
+
+                        if let Some(metrics) = metrics.as_ref() {
+                            if let Some(operation_type) = operation_type {
+                                metrics.record_operation_complete(
+                                    operation_type,
+                                    started_at.elapsed(),
+                                    result.is_ok(),
+                                );
                             }
+                        }
+
+                        if let Err(err) = result {
+                            error!("Failed to process message: {}", err);
                             return;
                         }
                     }
@@ -1145,6 +1239,21 @@ async fn decode_messages(
     Ok(messages)
 }
 
+fn parse_abandon_message_fallback(
+    message_bytes: &[u8],
+) -> Option<ldap_parser::ldap::LdapMessage<'static>> {
+    let message: RasnLdapMessage = rasn::ber::decode(message_bytes).ok()?;
+    let RasnProtocolOp::AbandonRequest(request_id) = message.protocol_op else {
+        return None;
+    };
+
+    Some(ldap_parser::ldap::LdapMessage {
+        message_id: MessageID(message.message_id),
+        protocol_op: ProtocolOp::AbandonRequest(MessageID(request_id.0)),
+        controls: None,
+    })
+}
+
 pub async fn process_message(
     socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
@@ -1152,6 +1261,7 @@ pub async fn process_message(
     message: ldap_parser::ldap::LdapMessage<'_>,
 ) -> Result<(), ServerError> {
     let mut session = ConnectionSession::default();
+    let mut operation_registry = ConnectionOperationRegistry::default();
     let runtime_config = LegacyServerConfig::default();
     process_message_with_session(
         socket,
@@ -1159,6 +1269,7 @@ pub async fn process_message(
         schema,
         &runtime_config,
         &mut session,
+        &mut operation_registry,
         message,
         None,
         &RequestContext::default(),
@@ -1172,6 +1283,7 @@ async fn process_message_with_session(
     schema: &LdapSchema,
     runtime_config: &LegacyServerConfig,
     session: &mut ConnectionSession,
+    operation_registry: &mut ConnectionOperationRegistry,
     message: ldap_parser::ldap::LdapMessage<'_>,
     tls_handler: Option<&RustlsTlsHandler>,
     request_context: &RequestContext,
@@ -1207,7 +1319,7 @@ async fn process_message_with_session(
             .await?;
         }
         ProtocolOp::SearchRequest(search_request) => {
-            handle_search_request_with_context(
+            handle_search_request_with_context_and_registry(
                 socket,
                 backend,
                 schema,
@@ -1215,6 +1327,7 @@ async fn process_message_with_session(
                 message_id,
                 search_request,
                 session,
+                operation_registry,
                 request_context,
                 &request_controls,
                 socket.is_secure(),
@@ -1331,15 +1444,16 @@ async fn process_message_with_session(
             return Ok(());
         }
         ProtocolOp::AbandonRequest(request_id) => {
-            handle_abandon_request(request_id);
+            handle_abandon_request(request_id, operation_registry, session, request_context).await;
         }
         ProtocolOp::ExtendedRequest(request) => {
-            handle_extended_request_with_session(
+            handle_extended_request_with_session_and_registry(
                 socket,
                 backend,
                 message_id,
                 request,
                 session,
+                operation_registry,
                 tls_handler,
                 request_context,
                 &request_controls,
@@ -2178,6 +2292,29 @@ async fn send_extended_response_with_controls(
     Ok(())
 }
 
+async fn send_custom_extended_response(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    result_code: CustomResultCode,
+    diagnostic_message: impl Into<String>,
+) -> Result<(), ServerError> {
+    let encoded = encode_custom_extended_response(message_id, result_code, "", diagnostic_message)?;
+    socket.write_all(&encoded).await?;
+    Ok(())
+}
+
+async fn send_custom_search_done(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    result_code: CustomResultCode,
+    diagnostic_message: impl Into<String>,
+) -> Result<(), ServerError> {
+    let encoded =
+        encode_custom_search_result_done(message_id, result_code, "", diagnostic_message)?;
+    socket.write_all(&encoded).await?;
+    Ok(())
+}
+
 async fn send_search_entry_with_controls(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -2364,6 +2501,7 @@ fn active_runtime_supported_extensions(
     if starttls_available && !connection_is_secure {
         supported.push(START_TLS_OID.to_string());
     }
+    supported.push(CANCEL_OID.to_string());
     supported.push(PASSWORD_MODIFY_OID.to_string());
     supported.push(WHO_AM_I_OID.to_string());
     supported
@@ -2453,7 +2591,7 @@ fn compute_new_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String
 }
 
 pub async fn handle_search_request(
-    socket: &mut (impl AsyncWrite + Unpin),
+    socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: SearchRequest<'_>,
@@ -2462,7 +2600,8 @@ pub async fn handle_search_request(
     let schema = LdapSchema::default();
     let runtime_config = LegacyServerConfig::default();
     let request_controls = RequestControls::default();
-    handle_search_request_with_context(
+    let mut operation_registry = ConnectionOperationRegistry::default();
+    handle_search_request_with_context_and_registry(
         socket,
         backend,
         &schema,
@@ -2470,6 +2609,7 @@ pub async fn handle_search_request(
         message_id,
         request,
         &session,
+        &mut operation_registry,
         &RequestContext::default(),
         &request_controls,
         false,
@@ -2478,14 +2618,47 @@ pub async fn handle_search_request(
     .await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_search_request_with_context(
-    socket: &mut (impl AsyncWrite + Unpin),
+    socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
     runtime_config: &LegacyServerConfig,
     message_id: u32,
     request: SearchRequest<'_>,
     session: &ConnectionSession,
+    request_context: &RequestContext,
+    _request_controls: &RequestControls,
+    connection_is_secure: bool,
+    starttls_available: bool,
+) -> Result<(), ServerError> {
+    let mut operation_registry = ConnectionOperationRegistry::default();
+    handle_search_request_with_context_and_registry(
+        socket,
+        backend,
+        schema,
+        runtime_config,
+        message_id,
+        request,
+        session,
+        &mut operation_registry,
+        request_context,
+        _request_controls,
+        connection_is_secure,
+        starttls_available,
+    )
+    .await
+}
+
+async fn handle_search_request_with_context_and_registry(
+    socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
+    runtime_config: &LegacyServerConfig,
+    message_id: u32,
+    request: SearchRequest<'_>,
+    session: &ConnectionSession,
+    operation_registry: &mut ConnectionOperationRegistry,
     request_context: &RequestContext,
     _request_controls: &RequestControls,
     connection_is_secure: bool,
@@ -2543,9 +2716,14 @@ async fn handle_search_request_with_context(
             message_id,
             &base_dn,
             &attribute_selection,
+            session,
+            operation_registry,
+            request_context,
         )
         .await;
     }
+
+    operation_registry.register(message_id, ConnectionOperationKind::Search, true);
 
     let search_hint = extract_search_hint(&request.filter);
     let entries = match backend
@@ -2564,6 +2742,7 @@ async fn handle_search_request_with_context(
                 diagnostic_for_error(&err),
             )
             .await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
             return Ok(());
         }
     };
@@ -2609,6 +2788,7 @@ async fn handle_search_request_with_context(
         diagnostic,
     )
     .await?;
+    operation_registry.finish(message_id, FinishedOperationState::Completed);
 
     Ok(())
 }
@@ -2628,18 +2808,23 @@ fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
 }
 
 async fn handle_replication_stream_request(
-    socket: &mut (impl AsyncWrite + Unpin),
+    socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
     base_dn: &str,
     attribute_selection: &[String],
+    connection_session: &ConnectionSession,
+    operation_registry: &mut ConnectionOperationRegistry,
+    request_context: &RequestContext,
 ) -> Result<(), ServerError> {
+    operation_registry.register(message_id, ConnectionOperationKind::ReplicationStream, true);
     let mut session = ProviderOwnedReplicationSession::new(socket, message_id, base_dn);
     let provider_lifecycle = backend.replication_provider_lifecycle();
     let _session_guard = if let Some(lifecycle) = provider_lifecycle.as_ref() {
         match lifecycle.register_session() {
             Some(guard) => Some(guard),
             None => {
+                operation_registry.finish(message_id, FinishedOperationState::Completed);
                 return finish_replication_stream_unavailable(
                     &mut session,
                     "replication provider shutting down",
@@ -2657,8 +2842,11 @@ async fn handle_replication_stream_request(
         session
             .send_unavailable("replication stream not available")
             .await?;
+        operation_registry.finish(message_id, FinishedOperationState::Completed);
         return Ok(());
     };
+    let mut control_decoder = BerDecoderFsmImpl::new();
+    let mut control_buffer = vec![0_u8; 4096];
 
     let start_cookie = attribute_selection.iter().find_map(|attribute| {
         attribute
@@ -2680,6 +2868,7 @@ async fn handle_replication_stream_request(
                 .as_ref()
                 .is_some_and(|lifecycle| lifecycle.is_draining())
             {
+                operation_registry.finish(message_id, FinishedOperationState::Completed);
                 return finish_replication_stream_unavailable(
                     &mut session,
                     "replication provider shutting down",
@@ -2697,15 +2886,82 @@ async fn handle_replication_stream_request(
         let recv_result = if let Some(lifecycle) = provider_lifecycle.as_ref() {
             tokio::select! {
                 _ = lifecycle.wait_for_shutdown() => {
+                    operation_registry.finish(message_id, FinishedOperationState::Completed);
                     return finish_replication_stream_unavailable(
                         &mut session,
                         "replication provider shutting down",
                     ).await;
                 }
+                control_result = receive_stream_control_event(
+                    session.socket,
+                    &mut control_decoder,
+                    &mut control_buffer,
+                    message_id,
+                    operation_registry,
+                    connection_session,
+                    request_context,
+                ) => {
+                    match control_result? {
+                        StreamControlEvent::Continue => continue,
+                        StreamControlEvent::Cancel => {
+                            operation_registry.finish(message_id, FinishedOperationState::Canceled);
+                            let _ = send_custom_search_done(
+                                session.socket,
+                                message_id,
+                                CustomResultCode::Canceled,
+                                "operation canceled",
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        StreamControlEvent::Abandon => {
+                            operation_registry.finish(message_id, FinishedOperationState::Abandoned);
+                            return Ok(());
+                        }
+                        StreamControlEvent::ClientClosed => {
+                            operation_registry.finish(message_id, FinishedOperationState::Completed);
+                            return Ok(());
+                        }
+                    }
+                }
                 recv_result = receiver.recv() => recv_result,
             }
         } else {
-            receiver.recv().await
+            tokio::select! {
+                control_result = receive_stream_control_event(
+                    session.socket,
+                    &mut control_decoder,
+                    &mut control_buffer,
+                    message_id,
+                    operation_registry,
+                    connection_session,
+                    request_context,
+                ) => {
+                    match control_result? {
+                        StreamControlEvent::Continue => continue,
+                        StreamControlEvent::Cancel => {
+                            operation_registry.finish(message_id, FinishedOperationState::Canceled);
+                            let _ = send_custom_search_done(
+                                session.socket,
+                                message_id,
+                                CustomResultCode::Canceled,
+                                "operation canceled",
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        StreamControlEvent::Abandon => {
+                            operation_registry.finish(message_id, FinishedOperationState::Abandoned);
+                            return Ok(());
+                        }
+                        StreamControlEvent::ClientClosed => {
+                            operation_registry.finish(message_id, FinishedOperationState::Completed);
+                            return Ok(());
+                        }
+                    }
+                }
+                recv_result = receiver.recv() => recv_result,
+            }
         };
 
         match recv_result {
@@ -2714,6 +2970,7 @@ async fn handle_replication_stream_request(
                     .as_ref()
                     .is_some_and(|lifecycle| lifecycle.is_draining())
                 {
+                    operation_registry.finish(message_id, FinishedOperationState::Completed);
                     return finish_replication_stream_unavailable(
                         &mut session,
                         "replication provider shutting down",
@@ -2725,6 +2982,7 @@ async fn handle_replication_stream_request(
                 }
                 if let Err(err) = session.send_change(&entry).await {
                     warn!("Replication stream send failed: {}", err);
+                    operation_registry.finish(message_id, FinishedOperationState::Completed);
                     break;
                 }
             }
@@ -2735,9 +2993,195 @@ async fn handle_replication_stream_request(
         }
     }
 
+    operation_registry.finish(message_id, FinishedOperationState::Completed);
     let _ = session.finish().await;
 
     Ok(())
+}
+
+enum StreamControlEvent {
+    Continue,
+    Cancel,
+    Abandon,
+    ClientClosed,
+}
+
+async fn receive_stream_control_event(
+    socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    decoder: &mut BerDecoderFsmImpl,
+    read_buffer: &mut [u8],
+    active_message_id: u32,
+    operation_registry: &mut ConnectionOperationRegistry,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> Result<StreamControlEvent, ServerError> {
+    let bytes_read = socket.read(read_buffer).await?;
+    if bytes_read == 0 {
+        return Ok(StreamControlEvent::ClientClosed);
+    }
+
+    let decoded_messages = match decode_messages(decoder, read_buffer[..bytes_read].to_vec()).await
+    {
+        Ok(messages) => messages,
+        Err(err) => {
+            error!("Failed to decode stream control message: {}", err);
+            send_bind_response(socket, 0, ResultCode::ProtocolError, "invalid message").await?;
+            return Ok(StreamControlEvent::Continue);
+        }
+    };
+
+    for message_bytes in decoded_messages {
+        let parsed_messages = match parse_ldap_messages(&message_bytes) {
+            Ok((_, messages)) => messages,
+            Err(_) => {
+                if let Some(message) = parse_abandon_message_fallback(&message_bytes) {
+                    vec![message]
+                } else {
+                    send_bind_response(socket, 0, ResultCode::ProtocolError, "invalid message")
+                        .await?;
+                    continue;
+                }
+            }
+        };
+
+        for message in parsed_messages {
+            match message.protocol_op {
+                ProtocolOp::AbandonRequest(request_id) => {
+                    let abandoned = operation_registry.request_abandon(request_id.0);
+                    if let Some(metrics) = request_context.metrics.as_ref() {
+                        metrics.increment_counter("ldap_abandon_requests_total", 1);
+                        if abandoned {
+                            metrics.increment_counter("ldap_abandon_accepted_total", 1);
+                        }
+                    }
+                    log_generic_audit_event(
+                        request_context,
+                        session,
+                        AuditLevel::Info,
+                        AuditEventType::System,
+                        "abandon",
+                        abandoned,
+                        None,
+                        if abandoned {
+                            None
+                        } else {
+                            Some("target operation was not active or not cancellable")
+                        },
+                        vec![("target_message_id".to_string(), request_id.0.to_string())],
+                    )
+                    .await;
+                    if abandoned && request_id.0 == active_message_id {
+                        return Ok(StreamControlEvent::Abandon);
+                    }
+                }
+                ProtocolOp::ExtendedRequest(request)
+                    if request.request_name.0.as_ref() == CANCEL_OID =>
+                {
+                    increment_control_counter(request_context, "ldap_cancel_requests_total", 1);
+                    let cancel_id =
+                        match parse_cancel_request_value(request.request_value.as_deref()) {
+                            Ok(cancel_id) => cancel_id as u32,
+                            Err(err) => {
+                                send_custom_extended_response(
+                                    socket,
+                                    message.message_id.0,
+                                    CustomResultCode::ProtocolError,
+                                    err.to_string(),
+                                )
+                                .await?;
+                                log_generic_audit_event(
+                                    request_context,
+                                    session,
+                                    AuditLevel::Warning,
+                                    AuditEventType::System,
+                                    "cancel",
+                                    false,
+                                    None,
+                                    Some("Malformed Cancel request"),
+                                    vec![("result".to_string(), "protocol_error".to_string())],
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+
+                    let outcome = operation_registry.request_cancel(cancel_id);
+                    let (result_code, diagnostic, success, result_name) = match outcome {
+                        CancelRequestOutcome::Accepted => {
+                            (CustomResultCode::Success, String::new(), true, "success")
+                        }
+                        CancelRequestOutcome::NoSuchOperation => (
+                            CustomResultCode::NoSuchOperation,
+                            "no such operation".to_string(),
+                            false,
+                            "no_such_operation",
+                        ),
+                        CancelRequestOutcome::TooLate => (
+                            CustomResultCode::TooLate,
+                            "too late to cancel operation".to_string(),
+                            false,
+                            "too_late",
+                        ),
+                        CancelRequestOutcome::CannotCancel => (
+                            CustomResultCode::CannotCancel,
+                            "operation cannot be canceled".to_string(),
+                            false,
+                            "cannot_cancel",
+                        ),
+                    };
+                    if success {
+                        increment_control_counter(request_context, "ldap_cancel_accepted_total", 1);
+                    }
+                    send_custom_extended_response(
+                        socket,
+                        message.message_id.0,
+                        result_code,
+                        &diagnostic,
+                    )
+                    .await?;
+                    log_generic_audit_event(
+                        request_context,
+                        session,
+                        if success {
+                            AuditLevel::Info
+                        } else {
+                            AuditLevel::Warning
+                        },
+                        AuditEventType::System,
+                        "cancel",
+                        success,
+                        None,
+                        if diagnostic.is_empty() {
+                            None
+                        } else {
+                            Some(diagnostic.as_str())
+                        },
+                        vec![
+                            ("target_message_id".to_string(), cancel_id.to_string()),
+                            ("result".to_string(), result_name.to_string()),
+                        ],
+                    )
+                    .await;
+                    if success && cancel_id == active_message_id {
+                        return Ok(StreamControlEvent::Cancel);
+                    }
+                }
+                other => {
+                    let response_kind = rejection_response_for_protocol(&other);
+                    send_rejection_response(
+                        socket,
+                        message.message_id.0,
+                        response_kind,
+                        ResultCode::Busy,
+                        "another operation is already in progress",
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    Ok(StreamControlEvent::Continue)
 }
 
 async fn finish_replication_stream_unavailable<S: AsyncWrite + Unpin>(
@@ -3515,8 +3959,36 @@ async fn handle_compare_request_with_context(
     Ok(())
 }
 
-fn handle_abandon_request(request_id: ldap_parser::ldap::MessageID) {
+async fn handle_abandon_request(
+    request_id: ldap_parser::ldap::MessageID,
+    operation_registry: &mut ConnectionOperationRegistry,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) {
     info!("Received abandon request for message {}", request_id.0);
+    let abandoned = operation_registry.request_abandon(request_id.0);
+    if let Some(metrics) = request_context.metrics.as_ref() {
+        metrics.increment_counter("ldap_abandon_requests_total", 1);
+        if abandoned {
+            metrics.increment_counter("ldap_abandon_accepted_total", 1);
+        }
+    }
+    log_generic_audit_event(
+        request_context,
+        session,
+        AuditLevel::Info,
+        AuditEventType::System,
+        "abandon",
+        abandoned,
+        None,
+        if abandoned {
+            None
+        } else {
+            Some("target operation was not active or not cancellable")
+        },
+        vec![("target_message_id".to_string(), request_id.0.to_string())],
+    )
+    .await;
 }
 
 pub async fn handle_extended_request(
@@ -3527,12 +3999,14 @@ pub async fn handle_extended_request(
     let backend = crate::backend::MockBackend::default();
     let mut session = ConnectionSession::default();
     let request_controls = RequestControls::default();
-    handle_extended_request_with_session(
+    let mut operation_registry = ConnectionOperationRegistry::default();
+    handle_extended_request_with_session_and_registry(
         socket,
         &backend,
         message_id,
         request,
         &mut session,
+        &mut operation_registry,
         None,
         &RequestContext::default(),
         &request_controls,
@@ -3540,12 +4014,39 @@ pub async fn handle_extended_request(
     .await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_extended_request_with_session(
     socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
     message_id: u32,
     request: ExtendedRequest<'_>,
     session: &mut ConnectionSession,
+    tls_handler: Option<&RustlsTlsHandler>,
+    request_context: &RequestContext,
+    request_controls: &RequestControls,
+) -> Result<(), ServerError> {
+    let mut operation_registry = ConnectionOperationRegistry::default();
+    handle_extended_request_with_session_and_registry(
+        socket,
+        backend,
+        message_id,
+        request,
+        session,
+        &mut operation_registry,
+        tls_handler,
+        request_context,
+        request_controls,
+    )
+    .await
+}
+
+async fn handle_extended_request_with_session_and_registry(
+    socket: &mut ConnectionStream,
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    request: ExtendedRequest<'_>,
+    session: &mut ConnectionSession,
+    operation_registry: &mut ConnectionOperationRegistry,
     tls_handler: Option<&RustlsTlsHandler>,
     request_context: &RequestContext,
     _request_controls: &RequestControls,
@@ -3677,6 +4178,87 @@ async fn handle_extended_request_with_session(
         )
         .await;
         return Ok(());
+    }
+
+    if oid == CANCEL_OID {
+        let cancel_id = match parse_cancel_request_value(request.request_value.as_deref()) {
+            Ok(cancel_id) => cancel_id as u32,
+            Err(err) => {
+                increment_control_counter(request_context, "ldap_cancel_requests_total", 1);
+                log_generic_audit_event(
+                    request_context,
+                    session,
+                    AuditLevel::Warning,
+                    AuditEventType::System,
+                    "cancel",
+                    false,
+                    None,
+                    Some("Malformed Cancel request"),
+                    vec![("result".to_string(), "protocol_error".to_string())],
+                )
+                .await;
+                return send_custom_extended_response(
+                    socket,
+                    message_id,
+                    CustomResultCode::ProtocolError,
+                    err.to_string(),
+                )
+                .await;
+            }
+        };
+
+        increment_control_counter(request_context, "ldap_cancel_requests_total", 1);
+        let (result_code, diagnostic, success, result_name) =
+            match operation_registry.request_cancel(cancel_id) {
+                CancelRequestOutcome::Accepted => {
+                    (CustomResultCode::Success, String::new(), true, "success")
+                }
+                CancelRequestOutcome::NoSuchOperation => (
+                    CustomResultCode::NoSuchOperation,
+                    "no such operation".to_string(),
+                    false,
+                    "no_such_operation",
+                ),
+                CancelRequestOutcome::TooLate => (
+                    CustomResultCode::TooLate,
+                    "too late to cancel operation".to_string(),
+                    false,
+                    "too_late",
+                ),
+                CancelRequestOutcome::CannotCancel => (
+                    CustomResultCode::CannotCancel,
+                    "operation cannot be canceled".to_string(),
+                    false,
+                    "cannot_cancel",
+                ),
+            };
+        if success {
+            increment_control_counter(request_context, "ldap_cancel_accepted_total", 1);
+        }
+        log_generic_audit_event(
+            request_context,
+            session,
+            if success {
+                AuditLevel::Info
+            } else {
+                AuditLevel::Warning
+            },
+            AuditEventType::System,
+            "cancel",
+            success,
+            None,
+            if diagnostic.is_empty() {
+                None
+            } else {
+                Some(diagnostic.as_str())
+            },
+            vec![
+                ("target_message_id".to_string(), cancel_id.to_string()),
+                ("result".to_string(), result_name.to_string()),
+            ],
+        )
+        .await;
+        return send_custom_extended_response(socket, message_id, result_code, diagnostic).await;
     }
 
     if oid == PASSWORD_MODIFY_OID {
@@ -4198,6 +4780,7 @@ mod tests {
     use crate::aci::AciEngine;
     use crate::backend::MockBackend;
     use crate::config::ServerConfig;
+    use crate::extended_ops::encode_cancel_request_value;
     use crate::ldap_controls::LdapControl;
     use crate::replication::REPLICATION_STREAM_ATTRIBUTE;
     use crate::replication_service::ReplicationService;
@@ -4216,7 +4799,8 @@ mod tests {
     use rasn::der;
     use rasn_ldap::{
         AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
-        Control as RasnControl, LdapMessage as RasnLdapMessage, ProtocolOp as RasnProtocolOp,
+        Control as RasnControl, ExtendedRequest as RasnExtendedRequest,
+        LdapMessage as RasnLdapMessage, ProtocolOp as RasnProtocolOp,
     };
     use std::borrow::Cow;
     use std::sync::Arc;
@@ -4277,6 +4861,71 @@ mod tests {
             message.controls = Some(controls.into_iter().collect());
         }
         der::encode(&message).unwrap()
+    }
+
+    fn cancel_extended_request(target_message_id: i32) -> ExtendedRequest<'static> {
+        ExtendedRequest {
+            request_name: LdapOID(Cow::Owned(CANCEL_OID.to_string())),
+            request_value: Some(Cow::Owned(
+                encode_cancel_request_value(target_message_id).unwrap(),
+            )),
+        }
+    }
+
+    fn cancel_request_message(message_id: u32, target_message_id: i32) -> Vec<u8> {
+        let request = RasnExtendedRequest {
+            request_name: CANCEL_OID.as_bytes().to_vec().into(),
+            request_value: Some(
+                encode_cancel_request_value(target_message_id)
+                    .unwrap()
+                    .into(),
+            ),
+        };
+        let message = RasnLdapMessage::new(message_id, RasnProtocolOp::ExtendedReq(request));
+        der::encode(&message).unwrap()
+    }
+
+    fn encode_ber_integer(value: u32) -> Vec<u8> {
+        let mut bytes = value.to_be_bytes().to_vec();
+        while bytes.len() > 1 && bytes[0] == 0 {
+            bytes.remove(0);
+        }
+        if bytes[0] & 0x80 != 0 {
+            bytes.insert(0, 0);
+        }
+        bytes
+    }
+
+    fn encode_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+        assert!(
+            value.len() < 128,
+            "test helper only supports short-form BER lengths"
+        );
+        let mut encoded = Vec::with_capacity(value.len() + 2);
+        encoded.push(tag);
+        encoded.push(value.len() as u8);
+        encoded.extend_from_slice(value);
+        encoded
+    }
+
+    fn abandon_request_message(message_id: u32, target_message_id: u32) -> Vec<u8> {
+        let message_id_tlv = encode_tlv(0x02, &encode_ber_integer(message_id));
+        let abandon_tlv = encode_tlv(0x50, &encode_ber_integer(target_message_id));
+
+        let mut payload = Vec::with_capacity(message_id_tlv.len() + abandon_tlv.len());
+        payload.extend_from_slice(&message_id_tlv);
+        payload.extend_from_slice(&abandon_tlv);
+        encode_tlv(0x30, &payload)
+    }
+
+    #[test]
+    fn parse_abandon_message_fallback_decodes_abandon_request() {
+        let message = parse_abandon_message_fallback(&abandon_request_message(42, 41)).unwrap();
+        assert_eq!(message.message_id.0, 42);
+        match message.protocol_op {
+            ProtocolOp::AbandonRequest(request_id) => assert_eq!(request_id.0, 41),
+            other => panic!("unexpected fallback protocol op: {:?}", other),
+        }
     }
 
     fn search_request_for_base(base_dn: &str, attributes: &[&str]) -> SearchRequest<'static> {
@@ -4710,6 +5359,117 @@ mod tests {
                         .as_ref()
                         .map(|value| value.as_ref()),
                     Some(b"dn:cn=admin,dc=example,dc=org".as_ref())
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn connection_operation_registry_reports_cancel_lifecycle() {
+        let mut registry = ConnectionOperationRegistry::default();
+
+        assert_eq!(
+            registry.request_cancel(7),
+            CancelRequestOutcome::NoSuchOperation
+        );
+
+        registry.register(7, ConnectionOperationKind::Search, true);
+        assert_eq!(registry.request_cancel(7), CancelRequestOutcome::Accepted);
+        assert_eq!(
+            registry.request_cancel(7),
+            CancelRequestOutcome::CannotCancel
+        );
+
+        registry.finish(7, FinishedOperationState::Completed);
+        assert_eq!(registry.request_cancel(7), CancelRequestOutcome::TooLate);
+
+        registry.register(8, ConnectionOperationKind::Search, false);
+        assert_eq!(
+            registry.request_cancel(8),
+            CancelRequestOutcome::CannotCancel
+        );
+
+        registry.register(9, ConnectionOperationKind::ReplicationStream, true);
+        assert!(registry.request_abandon(9));
+        assert!(!registry.request_abandon(9));
+    }
+
+    #[tokio::test]
+    async fn cancel_extended_request_reports_no_such_operation() {
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut server_stream = ConnectionStream::Plain(server_stream);
+        let backend = MockBackend::default();
+        let mut session = ConnectionSession::default();
+        let request_controls = RequestControls::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+
+        handle_extended_request_with_session_and_registry(
+            &mut server_stream,
+            &backend,
+            21,
+            cancel_extended_request(404),
+            &mut session,
+            &mut operation_registry,
+            None,
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::ExtendedResponse(extended_response) => {
+                assert_eq!(messages[0].message_id.0, 21);
+                assert_eq!(extended_response.result.result_code.0, 119);
+                assert_eq!(
+                    extended_response.result.diagnostic_message.0.as_ref(),
+                    "no such operation"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_extended_request_reports_too_late_for_completed_operation() {
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut server_stream = ConnectionStream::Plain(server_stream);
+        let backend = MockBackend::default();
+        let mut session = ConnectionSession::default();
+        let request_controls = RequestControls::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        operation_registry.finish(15, FinishedOperationState::Completed);
+
+        handle_extended_request_with_session_and_registry(
+            &mut server_stream,
+            &backend,
+            22,
+            cancel_extended_request(15),
+            &mut session,
+            &mut operation_registry,
+            None,
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::ExtendedResponse(extended_response) => {
+                assert_eq!(messages[0].message_id.0, 22);
+                assert_eq!(extended_response.result.result_code.0, 120);
+                assert_eq!(
+                    extended_response.result.diagnostic_message.0.as_ref(),
+                    "too late to cancel operation"
                 );
             }
             other => panic!("unexpected response: {:?}", other),
@@ -5154,14 +5914,16 @@ mod tests {
             attributes.get("contextCSN").unwrap(),
             &vec!["1696680896789012#001#000001#000000".to_string()]
         );
-        assert_eq!(
-            attributes.get("supportedExtension").unwrap(),
-            &vec![
-                START_TLS_OID.to_string(),
-                PASSWORD_MODIFY_OID.to_string(),
-                WHO_AM_I_OID.to_string(),
-            ]
-        );
+        let mut supported_extensions = attributes.get("supportedExtension").unwrap().clone();
+        supported_extensions.sort();
+        let mut expected_extensions = vec![
+            START_TLS_OID.to_string(),
+            CANCEL_OID.to_string(),
+            PASSWORD_MODIFY_OID.to_string(),
+            WHO_AM_I_OID.to_string(),
+        ];
+        expected_extensions.sort();
+        assert_eq!(supported_extensions, expected_extensions);
         assert!(!attributes.contains_key("supportedControl"));
 
         match &messages[1].protocol_op {
@@ -5207,10 +5969,15 @@ mod tests {
             other => panic!("unexpected response: {:?}", other),
         };
 
-        assert_eq!(
-            attributes.get("supportedExtension").unwrap(),
-            &vec![PASSWORD_MODIFY_OID.to_string(), WHO_AM_I_OID.to_string()]
-        );
+        let mut supported_extensions = attributes.get("supportedExtension").unwrap().clone();
+        supported_extensions.sort();
+        let mut expected_extensions = vec![
+            CANCEL_OID.to_string(),
+            PASSWORD_MODIFY_OID.to_string(),
+            WHO_AM_I_OID.to_string(),
+        ];
+        expected_extensions.sort();
+        assert_eq!(supported_extensions, expected_extensions);
     }
 
     #[tokio::test]
@@ -5423,5 +6190,101 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(lifecycle.active_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn replication_stream_cancel_returns_cancel_response_and_canceled_search_done() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request = replication_stream_request();
+        let stream_backend = provider_backend.clone();
+
+        let handler = tokio::spawn(async move {
+            handle_search_request(&mut server_stream, stream_backend.as_ref(), 31, request)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client_stream
+            .write_all(&cancel_request_message(32, 31))
+            .await
+            .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| {
+            matches!(
+                &message.protocol_op,
+                ProtocolOp::ExtendedResponse(extended_response)
+                    if message.message_id.0 == 32
+                        && extended_response.result.result_code == ParserResultCode::Success
+            )
+        }));
+        assert!(messages.iter().any(|message| {
+            matches!(
+                &message.protocol_op,
+                ProtocolOp::SearchResultDone(done)
+                    if message.message_id.0 == 31 && done.result_code.0 == 118
+            )
+        }));
+
+        timeout(Duration::from_secs(1), handler)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replication_stream_abandon_stops_search_without_sending_response() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request = replication_stream_request();
+        let stream_backend = provider_backend.clone();
+
+        let handler = tokio::spawn(async move {
+            handle_search_request(&mut server_stream, stream_backend.as_ref(), 41, request)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let _ = server_stream.peer_addr();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client_stream
+            .write_all(&abandon_request_message(42, 41))
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 64];
+        match timeout(Duration::from_millis(150), client_stream.read(&mut buf)).await {
+            Err(_) => {}
+            Ok(Ok(0)) => {}
+            Ok(Ok(len)) => panic!("unexpected abandon response bytes: {:?}", &buf[..len]),
+            Ok(Err(err)) => panic!("failed to read abandon response state: {err}"),
+        }
+
+        timeout(Duration::from_secs(1), handler)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

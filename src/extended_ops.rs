@@ -22,6 +22,51 @@ pub mod oids {
     pub const CANCEL: &str = "1.3.6.1.1.8";
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelRequestCodecError {
+    MissingRequestValue,
+    InvalidAsn1(String),
+    InvalidMessageId,
+}
+
+impl std::fmt::Display for CancelRequestCodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingRequestValue => write!(f, "cancel requires requestValue"),
+            Self::InvalidAsn1(err) => write!(f, "invalid cancel BER: {err}"),
+            Self::InvalidMessageId => write!(f, "cancelID must be a positive message ID"),
+        }
+    }
+}
+
+impl std::error::Error for CancelRequestCodecError {}
+
+#[derive(AsnType, Decode, Encode)]
+struct CancelRequestValue {
+    cancel_id: i32,
+}
+
+pub fn encode_cancel_request_value(message_id: i32) -> Result<Vec<u8>, CancelRequestCodecError> {
+    if message_id <= 0 {
+        return Err(CancelRequestCodecError::InvalidMessageId);
+    }
+
+    rasn::ber::encode(&CancelRequestValue {
+        cancel_id: message_id,
+    })
+    .map_err(|err| CancelRequestCodecError::InvalidAsn1(err.to_string()))
+}
+
+pub fn parse_cancel_request_value(value: Option<&[u8]>) -> Result<i32, CancelRequestCodecError> {
+    let value = value.ok_or(CancelRequestCodecError::MissingRequestValue)?;
+    let decoded: CancelRequestValue = rasn::ber::decode(value)
+        .map_err(|err| CancelRequestCodecError::InvalidAsn1(err.to_string()))?;
+    if decoded.cancel_id <= 0 {
+        return Err(CancelRequestCodecError::InvalidMessageId);
+    }
+    Ok(decoded.cancel_id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PasswordModifyRequest {
     pub user_identity: Option<String>,
@@ -261,14 +306,7 @@ impl StandardExtendedOpBackend {
 
     /// Handle Cancel operation
     async fn handle_cancel(&self, value: Option<&[u8]>) -> Result<Vec<u8>, String> {
-        let data = value.ok_or("Cancel requires message ID")?;
-
-        // Parse message ID (simplified)
-        let message_id_str = String::from_utf8(data.to_vec())
-            .map_err(|e| format!("Invalid message ID encoding: {}", e))?;
-        let message_id: i32 = message_id_str
-            .parse()
-            .map_err(|e| format!("Invalid message ID: {}", e))?;
+        let message_id = parse_cancel_request_value(value).map_err(|err| err.to_string())?;
 
         self.operation_canceller
             .cancel_operation(message_id)
@@ -518,9 +556,9 @@ mod tests {
             Arc::new(MockOperationCanceller),
         );
 
-        let message_id = b"42";
+        let message_id = encode_cancel_request_value(42).unwrap();
         let result = backend
-            .execute_operation(oids::CANCEL, Some(message_id))
+            .execute_operation(oids::CANCEL, Some(&message_id))
             .await;
         assert!(result.is_ok());
     }
@@ -593,6 +631,13 @@ mod tests {
         let encoded = encode_password_modify_response_value(Some(b"generated-secret")).unwrap();
         let decoded = decode_password_modify_response_value(encoded.as_deref()).unwrap();
         assert_eq!(decoded.as_deref(), Some(b"generated-secret".as_ref()));
+    }
+
+    #[test]
+    fn cancel_request_value_round_trips_message_id() {
+        let encoded = encode_cancel_request_value(42).unwrap();
+        let decoded = parse_cancel_request_value(Some(&encoded)).unwrap();
+        assert_eq!(decoded, 42);
     }
 
     #[test]
