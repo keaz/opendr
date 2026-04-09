@@ -3,19 +3,25 @@
 //! These tests validate the consumer service integration with the main server,
 //! including initialization, sync cycles, error handling, and shutdown behavior.
 
-use opendr::backend::MockBackend;
+use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::config::ServerConfig;
 use opendr::replication_service::ReplicationService;
+use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::NamedTempFile;
-use tokio::time::sleep;
+use tempfile::{NamedTempFile, TempDir};
+use tokio::net::TcpStream;
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, timeout, Instant};
 
 /// Helper function to create a test configuration for consumer mode
 fn create_consumer_config() -> ServerConfig {
     let mut config = ServerConfig::default();
+    config.server.base_dn = "dc=example,dc=org".to_string();
     config.replication.enabled = true;
     config.replication.mode = "consumer".to_string();
     config.replication.provider_url = Some("ldap://provider.example.com:389".to_string());
@@ -23,6 +29,134 @@ fn create_consumer_config() -> ServerConfig {
     config.replication.bind_dn = Some("cn=admin,dc=example,dc=com".to_string());
     config.replication.bind_password = Some("secret".to_string());
     config
+}
+
+fn create_provider_config() -> ServerConfig {
+    let mut config = ServerConfig::default();
+    config.server.base_dn = "dc=example,dc=org".to_string();
+    config.replication.enabled = true;
+    config.replication.mode = "provider".to_string();
+    config.replication.sync_interval_secs = 1;
+    config
+}
+
+fn create_test_entry(dn: &str, cn: &str) -> DirectoryEntry {
+    DirectoryEntry::new(
+        dn,
+        HashMap::from([
+            (
+                "objectclass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            ("cn".to_string(), vec![cn.to_string()]),
+            ("sn".to_string(), vec!["Replication".to_string()]),
+        ]),
+    )
+}
+
+fn allocate_listen_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    format!("127.0.0.1:{}", addr.port())
+}
+
+async fn wait_for_port(addr: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for LDAP server on {addr}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_entry(backend: &MockBackend, dn: &str) -> DirectoryEntry {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(entry) = backend
+                .get_entry(dn)
+                .await
+                .expect("backend lookup should succeed")
+            {
+                return entry;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for replicated entry")
+}
+
+async fn assert_entry_absent_for(backend: &MockBackend, dn: &str, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    loop {
+        assert!(
+            backend
+                .get_entry(dn)
+                .await
+                .expect("backend lookup should succeed")
+                .is_none(),
+            "entry {dn} should stay absent during the observation window"
+        );
+
+        if Instant::now() >= deadline {
+            return;
+        }
+
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn shutdown_consumer(
+    shutdown: Arc<ShutdownCoordinator>,
+    handle: JoinHandle<()>,
+    context: &str,
+) {
+    shutdown.initiate_shutdown().await;
+    timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap_or_else(|_| panic!("{context} did not shut down within timeout"))
+        .expect("consumer task should exit cleanly");
+}
+
+async fn shutdown_provider(shutdown_tx: &broadcast::Sender<()>, handle: JoinHandle<()>) {
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("provider server did not shut down within timeout")
+        .expect("provider server task should exit cleanly");
+}
+
+async fn start_provider_server() -> (
+    Arc<dyn DirectoryBackend>,
+    broadcast::Sender<()>,
+    JoinHandle<()>,
+    String,
+) {
+    let config = create_provider_config();
+    let backend = Arc::new(MockBackend::new());
+    let service = ReplicationService::from_config(&config, backend).unwrap();
+    let provider_backend = service.backend();
+
+    let addr = allocate_listen_addr();
+    let ldap_url = format!("ldap://{addr}");
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(4);
+    let server_backend = provider_backend.clone();
+    let server_addr = addr.clone();
+
+    let task = tokio::spawn(async move {
+        server::run(&server_addr, server_backend, shutdown_rx)
+            .await
+            .expect("provider LDAP server should run");
+    });
+
+    wait_for_port(&addr).await;
+
+    (provider_backend, shutdown_tx, task, ldap_url)
 }
 
 #[tokio::test]
@@ -272,4 +406,170 @@ async fn test_consumer_custom_listening_config_propagates() {
     assert!(!consumer_cfg.enable_change_listening);
     assert_eq!(consumer_cfg.heartbeat_interval_secs, 47);
     assert_eq!(consumer_cfg.state_storage_path, "/tmp/opendr/repl_state");
+}
+
+#[tokio::test]
+async fn test_consumer_service_listening_mode_applies_initial_refresh_and_live_update_in_one_session(
+) {
+    let (provider_backend, provider_shutdown, provider_task, provider_url) =
+        start_provider_server().await;
+    let state_dir = TempDir::new().unwrap();
+    let consumer_backend = Arc::new(MockBackend::new());
+
+    let initial_entry = create_test_entry("cn=initial,dc=example,dc=org", "initial");
+    provider_backend
+        .add_entry(initial_entry.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    let mut config = create_consumer_config();
+    config.replication.provider_url = Some(provider_url);
+    config.replication.bind_dn = None;
+    config.replication.bind_password = None;
+    config.replication.sync_interval_secs = 5;
+    config.replication.enable_change_listening = true;
+    config.replication.state_storage_path = state_dir.path().to_path_buf();
+
+    let service = ReplicationService::from_config(&config, consumer_backend.clone()).unwrap();
+    let shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig::default()));
+    let handle = service
+        .start_consumer(shutdown.clone())
+        .await
+        .unwrap()
+        .expect("consumer handle should be present");
+
+    wait_for_entry(consumer_backend.as_ref(), &initial_entry.dn).await;
+
+    let live_entry = create_test_entry("cn=live,dc=example,dc=org", "live");
+    provider_backend
+        .add_entry(live_entry.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    wait_for_entry(consumer_backend.as_ref(), &live_entry.dn).await;
+    assert!(
+        state_dir.path().join("replication_cookie.txt").exists(),
+        "initial refresh should persist a replication cookie"
+    );
+
+    shutdown_consumer(shutdown, handle, "listening consumer").await;
+    shutdown_provider(&provider_shutdown, provider_task).await;
+}
+
+#[tokio::test]
+async fn test_consumer_service_reconnects_and_resumes_from_persisted_cookie() {
+    let (provider_backend, provider_shutdown, provider_task, provider_url) =
+        start_provider_server().await;
+    let state_dir = TempDir::new().unwrap();
+    let consumer_backend = Arc::new(MockBackend::new());
+
+    let initial_entry = create_test_entry("cn=resume-initial,dc=example,dc=org", "resume-initial");
+    provider_backend
+        .add_entry(initial_entry.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    let mut config = create_consumer_config();
+    config.replication.provider_url = Some(provider_url.clone());
+    config.replication.bind_dn = None;
+    config.replication.bind_password = None;
+    config.replication.sync_interval_secs = 5;
+    config.replication.enable_change_listening = true;
+    config.replication.state_storage_path = state_dir.path().to_path_buf();
+
+    let first_service = ReplicationService::from_config(&config, consumer_backend.clone()).unwrap();
+    let first_shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig::default()));
+    let first_handle = first_service
+        .start_consumer(first_shutdown.clone())
+        .await
+        .unwrap()
+        .expect("first consumer handle should be present");
+
+    wait_for_entry(consumer_backend.as_ref(), &initial_entry.dn).await;
+    shutdown_consumer(first_shutdown, first_handle, "first listening consumer").await;
+
+    consumer_backend
+        .delete_entry(&initial_entry.dn)
+        .await
+        .unwrap();
+
+    let offline_entry = create_test_entry("cn=resume-offline,dc=example,dc=org", "resume-offline");
+    provider_backend
+        .add_entry(offline_entry.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    let restarted_service =
+        ReplicationService::from_config(&config, consumer_backend.clone()).unwrap();
+    let restarted_shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig::default()));
+    let restarted_handle = restarted_service
+        .start_consumer(restarted_shutdown.clone())
+        .await
+        .unwrap()
+        .expect("restarted consumer handle should be present");
+
+    wait_for_entry(consumer_backend.as_ref(), &offline_entry.dn).await;
+    assert_entry_absent_for(
+        consumer_backend.as_ref(),
+        &initial_entry.dn,
+        Duration::from_millis(300),
+    )
+    .await;
+
+    shutdown_consumer(
+        restarted_shutdown,
+        restarted_handle,
+        "restarted listening consumer",
+    )
+    .await;
+    shutdown_provider(&provider_shutdown, provider_task).await;
+}
+
+#[tokio::test]
+async fn test_consumer_service_polling_mode_waits_for_next_sync_cycle() {
+    let (provider_backend, provider_shutdown, provider_task, provider_url) =
+        start_provider_server().await;
+    let state_dir = TempDir::new().unwrap();
+    let consumer_backend = Arc::new(MockBackend::new());
+
+    let initial_entry = create_test_entry("cn=poll-initial,dc=example,dc=org", "poll-initial");
+    provider_backend
+        .add_entry(initial_entry.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    let mut config = create_consumer_config();
+    config.replication.provider_url = Some(provider_url);
+    config.replication.bind_dn = None;
+    config.replication.bind_password = None;
+    config.replication.enable_change_listening = false;
+    config.replication.sync_interval_secs = 1;
+    config.replication.state_storage_path = state_dir.path().to_path_buf();
+
+    let service = ReplicationService::from_config(&config, consumer_backend.clone()).unwrap();
+    let shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig::default()));
+    let handle = service
+        .start_consumer(shutdown.clone())
+        .await
+        .unwrap()
+        .expect("polling consumer handle should be present");
+
+    wait_for_entry(consumer_backend.as_ref(), &initial_entry.dn).await;
+
+    let delayed_entry = create_test_entry("cn=poll-delayed,dc=example,dc=org", "poll-delayed");
+    provider_backend
+        .add_entry(delayed_entry.clone(), Vec::new())
+        .await
+        .unwrap();
+
+    assert_entry_absent_for(
+        consumer_backend.as_ref(),
+        &delayed_entry.dn,
+        Duration::from_millis(300),
+    )
+    .await;
+    wait_for_entry(consumer_backend.as_ref(), &delayed_entry.dn).await;
+
+    shutdown_consumer(shutdown, handle, "polling consumer").await;
+    shutdown_provider(&provider_shutdown, provider_task).await;
 }
