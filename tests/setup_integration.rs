@@ -1,6 +1,10 @@
 // Integration tests for server setup functionality
 
-use opendr::setup::{BackendType, SetupConfig, SetupHandler, ReplicationConfig, ReplicationRole, ProviderConfig, ConsumerConfig};
+use opendr::config::ServerConfig;
+use opendr::setup::{
+    BackendType, ConsumerConfig, ProviderConfig, ReplicationConfig, ReplicationRole, SetupConfig,
+    SetupHandler,
+};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -206,7 +210,10 @@ async fn test_password_validation() {
         replication: ReplicationConfig::default(),
     };
 
-    handler.run_non_interactive_setup(strong_config).await.unwrap();
+    handler
+        .run_non_interactive_setup(strong_config)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -309,7 +316,10 @@ async fn test_password_hashing_uniqueness() {
         replication: ReplicationConfig::default(),
     };
 
-    handler.run_non_interactive_setup(config.clone()).await.unwrap();
+    handler
+        .run_non_interactive_setup(config.clone())
+        .await
+        .unwrap();
 
     let admin_file1 = temp_dir.path().join("admin.ldif");
     let content1 = tokio::fs::read_to_string(&admin_file1).await.unwrap();
@@ -364,7 +374,10 @@ async fn test_multiple_organizational_units() {
 fn extract_password_hash(ldif: &str) -> String {
     for line in ldif.lines() {
         if line.starts_with("userPassword: {SSHA512}") {
-            return line.replace("userPassword: {SSHA512}", "").trim().to_string();
+            return line
+                .replace("userPassword: {SSHA512}", "")
+                .trim()
+                .to_string();
         }
     }
     String::new()
@@ -393,6 +406,8 @@ async fn test_replication_config_provider_serialization() {
                 max_batch_size: 100,
                 enable_streaming: true,
                 heartbeat_interval_secs: 60,
+                max_concurrent_consumers: 10,
+                consumer_timeout_secs: 300,
             }),
             consumer: None,
         },
@@ -402,8 +417,11 @@ async fn test_replication_config_provider_serialization() {
     let serialized = toml::to_string(&config).unwrap();
 
     // Verify it contains the correct case-sensitive role
-    assert!(serialized.contains("role = \"Provider\""),
-            "Serialized config should contain 'role = \"Provider\"', got:\n{}", serialized);
+    assert!(
+        serialized.contains("role = \"Provider\""),
+        "Serialized config should contain 'role = \"Provider\"', got:\n{}",
+        serialized
+    );
 
     // Deserialize back
     let deserialized: SetupConfig = toml::from_str(&serialized).unwrap();
@@ -436,10 +454,15 @@ async fn test_replication_config_consumer_serialization() {
                 provider_url: "ldap://provider.example.com:1389".to_string(),
                 provider_bind_dn: Some("cn=replication".to_string()),
                 provider_bind_password: Some("secret".to_string()),
+                max_batch_size: 100,
                 sync_interval_secs: 60,
                 max_retry_attempts: 3,
                 retry_delay_secs: 10,
                 enable_change_listening: true,
+                heartbeat_interval_secs: 30,
+                provider_timeout_secs: 30,
+                state_persistence_timeout_secs: 10,
+                change_buffer_size: 1000,
                 state_storage_path: PathBuf::from("/tmp/repl_state"),
             }),
         },
@@ -449,8 +472,11 @@ async fn test_replication_config_consumer_serialization() {
     let serialized = toml::to_string(&config).unwrap();
 
     // Verify it contains the correct case-sensitive role
-    assert!(serialized.contains("role = \"Consumer\""),
-            "Serialized config should contain 'role = \"Consumer\"', got:\n{}", serialized);
+    assert!(
+        serialized.contains("role = \"Consumer\""),
+        "Serialized config should contain 'role = \"Consumer\"', got:\n{}",
+        serialized
+    );
 
     // Deserialize back
     let deserialized: SetupConfig = toml::from_str(&serialized).unwrap();
@@ -524,14 +550,11 @@ state_storage_path = "/tmp/state"
     assert!(config.replication.enabled);
 }
 
-// NOTE: This test is commented out because it requires full setup infrastructure
-// The core serialization/deserialization tests above verify the fix works
 #[tokio::test]
-#[ignore]
 async fn test_setup_handler_generates_loadable_config() {
     // Test the complete flow: SetupHandler generates config -> save to file -> load from file
     let temp_dir = TempDir::new().unwrap();
-    let config_dir = temp_dir.path().join("config");
+    let config_dir = temp_dir.path().to_path_buf();
     let handler = SetupHandler::new(&config_dir);
 
     let config = SetupConfig {
@@ -542,7 +565,7 @@ async fn test_setup_handler_generates_loadable_config() {
         ldaps_port: 1636,
         hostname: "localhost".to_string(),
         organization_name: "Example Org".to_string(),
-        backend_type: BackendType::Lmdb,
+        backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
         replication: ReplicationConfig {
@@ -554,32 +577,135 @@ async fn test_setup_handler_generates_loadable_config() {
                 max_batch_size: 100,
                 enable_streaming: true,
                 heartbeat_interval_secs: 60,
+                max_concurrent_consumers: 10,
+                consumer_timeout_secs: 300,
             }),
             consumer: None,
         },
     };
 
     // Run setup which generates the config file
-    handler.run_non_interactive_setup(config.clone()).await.unwrap();
+    handler
+        .run_non_interactive_setup(config.clone())
+        .await
+        .unwrap();
 
     // Verify config file exists
     let config_path = config_dir.join("server.toml");
-    assert!(config_path.exists(), "Config file should be created at {:?}", config_path);
+    assert!(
+        config_path.exists(),
+        "Config file should be created at {:?}",
+        config_path
+    );
 
     // Load the generated config file
     let config_content = tokio::fs::read_to_string(&config_path).await.unwrap();
 
-    // Verify the content has correct case for role
-    assert!(config_content.contains("role = \"Provider\""),
-            "Config should contain role = \"Provider\", got:\n{}", config_content);
+    // Verify the content uses canonical server config replication keys
+    assert!(
+        config_content.contains("mode = \"provider\""),
+        "Config should contain mode = \"provider\", got:\n{}",
+        config_content
+    );
+    assert!(config_content.contains("changelog_capacity = 100000"));
 
-    // Deserialize the loaded config
-    let loaded_config: SetupConfig = toml::from_str(&config_content)
-        .map_err(|e| format!("Failed to deserialize config: {}\nConfig content:\n{}", e, config_content))
+    // Deserialize the generated server config through the canonical runtime config type.
+    let loaded_config = ServerConfig::from_toml_str(&config_content)
+        .map_err(|e| {
+            format!(
+                "Failed to deserialize server config: {}\nConfig content:\n{}",
+                e, config_content
+            )
+        })
         .unwrap();
 
-    // Verify key fields match
-    assert_eq!(loaded_config.base_dn, config.base_dn);
-    assert_eq!(loaded_config.replication.enabled, true);
-    assert_eq!(loaded_config.replication.role, ReplicationRole::Provider);
+    assert_eq!(loaded_config.server.base_dn, config.base_dn);
+    assert!(loaded_config.replication.enabled);
+    assert_eq!(loaded_config.replication.mode, "provider");
+    assert_eq!(loaded_config.replication.changelog_capacity, 100000);
+}
+
+#[tokio::test]
+async fn test_setup_handler_generates_canonical_consumer_replication_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_dir = temp_dir.path().to_path_buf();
+    let handler = SetupHandler::new(&config_dir);
+
+    let config = SetupConfig {
+        base_dn: "dc=example,dc=com".to_string(),
+        root_user_dn: "cn=manager".to_string(),
+        root_password: "SecurePass123".to_string(),
+        ldap_port: 1389,
+        ldaps_port: 1636,
+        hostname: "localhost".to_string(),
+        organization_name: "Example Org".to_string(),
+        backend_type: BackendType::InMemory,
+        data_directory: temp_dir.path().join("data"),
+        import_sample_data: false,
+        replication: ReplicationConfig {
+            enabled: true,
+            role: ReplicationRole::Consumer,
+            provider: None,
+            consumer: Some(ConsumerConfig {
+                provider_url: "ldap://provider.example.com:1389".to_string(),
+                provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
+                provider_bind_password: Some("replica-secret".to_string()),
+                sync_interval_secs: 45,
+                max_retry_attempts: 8,
+                retry_delay_secs: 12,
+                enable_change_listening: false,
+                heartbeat_interval_secs: 50,
+                max_batch_size: 250,
+                provider_timeout_secs: 80,
+                state_persistence_timeout_secs: 20,
+                change_buffer_size: 4096,
+                state_storage_path: PathBuf::from("/tmp/opendr-repl-state"),
+            }),
+        },
+    };
+
+    handler
+        .run_non_interactive_setup(config.clone())
+        .await
+        .unwrap();
+
+    let config_path = config_dir.join("server.toml");
+    let config_content = tokio::fs::read_to_string(&config_path).await.unwrap();
+
+    assert!(config_content.contains("mode = \"consumer\""));
+    assert!(config_content.contains("bind_dn = \"cn=replication,dc=example,dc=com\""));
+    assert!(config_content.contains("retry_delay_secs = 12"));
+    assert!(config_content.contains("state_storage_path = \"/tmp/opendr-repl-state\""));
+
+    let loaded_config = ServerConfig::from_toml_str(&config_content)
+        .map_err(|e| {
+            format!(
+                "Failed to deserialize server config: {}\nConfig content:\n{}",
+                e, config_content
+            )
+        })
+        .unwrap();
+
+    assert!(loaded_config.replication.enabled);
+    assert_eq!(loaded_config.replication.mode, "consumer");
+    assert_eq!(
+        loaded_config.replication.provider_url.as_deref(),
+        Some("ldap://provider.example.com:1389")
+    );
+    assert_eq!(
+        loaded_config.replication.bind_dn.as_deref(),
+        Some("cn=replication,dc=example,dc=com")
+    );
+    assert_eq!(loaded_config.replication.max_retry_attempts, 8);
+    assert_eq!(loaded_config.replication.retry_delay_secs, 12);
+    assert!(!loaded_config.replication.enable_change_listening);
+    assert_eq!(loaded_config.replication.heartbeat_interval_secs, 50);
+    assert_eq!(loaded_config.replication.max_batch_size, 250);
+    assert_eq!(loaded_config.replication.provider_timeout_secs, 80);
+    assert_eq!(loaded_config.replication.state_persistence_timeout_secs, 20);
+    assert_eq!(loaded_config.replication.change_buffer_size, 4096);
+    assert_eq!(
+        loaded_config.replication.state_storage_path,
+        PathBuf::from("/tmp/opendr-repl-state")
+    );
 }

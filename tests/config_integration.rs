@@ -16,9 +16,17 @@ fn test_load_default_config() {
     assert_eq!(config.server.base_dn, "dc=example,dc=com");
     assert!(config.rate_limit.enabled);
     assert!(config.replication.enable_change_listening);
+    assert!(config.replication.changelog_enabled);
+    assert_eq!(config.replication.max_batch_size, 100);
     assert_eq!(config.replication.max_retry_attempts, 3);
     assert_eq!(config.replication.retry_delay_secs, 5);
+    assert!(config.replication.enable_streaming);
     assert_eq!(config.replication.heartbeat_interval_secs, 30);
+    assert_eq!(config.replication.max_concurrent_consumers, 10);
+    assert_eq!(config.replication.consumer_timeout_secs, 300);
+    assert_eq!(config.replication.provider_timeout_secs, 30);
+    assert_eq!(config.replication.state_persistence_timeout_secs, 10);
+    assert_eq!(config.replication.change_buffer_size, 1000);
     assert_eq!(
         config.replication.state_storage_path,
         PathBuf::from("./data/replication_state")
@@ -56,7 +64,10 @@ metrics_port = 8080
     assert_eq!(config.server.base_dn, "dc=test,dc=local");
     assert_eq!(config.server.hostname, "ldap.test.local");
     assert_eq!(config.backend.backend_type, "memory");
-    assert_eq!(config.backend.data_directory, PathBuf::from("/var/lib/opendr"));
+    assert_eq!(
+        config.backend.data_directory,
+        PathBuf::from("/var/lib/opendr")
+    );
     assert!(!config.rate_limit.enabled);
     assert_eq!(config.rate_limit.global_requests_per_second, 500);
     assert!(config.monitoring.enabled);
@@ -112,7 +123,10 @@ ldaps_port = 1389
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("ports must be different"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("ports must be different"));
 }
 
 #[test]
@@ -140,7 +154,10 @@ base_dn = ""
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Base DN cannot be empty"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Base DN cannot be empty"));
 }
 
 #[test]
@@ -154,7 +171,10 @@ backend_type = "postgresql"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid backend type"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid backend type"));
 }
 
 #[test]
@@ -168,7 +188,10 @@ adaptive_threshold = 1.5
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("adaptive_threshold"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("adaptive_threshold"));
 }
 
 #[test]
@@ -182,7 +205,10 @@ blacklist = ["not-an-ip-address", "192.168.1.1"]
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid blacklist IP"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid blacklist IP"));
 }
 
 #[test]
@@ -211,7 +237,10 @@ mode = "invalid"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid replication mode"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid replication mode"));
 }
 
 #[test]
@@ -238,21 +267,38 @@ mode = "consumer"
 provider_url = "ldap://provider.example.com:389"
 bind_dn = "cn=replicator,dc=example,dc=com"
 bind_password = "secret"
+max_batch_size = 128
 max_retry_attempts = 9
 retry_delay_secs = 12
 enable_change_listening = true
+enable_streaming = true
 heartbeat_interval_secs = 45
+max_concurrent_consumers = 20
+consumer_timeout_secs = 600
+provider_timeout_secs = 55
+state_persistence_timeout_secs = 22
+change_buffer_size = 2048
 state_storage_path = "/var/lib/opendr/repl_state"
     "#;
 
     let config = ServerConfig::from_toml_str(toml).unwrap();
     assert!(config.validate().is_ok());
     assert_eq!(config.replication.mode, "consumer");
-    assert_eq!(config.replication.provider_url.unwrap(), "ldap://provider.example.com:389");
+    assert_eq!(
+        config.replication.provider_url.unwrap(),
+        "ldap://provider.example.com:389"
+    );
+    assert_eq!(config.replication.max_batch_size, 128);
     assert_eq!(config.replication.max_retry_attempts, 9);
     assert_eq!(config.replication.retry_delay_secs, 12);
     assert!(config.replication.enable_change_listening);
+    assert!(config.replication.enable_streaming);
     assert_eq!(config.replication.heartbeat_interval_secs, 45);
+    assert_eq!(config.replication.max_concurrent_consumers, 20);
+    assert_eq!(config.replication.consumer_timeout_secs, 600);
+    assert_eq!(config.replication.provider_timeout_secs, 55);
+    assert_eq!(config.replication.state_persistence_timeout_secs, 22);
+    assert_eq!(config.replication.change_buffer_size, 2048);
     assert_eq!(
         config.replication.state_storage_path,
         PathBuf::from("/var/lib/opendr/repl_state")
@@ -266,9 +312,15 @@ fn test_validation_invalid_replication_listening_settings() {
 enabled = true
 mode = "consumer"
 provider_url = "ldap://provider.example.com:389"
+max_batch_size = 0
 max_retry_attempts = 0
 retry_delay_secs = 0
 heartbeat_interval_secs = 0
+max_concurrent_consumers = 0
+consumer_timeout_secs = 0
+provider_timeout_secs = 0
+state_persistence_timeout_secs = 0
+change_buffer_size = 0
     "#;
 
     let config = ServerConfig::from_toml_str(toml).unwrap();
@@ -278,8 +330,14 @@ heartbeat_interval_secs = 0
     let message = result.unwrap_err().to_string();
     assert!(
         message.contains("max_retry_attempts")
+            || message.contains("max_batch_size")
             || message.contains("retry_delay_secs")
             || message.contains("heartbeat_interval_secs")
+            || message.contains("max_concurrent_consumers")
+            || message.contains("consumer_timeout_secs")
+            || message.contains("provider_timeout_secs")
+            || message.contains("state_persistence_timeout_secs")
+            || message.contains("change_buffer_size")
     );
 }
 
@@ -293,24 +351,54 @@ provider_url = "ldap://provider.example.com:389"
 bind_dn = "cn=replicator,dc=example,dc=com"
 bind_password = "secret"
 sync_interval_secs = 15
+max_batch_size = 250
 max_retry_attempts = 9
 retry_delay_secs = 11
 enable_change_listening = false
+enable_streaming = false
 heartbeat_interval_secs = 45
+max_concurrent_consumers = 14
+consumer_timeout_secs = 480
+provider_timeout_secs = 90
+state_persistence_timeout_secs = 18
+change_buffer_size = 4096
 state_storage_path = "/var/lib/opendr/replication_state"
     "#;
 
     let config = ServerConfig::from_toml_str(toml).unwrap();
     assert!(config.validate().is_ok());
     assert_eq!(config.replication.sync_interval_secs, 15);
+    assert_eq!(config.replication.max_batch_size, 250);
     assert_eq!(config.replication.max_retry_attempts, 9);
     assert_eq!(config.replication.retry_delay_secs, 11);
     assert!(!config.replication.enable_change_listening);
+    assert!(!config.replication.enable_streaming);
     assert_eq!(config.replication.heartbeat_interval_secs, 45);
+    assert_eq!(config.replication.max_concurrent_consumers, 14);
+    assert_eq!(config.replication.consumer_timeout_secs, 480);
+    assert_eq!(config.replication.provider_timeout_secs, 90);
+    assert_eq!(config.replication.state_persistence_timeout_secs, 18);
+    assert_eq!(config.replication.change_buffer_size, 4096);
     assert_eq!(
         config.replication.state_storage_path,
         PathBuf::from("/var/lib/opendr/replication_state")
     );
+}
+
+#[test]
+fn test_validation_legacy_setup_role_alias_is_normalized() {
+    let toml = r#"
+[replication]
+enabled = true
+role = "Consumer"
+provider_url = "ldap://provider.example.com:389"
+bind_dn = "cn=replicator,dc=example,dc=com"
+bind_password = "secret"
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    assert_eq!(config.replication.mode, "consumer");
+    assert!(config.validate().is_ok());
 }
 
 #[test]
@@ -344,7 +432,10 @@ format = "xml"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid audit format"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid audit format"));
 }
 
 #[test]
@@ -358,7 +449,10 @@ level = "verbose"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid audit level"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid audit level"));
 }
 
 #[test]
@@ -372,7 +466,10 @@ default_policy = "maybe"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Invalid access policy"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid access policy"));
 }
 
 #[test]
@@ -548,8 +645,14 @@ indexed_attributes = ["cn", "uid", "mail", "sn", "givenName", "objectClass", "ou
 
     let config = ServerConfig::from_toml_str(toml).unwrap();
     assert_eq!(config.backend.indexed_attributes.len(), 7);
-    assert!(config.backend.indexed_attributes.contains(&"sn".to_string()));
-    assert!(config.backend.indexed_attributes.contains(&"givenName".to_string()));
+    assert!(config
+        .backend
+        .indexed_attributes
+        .contains(&"sn".to_string()));
+    assert!(config
+        .backend
+        .indexed_attributes
+        .contains(&"givenName".to_string()));
 }
 
 #[test]
@@ -564,7 +667,10 @@ max_connections_per_ip = 200
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("max_connections_per_ip cannot exceed max_connections"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("max_connections_per_ip cannot exceed max_connections"));
 }
 
 #[test]
@@ -578,5 +684,8 @@ max_connections = 0
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("max_connections must be > 0"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("max_connections must be > 0"));
 }

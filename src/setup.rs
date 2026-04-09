@@ -90,6 +90,14 @@ pub struct ProviderConfig {
 
     /// Heartbeat interval in seconds
     pub heartbeat_interval_secs: u64,
+
+    /// Maximum concurrent replication consumers
+    #[serde(default = "default_setup_max_concurrent_consumers")]
+    pub max_concurrent_consumers: usize,
+
+    /// Consumer session timeout in seconds
+    #[serde(default = "default_setup_consumer_timeout_secs")]
+    pub consumer_timeout_secs: u64,
 }
 
 /// Consumer-specific replication configuration
@@ -118,6 +126,26 @@ pub struct ConsumerConfig {
     /// Enable continuous listening for changes
     pub enable_change_listening: bool,
 
+    /// Heartbeat interval in seconds
+    #[serde(default = "default_setup_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+
+    /// Maximum entries per sync batch
+    #[serde(default = "default_setup_max_batch_size")]
+    pub max_batch_size: usize,
+
+    /// Provider request timeout in seconds
+    #[serde(default = "default_setup_provider_timeout_secs")]
+    pub provider_timeout_secs: u64,
+
+    /// State persistence timeout in seconds
+    #[serde(default = "default_setup_state_persistence_timeout_secs")]
+    pub state_persistence_timeout_secs: u64,
+
+    /// Live change buffer size
+    #[serde(default = "default_setup_change_buffer_size")]
+    pub change_buffer_size: usize,
+
     /// Path to store replication state
     pub state_storage_path: PathBuf,
 }
@@ -141,6 +169,8 @@ impl Default for ProviderConfig {
             max_batch_size: 100,
             enable_streaming: true,
             heartbeat_interval_secs: 60,
+            max_concurrent_consumers: 10,
+            consumer_timeout_secs: 300,
         }
     }
 }
@@ -155,6 +185,11 @@ impl Default for ConsumerConfig {
             max_retry_attempts: 3,
             retry_delay_secs: 5,
             enable_change_listening: true,
+            heartbeat_interval_secs: 30,
+            max_batch_size: 100,
+            provider_timeout_secs: 30,
+            state_persistence_timeout_secs: 10,
+            change_buffer_size: 1000,
             state_storage_path: PathBuf::from("./data/replication_state"),
         }
     }
@@ -178,6 +213,34 @@ pub struct SetupState {
     pub setup_timestamp: Option<String>,
     pub config_version: String,
     pub base_dn: Option<String>,
+}
+
+fn default_setup_max_concurrent_consumers() -> usize {
+    10
+}
+
+fn default_setup_consumer_timeout_secs() -> u64 {
+    300
+}
+
+fn default_setup_heartbeat_interval_secs() -> u64 {
+    30
+}
+
+fn default_setup_max_batch_size() -> usize {
+    100
+}
+
+fn default_setup_provider_timeout_secs() -> u64 {
+    30
+}
+
+fn default_setup_state_persistence_timeout_secs() -> u64 {
+    10
+}
+
+fn default_setup_change_buffer_size() -> usize {
+    1000
 }
 
 impl Default for SetupConfig {
@@ -229,8 +292,7 @@ impl SetupHandler {
             .await
             .map_err(|e| format!("Failed to read setup state: {}", e))?;
 
-        toml::from_str(&content)
-            .map_err(|e| format!("Failed to parse setup state: {}", e))
+        toml::from_str(&content).map_err(|e| format!("Failed to parse setup state: {}", e))
     }
 
     /// Save setup state
@@ -298,32 +360,85 @@ lmdb_max_readers = 126
 
             match config.replication.role {
                 ReplicationRole::Provider => {
-                    content.push_str("role = \"Provider\"\n");
+                    content.push_str("mode = \"provider\"\n");
                     if let Some(ref provider) = config.replication.provider {
-                        content.push_str(&format!("changelog_enabled = {}\n", provider.changelog_enabled));
-                        if provider.changelog_enabled {
-                            content.push_str(&format!("changelog_max_entries = {}\n", provider.changelog_max_entries));
-                        }
-                        content.push_str(&format!("max_batch_size = {}\n", provider.max_batch_size));
-                        content.push_str(&format!("enable_streaming = {}\n", provider.enable_streaming));
-                        content.push_str(&format!("heartbeat_interval_secs = {}\n", provider.heartbeat_interval_secs));
+                        content.push_str(&format!(
+                            "changelog_enabled = {}\n",
+                            provider.changelog_enabled
+                        ));
+                        content.push_str(&format!(
+                            "changelog_capacity = {}\n",
+                            provider.changelog_max_entries
+                        ));
+                        content
+                            .push_str(&format!("max_batch_size = {}\n", provider.max_batch_size));
+                        content.push_str(&format!(
+                            "enable_streaming = {}\n",
+                            provider.enable_streaming
+                        ));
+                        content.push_str(&format!(
+                            "heartbeat_interval_secs = {}\n",
+                            provider.heartbeat_interval_secs
+                        ));
+                        content.push_str(&format!(
+                            "max_concurrent_consumers = {}\n",
+                            provider.max_concurrent_consumers
+                        ));
+                        content.push_str(&format!(
+                            "consumer_timeout_secs = {}\n",
+                            provider.consumer_timeout_secs
+                        ));
                     }
                 }
                 ReplicationRole::Consumer => {
-                    content.push_str("role = \"Consumer\"\n");
+                    content.push_str("mode = \"consumer\"\n");
                     if let Some(ref consumer) = config.replication.consumer {
-                        content.push_str(&format!("provider_url = \"{}\"\n", consumer.provider_url));
+                        content
+                            .push_str(&format!("provider_url = \"{}\"\n", consumer.provider_url));
                         if let Some(ref bind_dn) = consumer.provider_bind_dn {
-                            content.push_str(&format!("provider_bind_dn = \"{}\"\n", bind_dn));
+                            content.push_str(&format!("bind_dn = \"{}\"\n", bind_dn));
                         }
                         if let Some(ref bind_pw) = consumer.provider_bind_password {
-                            content.push_str(&format!("provider_bind_password = \"{}\"\n", bind_pw));
+                            content.push_str(&format!("bind_password = \"{}\"\n", bind_pw));
                         }
-                        content.push_str(&format!("sync_interval_secs = {}\n", consumer.sync_interval_secs));
-                        content.push_str(&format!("max_retry_attempts = {}\n", consumer.max_retry_attempts));
-                        content.push_str(&format!("retry_delay_secs = {}\n", consumer.retry_delay_secs));
-                        content.push_str(&format!("enable_change_listening = {}\n", consumer.enable_change_listening));
-                        content.push_str(&format!("state_storage_path = \"{}\"\n", consumer.state_storage_path.display()));
+                        content.push_str(&format!(
+                            "sync_interval_secs = {}\n",
+                            consumer.sync_interval_secs
+                        ));
+                        content
+                            .push_str(&format!("max_batch_size = {}\n", consumer.max_batch_size));
+                        content.push_str(&format!(
+                            "max_retry_attempts = {}\n",
+                            consumer.max_retry_attempts
+                        ));
+                        content.push_str(&format!(
+                            "retry_delay_secs = {}\n",
+                            consumer.retry_delay_secs
+                        ));
+                        content.push_str(&format!(
+                            "enable_change_listening = {}\n",
+                            consumer.enable_change_listening
+                        ));
+                        content.push_str(&format!(
+                            "heartbeat_interval_secs = {}\n",
+                            consumer.heartbeat_interval_secs
+                        ));
+                        content.push_str(&format!(
+                            "provider_timeout_secs = {}\n",
+                            consumer.provider_timeout_secs
+                        ));
+                        content.push_str(&format!(
+                            "state_persistence_timeout_secs = {}\n",
+                            consumer.state_persistence_timeout_secs
+                        ));
+                        content.push_str(&format!(
+                            "change_buffer_size = {}\n",
+                            consumer.change_buffer_size
+                        ));
+                        content.push_str(&format!(
+                            "state_storage_path = \"{}\"\n",
+                            consumer.state_storage_path.display()
+                        ));
                     }
                 }
             }
@@ -350,26 +465,28 @@ lmdb_max_readers = 126
         let mut config = SetupConfig::default();
 
         // 1. Base DN
-        config.base_dn = self.prompt_with_default(
-            "Enter the base DN for your directory",
-            &config.base_dn,
-        ).await?;
+        config.base_dn = self
+            .prompt_with_default("Enter the base DN for your directory", &config.base_dn)
+            .await?;
 
         // 2. Organization name
-        config.organization_name = self.prompt_with_default(
-            "Enter your organization name",
-            &config.organization_name,
-        ).await?;
+        config.organization_name = self
+            .prompt_with_default("Enter your organization name", &config.organization_name)
+            .await?;
 
         // 3. Root user DN
-        config.root_user_dn = self.prompt_with_default(
-            "Enter the root user DN (administrator account)",
-            &config.root_user_dn,
-        ).await?;
+        config.root_user_dn = self
+            .prompt_with_default(
+                "Enter the root user DN (administrator account)",
+                &config.root_user_dn,
+            )
+            .await?;
 
         // 4. Root password
         config.root_password = self.prompt_password("Enter the root user password").await?;
-        let confirm_password = self.prompt_password("Confirm the root user password").await?;
+        let confirm_password = self
+            .prompt_password("Confirm the root user password")
+            .await?;
 
         if config.root_password != confirm_password {
             return Err("Passwords do not match".to_string());
@@ -379,36 +496,35 @@ lmdb_max_readers = 126
         self.validate_password(&config.root_password)?;
 
         // 5. LDAP port
-        let port_str = self.prompt_with_default(
-            "Enter the LDAP port",
-            &config.ldap_port.to_string(),
-        ).await?;
-        config.ldap_port = port_str.parse()
+        let port_str = self
+            .prompt_with_default("Enter the LDAP port", &config.ldap_port.to_string())
+            .await?;
+        config.ldap_port = port_str
+            .parse()
             .map_err(|_| "Invalid port number".to_string())?;
 
         // 6. LDAPS port
-        let ports_str = self.prompt_with_default(
-            "Enter the LDAPS port (secure)",
-            &config.ldaps_port.to_string(),
-        ).await?;
-        config.ldaps_port = ports_str.parse()
+        let ports_str = self
+            .prompt_with_default(
+                "Enter the LDAPS port (secure)",
+                &config.ldaps_port.to_string(),
+            )
+            .await?;
+        config.ldaps_port = ports_str
+            .parse()
             .map_err(|_| "Invalid port number".to_string())?;
 
         // 7. Hostname
-        config.hostname = self.prompt_with_default(
-            "Enter the server hostname",
-            &config.hostname,
-        ).await?;
+        config.hostname = self
+            .prompt_with_default("Enter the server hostname", &config.hostname)
+            .await?;
 
         // 8. Backend type
         println!("\nSelect storage backend:");
         println!("  1. LMDB (recommended for production)");
         println!("  2. In-Memory (for testing only)");
 
-        let backend_choice = self.prompt_with_default(
-            "Enter your choice",
-            "1",
-        ).await?;
+        let backend_choice = self.prompt_with_default("Enter your choice", "1").await?;
 
         config.backend_type = match backend_choice.as_str() {
             "1" => BackendType::Lmdb,
@@ -418,43 +534,40 @@ lmdb_max_readers = 126
 
         // 9. Data directory (only for persistent backends)
         if config.backend_type != BackendType::InMemory {
-            let data_dir = self.prompt_with_default(
-                "Enter the data directory path",
-                config.data_directory.to_string_lossy().as_ref(),
-            ).await?;
+            let data_dir = self
+                .prompt_with_default(
+                    "Enter the data directory path",
+                    config.data_directory.to_string_lossy().as_ref(),
+                )
+                .await?;
             config.data_directory = PathBuf::from(data_dir);
         }
 
         // 10. Sample data
-        let sample_data = self.prompt_with_default(
-            "Import sample data? (yes/no)",
-            "no",
-        ).await?;
-        config.import_sample_data = sample_data.to_lowercase() == "yes"
-            || sample_data.to_lowercase() == "y";
+        let sample_data = self
+            .prompt_with_default("Import sample data? (yes/no)", "no")
+            .await?;
+        config.import_sample_data =
+            sample_data.to_lowercase() == "yes" || sample_data.to_lowercase() == "y";
 
         // 11. Replication configuration
         println!("\n╔════════════════════════════════════════════════╗");
         println!("║        Replication Configuration              ║");
         println!("╚════════════════════════════════════════════════╝\n");
 
-        let enable_repl = self.prompt_with_default(
-            "Enable replication? (yes/no)",
-            "no",
-        ).await?;
+        let enable_repl = self
+            .prompt_with_default("Enable replication? (yes/no)", "no")
+            .await?;
 
-        config.replication.enabled = enable_repl.to_lowercase() == "yes"
-            || enable_repl.to_lowercase() == "y";
+        config.replication.enabled =
+            enable_repl.to_lowercase() == "yes" || enable_repl.to_lowercase() == "y";
 
         if config.replication.enabled {
             println!("\nSelect replication role:");
             println!("  1. Provider (Master) - Source of directory data");
             println!("  2. Consumer (Replica) - Receives updates from provider");
 
-            let role_choice = self.prompt_with_default(
-                "Enter your choice",
-                "1",
-            ).await?;
+            let role_choice = self.prompt_with_default("Enter your choice", "1").await?;
 
             config.replication.role = match role_choice.as_str() {
                 "1" => ReplicationRole::Provider,
@@ -468,35 +581,49 @@ lmdb_max_readers = 126
 
                     let mut provider_config = ProviderConfig::default();
 
-                    let changelog = self.prompt_with_default(
-                        "Enable changelog tracking? (yes/no)",
-                        "yes",
-                    ).await?;
-                    provider_config.changelog_enabled = changelog.to_lowercase() == "yes"
-                        || changelog.to_lowercase() == "y";
+                    let changelog = self
+                        .prompt_with_default("Enable changelog tracking? (yes/no)", "yes")
+                        .await?;
+                    provider_config.changelog_enabled =
+                        changelog.to_lowercase() == "yes" || changelog.to_lowercase() == "y";
 
                     if provider_config.changelog_enabled {
-                        let max_entries = self.prompt_with_default(
-                            "Maximum changelog entries",
-                            &provider_config.changelog_max_entries.to_string(),
-                        ).await?;
-                        provider_config.changelog_max_entries = max_entries.parse()
+                        let max_entries = self
+                            .prompt_with_default(
+                                "Maximum changelog entries",
+                                &provider_config.changelog_max_entries.to_string(),
+                            )
+                            .await?;
+                        provider_config.changelog_max_entries = max_entries
+                            .parse()
                             .map_err(|_| "Invalid number".to_string())?;
                     }
 
-                    let batch_size = self.prompt_with_default(
-                        "Maximum batch size (entries per sync)",
-                        &provider_config.max_batch_size.to_string(),
-                    ).await?;
-                    provider_config.max_batch_size = batch_size.parse()
+                    let batch_size = self
+                        .prompt_with_default(
+                            "Maximum batch size (entries per sync)",
+                            &provider_config.max_batch_size.to_string(),
+                        )
+                        .await?;
+                    provider_config.max_batch_size = batch_size
+                        .parse()
                         .map_err(|_| "Invalid number".to_string())?;
 
-                    let streaming = self.prompt_with_default(
-                        "Enable real-time streaming? (yes/no)",
-                        "yes",
-                    ).await?;
-                    provider_config.enable_streaming = streaming.to_lowercase() == "yes"
-                        || streaming.to_lowercase() == "y";
+                    let streaming = self
+                        .prompt_with_default("Enable real-time streaming? (yes/no)", "yes")
+                        .await?;
+                    provider_config.enable_streaming =
+                        streaming.to_lowercase() == "yes" || streaming.to_lowercase() == "y";
+
+                    let heartbeat_interval = self
+                        .prompt_with_default(
+                            "Provider heartbeat interval (seconds)",
+                            &provider_config.heartbeat_interval_secs.to_string(),
+                        )
+                        .await?;
+                    provider_config.heartbeat_interval_secs = heartbeat_interval
+                        .parse()
+                        .map_err(|_| "Invalid number".to_string())?;
 
                     config.replication.provider = Some(provider_config);
                 }
@@ -505,52 +632,85 @@ lmdb_max_readers = 126
 
                     let mut consumer_config = ConsumerConfig::default();
 
-                    consumer_config.provider_url = self.prompt_with_default(
-                        "Provider URL (e.g., ldap://provider.example.com:389)",
-                        &consumer_config.provider_url,
-                    ).await?;
+                    consumer_config.provider_url = self
+                        .prompt_with_default(
+                            "Provider URL (e.g., ldap://provider.example.com:389)",
+                            &consumer_config.provider_url,
+                        )
+                        .await?;
 
-                    let use_auth = self.prompt_with_default(
-                        "Authenticate to provider? (yes/no)",
-                        "no",
-                    ).await?;
+                    let use_auth = self
+                        .prompt_with_default("Authenticate to provider? (yes/no)", "no")
+                        .await?;
 
                     if use_auth.to_lowercase() == "yes" || use_auth.to_lowercase() == "y" {
-                        consumer_config.provider_bind_dn = Some(self.prompt_with_default(
-                            "Provider bind DN",
-                            "cn=replication,dc=example,dc=com",
-                        ).await?);
-
-                        consumer_config.provider_bind_password = Some(
-                            self.prompt_password("Provider bind password").await?
+                        consumer_config.provider_bind_dn = Some(
+                            self.prompt_with_default(
+                                "Provider bind DN",
+                                "cn=replication,dc=example,dc=com",
+                            )
+                            .await?,
                         );
+
+                        consumer_config.provider_bind_password =
+                            Some(self.prompt_password("Provider bind password").await?);
                     }
 
-                    let sync_interval = self.prompt_with_default(
-                        "Synchronization interval (seconds)",
-                        &consumer_config.sync_interval_secs.to_string(),
-                    ).await?;
-                    consumer_config.sync_interval_secs = sync_interval.parse()
+                    let sync_interval = self
+                        .prompt_with_default(
+                            "Synchronization interval (seconds)",
+                            &consumer_config.sync_interval_secs.to_string(),
+                        )
+                        .await?;
+                    consumer_config.sync_interval_secs = sync_interval
+                        .parse()
                         .map_err(|_| "Invalid number".to_string())?;
 
-                    let retry_attempts = self.prompt_with_default(
-                        "Maximum retry attempts",
-                        &consumer_config.max_retry_attempts.to_string(),
-                    ).await?;
-                    consumer_config.max_retry_attempts = retry_attempts.parse()
+                    let retry_attempts = self
+                        .prompt_with_default(
+                            "Maximum retry attempts",
+                            &consumer_config.max_retry_attempts.to_string(),
+                        )
+                        .await?;
+                    consumer_config.max_retry_attempts = retry_attempts
+                        .parse()
                         .map_err(|_| "Invalid number".to_string())?;
 
-                    let listening = self.prompt_with_default(
-                        "Enable continuous change listening? (yes/no)",
-                        "yes",
-                    ).await?;
-                    consumer_config.enable_change_listening = listening.to_lowercase() == "yes"
-                        || listening.to_lowercase() == "y";
+                    let retry_delay = self
+                        .prompt_with_default(
+                            "Retry delay (seconds)",
+                            &consumer_config.retry_delay_secs.to_string(),
+                        )
+                        .await?;
+                    consumer_config.retry_delay_secs = retry_delay
+                        .parse()
+                        .map_err(|_| "Invalid number".to_string())?;
 
-                    let state_path = self.prompt_with_default(
-                        "Replication state storage path",
-                        consumer_config.state_storage_path.to_string_lossy().as_ref(),
-                    ).await?;
+                    let listening = self
+                        .prompt_with_default("Enable continuous change listening? (yes/no)", "yes")
+                        .await?;
+                    consumer_config.enable_change_listening =
+                        listening.to_lowercase() == "yes" || listening.to_lowercase() == "y";
+
+                    let heartbeat_interval = self
+                        .prompt_with_default(
+                            "Listening heartbeat interval (seconds)",
+                            &consumer_config.heartbeat_interval_secs.to_string(),
+                        )
+                        .await?;
+                    consumer_config.heartbeat_interval_secs = heartbeat_interval
+                        .parse()
+                        .map_err(|_| "Invalid number".to_string())?;
+
+                    let state_path = self
+                        .prompt_with_default(
+                            "Replication state storage path",
+                            consumer_config
+                                .state_storage_path
+                                .to_string_lossy()
+                                .as_ref(),
+                        )
+                        .await?;
                     consumer_config.state_storage_path = PathBuf::from(state_path);
 
                     config.replication.consumer = Some(consumer_config);
@@ -572,7 +732,14 @@ lmdb_max_readers = 126
         if config.backend_type != BackendType::InMemory {
             println!("  Data Directory: {}", config.data_directory.display());
         }
-        println!("  Sample Data:    {}", if config.import_sample_data { "Yes" } else { "No" });
+        println!(
+            "  Sample Data:    {}",
+            if config.import_sample_data {
+                "Yes"
+            } else {
+                "No"
+            }
+        );
 
         // Replication summary
         if config.replication.enabled {
@@ -581,12 +748,26 @@ lmdb_max_readers = 126
             match config.replication.role {
                 ReplicationRole::Provider => {
                     if let Some(ref provider) = config.replication.provider {
-                        println!("  Changelog:      {}", if provider.changelog_enabled { "Enabled" } else { "Disabled" });
+                        println!(
+                            "  Changelog:      {}",
+                            if provider.changelog_enabled {
+                                "Enabled"
+                            } else {
+                                "Disabled"
+                            }
+                        );
                         if provider.changelog_enabled {
                             println!("  Max Entries:    {}", provider.changelog_max_entries);
                         }
                         println!("  Batch Size:     {}", provider.max_batch_size);
-                        println!("  Streaming:      {}", if provider.enable_streaming { "Enabled" } else { "Disabled" });
+                        println!(
+                            "  Streaming:      {}",
+                            if provider.enable_streaming {
+                                "Enabled"
+                            } else {
+                                "Disabled"
+                            }
+                        );
                     }
                 }
                 ReplicationRole::Consumer => {
@@ -597,7 +778,10 @@ lmdb_max_readers = 126
                         }
                         println!("  Sync Interval:  {} seconds", consumer.sync_interval_secs);
                         println!("  Retry Attempts: {}", consumer.max_retry_attempts);
-                        println!("  State Path:     {}", consumer.state_storage_path.display());
+                        println!(
+                            "  State Path:     {}",
+                            consumer.state_storage_path.display()
+                        );
                     }
                 }
             }
@@ -606,10 +790,9 @@ lmdb_max_readers = 126
         }
         println!();
 
-        let confirm = self.prompt_with_default(
-            "Proceed with this configuration? (yes/no)",
-            "yes",
-        ).await?;
+        let confirm = self
+            .prompt_with_default("Proceed with this configuration? (yes/no)", "yes")
+            .await?;
 
         if confirm.to_lowercase() != "yes" && confirm.to_lowercase() != "y" {
             return Err("Setup cancelled by user".to_string());
@@ -635,7 +818,10 @@ lmdb_max_readers = 126
 
         // 1. Create data directory if needed
         if config.backend_type != BackendType::InMemory {
-            println!("  ✓ Creating data directory: {}", config.data_directory.display());
+            println!(
+                "  ✓ Creating data directory: {}",
+                config.data_directory.display()
+            );
             fs::create_dir_all(&config.data_directory)
                 .await
                 .map_err(|e| format!("Failed to create data directory: {}", e))?;
@@ -644,7 +830,10 @@ lmdb_max_readers = 126
         // 1b. Create replication state directory if consumer
         if config.replication.enabled && config.replication.role == ReplicationRole::Consumer {
             if let Some(ref consumer) = config.replication.consumer {
-                println!("  ✓ Creating replication state directory: {}", consumer.state_storage_path.display());
+                println!(
+                    "  ✓ Creating replication state directory: {}",
+                    consumer.state_storage_path.display()
+                );
                 fs::create_dir_all(&consumer.state_storage_path)
                     .await
                     .map_err(|e| format!("Failed to create replication state directory: {}", e))?;
@@ -656,7 +845,10 @@ lmdb_max_readers = 126
         self.initialize_backend(config).await?;
 
         // 3. Create root user entry
-        println!("  ✓ Creating root administrator account: {}", config.root_user_dn);
+        println!(
+            "  ✓ Creating root administrator account: {}",
+            config.root_user_dn
+        );
         self.create_root_user(config).await?;
 
         // 4. Create base DN structure
@@ -724,7 +916,7 @@ lmdb_max_readers = 126
 
         if !has_uppercase || !has_lowercase || !has_digit {
             return Err(
-                "Password must contain uppercase, lowercase, and numeric characters".to_string()
+                "Password must contain uppercase, lowercase, and numeric characters".to_string(),
             );
         }
 
@@ -771,9 +963,7 @@ description: Root Administrator Account
         );
 
         // Store this in a special admin.ldif file
-        let admin_file = self.config_path.parent()
-            .unwrap()
-            .join("admin.ldif");
+        let admin_file = self.config_path.parent().unwrap().join("admin.ldif");
 
         fs::write(admin_file, ldif)
             .await
@@ -826,9 +1016,7 @@ objectClass: organization
 o: {}
 description: {}
 "#,
-                config.base_dn,
-                config.organization_name,
-                config.organization_name
+                config.base_dn, config.organization_name, config.organization_name
             ));
         }
 
@@ -847,9 +1035,7 @@ description: {} container
         }
 
         // Write to base.ldif
-        let base_file = self.config_path.parent()
-            .unwrap()
-            .join("base.ldif");
+        let base_file = self.config_path.parent().unwrap().join("base.ldif");
 
         let ldif_content = entries.join("\n");
         fs::write(base_file, ldif_content)
@@ -905,9 +1091,7 @@ description: Standard users group
             config.base_dn
         );
 
-        let sample_file = self.config_path.parent()
-            .unwrap()
-            .join("sample.ldif");
+        let sample_file = self.config_path.parent().unwrap().join("sample.ldif");
 
         fs::write(sample_file, sample_data)
             .await
@@ -941,14 +1125,16 @@ description: Standard users group
     async fn prompt_with_default(&self, prompt: &str, default: &str) -> Result<String, String> {
         use std::io::Write;
         print!("{} [{}]: ", prompt, default);
-        std::io::stdout().flush()
+        std::io::stdout()
+            .flush()
             .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::new(stdin);
         let mut input = String::new();
 
-        reader.read_line(&mut input)
+        reader
+            .read_line(&mut input)
             .await
             .map_err(|e| format!("Failed to read input: {}", e))?;
 
@@ -964,7 +1150,8 @@ description: Standard users group
     async fn prompt_password(&self, prompt: &str) -> Result<String, String> {
         use std::io::Write;
         print!("{}: ", prompt);
-        std::io::stdout().flush()
+        std::io::stdout()
+            .flush()
             .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
         // In production, use rpassword crate for hidden input
@@ -973,7 +1160,8 @@ description: Standard users group
         let mut reader = BufReader::new(stdin);
         let mut input = String::new();
 
-        reader.read_line(&mut input)
+        reader
+            .read_line(&mut input)
             .await
             .map_err(|e| format!("Failed to read input: {}", e))?;
 
@@ -983,10 +1171,7 @@ description: Standard users group
 
 /// Extract CN from DN
 fn extract_cn(dn: &str) -> Option<&str> {
-    dn.split(',')
-        .next()?
-        .split('=')
-        .nth(1)
+    dn.split(',').next()?.split('=').nth(1)
 }
 
 /// Parse DN into components
@@ -1020,7 +1205,10 @@ mod tests {
     #[test]
     fn test_extract_cn() {
         assert_eq!(extract_cn("cn=admin,dc=example,dc=com"), Some("admin"));
-        assert_eq!(extract_cn("uid=user,ou=people,dc=example,dc=com"), Some("user"));
+        assert_eq!(
+            extract_cn("uid=user,ou=people,dc=example,dc=com"),
+            Some("user")
+        );
     }
 
     #[test]

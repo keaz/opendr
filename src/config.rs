@@ -334,7 +334,7 @@ pub struct ReplicationSettings {
     pub enabled: bool,
 
     /// Replication mode: "provider", "consumer", "both"
-    #[serde(default = "default_replication_mode")]
+    #[serde(default = "default_replication_mode", alias = "role")]
     pub mode: String,
 
     /// Provider URL (for consumer mode)
@@ -373,8 +373,19 @@ pub struct ReplicationSettings {
     pub bind_password_file: Option<PathBuf>,
 
     /// Changelog capacity
-    #[serde(default = "default_changelog_capacity")]
+    #[serde(
+        default = "default_changelog_capacity",
+        alias = "changelog_max_entries"
+    )]
     pub changelog_capacity: usize,
+
+    /// Keep the provider changelog enabled when running in provider/both mode.
+    #[serde(default = "default_true")]
+    pub changelog_enabled: bool,
+
+    /// Maximum entries per replication batch.
+    #[serde(default = "default_replication_max_batch_size")]
+    pub max_batch_size: usize,
 
     /// Sync interval (seconds)
     #[serde(default = "default_sync_interval_secs")]
@@ -392,9 +403,33 @@ pub struct ReplicationSettings {
     #[serde(default = "default_true", alias = "listen_for_changes")]
     pub enable_change_listening: bool,
 
+    /// Enable provider-side live streaming support.
+    #[serde(default = "default_true")]
+    pub enable_streaming: bool,
+
     /// Heartbeat interval for listening-based replication (seconds)
     #[serde(default = "default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
+
+    /// Maximum concurrent provider-side consumers.
+    #[serde(default = "default_max_concurrent_consumers")]
+    pub max_concurrent_consumers: usize,
+
+    /// Provider-side consumer session timeout in seconds.
+    #[serde(default = "default_consumer_timeout_secs")]
+    pub consumer_timeout_secs: u64,
+
+    /// Consumer-side provider request timeout in seconds.
+    #[serde(default = "default_provider_timeout_secs")]
+    pub provider_timeout_secs: u64,
+
+    /// Consumer-side state persistence timeout in seconds.
+    #[serde(default = "default_state_persistence_timeout_secs")]
+    pub state_persistence_timeout_secs: u64,
+
+    /// Consumer-side live change buffer size.
+    #[serde(default = "default_change_buffer_size")]
+    pub change_buffer_size: usize,
 
     /// Path for persisted replication state
     #[serde(default = "default_replication_state_storage_path")]
@@ -675,6 +710,9 @@ fn default_replication_mode() -> String {
 fn default_changelog_capacity() -> usize {
     10000
 }
+fn default_replication_max_batch_size() -> usize {
+    100
+}
 fn default_sync_interval_secs() -> u64 {
     60
 }
@@ -686,6 +724,21 @@ fn default_retry_delay_secs() -> u64 {
 }
 fn default_heartbeat_interval_secs() -> u64 {
     30
+}
+fn default_max_concurrent_consumers() -> usize {
+    10
+}
+fn default_consumer_timeout_secs() -> u64 {
+    300
+}
+fn default_provider_timeout_secs() -> u64 {
+    30
+}
+fn default_state_persistence_timeout_secs() -> u64 {
+    10
+}
+fn default_change_buffer_size() -> usize {
+    1000
 }
 fn default_replication_state_storage_path() -> PathBuf {
     PathBuf::from("./data/replication_state")
@@ -816,11 +869,19 @@ impl Default for ReplicationSettings {
             bind_password_env: None,
             bind_password_file: None,
             changelog_capacity: default_changelog_capacity(),
+            changelog_enabled: true,
+            max_batch_size: default_replication_max_batch_size(),
             sync_interval_secs: default_sync_interval_secs(),
             max_retry_attempts: default_max_retry_attempts(),
             retry_delay_secs: default_retry_delay_secs(),
             enable_change_listening: true,
+            enable_streaming: true,
             heartbeat_interval_secs: default_heartbeat_interval_secs(),
+            max_concurrent_consumers: default_max_concurrent_consumers(),
+            consumer_timeout_secs: default_consumer_timeout_secs(),
+            provider_timeout_secs: default_provider_timeout_secs(),
+            state_persistence_timeout_secs: default_state_persistence_timeout_secs(),
+            change_buffer_size: default_change_buffer_size(),
             state_storage_path: default_replication_state_storage_path(),
             stream_port: 0,
         }
@@ -1016,11 +1077,22 @@ impl fmt::Debug for ReplicationSettings {
             .field("bind_password_env", &self.bind_password_env)
             .field("bind_password_file", &self.bind_password_file)
             .field("changelog_capacity", &self.changelog_capacity)
+            .field("changelog_enabled", &self.changelog_enabled)
+            .field("max_batch_size", &self.max_batch_size)
             .field("sync_interval_secs", &self.sync_interval_secs)
             .field("max_retry_attempts", &self.max_retry_attempts)
             .field("retry_delay_secs", &self.retry_delay_secs)
             .field("enable_change_listening", &self.enable_change_listening)
+            .field("enable_streaming", &self.enable_streaming)
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("max_concurrent_consumers", &self.max_concurrent_consumers)
+            .field("consumer_timeout_secs", &self.consumer_timeout_secs)
+            .field("provider_timeout_secs", &self.provider_timeout_secs)
+            .field(
+                "state_persistence_timeout_secs",
+                &self.state_persistence_timeout_secs,
+            )
+            .field("change_buffer_size", &self.change_buffer_size)
             .field("state_storage_path", &self.state_storage_path)
             .field("stream_port", &self.stream_port)
             .finish()
@@ -1028,6 +1100,10 @@ impl fmt::Debug for ReplicationSettings {
 }
 
 impl ServerConfig {
+    fn normalize_compatibility_fields(&mut self) {
+        self.replication.mode = self.replication.mode.to_lowercase();
+    }
+
     fn normalize_secret_placeholders(&mut self) {
         let uses_external_root_secret =
             self.server.root_password_env.is_some() || self.server.root_password_file.is_some();
@@ -1173,6 +1249,7 @@ impl ServerConfig {
         let mut config: Self = config
             .try_deserialize()
             .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        config.normalize_compatibility_fields();
         config.normalize_secret_placeholders();
         Ok(config)
     }
@@ -1181,6 +1258,7 @@ impl ServerConfig {
     pub fn from_toml_str(toml: &str) -> Result<Self, ConfigError> {
         let mut config: Self =
             toml::from_str(toml).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        config.normalize_compatibility_fields();
         config.normalize_secret_placeholders();
         Ok(config)
     }
@@ -1320,6 +1398,11 @@ impl ServerConfig {
                     "max_retry_attempts must be > 0".to_string(),
                 ));
             }
+            if self.replication.max_batch_size == 0 {
+                return Err(ConfigError::ValidationError(
+                    "max_batch_size must be > 0".to_string(),
+                ));
+            }
             if self.replication.retry_delay_secs == 0 {
                 return Err(ConfigError::ValidationError(
                     "retry_delay_secs must be > 0".to_string(),
@@ -1328,6 +1411,31 @@ impl ServerConfig {
             if self.replication.heartbeat_interval_secs == 0 {
                 return Err(ConfigError::ValidationError(
                     "heartbeat_interval_secs must be > 0".to_string(),
+                ));
+            }
+            if self.replication.max_concurrent_consumers == 0 {
+                return Err(ConfigError::ValidationError(
+                    "max_concurrent_consumers must be > 0".to_string(),
+                ));
+            }
+            if self.replication.consumer_timeout_secs == 0 {
+                return Err(ConfigError::ValidationError(
+                    "consumer_timeout_secs must be > 0".to_string(),
+                ));
+            }
+            if self.replication.provider_timeout_secs == 0 {
+                return Err(ConfigError::ValidationError(
+                    "provider_timeout_secs must be > 0".to_string(),
+                ));
+            }
+            if self.replication.state_persistence_timeout_secs == 0 {
+                return Err(ConfigError::ValidationError(
+                    "state_persistence_timeout_secs must be > 0".to_string(),
+                ));
+            }
+            if self.replication.change_buffer_size == 0 {
+                return Err(ConfigError::ValidationError(
+                    "change_buffer_size must be > 0".to_string(),
                 ));
             }
             if self.replication.stream_port != 0

@@ -94,6 +94,8 @@ pub struct ProviderServiceConfig {
     pub enable_streaming: bool,
     pub heartbeat_interval_secs: u64,
     pub max_concurrent_consumers: usize,
+    pub consumer_timeout_secs: u64,
+    pub max_retry_attempts: u32,
 }
 
 /// Consumer service configuration
@@ -103,11 +105,15 @@ pub struct ConsumerServiceConfig {
     pub base_dn: String,
     pub provider_bind_dn: Option<String>,
     pub provider_bind_password: Option<String>,
+    pub max_batch_size: usize,
     pub sync_interval_secs: u64,
     pub max_retry_attempts: u32,
     pub retry_delay_secs: u64,
     pub enable_change_listening: bool,
     pub heartbeat_interval_secs: u64,
+    pub provider_timeout_secs: u64,
+    pub state_persistence_timeout_secs: u64,
+    pub change_buffer_size: usize,
     pub state_storage_path: String,
 }
 
@@ -125,11 +131,18 @@ impl fmt::Debug for ConsumerServiceConfig {
                     .map(|_| "<redacted>")
                     .unwrap_or("<unset>"),
             )
+            .field("max_batch_size", &self.max_batch_size)
             .field("sync_interval_secs", &self.sync_interval_secs)
             .field("max_retry_attempts", &self.max_retry_attempts)
             .field("retry_delay_secs", &self.retry_delay_secs)
             .field("enable_change_listening", &self.enable_change_listening)
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
+            .field("provider_timeout_secs", &self.provider_timeout_secs)
+            .field(
+                "state_persistence_timeout_secs",
+                &self.state_persistence_timeout_secs,
+            )
+            .field("change_buffer_size", &self.change_buffer_size)
             .field("state_storage_path", &self.state_storage_path)
             .finish()
     }
@@ -149,9 +162,14 @@ impl ReplicationService {
         backend: Arc<dyn DirectoryBackend>,
     ) -> Result<Self, String> {
         let repl_config = Self::parse_replication_config(config)?;
+        let should_track_changelog = repl_config
+            .provider_config
+            .as_ref()
+            .map(|provider| provider.changelog_enabled)
+            .unwrap_or(false);
 
         // Create changelog if replication enabled
-        let changelog = if repl_config.enabled {
+        let changelog = if should_track_changelog {
             let capacity = repl_config
                 .provider_config
                 .as_ref()
@@ -169,10 +187,7 @@ impl ReplicationService {
         };
 
         // Wrap backend with changelog tracking if provider mode
-        let wrapped_backend = if repl_config.enabled
-            && (repl_config.mode == ReplicationMode::Provider
-                || repl_config.mode == ReplicationMode::Both)
-        {
+        let wrapped_backend = if should_track_changelog {
             let mut wrapper = ChangelogBackendWrapper::new(backend.clone(), changelog.clone());
             let (replication_sender, _) = broadcast::channel(1024);
             wrapper.set_replication_sender(replication_sender);
@@ -216,11 +231,13 @@ impl ReplicationService {
         {
             Some(ProviderServiceConfig {
                 changelog_capacity: config.replication.changelog_capacity,
-                changelog_enabled: true,
-                max_batch_size: 100,
-                enable_streaming: true,
-                heartbeat_interval_secs: 60,
-                max_concurrent_consumers: 10,
+                changelog_enabled: config.replication.changelog_enabled,
+                max_batch_size: config.replication.max_batch_size,
+                enable_streaming: config.replication.enable_streaming,
+                heartbeat_interval_secs: config.replication.heartbeat_interval_secs,
+                max_concurrent_consumers: config.replication.max_concurrent_consumers,
+                consumer_timeout_secs: config.replication.consumer_timeout_secs,
+                max_retry_attempts: config.replication.max_retry_attempts,
             })
         } else {
             None
@@ -242,11 +259,15 @@ impl ReplicationService {
                 base_dn: config.server.base_dn.clone(),
                 provider_bind_dn: config.replication.bind_dn.clone(),
                 provider_bind_password,
+                max_batch_size: config.replication.max_batch_size,
                 sync_interval_secs: config.replication.sync_interval_secs,
                 max_retry_attempts: config.replication.max_retry_attempts,
                 retry_delay_secs: config.replication.retry_delay_secs,
                 enable_change_listening: config.replication.enable_change_listening,
                 heartbeat_interval_secs: config.replication.heartbeat_interval_secs,
+                provider_timeout_secs: config.replication.provider_timeout_secs,
+                state_persistence_timeout_secs: config.replication.state_persistence_timeout_secs,
+                change_buffer_size: config.replication.change_buffer_size,
                 state_storage_path: config.replication.state_storage_path.display().to_string(),
             })
         } else {
@@ -319,12 +340,12 @@ impl ReplicationService {
         let fsm_config = ReplicationProviderConfig {
             refresh_batch_size: provider_config.max_batch_size,
             changelog_batch_size: provider_config.max_batch_size / 2,
-            consumer_timeout: Duration::from_secs(300),
+            consumer_timeout: Duration::from_secs(provider_config.consumer_timeout_secs),
             max_concurrent_consumers: provider_config.max_concurrent_consumers as u32,
             enable_compression: true,
             heartbeat_interval: Duration::from_secs(provider_config.heartbeat_interval_secs),
             cookie_expiry: Duration::from_secs(3600),
-            max_retry_attempts: 3,
+            max_retry_attempts: provider_config.max_retry_attempts,
         };
 
         // Create provider FSM
@@ -433,7 +454,7 @@ impl ReplicationService {
                         consumer_config.base_dn.clone(),
                         consumer_config.provider_bind_dn.clone(),
                         consumer_config.provider_bind_password.clone(),
-                        1000,
+                        consumer_config.change_buffer_size,
                     ))
                 }
             } else {
@@ -442,14 +463,16 @@ impl ReplicationService {
 
         // Create consumer FSM configuration
         let fsm_config = ConsumerConfig {
-            max_batch_size: 100,
-            provider_timeout: Duration::from_secs(30),
+            max_batch_size: consumer_config.max_batch_size,
+            provider_timeout: Duration::from_secs(consumer_config.provider_timeout_secs),
             max_retry_attempts: consumer_config.max_retry_attempts,
             retry_delay: Duration::from_secs(consumer_config.retry_delay_secs),
             enable_change_listening: consumer_config.enable_change_listening,
             heartbeat_interval: Duration::from_secs(consumer_config.heartbeat_interval_secs),
-            change_buffer_size: 1000,
-            state_persistence_timeout: Duration::from_secs(10),
+            change_buffer_size: consumer_config.change_buffer_size,
+            state_persistence_timeout: Duration::from_secs(
+                consumer_config.state_persistence_timeout_secs,
+            ),
         };
 
         // Create consumer FSM
@@ -702,6 +725,7 @@ mod tests {
 
         assert!(!service.is_provider());
         assert!(service.is_consumer());
+        assert!(service.changelog().is_none());
     }
 
     #[test]
@@ -875,6 +899,7 @@ mod tests {
         let mut config = create_test_config();
         config.replication.mode = "consumer".to_string();
         config.replication.provider_url = Some("ldap://provider:389".to_string());
+        config.replication.max_batch_size = 150;
         config.replication.sync_interval_secs = 60;
         config.replication.bind_dn = Some("cn=admin,dc=example,dc=com".to_string());
         config.replication.bind_password = Some("secret".to_string());
@@ -888,6 +913,7 @@ mod tests {
 
         let consumer_cfg = service.config.consumer_config.as_ref().unwrap();
         assert_eq!(consumer_cfg.provider_url, "ldap://provider:389");
+        assert_eq!(consumer_cfg.max_batch_size, 150);
         assert_eq!(consumer_cfg.sync_interval_secs, 60);
         assert_eq!(
             consumer_cfg.provider_bind_dn,
@@ -925,10 +951,14 @@ mod tests {
         config.server.base_dn = "dc=test,dc=org".to_string();
         config.replication.mode = "consumer".to_string();
         config.replication.provider_url = Some("ldap://provider:389".to_string());
+        config.replication.max_batch_size = 250;
         config.replication.max_retry_attempts = 7;
         config.replication.retry_delay_secs = 11;
         config.replication.enable_change_listening = false;
         config.replication.heartbeat_interval_secs = 45;
+        config.replication.provider_timeout_secs = 90;
+        config.replication.state_persistence_timeout_secs = 18;
+        config.replication.change_buffer_size = 4096;
         config.replication.state_storage_path =
             std::path::PathBuf::from("/tmp/opendr-replication-state");
         let backend = Arc::new(MockBackend::new());
@@ -937,13 +967,40 @@ mod tests {
         let consumer_cfg = service.consumer_config().unwrap();
 
         assert_eq!(consumer_cfg.base_dn, "dc=test,dc=org");
+        assert_eq!(consumer_cfg.max_batch_size, 250);
         assert_eq!(consumer_cfg.max_retry_attempts, 7);
         assert_eq!(consumer_cfg.retry_delay_secs, 11);
         assert!(!consumer_cfg.enable_change_listening);
         assert_eq!(consumer_cfg.heartbeat_interval_secs, 45);
+        assert_eq!(consumer_cfg.provider_timeout_secs, 90);
+        assert_eq!(consumer_cfg.state_persistence_timeout_secs, 18);
+        assert_eq!(consumer_cfg.change_buffer_size, 4096);
         assert_eq!(
             consumer_cfg.state_storage_path,
             "/tmp/opendr-replication-state"
         );
+    }
+
+    #[test]
+    fn test_provider_config_parses_runtime_settings() {
+        let mut config = create_test_config();
+        config.replication.max_batch_size = 220;
+        config.replication.enable_streaming = false;
+        config.replication.heartbeat_interval_secs = 75;
+        config.replication.max_concurrent_consumers = 17;
+        config.replication.consumer_timeout_secs = 600;
+        config.replication.max_retry_attempts = 8;
+        let backend = Arc::new(MockBackend::new());
+
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_cfg = service.provider_config().unwrap();
+
+        assert!(provider_cfg.changelog_enabled);
+        assert_eq!(provider_cfg.max_batch_size, 220);
+        assert!(!provider_cfg.enable_streaming);
+        assert_eq!(provider_cfg.heartbeat_interval_secs, 75);
+        assert_eq!(provider_cfg.max_concurrent_consumers, 17);
+        assert_eq!(provider_cfg.consumer_timeout_secs, 600);
+        assert_eq!(provider_cfg.max_retry_attempts, 8);
     }
 }
