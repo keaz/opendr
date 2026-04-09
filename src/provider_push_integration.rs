@@ -3,6 +3,11 @@
 //! This module integrates the Replication Provider FSM with the Push Manager
 //! to enable refreshAndPersist mode support for push-based replication.
 //!
+//! The active server runtime now delivers RFC 4533 live updates through the
+//! provider-owned search session in [`crate::server::handle_search_request`].
+//! This module remains as a compatibility harness around older push-manager
+//! abstractions and is not the shipped streaming path for the server binary.
+//!
 //! # Architecture
 //!
 //! ```text

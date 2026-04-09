@@ -4,6 +4,11 @@
 //! to consumers in refreshAndPersist mode (RFC 4533). It manages connection lifecycle,
 //! sends change notifications in real-time, and handles connection health monitoring.
 //!
+//! The shipped server runtime now delivers live replication over the provider's
+//! active LDAP search session in [`crate::server::handle_search_request`]. This
+//! module remains as compatibility infrastructure for older push-manager tests
+//! and experiments that model outbound delivery separately from the runtime.
+//!
 //! # Key Components
 //!
 //! - `PersistentConsumer`: Maintains a persistent LDAP connection to a single consumer

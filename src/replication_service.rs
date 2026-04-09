@@ -46,10 +46,9 @@ use crate::backend::DirectoryBackend;
 use crate::backend_changelog_wrapper::ChangelogBackendWrapper;
 use crate::config::ServerConfig;
 use crate::replication::{
-    ChangeListenerImpl, ChangelogProviderImpl, ChangelogTracker, ConsumerRegistryImpl,
-    LdapChangeListener, ProviderConnectionImpl, StreamingManagerImpl, SyncRequestHandlerImpl,
+    ChangeListenerImpl, ChangelogProviderImpl, ChangelogTracker, LdapChangeListener,
+    ProviderConnectionImpl,
 };
-use crate::replication_provider_fsm::{ReplicationProviderConfig, ReplicationProviderFsmImpl};
 use crate::shutdown::ShutdownCoordinator;
 
 /// Replication service for managing provider and consumer
@@ -322,42 +321,14 @@ impl ReplicationService {
             .as_ref()
             .ok_or_else(|| "Provider config not available".to_string())?;
 
-        let changelog = self
-            .changelog
+        self.changelog
             .as_ref()
             .ok_or_else(|| "Changelog not initialized".to_string())?;
 
-        info!("Starting replication provider service");
-
-        // Create provider dependencies
-        let changelog_provider = Box::new(ChangelogProviderImpl::new(
-            changelog.as_ref().clone(),
-            self.original_backend.clone(),
-        ));
-
-        let consumer_registry = Box::new(ConsumerRegistryImpl::new());
-        let streaming_manager = Box::new(StreamingManagerImpl::new());
-        let sync_handler = Box::new(SyncRequestHandlerImpl::new());
-
-        // Create provider FSM configuration
-        let fsm_config = ReplicationProviderConfig {
-            refresh_batch_size: provider_config.max_batch_size,
-            changelog_batch_size: provider_config.max_batch_size / 2,
-            consumer_timeout: Duration::from_secs(provider_config.consumer_timeout_secs),
-            max_concurrent_consumers: provider_config.max_concurrent_consumers as u32,
-            enable_compression: true,
-            heartbeat_interval: Duration::from_secs(provider_config.heartbeat_interval_secs),
-            cookie_expiry: Duration::from_secs(3600),
-            max_retry_attempts: provider_config.max_retry_attempts,
-        };
-
-        // Create provider FSM
-        let _provider_fsm = ReplicationProviderFsmImpl::with_config(
-            changelog_provider,
-            consumer_registry,
-            streaming_manager,
-            sync_handler,
-            fsm_config,
+        info!(
+            "Starting replication provider service with inbound stream sessions (streaming={}, heartbeat={}s)",
+            provider_config.enable_streaming,
+            provider_config.heartbeat_interval_secs
         );
 
         // Get shutdown receiver
@@ -365,7 +336,9 @@ impl ReplicationService {
 
         // Spawn provider service task
         let handle = tokio::spawn(async move {
-            info!("Replication provider service started");
+            info!(
+                "Replication provider service started; live changes are served through inbound replication search sessions"
+            );
 
             // Wait for shutdown signal
             let _ = shutdown_rx.recv().await;

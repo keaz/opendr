@@ -3,6 +3,11 @@
 //! This module implements the Push Manager, which coordinates real-time change
 //! propagation to persistent consumers in refreshAndPersist mode (RFC 4533).
 //!
+//! The active runtime path for replication streaming is the provider-owned LDAP
+//! search session handled in [`crate::server::handle_search_request`]. This
+//! module remains available for compatibility and test harnesses that model
+//! push delivery outside the shipped server runtime.
+//!
 //! # Architecture
 //!
 //! ```text

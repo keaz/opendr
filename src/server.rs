@@ -1058,18 +1058,14 @@ async fn handle_replication_stream_request(
     base_dn: &str,
     attribute_selection: &[String],
 ) -> Result<(), ServerError> {
+    let mut session = ProviderOwnedReplicationSession::new(socket, message_id, base_dn);
+
     let mut receiver = if let Some(receiver) = backend.subscribe_to_replication_changes() {
         receiver
     } else {
-        send_result(
-            socket,
-            message_id,
-            ResponseOp::SearchDone,
-            ResultCode::Unavailable,
-            base_dn,
-            "replication stream not available",
-        )
-        .await?;
+        session
+            .send_unavailable("replication stream not available")
+            .await?;
         return Ok(());
     };
 
@@ -1092,7 +1088,7 @@ async fn handle_replication_stream_request(
             if !is_dn_in_scope(&entry.dn, base_dn) {
                 continue;
             }
-            send_replication_stream_entry(socket, message_id, &entry).await?;
+            session.send_change(&entry).await?;
         }
     }
 
@@ -1102,7 +1098,7 @@ async fn handle_replication_stream_request(
                 if !is_dn_in_scope(&entry.dn, base_dn) {
                     continue;
                 }
-                if let Err(err) = send_replication_stream_entry(socket, message_id, &entry).await {
+                if let Err(err) = session.send_change(&entry).await {
                     warn!("Replication stream send failed: {}", err);
                     break;
                 }
@@ -1114,29 +1110,60 @@ async fn handle_replication_stream_request(
         }
     }
 
-    let _ = send_result(
-        socket,
-        message_id,
-        ResponseOp::SearchDone,
-        ResultCode::Success,
-        base_dn,
-        "",
-    )
-    .await;
+    let _ = session.finish().await;
 
     Ok(())
 }
 
-async fn send_replication_stream_entry(
-    socket: &mut TcpStream,
+struct ProviderOwnedReplicationSession<'a> {
+    socket: &'a mut TcpStream,
     message_id: u32,
-    entry: &crate::replication_provider_fsm::ChangelogEntry,
-) -> Result<(), ServerError> {
-    let synthetic_entry = DirectoryEntry::new(entry.dn.clone(), HashMap::new());
-    let attributes = changelog_entry_to_replication_attrs(entry);
-    let encoded = encode_search_entry(message_id, &synthetic_entry, &attributes, false)?;
-    socket.write_all(&encoded).await?;
-    Ok(())
+    base_dn: &'a str,
+}
+
+impl<'a> ProviderOwnedReplicationSession<'a> {
+    fn new(socket: &'a mut TcpStream, message_id: u32, base_dn: &'a str) -> Self {
+        Self {
+            socket,
+            message_id,
+            base_dn,
+        }
+    }
+
+    async fn send_change(
+        &mut self,
+        entry: &crate::replication_provider_fsm::ChangelogEntry,
+    ) -> Result<(), ServerError> {
+        let synthetic_entry = DirectoryEntry::new(entry.dn.clone(), HashMap::new());
+        let attributes = changelog_entry_to_replication_attrs(entry);
+        let encoded = encode_search_entry(self.message_id, &synthetic_entry, &attributes, false)?;
+        self.socket.write_all(&encoded).await?;
+        Ok(())
+    }
+
+    async fn send_unavailable(&mut self, message: &str) -> Result<(), ServerError> {
+        send_result(
+            self.socket,
+            self.message_id,
+            ResponseOp::SearchDone,
+            ResultCode::Unavailable,
+            self.base_dn,
+            message,
+        )
+        .await
+    }
+
+    async fn finish(&mut self) -> Result<(), ServerError> {
+        send_result(
+            self.socket,
+            self.message_id,
+            ResponseOp::SearchDone,
+            ResultCode::Success,
+            self.base_dn,
+            "",
+        )
+        .await
+    }
 }
 
 pub async fn handle_modify_request(
@@ -1647,13 +1674,17 @@ fn bytes_to_string(value: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::backend::MockBackend;
+    use crate::config::ServerConfig;
+    use crate::replication::REPLICATION_STREAM_ATTRIBUTE;
+    use crate::replication_service::ReplicationService;
     use ldap_parser::filter::{
         Attribute as FilterAttribute, AttributeValue, AttributeValueAssertion, Filter,
         PartialAttribute,
     };
     use ldap_parser::ldap::LdapString;
     use ldap_parser::ldap::{
-        AuthenticationChoice, BindRequest, LdapDN, ResultCode as ParserResultCode,
+        AuthenticationChoice, BindRequest, DerefAliases, LdapDN, ResultCode as ParserResultCode,
+        SearchRequest, SearchScope,
     };
     use ldap_parser::ldap::{Change, Operation};
     use rasn::der;
@@ -1683,6 +1714,21 @@ mod tests {
             .expect("failed to read response");
         buf.truncate(len);
         buf
+    }
+
+    fn replication_stream_request() -> SearchRequest<'static> {
+        SearchRequest {
+            base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
+            scope: SearchScope::BaseObject,
+            deref_aliases: DerefAliases(0),
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter: Filter::Present(LdapString(Cow::Owned("objectClass".to_string()))),
+            attributes: vec![LdapString(Cow::Owned(
+                REPLICATION_STREAM_ATTRIBUTE.to_string(),
+            ))],
+        }
     }
 
     #[test]
@@ -1911,5 +1957,79 @@ mod tests {
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replication_stream_request_without_provider_runtime_returns_unavailable() {
+        let backend = MockBackend::new();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_search_request(
+            &mut server_stream,
+            &backend,
+            9,
+            replication_stream_request(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Unavailable);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_stream_request_emits_live_change_through_provider_owned_session() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request = replication_stream_request();
+        let stream_backend = provider_backend.clone();
+
+        let handler = tokio::spawn(async move {
+            handle_search_request(&mut server_stream, stream_backend.as_ref(), 11, request)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=stream-user,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["stream-user".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_))));
+
+        handler.abort();
+        let _ = handler.await;
     }
 }
