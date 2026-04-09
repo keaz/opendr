@@ -23,6 +23,7 @@ pub mod fsm;
 pub mod fsm_runtime;
 pub mod fsm_server;
 pub mod metrics;
+pub mod monitoring_runtime;
 pub mod operational_attrs;
 pub mod parser;
 pub mod persistent_connection;

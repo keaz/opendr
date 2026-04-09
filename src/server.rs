@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ldap_parser::filter::{Filter, Substring, SubstringFilter};
 use ldap_parser::ldap::{
@@ -19,6 +20,7 @@ use crate::backend::{
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
+use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
     encode_bind_response, encode_result_response, encode_search_entry, ResponseOp,
 };
@@ -85,7 +87,16 @@ impl ConnectionSession {
 pub async fn run(
     addr: &str,
     backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), ServerError> {
+    run_with_metrics(addr, backend, shutdown_rx, None).await
+}
+
+pub async fn run_with_metrics(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAP server listening on {}", addr);
@@ -96,14 +107,30 @@ pub async fn run(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (socket, addr) = result?;
+                let (socket, addr) = match result {
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_connection_failed();
+                        }
+                        return Err(err.into());
+                    }
+                };
                 info!("Accepted connection from {:?}", addr);
 
                 let backend = backend.clone();
                 let schema = schema.clone();
+                let metrics = metrics.clone();
+
+                if let Some(metrics) = metrics.as_ref() {
+                    metrics.record_connection_accepted();
+                }
 
                 tokio::spawn(async move {
-                    handle_client(socket, backend, schema).await;
+                    handle_client_with_metrics(socket, backend, schema, metrics.clone()).await;
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_connection_closed();
+                    }
                     info!("Connection {:?} closed", addr);
                 });
             }
@@ -119,9 +146,18 @@ pub async fn run(
 }
 
 pub async fn handle_client(
+    socket: TcpStream,
+    backend: Arc<dyn DirectoryBackend>,
+    schema: Arc<LdapSchema>,
+) {
+    handle_client_with_metrics(socket, backend, schema, None).await;
+}
+
+async fn handle_client_with_metrics(
     mut socket: TcpStream,
     backend: Arc<dyn DirectoryBackend>,
     schema: Arc<LdapSchema>,
+    metrics: Option<Arc<MetricsCollector>>,
 ) {
     let mut read_buffer = vec![0; 8192];
     let mut decoder = BerDecoderFsmImpl::new();
@@ -154,15 +190,35 @@ pub async fn handle_client(
                     match parse_ldap_messages(&message_bytes) {
                         Ok((_, messages)) => {
                             for message in messages {
-                                if let Err(err) = process_message_with_session(
+                                let operation_type =
+                                    operation_type_for_protocol(&message.protocol_op);
+                                let started_at = Instant::now();
+                                if let Some(metrics) = metrics.as_ref() {
+                                    if let Some(operation_type) = operation_type {
+                                        metrics.record_operation_start(operation_type, "");
+                                    }
+                                }
+
+                                let result = process_message_with_session(
                                     &mut socket,
                                     backend.as_ref(),
                                     schema.as_ref(),
                                     &mut session,
                                     message,
                                 )
-                                .await
-                                {
+                                .await;
+
+                                if let Some(metrics) = metrics.as_ref() {
+                                    if let Some(operation_type) = operation_type {
+                                        metrics.record_operation_complete(
+                                            operation_type,
+                                            started_at.elapsed(),
+                                            result.is_ok(),
+                                        );
+                                    }
+                                }
+
+                                if let Err(err) = result {
                                     error!("Failed to process message: {}", err);
                                     return;
                                 }
@@ -186,10 +242,29 @@ pub async fn handle_client(
                 }
             }
             Err(err) => {
+                if let Some(metrics) = metrics.as_ref() {
+                    metrics.record_connection_failed();
+                }
                 error!("Failed to read from socket: {}", err);
                 return;
             }
         }
+    }
+}
+
+fn operation_type_for_protocol(protocol_op: &ProtocolOp<'_>) -> Option<OperationType> {
+    match protocol_op {
+        ProtocolOp::BindRequest(_) => Some(OperationType::Bind),
+        ProtocolOp::SearchRequest(_) => Some(OperationType::Search),
+        ProtocolOp::ModifyRequest(_) => Some(OperationType::Modify),
+        ProtocolOp::AddRequest(_) => Some(OperationType::Add),
+        ProtocolOp::DelRequest(_) => Some(OperationType::Delete),
+        ProtocolOp::ModDnRequest(_) => Some(OperationType::ModifyDN),
+        ProtocolOp::CompareRequest(_) => Some(OperationType::Compare),
+        ProtocolOp::UnbindRequest => Some(OperationType::Unbind),
+        ProtocolOp::AbandonRequest(_) => Some(OperationType::Abandon),
+        ProtocolOp::ExtendedRequest(_) => Some(OperationType::Extended),
+        _ => None,
     }
 }
 

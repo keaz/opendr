@@ -5,6 +5,8 @@ use std::sync::Arc;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
 use opendr::config::ServerConfig;
+use opendr::metrics::MetricsCollector;
+use opendr::monitoring_runtime::{spawn_monitoring_server, ComponentStatus, RuntimeHealthRegistry};
 use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
@@ -34,6 +36,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         shutdown_signal.wait().await;
         println!("\nShutdown signal received, initiating graceful shutdown...");
     });
+
+    let monitoring_metrics = if config.monitoring.enabled {
+        Some(MetricsCollector::new())
+    } else {
+        None
+    };
+    let monitoring_health = if config.monitoring.enabled {
+        Some(RuntimeHealthRegistry::new())
+    } else {
+        None
+    };
 
     // Create backend based on configuration
     let raw_backend: Arc<dyn DirectoryBackend> =
@@ -86,8 +99,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
+    if let Some(health) = monitoring_health.as_ref() {
+        health
+            .set_component(
+                "backend",
+                ComponentStatus::Healthy,
+                Some(format!(
+                    "{} backend initialized",
+                    config.backend.backend_type.to_lowercase()
+                )),
+            )
+            .await;
+    }
+
     // Wrap backend with replication service if configured
     let replication_service = ReplicationService::from_config(&config, raw_backend)?;
+
+    if let Some(health) = monitoring_health.as_ref() {
+        let provider_status = if replication_service.is_provider() {
+            (
+                ComponentStatus::Degraded,
+                Some("replication provider is configured but not started yet".to_string()),
+            )
+        } else {
+            (
+                ComponentStatus::Disabled,
+                Some("replication provider not enabled".to_string()),
+            )
+        };
+        health
+            .set_component("replication_provider", provider_status.0, provider_status.1)
+            .await;
+
+        let consumer_status = if replication_service.is_consumer() {
+            (
+                ComponentStatus::Degraded,
+                Some("replication consumer is configured but not started yet".to_string()),
+            )
+        } else {
+            (
+                ComponentStatus::Disabled,
+                Some("replication consumer not enabled".to_string()),
+            )
+        };
+        health
+            .set_component("replication_consumer", consumer_status.0, consumer_status.1)
+            .await;
+    }
 
     // Get the backend to use (wrapped with changelog if provider enabled)
     let backend = replication_service.backend();
@@ -96,10 +154,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let provider_handle = match replication_service.start_provider(shutdown.clone()).await {
         Ok(Some(handle)) => {
             println!("Replication provider started");
+            if let Some(health) = monitoring_health.as_ref() {
+                health
+                    .set_component(
+                        "replication_provider",
+                        ComponentStatus::Healthy,
+                        Some("replication provider running".to_string()),
+                    )
+                    .await;
+            }
             Some(handle)
         }
-        Ok(None) => None,
+        Ok(None) => {
+            if let Some(health) = monitoring_health.as_ref() {
+                health
+                    .set_component(
+                        "replication_provider",
+                        ComponentStatus::Disabled,
+                        Some("replication provider not enabled".to_string()),
+                    )
+                    .await;
+            }
+            None
+        }
         Err(e) => {
+            if let Some(health) = monitoring_health.as_ref() {
+                health
+                    .set_component(
+                        "replication_provider",
+                        ComponentStatus::Degraded,
+                        Some(format!("replication provider failed to start: {e}")),
+                    )
+                    .await;
+            }
             eprintln!("Failed to start replication provider: {}", e);
             None
         }
@@ -109,13 +196,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let consumer_handle = match replication_service.start_consumer(shutdown.clone()).await {
         Ok(Some(handle)) => {
             println!("Replication consumer started");
+            if let Some(health) = monitoring_health.as_ref() {
+                health
+                    .set_component(
+                        "replication_consumer",
+                        ComponentStatus::Healthy,
+                        Some("replication consumer running".to_string()),
+                    )
+                    .await;
+            }
             Some(handle)
         }
-        Ok(None) => None,
+        Ok(None) => {
+            if let Some(health) = monitoring_health.as_ref() {
+                health
+                    .set_component(
+                        "replication_consumer",
+                        ComponentStatus::Disabled,
+                        Some("replication consumer not enabled".to_string()),
+                    )
+                    .await;
+            }
+            None
+        }
         Err(e) => {
+            if let Some(health) = monitoring_health.as_ref() {
+                health
+                    .set_component(
+                        "replication_consumer",
+                        ComponentStatus::Degraded,
+                        Some(format!("replication consumer failed to start: {e}")),
+                    )
+                    .await;
+            }
             eprintln!("Failed to start replication consumer: {}", e);
             None
         }
+    };
+
+    let monitoring_handle = if let (Some(metrics), Some(health)) =
+        (monitoring_metrics.clone(), monitoring_health.clone())
+    {
+        Some(spawn_monitoring_server(
+            config.monitoring.clone(),
+            metrics,
+            health,
+            shutdown_clone.subscribe(),
+        )?)
+    } else {
+        None
     };
 
     let bind_addr = config.ldap_bind_address();
@@ -128,7 +257,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let selected_runtime = config.server.runtime.clone();
     let server_task = tokio::spawn(async move {
         let result = match selected_runtime.as_str() {
-            "legacy" => server::run(&bind_addr, backend, shutdown_rx).await,
+            "legacy" => {
+                server::run_with_metrics(&bind_addr, backend, shutdown_rx, monitoring_metrics).await
+            }
             unsupported => Err(std::io::Error::other(format!(
                 "server.runtime = {:?} is not supported by the shipped opendr binary",
                 unsupported
@@ -155,6 +286,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match server_task.await {
         Ok(()) => println!("Server shutdown complete"),
         Err(e) => eprintln!("Server task error: {}", e),
+    }
+
+    if let Some(handle) = monitoring_handle {
+        match handle.await {
+            Ok(()) => println!("Monitoring server shutdown complete"),
+            Err(e) => eprintln!("Monitoring task error: {}", e),
+        }
     }
 
     // Wait for replication provider to finish if it was started
