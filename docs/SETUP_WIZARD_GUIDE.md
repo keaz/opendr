@@ -2,6 +2,8 @@
 
 The `opendr-setup` utility helps create an initial OpenDR configuration and data directory layout. This guide focuses on the replication choices that matter for provider and consumer deployments.
 
+Important: the current setup utility still emits older replication template fields such as `role`, `provider_bind_dn`, and `changelog_max_entries`. The shipped runtime docs use the canonical runtime keys `mode`, `bind_dn`, `bind_password(_env|_file)`, `changelog_capacity`, and `enable_change_listening`. Normalize wizard-generated replication blocks to that canonical form before launching `opendr`.
+
 ## Quick Start
 
 Interactive setup:
@@ -44,6 +46,8 @@ changelog_capacity = 100000
 heartbeat_interval_secs = 60
 ```
 
+Current `opendr-setup` templates do not emit that exact block yet. They still write legacy provider fields like `role = "Provider"` and `changelog_max_entries`. Treat the canonical block above as the source of truth for the runtime.
+
 ### Consumer Flow
 
 Current prompts include:
@@ -78,6 +82,20 @@ state_storage_path = "./data/replication_state"
 
 `bind_dn` and `bind_password` are the canonical runtime keys. `provider_bind_dn` and `provider_bind_password` remain accepted as aliases. In production, point them at a dedicated read-only replication account on the provider and inject the secret through `bind_password_env` or `bind_password_file`.
 
+Current setup templates still emit `role = "Consumer"` and `provider_bind_dn` / `provider_bind_password`. Normalize those fields before launching the runtime.
+
+### Normalize Wizard Output Before Launch
+
+Map the current setup-template fields to the canonical runtime fields like this:
+
+```text
+role -> mode
+provider_bind_dn -> bind_dn
+provider_bind_password(_env|_file) -> bind_password(_env|_file)
+changelog_max_entries -> changelog_capacity
+remove changelog_enabled / max_batch_size / enable_streaming from the runtime block
+```
+
 ## Recommended Runtime Layout
 
 Run each server from its own working directory because `opendr` loads `config/server.toml` and `config/log4rs.yml` from the current working directory:
@@ -110,6 +128,7 @@ After setup, verify the provider runtime config looks like this:
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 1389
+replica_id = 1
 base_dn = "dc=company,dc=com"
 root_user_dn = "cn=manager"
 root_password_file = "/run/secrets/opendr-provider-root-password-hash"
@@ -136,6 +155,7 @@ After setup, verify the consumer runtime config looks like this:
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 2389
+replica_id = 2
 base_dn = "dc=company,dc=com"
 root_user_dn = "cn=manager"
 root_password_file = "/run/secrets/opendr-consumer-root-password-hash"

@@ -11,6 +11,15 @@ OpenDR replication has two roles:
 
 When `enable_change_listening = true`, steady-state replication is listener-based rather than timer-based polling. `sync_interval_secs` then controls refresh and reconnect cadence, not normal change latency. If listening is disabled, the consumer falls back to periodic refreshes.
 
+The canonical runtime config model for the shipped `opendr` binary is:
+
+- `mode = "provider" | "consumer" | "both"`
+- `bind_dn` / `bind_password(_env|_file)` for consumer authentication
+- `changelog_capacity` for provider-side retention
+- `enable_change_listening` for the post-refresh live stream
+
+If you start from `opendr-setup` output, normalize legacy template fields such as `role`, `provider_bind_dn`, and `changelog_max_entries` to the canonical keys above before launching the binary.
+
 ## How to Enable Replication
 
 1. Run each instance from its own working directory.
@@ -68,6 +77,7 @@ Notes:
 - `root_user_dn` is the relative DN. The full bind DN is `cn=manager,dc=example,dc=com`.
 - `replica_id` must be unique per replicated node.
 - The provider serves replication data through the normal LDAP server. There is no separate polling service to start.
+- Manual configs should use `mode` and `changelog_capacity`; older setup/template fields such as `role`, `changelog_enabled`, `changelog_max_entries`, `max_batch_size`, and `enable_streaming` are not the canonical runtime examples.
 
 ## Consumer Configuration
 
@@ -110,6 +120,16 @@ Notes:
 - Use `root_password_env` / `root_password_file` and `bind_password_env` / `bind_password_file` in production so secrets are injected instead of committed.
 - `state_storage_path` stores the last replication cookie so a restart can resume instead of forcing a full refresh.
 - If you want refresh-only behavior, set `enable_change_listening = false`.
+
+If you start from a setup-generated template, apply this normalization before launching:
+
+```text
+role -> mode
+provider_bind_dn -> bind_dn
+provider_bind_password(_env|_file) -> bind_password(_env|_file)
+changelog_max_entries -> changelog_capacity
+remove changelog_enabled / max_batch_size / enable_streaming from the runtime block
+```
 
 ## Replication Settings Reference
 

@@ -240,6 +240,7 @@ state_storage_path = "./data/replication_state" # Consumer cookie/state storage
 - `enable_change_listening` keeps a long-lived LDAP search open for live updates after refresh
 - `state_storage_path` stores the replication cookie between restarts
 - When running multiple instances on the same host, use distinct `ldap_port` and `data_directory` values
+- `mode` is the canonical role selector for the shipped runtime. Older setup/template fields such as `role`, `changelog_enabled`, `changelog_max_entries`, `max_batch_size`, and `enable_streaming` are not part of the supported runtime config surface and should be normalized before launch
 
 **Provider Behavior:**
 - The provider exposes live replication data through the normal LDAP server path

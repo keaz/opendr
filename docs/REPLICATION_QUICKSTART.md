@@ -1,6 +1,7 @@
 # OpenDR Replication Quick Start
 
 This guide shows the shortest working path for provider-consumer replication with listener-based updates.
+Use the canonical runtime keys shown below: `mode`, `bind_dn`, `bind_password(_env|_file)`, `changelog_capacity`, and `enable_change_listening`. If you start from `opendr-setup` output, normalize older fields such as `role`, `provider_bind_dn`, and `changelog_max_entries` before launching the binary.
 
 ## Before You Start
 
@@ -33,6 +34,7 @@ Create `/srv/opendr-provider/config/server.toml`:
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 1389
+replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
 root_password = "{SSHA512}<generated-hash>"
@@ -59,6 +61,7 @@ Create `/srv/opendr-consumer/config/server.toml`:
 [server]
 bind_address = "0.0.0.0"
 ldap_port = 2389
+replica_id = 2
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
 root_password_file = "/run/secrets/opendr-consumer-root-password-hash"
@@ -85,6 +88,8 @@ state_storage_path = "./data/replication_state"
 ```
 
 `bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` remain supported as aliases. In production, use a dedicated read-only replication account on the provider and inject the secret through `bind_password_env` or `bind_password_file`.
+
+Legacy setup/template fields such as `role`, `changelog_enabled`, `changelog_max_entries`, `max_batch_size`, and `enable_streaming` are not the canonical documented runtime surface for these examples.
 
 ## 3. Start Both Servers
 
@@ -152,6 +157,7 @@ In that mode, the consumer uses scheduled refresh cycles and does not hold the l
 - `mode`: `provider`, `consumer`, or `both`
 - `changelog_capacity`: provider-side number of retained change records
 - `provider_url`: consumer-side LDAP endpoint of the provider
+- `bind_dn` / `bind_password`: canonical consumer authentication keys
 - `sync_interval_secs`: refresh and reconnect cadence
 - `enable_change_listening`: enables the long-lived listener after refresh
 - `state_storage_path`: filesystem path for the persisted replication cookie

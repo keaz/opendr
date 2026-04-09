@@ -109,6 +109,7 @@ ldapdelete -x -H ldap://localhost:389 -D "cn=admin,dc=example,dc=com" -w passwor
 
 OpenDR supports provider-consumer replication for high availability and load distribution.
 After the initial refresh, consumers keep a live LDAP search open for change delivery when `enable_change_listening = true`; polling remains available as a fallback.
+The canonical runtime keys are `mode`, `bind_dn`, `bind_password`, `changelog_capacity`, and `enable_change_listening`. If you start from `opendr-setup` output, normalize any legacy replication keys such as `role`, `provider_bind_dn`, or `changelog_max_entries` before launching the binary.
 
 ### 1. Create Per-Instance Runtime Directories
 
@@ -191,6 +192,8 @@ state_storage_path = "./data/replication_state"
 ```
 
 `bind_dn` and `bind_password` are the canonical consumer authentication keys. `provider_bind_dn` and `provider_bind_password` are still accepted as aliases. In production, point them at a dedicated read-only replication account on the provider and inject the actual secret with `bind_password_env` or `bind_password_file`. `replica_id` must be unique per replicated node so CSNs remain globally ordered.
+
+The supported runtime config surface uses the block shown above. Legacy setup/template fields such as `role`, `changelog_enabled`, `changelog_max_entries`, `max_batch_size`, and `enable_streaming` are not the canonical documented model for the shipped runtime.
 
 ### 4. Start Both Servers
 
