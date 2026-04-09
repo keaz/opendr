@@ -341,6 +341,81 @@ impl LmdbBackend {
         Ok(results)
     }
 
+    fn search_entries_paginated_internal(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<StoredEntry>, BackendError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+
+        let mut results = Vec::with_capacity(limit);
+        let base_components = Self::dn_components(base_dn);
+        let mut matched = 0usize;
+
+        let mut cursor = txn
+            .open_ro_cursor(self.entries_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+
+        for (key, value) in cursor.iter() {
+            let dn = String::from_utf8_lossy(key).to_string();
+            if !Self::entry_in_scope(&dn, &base_components, scope) {
+                continue;
+            }
+
+            if matched < offset {
+                matched += 1;
+                continue;
+            }
+
+            let entry: StoredEntry = bincode::deserialize(value).map_err(|e| {
+                BackendError::Storage(format!("Failed to deserialize entry: {}", e))
+            })?;
+            results.push(entry);
+            matched += 1;
+
+            if results.len() == limit {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn count_entries_internal(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+    ) -> Result<usize, BackendError> {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+
+        let base_components = Self::dn_components(base_dn);
+        let mut count = 0usize;
+        let mut cursor = txn
+            .open_ro_cursor(self.entries_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+
+        for (key, _) in cursor.iter() {
+            let dn = String::from_utf8_lossy(key).to_string();
+            if Self::entry_in_scope(&dn, &base_components, scope) {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
     /// Check if DN is in search scope
     fn entry_in_scope(dn: &str, base_components: &[String], scope: SearchScope) -> bool {
         let components = Self::dn_components(dn);
@@ -1132,6 +1207,28 @@ impl DirectoryBackend for LmdbBackend {
             .into_iter()
             .map(|e| e.to_directory_entry())
             .collect())
+    }
+
+    async fn search_entries_paginated(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        let entries = self.search_entries_paginated_internal(base_dn, scope, offset, limit)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| entry.to_directory_entry())
+            .collect())
+    }
+
+    async fn count_entries(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+    ) -> Result<usize, BackendError> {
+        self.count_entries_internal(base_dn, scope)
     }
 
     async fn search_entries_with_hint(

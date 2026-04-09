@@ -72,6 +72,36 @@ pub trait ChangelogProvider: Send + Sync {
         filter: Option<&str>,
     ) -> Result<Vec<DirectoryEntry>, String>;
 
+    /// Count refresh entries without materializing the full result set when possible.
+    async fn count_all_entries(
+        &self,
+        base_dn: &str,
+        filter: Option<&str>,
+    ) -> Result<usize, String> {
+        Ok(self.get_all_entries(base_dn, filter).await?.len())
+    }
+
+    /// Get a bounded batch of refresh entries.
+    async fn get_all_entries_batch(
+        &self,
+        base_dn: &str,
+        filter: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<DirectoryEntry>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(self
+            .get_all_entries(base_dn, filter)
+            .await?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
+
     /// Get changelog entries since a specific cookie
     ///
     /// # Arguments
@@ -86,6 +116,31 @@ pub trait ChangelogProvider: Send + Sync {
         cookie: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ChangelogEntry>, String>;
+
+    /// Count retained changelog entries after a cookie without materializing them when possible.
+    async fn count_changelog_since(&self, cookie: Option<&str>) -> Result<usize, String> {
+        Ok(self.get_changelog_since(cookie, usize::MAX).await?.len())
+    }
+
+    /// Get a bounded batch of retained changelog entries after a cookie.
+    async fn get_changelog_batch(
+        &self,
+        cookie: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ChangelogEntry>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(self
+            .get_changelog_since(cookie, offset.saturating_add(limit))
+            .await?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
 
     /// Generate new replication cookie from CSN
     ///
@@ -1031,6 +1086,12 @@ pub struct ReplicationSession {
     pub sync_request: Option<SyncRequest>,
     /// Changelog entries queued for replay during the present phase
     pub pending_replay_entries: Vec<ChangelogEntry>,
+    /// Offset into the refresh result set for bounded refresh batching
+    pub refresh_offset: usize,
+    /// Offset into the replay changelog for bounded present-phase batching
+    pub replay_offset: usize,
+    /// Total replay entries planned for the session
+    pub replay_total_entries: usize,
     /// Last replication cookie sent
     pub last_cookie: Option<String>,
     /// Entries sent during refresh phase
@@ -1066,6 +1127,9 @@ impl ReplicationSession {
             connection,
             sync_request: None,
             pending_replay_entries: Vec::new(),
+            refresh_offset: 0,
+            replay_offset: 0,
+            replay_total_entries: 0,
             last_cookie: None,
             refresh_entries_sent: 0,
             refresh_total_entries: 0,
@@ -1096,7 +1160,7 @@ impl ReplicationSession {
 
     /// Get the number of queued replay entries for this session.
     pub fn pending_replay_count(&self) -> usize {
-        self.pending_replay_entries.len()
+        self.replay_total_entries.saturating_sub(self.replay_offset)
     }
 
     /// Update session activity timestamp
@@ -1397,20 +1461,20 @@ impl ReplicationProviderFsmImpl {
         Ok(())
     }
 
-    async fn load_replay_entries(
+    async fn count_replay_entries(
         &self,
         request: &SyncRequest,
-    ) -> Result<Vec<ChangelogEntry>, ReplicationProviderError> {
+    ) -> Result<usize, ReplicationProviderError> {
         if request.sync_mode == SyncMode::RefreshOnly {
-            return Ok(Vec::new());
+            return Ok(0);
         }
 
         let Some(cookie) = request.cookie.as_deref() else {
-            return Ok(Vec::new());
+            return Ok(0);
         };
 
         self.changelog_provider
-            .get_changelog_since(Some(cookie), self.config.changelog_batch_size)
+            .count_changelog_since(Some(cookie))
             .await
             .map_err(|message| {
                 if message.contains("Stale replication cookie") {
@@ -1425,6 +1489,43 @@ impl ReplicationProviderFsmImpl {
                     ReplicationProviderError::ChangelogError { message }
                 }
             })
+    }
+
+    async fn prune_timed_out_sessions(&mut self) -> Result<(), ReplicationProviderError> {
+        let timed_out_consumers: Vec<String> = self
+            .sessions
+            .iter()
+            .filter_map(|(consumer_id, session)| {
+                session
+                    .is_timed_out(self.config.consumer_timeout)
+                    .then(|| consumer_id.clone())
+            })
+            .collect();
+
+        for consumer_id in timed_out_consumers {
+            let Some(session) = self.sessions.remove(&consumer_id) else {
+                continue;
+            };
+
+            let _ = self.streaming_manager.stop_streaming(&consumer_id).await;
+            self.consumer_registry
+                .unregister_consumer(&consumer_id)
+                .await
+                .map_err(|message| ReplicationProviderError::RegistryError { message })?;
+
+            if let Some(ref metrics) = self.metrics {
+                metrics.record_consumer_disconnection(
+                    &consumer_id,
+                    "timeout",
+                    session.session_duration(),
+                );
+            }
+
+            self.failed_sessions += 1;
+        }
+
+        self.update_summary_state();
+        Ok(())
     }
 
     fn sync_mode_label(sync_mode: &SyncMode) -> &'static str {
@@ -1450,6 +1551,129 @@ impl ReplicationProviderFsmImpl {
         } else {
             Ok("csn-empty".to_string())
         }
+    }
+
+    pub async fn next_refresh_batch(
+        &mut self,
+        consumer_id: &str,
+    ) -> Result<Option<Vec<DirectoryEntry>>, ReplicationProviderError> {
+        self.prune_timed_out_sessions().await?;
+
+        let (base_dn, filter, offset, phase) =
+            {
+                let session = self.sessions.get(consumer_id).ok_or_else(|| {
+                    ReplicationProviderError::ConsumerNotFound {
+                        consumer_id: consumer_id.to_string(),
+                    }
+                })?;
+                let request = session.sync_request.as_ref().ok_or_else(|| {
+                    ReplicationProviderError::Generic {
+                        message: format!("Consumer {} has no sync request", consumer_id),
+                    }
+                })?;
+
+                (
+                    request.base_dn.clone(),
+                    request.filter.clone(),
+                    session.refresh_offset,
+                    session.current_phase.clone(),
+                )
+            };
+
+        if phase != ReplicationPhase::Refresh {
+            return Err(ReplicationProviderError::InvalidStateTransition {
+                from: self
+                    .get_session(consumer_id)
+                    .map(|session| Self::session_state(session, self.sessions.len()))
+                    .unwrap_or_else(|| self.state.clone()),
+                to: ReplicationProviderState::Refresh {
+                    entries_sent: 0,
+                    total_entries: 0,
+                },
+            });
+        }
+
+        let batch = self
+            .changelog_provider
+            .get_all_entries_batch(
+                &base_dn,
+                filter.as_deref(),
+                offset,
+                self.config.refresh_batch_size,
+            )
+            .await
+            .map_err(|message| ReplicationProviderError::ChangelogError { message })?;
+
+        if let Some(session) = self.sessions.get_mut(consumer_id) {
+            session.refresh_offset += batch.len();
+            session.update_activity();
+        }
+
+        Ok((!batch.is_empty()).then_some(batch))
+    }
+
+    pub async fn next_replay_batch(
+        &mut self,
+        consumer_id: &str,
+    ) -> Result<Option<Vec<ChangelogEntry>>, ReplicationProviderError> {
+        self.prune_timed_out_sessions().await?;
+
+        let (cookie, offset, phase) =
+            {
+                let session = self.sessions.get(consumer_id).ok_or_else(|| {
+                    ReplicationProviderError::ConsumerNotFound {
+                        consumer_id: consumer_id.to_string(),
+                    }
+                })?;
+                let request = session.sync_request.as_ref().ok_or_else(|| {
+                    ReplicationProviderError::Generic {
+                        message: format!("Consumer {} has no sync request", consumer_id),
+                    }
+                })?;
+
+                (
+                    request.cookie.clone(),
+                    session.replay_offset,
+                    session.current_phase.clone(),
+                )
+            };
+
+        if phase != ReplicationPhase::Present {
+            return Err(ReplicationProviderError::InvalidStateTransition {
+                from: self
+                    .get_session(consumer_id)
+                    .map(|session| Self::session_state(session, self.sessions.len()))
+                    .unwrap_or_else(|| self.state.clone()),
+                to: ReplicationProviderState::Present {
+                    entries_streamed: 0,
+                },
+            });
+        }
+
+        let batch = self
+            .changelog_provider
+            .get_changelog_batch(cookie.as_deref(), offset, self.config.changelog_batch_size)
+            .await
+            .map_err(|message| {
+                if let Some(cookie) = cookie {
+                    if message.contains("Stale replication cookie") {
+                        return ReplicationProviderError::FullRefreshRequired { cookie };
+                    }
+                    if message.contains("cookie") {
+                        return ReplicationProviderError::InvalidCookie { cookie };
+                    }
+                }
+
+                ReplicationProviderError::ChangelogError { message }
+            })?;
+
+        if let Some(session) = self.sessions.get_mut(consumer_id) {
+            session.pending_replay_entries = batch.clone();
+            session.replay_offset += batch.len();
+            session.update_activity();
+        }
+
+        Ok((!batch.is_empty()).then_some(batch))
     }
 
     /// Handle sync replication start event
@@ -1499,16 +1723,16 @@ impl ReplicationProviderFsmImpl {
 
         self.validate_request_cookie(&request).await?;
 
-        let refresh_entries = if request.sync_mode == SyncMode::PresentOnly {
-            Vec::new()
+        let refresh_entry_count = if request.sync_mode == SyncMode::PresentOnly {
+            0
         } else {
             self.changelog_provider
-                .get_all_entries(&request.base_dn, request.filter.as_deref())
+                .count_all_entries(&request.base_dn, request.filter.as_deref())
                 .await
                 .map_err(|e| ReplicationProviderError::ChangelogError { message: e })?
         };
 
-        let replay_entries = self.load_replay_entries(&request).await?;
+        let replay_entry_count = self.count_replay_entries(&request).await?;
 
         // Create consumer connection info after the request validates successfully.
         let mut connection = ConsumerConnection::with_sync_mode(
@@ -1528,8 +1752,9 @@ impl ReplicationProviderFsmImpl {
         // Create session
         let mut session = ReplicationSession::new(consumer_id.clone(), connection);
         session.set_sync_request(request.clone());
-        session.pending_replay_entries = replay_entries;
-        session.refresh_total_entries = refresh_entries.len();
+        session.pending_replay_entries = Vec::new();
+        session.refresh_total_entries = refresh_entry_count;
+        session.replay_total_entries = replay_entry_count;
         session.current_phase = match request.sync_mode {
             SyncMode::PresentOnly => ReplicationPhase::Present,
             SyncMode::RefreshOnly | SyncMode::RefreshAndPersist => ReplicationPhase::Refresh,
@@ -1597,6 +1822,7 @@ impl ReplicationProviderFsmImpl {
             }
 
             session.refresh_entries_sent = entries_sent;
+            session.refresh_offset = entries_sent;
             session.current_phase = match session.sync_mode() {
                 SyncMode::RefreshOnly => ReplicationPhase::Complete,
                 SyncMode::RefreshAndPersist => ReplicationPhase::Present,
@@ -1678,6 +1904,7 @@ impl ReplicationProviderFsmImpl {
 
             session.present_entries_sent = entries_streamed;
             session.pending_replay_entries.clear();
+            session.replay_offset = session.replay_total_entries;
             session.last_cookie = Some(new_cookie.clone());
             session.current_phase = next_phase;
             session.update_activity();
@@ -1711,6 +1938,8 @@ impl ReplicationProviderFsmImpl {
         &mut self,
         change: ChangelogEntry,
     ) -> Result<Option<usize>, ReplicationProviderError> {
+        self.prune_timed_out_sessions().await?;
+
         if self.sessions.is_empty() {
             return Err(ReplicationProviderError::NoActiveConsumer);
         }
@@ -1735,6 +1964,7 @@ impl ReplicationProviderFsmImpl {
 
         let entry_size = change.data_size();
         let mut successful_streams = 0;
+        let mut exhausted_consumers = Vec::new();
 
         // Stream to all active consumers
         for consumer_id in &consumer_ids {
@@ -1756,6 +1986,9 @@ impl ReplicationProviderFsmImpl {
                 {
                     if let Some(session) = self.sessions.get_mut(consumer_id) {
                         session.record_error();
+                        if session.error_count >= self.config.max_retry_attempts as usize {
+                            exhausted_consumers.push(consumer_id.clone());
+                        }
                     }
 
                     if let Some(ref metrics) = self.metrics {
@@ -1792,6 +2025,9 @@ impl ReplicationProviderFsmImpl {
                     // Record streaming error
                     if let Some(session) = self.sessions.get_mut(consumer_id) {
                         session.record_error();
+                        if session.error_count >= self.config.max_retry_attempts as usize {
+                            exhausted_consumers.push(consumer_id.clone());
+                        }
                     }
 
                     if let Some(ref metrics) = self.metrics {
@@ -1799,6 +2035,10 @@ impl ReplicationProviderFsmImpl {
                     }
                 }
             }
+        }
+
+        for consumer_id in exhausted_consumers {
+            let _ = self.handle_consumer_disconnected(consumer_id).await;
         }
 
         // Update statistics
@@ -2364,6 +2604,7 @@ pub mod tests {
 
     pub struct MockStreamingManager {
         should_fail: bool,
+        fail_send_only: bool,
         active_streams: HashSet<String>,
         sent_entries: Arc<Mutex<Vec<(String, ChangelogEntry)>>>,
     }
@@ -2372,6 +2613,7 @@ pub mod tests {
         pub fn new() -> Self {
             Self {
                 should_fail: false,
+                fail_send_only: false,
                 active_streams: HashSet::new(),
                 sent_entries: Arc::new(Mutex::new(Vec::new())),
             }
@@ -2379,6 +2621,11 @@ pub mod tests {
 
         pub fn with_failure(mut self) -> Self {
             self.should_fail = true;
+            self
+        }
+
+        pub fn with_send_failure(mut self) -> Self {
+            self.fail_send_only = true;
             self
         }
 
@@ -2416,7 +2663,7 @@ pub mod tests {
             consumer_id: &str,
             entry: &ChangelogEntry,
         ) -> Result<(), String> {
-            if self.should_fail {
+            if self.should_fail || self.fail_send_only {
                 Err("Mock streaming failure".to_string())
             } else {
                 self.sent_entries
@@ -3416,6 +3663,183 @@ pub mod tests {
                 .map(|session| session.pending_replay_count()),
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn test_next_refresh_batch_honors_configured_batch_size() {
+        let changelog_provider = Box::new(MockChangelogProvider::new().with_entries(vec![
+            DirectoryEntry::new("cn=user1,dc=example,dc=org".to_string(), HashMap::new()),
+            DirectoryEntry::new("cn=user2,dc=example,dc=org".to_string(), HashMap::new()),
+            DirectoryEntry::new("cn=user3,dc=example,dc=org".to_string(), HashMap::new()),
+        ]));
+        let config = ReplicationProviderConfig {
+            refresh_batch_size: 2,
+            ..Default::default()
+        };
+        let mut fsm = ReplicationProviderFsmImpl::with_config(
+            changelog_provider,
+            Box::new(MockConsumerRegistry::new()),
+            Box::new(MockStreamingManager::new()),
+            Box::new(MockSyncRequestHandler::new()),
+            config,
+        );
+
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
+
+        let first_batch = fsm
+            .next_refresh_batch("consumer1")
+            .await
+            .unwrap()
+            .expect("first refresh batch");
+        let second_batch = fsm
+            .next_refresh_batch("consumer1")
+            .await
+            .unwrap()
+            .expect("second refresh batch");
+        let third_batch = fsm.next_refresh_batch("consumer1").await.unwrap();
+
+        assert_eq!(first_batch.len(), 2);
+        assert_eq!(second_batch.len(), 1);
+        assert!(third_batch.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_next_replay_batch_honors_configured_batch_size() {
+        let changelog_provider = Box::new(MockChangelogProvider::new().with_changelog(vec![
+            ChangelogEntry::new(
+                crate::csn::Csn::new(2),
+                ChangeType::Add,
+                "cn=user2,dc=example,dc=org".to_string(),
+                b"entry data 2".to_vec(),
+            ),
+            ChangelogEntry::new(
+                crate::csn::Csn::new(3),
+                ChangeType::Delete,
+                "cn=user3,dc=example,dc=org".to_string(),
+                b"entry data 3".to_vec(),
+            ),
+        ]));
+        let config = ReplicationProviderConfig {
+            changelog_batch_size: 1,
+            ..Default::default()
+        };
+        let mut fsm = ReplicationProviderFsmImpl::with_config(
+            changelog_provider,
+            Box::new(MockConsumerRegistry::new()),
+            Box::new(MockStreamingManager::new()),
+            Box::new(MockSyncRequestHandler::new()),
+            config,
+        );
+
+        fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+            request: SyncRequest::new("consumer1".to_string(), "dc=example,dc=org".to_string())
+                .with_cookie("csn-20250101000000000000#001#000001#000000".to_string())
+                .with_sync_mode(SyncMode::PresentOnly),
+        })
+        .await
+        .unwrap();
+
+        let first_batch = fsm
+            .next_replay_batch("consumer1")
+            .await
+            .unwrap()
+            .expect("first replay batch");
+        let second_batch = fsm
+            .next_replay_batch("consumer1")
+            .await
+            .unwrap()
+            .expect("second replay batch");
+        let third_batch = fsm.next_replay_batch("consumer1").await.unwrap();
+
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(second_batch.len(), 1);
+        assert!(third_batch.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_next_refresh_batch_prunes_timed_out_consumer() {
+        let config = ReplicationProviderConfig {
+            consumer_timeout: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let mut fsm = ReplicationProviderFsmImpl::with_config(
+            Box::new(MockChangelogProvider::new()),
+            Box::new(MockConsumerRegistry::new()),
+            Box::new(MockStreamingManager::new()),
+            Box::new(MockSyncRequestHandler::new()),
+            config,
+        );
+
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
+        fsm.sessions
+            .get_mut("consumer1")
+            .expect("session")
+            .last_activity = Instant::now() - Duration::from_secs(1);
+
+        let result = fsm.next_refresh_batch("consumer1").await;
+
+        assert!(matches!(
+            result,
+            Err(ReplicationProviderError::ConsumerNotFound { ref consumer_id })
+                if consumer_id == "consumer1"
+        ));
+        assert!(fsm.get_session("consumer1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_changelog_entry_disconnects_consumer_after_retry_limit() {
+        let config = ReplicationProviderConfig {
+            max_retry_attempts: 1,
+            ..Default::default()
+        };
+        let mut fsm = ReplicationProviderFsmImpl::with_config(
+            Box::new(MockChangelogProvider::new()),
+            Box::new(MockConsumerRegistry::new()),
+            Box::new(MockStreamingManager::new().with_send_failure()),
+            Box::new(MockSyncRequestHandler::new()),
+            config,
+        );
+
+        fsm.handle_event(default_start_event("consumer1"))
+            .await
+            .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::RefreshComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_sent: 2,
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::PresentComplete {
+            consumer_id: "consumer1".to_string(),
+            entries_streamed: 1,
+        })
+        .await
+        .unwrap();
+        fsm.handle_event(ReplicationProviderEvent::CookiePersisted {
+            consumer_id: "consumer1".to_string(),
+            new_cookie: "cookie-final".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let result = fsm
+            .handle_event(ReplicationProviderEvent::ChangelogEntry {
+                change: ChangelogEntry::new(
+                    crate::csn::Csn::new(4),
+                    ChangeType::Modify,
+                    "cn=user4,dc=example,dc=org".to_string(),
+                    b"entry data 4".to_vec(),
+                ),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(0));
+        assert!(fsm.get_session("consumer1").is_none());
     }
 
     #[tokio::test]

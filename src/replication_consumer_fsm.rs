@@ -40,7 +40,9 @@ use crate::fsm::{
 };
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::time::{Duration, Instant};
+use tokio::time::timeout;
 
 // ================================================================================================
 // External Trait Dependencies
@@ -74,6 +76,26 @@ pub trait ProviderConnection: Send + Sync {
         &self,
         cookie: Option<&str>,
     ) -> Result<Vec<Vec<u8>>, ConsumerError>;
+
+    /// Request a bounded batch of replication data from a specific cookie/state.
+    async fn request_batch_from_cookie(
+        &self,
+        cookie: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, ConsumerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(self
+            .request_from_cookie(cookie)
+            .await?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
 
     /// Disconnect from the replication provider
     ///
@@ -839,12 +861,79 @@ impl ReplicationConsumerFsmImpl {
         self.pending_batches.len()
     }
 
+    fn pending_entry_count(&self) -> usize {
+        self.pending_batches.iter().map(Vec::len).sum()
+    }
+
     /// Get session duration
     ///
     /// # Returns
     /// * Duration since session started (if active)
     pub fn session_duration(&self) -> Option<Duration> {
         self.session_start.map(|start| start.elapsed())
+    }
+
+    async fn run_provider_operation<T, F>(
+        &self,
+        description: &str,
+        future: F,
+    ) -> Result<T, ConsumerError>
+    where
+        F: Future<Output = Result<T, ConsumerError>>,
+    {
+        match timeout(self.config.provider_timeout, future).await {
+            Ok(result) => result.map_err(|err| ConsumerError::ConnectionError {
+                message: format!("{description} failed: {err}"),
+            }),
+            Err(_) => Err(ConsumerError::ConnectionError {
+                message: format!(
+                    "{description} timed out after {:?}",
+                    self.config.provider_timeout
+                ),
+            }),
+        }
+    }
+
+    async fn run_state_persistence_operation<T, F>(
+        &self,
+        description: &str,
+        future: F,
+    ) -> Result<T, ConsumerError>
+    where
+        F: Future<Output = Result<T, ConsumerError>>,
+    {
+        match timeout(self.config.state_persistence_timeout, future).await {
+            Ok(result) => result.map_err(|err| ConsumerError::StateError {
+                message: format!("{description} failed: {err}"),
+            }),
+            Err(_) => Err(ConsumerError::StateError {
+                message: format!(
+                    "{description} timed out after {:?}",
+                    self.config.state_persistence_timeout
+                ),
+            }),
+        }
+    }
+
+    async fn run_listening_operation<T, F>(
+        &self,
+        description: &str,
+        future: F,
+    ) -> Result<T, ConsumerError>
+    where
+        F: Future<Output = Result<T, ConsumerError>>,
+    {
+        match timeout(self.config.provider_timeout, future).await {
+            Ok(result) => result.map_err(|err| ConsumerError::ListeningError {
+                message: format!("{description} failed: {err}"),
+            }),
+            Err(_) => Err(ConsumerError::ListeningError {
+                message: format!(
+                    "{description} timed out after {:?}",
+                    self.config.provider_timeout
+                ),
+            }),
+        }
     }
 
     /// Handle start consumption event
@@ -915,12 +1004,11 @@ impl ReplicationConsumerFsmImpl {
         }
 
         // Connect to provider
-        self.provider_connection
-            .connect(&provider_url)
-            .await
-            .map_err(|e| ConsumerError::ConnectionError {
-                message: format!("Failed to connect to provider {}: {}", provider_url, e),
-            })?;
+        self.run_provider_operation(
+            &format!("connect to provider {provider_url}"),
+            self.provider_connection.connect(&provider_url),
+        )
+        .await?;
 
         // Request entries from cookie
         log::info!(
@@ -931,29 +1019,53 @@ impl ReplicationConsumerFsmImpl {
                 " (full sync)"
             }
         );
-        let entries = self
-            .provider_connection
-            .request_from_cookie(cookie.as_deref())
-            .await
-            .map_err(|e| ConsumerError::ConnectionError {
-                message: format!("Failed to request entries from cookie: {}", e),
-            })?;
+        let initial_sync_result: Result<usize, ConsumerError> = async {
+            let mut entry_count = 0usize;
+            let mut offset = 0usize;
 
-        let entry_count = entries.len();
+            loop {
+                let batch = self
+                    .run_provider_operation(
+                        "request entries from cookie",
+                        self.provider_connection.request_batch_from_cookie(
+                            cookie.as_deref(),
+                            offset,
+                            self.config.max_batch_size,
+                        ),
+                    )
+                    .await?;
 
-        let initial_sync_result: Result<(), ConsumerError> = async {
-            if !entries.is_empty() {
-                self.state = ReplicationConsumerState::ApplyingChanges { entries_applied: 0 };
+                if batch.is_empty() {
+                    break;
+                }
 
-                log::info!("Processing batch of {} entries", entry_count);
+                let batch_size = batch.len();
+                let batch_bytes = batch.iter().map(|entry| entry.len()).sum();
+                entry_count += batch_size;
+                offset += batch_size;
+                self.state = ReplicationConsumerState::ApplyingChanges {
+                    entries_applied: entry_count.saturating_sub(batch_size),
+                };
+
+                if let Some(ref metrics) = self.metrics {
+                    metrics.record_batch_received(batch_size, batch_bytes);
+                }
+
+                log::info!("Processing batch of {} entries", batch_size);
 
                 self.batch_processor
-                    .process_batch(entries)
+                    .process_batch(batch)
                     .await
                     .map_err(|e| ConsumerError::ProcessingError {
                         message: format!("Failed to process batch: {}", e),
                     })?;
 
+                if batch_size < self.config.max_batch_size {
+                    break;
+                }
+            }
+
+            if entry_count > 0 {
                 let csn = self
                     .batch_processor
                     .get_context_csn()
@@ -976,12 +1088,11 @@ impl ReplicationConsumerFsmImpl {
                     new_cookie: new_cookie.clone(),
                 };
 
-                self.state_manager
-                    .save_cookie(&new_cookie)
-                    .await
-                    .map_err(|e| ConsumerError::StateError {
-                        message: format!("Failed to persist replication cookie: {}", e),
-                    })?;
+                self.run_state_persistence_operation(
+                    "persist replication cookie",
+                    self.state_manager.save_cookie(&new_cookie),
+                )
+                .await?;
                 log::info!("Successfully persisted replication cookie");
                 self.current_cookie = Some(new_cookie);
             } else if let Some(ref cookie) = cookie {
@@ -990,7 +1101,7 @@ impl ReplicationConsumerFsmImpl {
                 log::info!("No entries available on provider");
             }
 
-            Ok(())
+            Ok(entry_count)
         }
         .await;
 
@@ -1001,16 +1112,16 @@ impl ReplicationConsumerFsmImpl {
             );
         }
 
-        initial_sync_result?;
+        let entry_count = initial_sync_result?;
 
         if self.config.enable_change_listening {
             let current_cookie = self.current_cookie.clone();
-            self.change_listener
-                .start_listening(current_cookie.as_deref())
-                .await
-                .map_err(|e| ConsumerError::ListeningError {
-                    message: format!("Failed to start listening: {}", e),
-                })?;
+            self.run_listening_operation(
+                "start listening for live changes",
+                self.change_listener
+                    .start_listening(current_cookie.as_deref()),
+            )
+            .await?;
 
             self.state = ReplicationConsumerState::Listening;
         } else {
@@ -1047,14 +1158,25 @@ impl ReplicationConsumerFsmImpl {
 
         let batch_size = entries.len();
         let batch_bytes = entries.iter().map(|e| e.len()).sum();
+        let pending_entries = self.pending_entry_count();
+        if pending_entries.saturating_add(batch_size) > self.config.change_buffer_size {
+            return Err(ConsumerError::ConfigError {
+                message: format!(
+                    "pending batch buffer exceeded {} entries",
+                    self.config.change_buffer_size
+                ),
+            });
+        }
 
         // Record metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_batch_received(batch_size, batch_bytes);
         }
 
-        // Add batch to pending queue
-        self.pending_batches.push_back(entries);
+        // Add batches to the pending queue in configured chunk sizes.
+        for batch in entries.chunks(self.config.max_batch_size) {
+            self.pending_batches.push_back(batch.to_vec());
+        }
 
         // Update state with new count
         if let ReplicationConsumerState::ReceivingBatches { entries_received } = &mut self.state {
@@ -1062,7 +1184,7 @@ impl ReplicationConsumerFsmImpl {
         }
 
         // If we've reached the batch processing threshold, move to applying changes
-        if self.pending_batches.len() >= 1 {
+        if self.pending_batches.front().is_some() {
             let total_received = match self.state {
                 ReplicationConsumerState::ReceivingBatches { entries_received } => entries_received,
                 _ => 0,
@@ -1147,12 +1269,11 @@ impl ReplicationConsumerFsmImpl {
 
         // Save cookie to persistent storage
         let persist_start = Instant::now();
-        self.state_manager
-            .save_cookie(&cookie)
-            .await
-            .map_err(|e| ConsumerError::StateError {
-                message: format!("Failed to save cookie: {}", e),
-            })?;
+        self.run_state_persistence_operation(
+            "save replication cookie",
+            self.state_manager.save_cookie(&cookie),
+        )
+        .await?;
 
         // Record metrics
         if let Some(ref metrics) = self.metrics {
@@ -1165,12 +1286,12 @@ impl ReplicationConsumerFsmImpl {
         // Transition to listening state if configured
         if self.config.enable_change_listening {
             let current_cookie = self.current_cookie.clone();
-            self.change_listener
-                .start_listening(current_cookie.as_deref())
-                .await
-                .map_err(|e| ConsumerError::ListeningError {
-                    message: format!("Failed to start listening: {}", e),
-                })?;
+            self.run_listening_operation(
+                "start listening for live changes",
+                self.change_listener
+                    .start_listening(current_cookie.as_deref()),
+            )
+            .await?;
 
             self.state = ReplicationConsumerState::Listening;
         } else {
@@ -1230,11 +1351,11 @@ impl ReplicationConsumerFsmImpl {
                 })?
         {
             let cookie = format!("csn-{}", context_csn);
-            self.state_manager.save_cookie(&cookie).await.map_err(|e| {
-                ConsumerError::StateError {
-                    message: format!("Failed to persist live change cookie: {}", e),
-                }
-            })?;
+            self.run_state_persistence_operation(
+                "persist live change cookie",
+                self.state_manager.save_cookie(&cookie),
+            )
+            .await?;
             self.current_cookie = Some(cookie);
         }
 
@@ -1399,7 +1520,10 @@ pub mod tests {
         should_fail: bool,
         connected: Arc<Mutex<bool>>,
         entries: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
+        request_batch_calls: Arc<Mutex<Vec<(Option<String>, usize, usize)>>>,
         connection_info: ConnectionInfo,
+        connect_delay: Option<Duration>,
+        request_delay: Option<Duration>,
     }
 
     impl MockProviderConnection {
@@ -1411,11 +1535,14 @@ pub mod tests {
                     b"entry1".to_vec(),
                     b"entry2".to_vec(),
                 ]])),
+                request_batch_calls: Arc::new(Mutex::new(Vec::new())),
                 connection_info: ConnectionInfo::new(
                     "ldap://mock.example.com:389".to_string(),
                     "3.0".to_string(),
                     false,
                 ),
+                connect_delay: None,
+                request_delay: None,
             }
         }
 
@@ -1428,11 +1555,38 @@ pub mod tests {
             self.entries = Arc::new(Mutex::new(entries));
             self
         }
+
+        pub fn with_connect_delay(mut self, delay: Duration) -> Self {
+            self.connect_delay = Some(delay);
+            self
+        }
+
+        pub fn with_request_delay(mut self, delay: Duration) -> Self {
+            self.request_delay = Some(delay);
+            self
+        }
+
+        pub fn request_batch_calls(&self) -> Vec<(Option<String>, usize, usize)> {
+            self.request_batch_calls.lock().unwrap().clone()
+        }
+
+        fn flattened_entries(&self) -> Vec<Vec<u8>> {
+            self.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .cloned()
+                .collect()
+        }
     }
 
     #[async_trait]
     impl ProviderConnection for MockProviderConnection {
         async fn connect(&self, _url: &str) -> Result<(), ConsumerError> {
+            if let Some(delay) = self.connect_delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.should_fail {
                 Err(ConsumerError::ConnectionError {
                     message: "Mock connection failure".to_string(),
@@ -1445,19 +1599,36 @@ pub mod tests {
 
         async fn request_from_cookie(
             &self,
-            _cookie: Option<&str>,
+            cookie: Option<&str>,
         ) -> Result<Vec<Vec<u8>>, ConsumerError> {
+            self.request_batch_from_cookie(cookie, 0, usize::MAX).await
+        }
+
+        async fn request_batch_from_cookie(
+            &self,
+            cookie: Option<&str>,
+            offset: usize,
+            limit: usize,
+        ) -> Result<Vec<Vec<u8>>, ConsumerError> {
+            if let Some(delay) = self.request_delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.should_fail {
                 Err(ConsumerError::ConnectionError {
                     message: "Mock request failure".to_string(),
                 })
             } else {
-                let entries = self.entries.lock().unwrap();
-                if let Some(batch) = entries.first() {
-                    Ok(batch.clone())
-                } else {
-                    Ok(vec![])
-                }
+                self.request_batch_calls.lock().unwrap().push((
+                    cookie.map(str::to_string),
+                    offset,
+                    limit,
+                ));
+                Ok(self
+                    .flattened_entries()
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect())
             }
         }
 
@@ -1496,6 +1667,7 @@ pub mod tests {
     pub struct MockBatchProcessor {
         should_fail: bool,
         processed_entries: Arc<Mutex<Vec<Vec<u8>>>>,
+        processed_batch_sizes: Arc<Mutex<Vec<usize>>>,
         stats: Arc<Mutex<ProcessingStats>>,
     }
 
@@ -1504,6 +1676,7 @@ pub mod tests {
             Self {
                 should_fail: false,
                 processed_entries: Arc::new(Mutex::new(Vec::new())),
+                processed_batch_sizes: Arc::new(Mutex::new(Vec::new())),
                 stats: Arc::new(Mutex::new(ProcessingStats::new())),
             }
         }
@@ -1515,6 +1688,10 @@ pub mod tests {
 
         pub fn get_processed_entries(&self) -> Vec<Vec<u8>> {
             self.processed_entries.lock().unwrap().clone()
+        }
+
+        pub fn get_processed_batch_sizes(&self) -> Vec<usize> {
+            self.processed_batch_sizes.lock().unwrap().clone()
         }
     }
 
@@ -1528,6 +1705,10 @@ pub mod tests {
             } else {
                 let mut processed = self.processed_entries.lock().unwrap();
                 processed.extend(entries.clone());
+                self.processed_batch_sizes
+                    .lock()
+                    .unwrap()
+                    .push(entries.len());
 
                 let mut stats = self.stats.lock().unwrap();
                 for entry in &entries {
@@ -1590,6 +1771,7 @@ pub mod tests {
         should_fail: bool,
         stored_cookie: Arc<Mutex<Option<String>>>,
         metadata: Arc<Mutex<StorageMetadata>>,
+        save_delay: Option<Duration>,
     }
 
     impl MockStateManager {
@@ -1602,6 +1784,7 @@ pub mod tests {
                     "1.0".to_string(),
                     false,
                 ))),
+                save_delay: None,
             }
         }
 
@@ -1614,11 +1797,19 @@ pub mod tests {
             self.stored_cookie = Arc::new(Mutex::new(Some(cookie)));
             self
         }
+
+        pub fn with_save_delay(mut self, delay: Duration) -> Self {
+            self.save_delay = Some(delay);
+            self
+        }
     }
 
     #[async_trait]
     impl StateManager for MockStateManager {
         async fn save_cookie(&self, cookie: &str) -> Result<(), ConsumerError> {
+            if let Some(delay) = self.save_delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.should_fail {
                 Err(ConsumerError::StateError {
                     message: "Mock save failure".to_string(),
@@ -1677,6 +1868,7 @@ pub mod tests {
         listening: Arc<Mutex<bool>>,
         changes: Arc<Mutex<VecDeque<Vec<u8>>>>,
         stats: Arc<Mutex<ListeningStats>>,
+        start_delay: Option<Duration>,
     }
 
     impl MockChangeListener {
@@ -1689,6 +1881,7 @@ pub mod tests {
                     b"change2".to_vec(),
                 ]))),
                 stats: Arc::new(Mutex::new(ListeningStats::new())),
+                start_delay: None,
             }
         }
 
@@ -1700,11 +1893,19 @@ pub mod tests {
         pub fn add_change(&self, change: Vec<u8>) {
             self.changes.lock().unwrap().push_back(change);
         }
+
+        pub fn with_start_delay(mut self, delay: Duration) -> Self {
+            self.start_delay = Some(delay);
+            self
+        }
     }
 
     #[async_trait]
     impl ChangeListener for MockChangeListener {
         async fn start_listening(&self, _cookie: Option<&str>) -> Result<(), ConsumerError> {
+            if let Some(delay) = self.start_delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.should_fail {
                 Err(ConsumerError::ListeningError {
                     message: "Mock listening failure".to_string(),
@@ -1931,6 +2132,53 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_consumption_honors_max_batch_size() {
+        let config = ConsumerConfig {
+            max_batch_size: 2,
+            enable_change_listening: false,
+            ..Default::default()
+        };
+        let mock_provider = MockProviderConnection::new().with_entries(vec![vec![
+            b"entry1".to_vec(),
+            b"entry2".to_vec(),
+            b"entry3".to_vec(),
+            b"entry4".to_vec(),
+            b"entry5".to_vec(),
+        ]]);
+        let request_batch_calls = mock_provider.request_batch_calls.clone();
+        let mock_batch_processor = MockBatchProcessor::new();
+        let processed_batch_sizes = mock_batch_processor.processed_batch_sizes.clone();
+
+        let mut fsm = ReplicationConsumerFsmImpl::with_config(
+            Box::new(mock_provider),
+            Box::new(mock_batch_processor),
+            Box::new(MockStateManager::new()),
+            Box::new(MockChangeListener::new()),
+            config,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(5));
+        assert_eq!(*processed_batch_sizes.lock().unwrap(), vec![2, 2, 1]);
+        assert_eq!(
+            request_batch_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, offset, limit)| (*offset, *limit))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (2, 2), (4, 2)]
+        );
+    }
+
+    #[tokio::test]
     async fn test_start_consumption_starts_live_listener() {
         let provider_connection = Box::new(MockProviderConnection::new());
         let batch_processor = Box::new(MockBatchProcessor::new());
@@ -2086,6 +2334,40 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_consumption_request_timeout_returns_connection_error() {
+        let config = ConsumerConfig {
+            provider_timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let provider_connection =
+            Box::new(MockProviderConnection::new().with_request_delay(Duration::from_millis(50)));
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager = Box::new(MockStateManager::new());
+        let change_listener = Box::new(MockChangeListener::new());
+
+        let mut fsm = ReplicationConsumerFsmImpl::with_config(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+            config,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: None,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConsumerError::ConnectionError { ref message }) if message.contains("timed out")
+        ));
+        assert!(!fsm.is_listening());
+    }
+
+    #[tokio::test]
     async fn test_start_consumption_batch_failure_keeps_existing_cookie() {
         let provider_connection = Box::new(MockProviderConnection::new());
         let batch_processor = Box::new(MockBatchProcessor::new().with_failure());
@@ -2138,6 +2420,75 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_consumption_persist_timeout_keeps_existing_cookie() {
+        let config = ConsumerConfig {
+            state_persistence_timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager =
+            Box::new(MockStateManager::new().with_save_delay(Duration::from_millis(50)));
+        let change_listener = Box::new(MockChangeListener::new());
+
+        let mut fsm = ReplicationConsumerFsmImpl::with_config(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+            config,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: Some("resume-cookie".to_string()),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConsumerError::StateError { ref message }) if message.contains("timed out")
+        ));
+        assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
+        assert!(!fsm.is_listening());
+    }
+
+    #[tokio::test]
+    async fn test_start_consumption_listener_timeout_surfaces_as_listening_error() {
+        let config = ConsumerConfig {
+            provider_timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager = Box::new(MockStateManager::new());
+        let change_listener =
+            Box::new(MockChangeListener::new().with_start_delay(Duration::from_millis(50)));
+
+        let mut fsm = ReplicationConsumerFsmImpl::with_config(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+            config,
+        );
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StartConsumption {
+                provider_url: "ldap://provider.example.com:389".to_string(),
+                cookie: None,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConsumerError::ListeningError { ref message }) if message.contains("timed out")
+        ));
+        assert!(!fsm.is_listening());
+    }
+
+    #[tokio::test]
     async fn test_batch_received_success() {
         let mut fsm = create_test_fsm();
 
@@ -2158,6 +2509,39 @@ pub mod tests {
         assert!(matches!(
             fsm.current_state(),
             ReplicationConsumerState::ApplyingChanges { entries_applied: 0 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_batch_received_rejects_when_pending_buffer_exceeded() {
+        let config = ConsumerConfig {
+            max_batch_size: 2,
+            change_buffer_size: 3,
+            ..Default::default()
+        };
+        let mut fsm = ReplicationConsumerFsmImpl::with_config(
+            Box::new(MockProviderConnection::new()),
+            Box::new(MockBatchProcessor::new()),
+            Box::new(MockStateManager::new()),
+            Box::new(MockChangeListener::new()),
+            config,
+        );
+        fsm.state = ReplicationConsumerState::ReceivingBatches {
+            entries_received: 1,
+        };
+        fsm.pending_batches
+            .push_back(vec![b"queued1".to_vec(), b"queued2".to_vec()]);
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::BatchReceived {
+                entries: vec![b"entry3".to_vec(), b"entry4".to_vec()],
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConsumerError::ConfigError { ref message })
+                if message.contains("pending batch buffer exceeded")
         ));
     }
 
@@ -2334,6 +2718,43 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_state_persisted_timeout_does_not_change_cookie() {
+        let config = ConsumerConfig {
+            state_persistence_timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager =
+            Box::new(MockStateManager::new().with_save_delay(Duration::from_millis(50)));
+        let change_listener = Box::new(MockChangeListener::new());
+
+        let mut fsm = ReplicationConsumerFsmImpl::with_config(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+            config,
+        );
+        fsm.state = ReplicationConsumerState::PersistingState {
+            new_cookie: "new-cookie-456".to_string(),
+        };
+        fsm.current_cookie = Some("resume-cookie".to_string());
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::StatePersisted {
+                cookie: "new-cookie-456".to_string(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConsumerError::StateError { ref message }) if message.contains("timed out")
+        ));
+        assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
+    }
+
+    #[tokio::test]
     async fn test_change_received_success() {
         let mut fsm = create_test_fsm();
 
@@ -2383,6 +2804,41 @@ pub mod tests {
         assert!(result.is_err());
         assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
         assert_eq!(fsm.entries_applied(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_change_received_persist_timeout_does_not_advance_cookie() {
+        let config = ConsumerConfig {
+            state_persistence_timeout: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let provider_connection = Box::new(MockProviderConnection::new());
+        let batch_processor = Box::new(MockBatchProcessor::new());
+        let state_manager =
+            Box::new(MockStateManager::new().with_save_delay(Duration::from_millis(50)));
+        let change_listener = Box::new(MockChangeListener::new());
+
+        let mut fsm = ReplicationConsumerFsmImpl::with_config(
+            provider_connection,
+            batch_processor,
+            state_manager,
+            change_listener,
+            config,
+        );
+        fsm.state = ReplicationConsumerState::Listening;
+        fsm.current_cookie = Some("resume-cookie".to_string());
+
+        let result = fsm
+            .handle_event(ReplicationConsumerEvent::ChangeReceived(
+                b"change data".to_vec(),
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConsumerError::StateError { ref message }) if message.contains("timed out")
+        ));
+        assert_eq!(fsm.current_cookie(), Some("resume-cookie"));
     }
 
     #[tokio::test]

@@ -49,7 +49,7 @@ use base64::Engine;
 use ldap3::{LdapConnAsync, LdapConnSettings};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -76,7 +76,7 @@ pub struct ChangelogTracker {
     /// CSN generator for creating unique change identifiers
     csn_generator: Arc<CsnGenerator>,
     /// Changelog entries (CSN string -> entry)
-    entries: Arc<Mutex<HashMap<String, ChangelogEntry>>>,
+    entries: Arc<Mutex<BTreeMap<String, ChangelogEntry>>>,
     /// Maximum entries to keep in memory
     max_entries: usize,
     /// Most recent CSN (for contextCSN)
@@ -154,7 +154,7 @@ impl ChangelogTracker {
     fn new_with_storage(max_entries: usize, replica_id: u16, storage_dir: Option<PathBuf>) -> Self {
         let tracker = Self {
             csn_generator: Arc::new(CsnGenerator::new(replica_id)),
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            entries: Arc::new(Mutex::new(BTreeMap::new())),
             max_entries,
             latest_csn: Arc::new(Mutex::new(None)),
             storage_dir,
@@ -273,14 +273,11 @@ impl ChangelogTracker {
         *latest = Some(csn.clone());
 
         // Prune old entries if we exceed max_entries
-        if entries.len() > self.max_entries {
-            // Remove oldest entries (smallest CSNs)
-            let mut csn_list: Vec<_> = entries.keys().cloned().collect();
-            csn_list.sort();
-            let to_remove = csn_list.len() - self.max_entries;
-            for csn_key in csn_list.iter().take(to_remove) {
-                entries.remove(csn_key);
-            }
+        while entries.len() > self.max_entries {
+            let Some(oldest_csn) = entries.keys().next().cloned() else {
+                break;
+            };
+            entries.remove(&oldest_csn);
         }
         drop(latest);
         drop(entries);
@@ -300,18 +297,65 @@ impl ChangelogTracker {
     /// # Returns
     /// * Vector of changelog entries after the given CSN, sorted by CSN
     pub fn get_since_csn(&self, csn: &Csn) -> Vec<ChangelogEntry> {
-        let entries = self.entries.lock().unwrap();
-        let mut result: Vec<_> = entries.values().filter(|e| e.csn > *csn).cloned().collect();
-        result.sort_by(|a, b| a.csn.cmp(&b.csn));
-        result
+        self.get_since_csn_batch(csn, 0, usize::MAX)
     }
 
     /// Get all entries (for full refresh)
     pub fn get_all(&self) -> Vec<ChangelogEntry> {
-        let entries = self.entries.lock().unwrap();
-        let mut result: Vec<_> = entries.values().cloned().collect();
-        result.sort_by(|a, b| a.csn.cmp(&b.csn));
-        result
+        self.get_all_batch(0, usize::MAX)
+    }
+
+    /// Get a bounded page of changelog entries after a CSN.
+    pub fn get_since_csn_batch(
+        &self,
+        csn: &Csn,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<ChangelogEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.csn > *csn)
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Count retained changelog entries after a CSN.
+    pub fn count_since_csn(&self, csn: &Csn) -> usize {
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.csn > *csn)
+            .count()
+    }
+
+    /// Get a bounded page of retained changelog entries.
+    pub fn get_all_batch(&self, offset: usize, limit: usize) -> Vec<ChangelogEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Count retained changelog entries.
+    pub fn count_all(&self) -> usize {
+        self.entries.lock().unwrap().len()
     }
 
     /// Get current contextCSN (latest CSN)
@@ -615,6 +659,83 @@ impl ChangelogProvider for ChangelogProviderImpl {
         Ok(limited_entries)
     }
 
+    async fn count_all_entries(
+        &self,
+        base_dn: &str,
+        _filter: Option<&str>,
+    ) -> Result<usize, String> {
+        use ldap_parser::ldap::SearchScope;
+        self.backend
+            .count_entries(base_dn, SearchScope(2))
+            .await
+            .map_err(|e| format!("Backend search failed: {:?}", e))
+    }
+
+    async fn get_all_entries_batch(
+        &self,
+        base_dn: &str,
+        _filter: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<DirectoryEntry>, String> {
+        use ldap_parser::ldap::SearchScope;
+        let backend_entries = self
+            .backend
+            .search_entries_paginated(base_dn, SearchScope(2), offset, limit)
+            .await
+            .map_err(|e| format!("Backend search failed: {:?}", e))?;
+
+        Ok(backend_entries
+            .into_iter()
+            .map(|entry| DirectoryEntry::new(entry.dn, entry.attributes))
+            .collect())
+    }
+
+    async fn count_changelog_since(&self, cookie: Option<&str>) -> Result<usize, String> {
+        let count = if let Some(cookie_str) = cookie {
+            match self.tracker.classify_cookie(cookie_str) {
+                ChangelogCookieStatus::Valid(None) => self.tracker.count_all(),
+                ChangelogCookieStatus::Valid(Some(csn)) => self.tracker.count_since_csn(&csn),
+                ChangelogCookieStatus::Stale => {
+                    return Err(format!("Stale replication cookie: {}", cookie_str));
+                }
+                ChangelogCookieStatus::Invalid => {
+                    return Err(format!("Invalid replication cookie: {}", cookie_str));
+                }
+            }
+        } else {
+            self.tracker.count_all()
+        };
+
+        Ok(count)
+    }
+
+    async fn get_changelog_batch(
+        &self,
+        cookie: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ChangelogEntry>, String> {
+        let entries = if let Some(cookie_str) = cookie {
+            match self.tracker.classify_cookie(cookie_str) {
+                ChangelogCookieStatus::Valid(None) => self.tracker.get_all_batch(offset, limit),
+                ChangelogCookieStatus::Valid(Some(csn)) => {
+                    self.tracker.get_since_csn_batch(&csn, offset, limit)
+                }
+                ChangelogCookieStatus::Stale => {
+                    return Err(format!("Stale replication cookie: {}", cookie_str));
+                }
+                ChangelogCookieStatus::Invalid => {
+                    return Err(format!("Invalid replication cookie: {}", cookie_str));
+                }
+            }
+        } else {
+            self.tracker.get_all_batch(offset, limit)
+        };
+
+        Ok(entries)
+    }
+
     async fn generate_cookie(&self, last_csn: &Csn) -> Result<String, String> {
         Ok(self.tracker.generate_cookie_from_csn(last_csn))
     }
@@ -849,6 +970,68 @@ impl ProviderConnectionImpl {
             bind_password,
             base_dn,
         }
+    }
+
+    fn include_refresh_entry(&self, entry: &DirectoryEntry) -> bool {
+        entry.dn != self.base_dn && !entry.dn.starts_with("ou=")
+    }
+
+    async fn request_local_refresh_batch(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, ConsumerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut raw_offset = 0usize;
+        let mut filtered_offset = 0usize;
+        let mut encoded_entries = Vec::with_capacity(limit);
+
+        while encoded_entries.len() < limit {
+            let remaining = limit - encoded_entries.len();
+            let batch = self
+                .changelog_provider
+                .get_all_entries_batch(&self.base_dn, None, raw_offset, limit.max(remaining))
+                .await
+                .map_err(|message| ConsumerError::ConnectionError { message })?;
+
+            if batch.is_empty() {
+                break;
+            }
+
+            raw_offset += batch.len();
+            let batch_len = batch.len();
+            for entry in batch {
+                if !self.include_refresh_entry(&entry) {
+                    continue;
+                }
+
+                if filtered_offset < offset {
+                    filtered_offset += 1;
+                    continue;
+                }
+
+                let backend_entry = crate::backend::DirectoryEntry {
+                    dn: entry.dn,
+                    attributes: entry.attributes,
+                    operational_attributes: crate::backend::OperationalAttributes::new(),
+                };
+                if let Some(encoded) = encode_directory_entry_as_change(backend_entry) {
+                    encoded_entries.push(encoded);
+                }
+                if encoded_entries.len() == limit {
+                    break;
+                }
+            }
+
+            if batch_len < limit.max(remaining) {
+                break;
+            }
+        }
+
+        Ok(encoded_entries)
     }
 }
 
@@ -1096,6 +1279,43 @@ impl ProviderConnection for ProviderConnectionImpl {
             result.len()
         );
         Ok(result)
+    }
+
+    async fn request_batch_from_cookie(
+        &self,
+        cookie: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, ConsumerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let has_ldap = self.ldap_connection.lock().unwrap().is_some();
+        if !has_ldap {
+            if cookie.is_none() || matches!(cookie, Some("csn-empty")) {
+                return self.request_local_refresh_batch(offset, limit).await;
+            }
+
+            let entries = self
+                .changelog_provider
+                .get_changelog_batch(cookie, offset, limit)
+                .await
+                .map_err(|message| ConsumerError::ConnectionError { message })?;
+
+            return Ok(entries
+                .iter()
+                .map(|entry| encode_change_bytes(&entry.change_type, &entry.dn, &entry.change_data))
+                .collect());
+        }
+
+        Ok(self
+            .request_from_cookie(cookie)
+            .await?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
     }
 
     async fn disconnect(&self) -> Result<(), ConsumerError> {

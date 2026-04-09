@@ -1176,25 +1176,79 @@ async fn test_provider_fsm_replays_only_newer_changes_for_valid_cookie() {
         .unwrap();
 
     assert_eq!(result, Some(2));
-    let session = fsm.get_session("consumer1").expect("session should exist");
-    assert_eq!(session.current_phase, ReplicationPhase::Present);
-    assert_eq!(session.pending_replay_count(), 2);
     assert_eq!(
-        session
-            .pending_replay_entries
+        fsm.get_session("consumer1")
+            .map(|session| session.current_phase.clone()),
+        Some(ReplicationPhase::Present)
+    );
+    assert_eq!(
+        fsm.get_session("consumer1")
+            .map(|session| session.pending_replay_count()),
+        Some(2)
+    );
+
+    let replay_batch = fsm
+        .next_replay_batch("consumer1")
+        .await
+        .unwrap()
+        .expect("replay batch should be available");
+    assert_eq!(
+        replay_batch
             .iter()
             .map(|entry| entry.dn.as_str())
             .collect::<Vec<_>>(),
         vec!["cn=new1,dc=example,dc=org", "cn=new2,dc=example,dc=org",]
     );
     assert_eq!(
-        session
-            .pending_replay_entries
+        replay_batch
             .iter()
             .map(|entry| entry.change_type.clone())
             .collect::<Vec<_>>(),
         vec![ChangeType::Modify, ChangeType::Delete]
     );
+}
+
+#[tokio::test]
+async fn test_provider_fsm_refresh_batches_entries_from_backend() {
+    let backend = Arc::new(create_test_backend().await);
+    let changelog_provider = Box::new(ChangelogProviderImpl::new(ChangelogTracker::new(), backend));
+    let consumer_registry = Box::new(ConsumerRegistryImpl::new());
+    let streaming_manager = Box::new(StreamingManagerImpl::new());
+    let sync_request_handler = Box::new(SyncRequestHandlerImpl::new());
+    let config = ReplicationProviderConfig {
+        refresh_batch_size: 1,
+        ..Default::default()
+    };
+
+    let mut fsm = ReplicationProviderFsmImpl::with_config(
+        changelog_provider,
+        consumer_registry,
+        streaming_manager,
+        sync_request_handler,
+        config,
+    );
+
+    fsm.handle_event(ReplicationProviderEvent::StartSyncReplication {
+        request: default_provider_request("consumer1"),
+    })
+    .await
+    .unwrap();
+
+    let mut total_entries = 0usize;
+    let mut batches = 0usize;
+    while let Some(batch) = fsm.next_refresh_batch("consumer1").await.unwrap() {
+        assert_eq!(batch.len(), 1);
+        total_entries += batch.len();
+        batches += 1;
+    }
+
+    assert_eq!(
+        total_entries,
+        fsm.get_session("consumer1")
+            .expect("session should exist")
+            .refresh_total_entries
+    );
+    assert!(batches >= 2);
 }
 
 #[tokio::test]

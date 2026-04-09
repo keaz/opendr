@@ -236,6 +236,34 @@ pub trait DirectoryBackend: Send + Sync {
         self.search_entries(base_dn, scope).await
     }
 
+    async fn search_entries_paginated(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(self
+            .search_entries(base_dn, scope)
+            .await?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
+
+    async fn count_entries(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+    ) -> Result<usize, BackendError> {
+        Ok(self.search_entries(base_dn, scope).await?.len())
+    }
+
     /// Get the current contextCSN for the database
     ///
     /// # Returns
@@ -528,6 +556,43 @@ impl DirectoryBackend for MockBackend {
         }
 
         Ok(results)
+    }
+
+    async fn search_entries_paginated(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let entries = self.entries.read().await;
+        let base_components = dn_components(base_dn);
+
+        Ok(entries
+            .values()
+            .filter(|stored| entry_in_scope(&stored.entry.dn, &base_components, scope))
+            .skip(offset)
+            .take(limit)
+            .map(|stored| stored.entry.clone())
+            .collect())
+    }
+
+    async fn count_entries(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+    ) -> Result<usize, BackendError> {
+        let entries = self.entries.read().await;
+        let base_components = dn_components(base_dn);
+
+        Ok(entries
+            .values()
+            .filter(|stored| entry_in_scope(&stored.entry.dn, &base_components, scope))
+            .count())
     }
 
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
