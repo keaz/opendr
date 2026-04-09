@@ -8,6 +8,8 @@ use crate::extended_op_fsm::{
     ExtendedOpParser, ExtendedOperationType, ParsedOperation,
 };
 use async_trait::async_trait;
+use rasn::types::OctetString;
+use rasn::{AsnType, Decode, Encode};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,6 +20,144 @@ pub mod oids {
     pub const PASSWORD_MODIFY: &str = "1.3.6.1.4.1.4203.1.11.1";
     pub const WHO_AM_I: &str = "1.3.6.1.4.1.4203.1.11.3";
     pub const CANCEL: &str = "1.3.6.1.1.8";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PasswordModifyRequest {
+    pub user_identity: Option<String>,
+    pub old_password: Option<Vec<u8>>,
+    pub new_password: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordModifyCodecError {
+    InvalidAsn1(String),
+    InvalidUtf8(&'static str),
+    EmptyRequestValue,
+    MissingGeneratedPassword,
+}
+
+impl std::fmt::Display for PasswordModifyCodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAsn1(err) => write!(f, "invalid password modify BER: {err}"),
+            Self::InvalidUtf8(field) => write!(f, "{field} must be valid UTF-8"),
+            Self::EmptyRequestValue => write!(
+                f,
+                "password modify requestValue must contain at least one field"
+            ),
+            Self::MissingGeneratedPassword => {
+                write!(f, "password modify response did not include genPasswd")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PasswordModifyCodecError {}
+
+#[derive(AsnType, Decode, Encode)]
+struct PasswordModifyRequestValue {
+    #[rasn(tag(context, 0))]
+    user_identity: Option<OctetString>,
+    #[rasn(tag(context, 1))]
+    old_password: Option<OctetString>,
+    #[rasn(tag(context, 2))]
+    new_password: Option<OctetString>,
+}
+
+#[derive(AsnType, Decode, Encode)]
+struct PasswordModifyResponseValue {
+    #[rasn(tag(context, 0))]
+    generated_password: Option<OctetString>,
+}
+
+pub fn parse_password_modify_request_value(
+    value: Option<&[u8]>,
+) -> Result<PasswordModifyRequest, PasswordModifyCodecError> {
+    let Some(value) = value else {
+        return Ok(PasswordModifyRequest::default());
+    };
+
+    let decoded: PasswordModifyRequestValue = rasn::ber::decode(value)
+        .map_err(|err| PasswordModifyCodecError::InvalidAsn1(err.to_string()))?;
+
+    if decoded.user_identity.is_none()
+        && decoded.old_password.is_none()
+        && decoded.new_password.is_none()
+    {
+        return Err(PasswordModifyCodecError::EmptyRequestValue);
+    }
+
+    let user_identity = decoded
+        .user_identity
+        .map(|value| {
+            String::from_utf8(value.to_vec())
+                .map_err(|_| PasswordModifyCodecError::InvalidUtf8("userIdentity"))
+        })
+        .transpose()?;
+
+    Ok(PasswordModifyRequest {
+        user_identity,
+        old_password: decoded.old_password.map(|value| value.to_vec()),
+        new_password: decoded.new_password.map(|value| value.to_vec()),
+    })
+}
+
+pub fn encode_password_modify_request_value(
+    request: &PasswordModifyRequest,
+) -> Result<Option<Vec<u8>>, PasswordModifyCodecError> {
+    if request.user_identity.is_none()
+        && request.old_password.is_none()
+        && request.new_password.is_none()
+    {
+        return Ok(None);
+    }
+
+    rasn::ber::encode(&PasswordModifyRequestValue {
+        user_identity: request
+            .user_identity
+            .as_deref()
+            .map(|value| value.as_bytes().to_vec().into()),
+        old_password: request
+            .old_password
+            .as_deref()
+            .map(|value| value.to_vec().into()),
+        new_password: request
+            .new_password
+            .as_deref()
+            .map(|value| value.to_vec().into()),
+    })
+    .map(Some)
+    .map_err(|err| PasswordModifyCodecError::InvalidAsn1(err.to_string()))
+}
+
+pub fn encode_password_modify_response_value(
+    generated_password: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, PasswordModifyCodecError> {
+    let Some(generated_password) = generated_password else {
+        return Ok(None);
+    };
+
+    rasn::ber::encode(&PasswordModifyResponseValue {
+        generated_password: Some(generated_password.to_vec().into()),
+    })
+    .map(Some)
+    .map_err(|err| PasswordModifyCodecError::InvalidAsn1(err.to_string()))
+}
+
+pub fn decode_password_modify_response_value(
+    value: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, PasswordModifyCodecError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let decoded: PasswordModifyResponseValue = rasn::ber::decode(value)
+        .map_err(|err| PasswordModifyCodecError::InvalidAsn1(err.to_string()))?;
+    let generated_password = decoded
+        .generated_password
+        .ok_or(PasswordModifyCodecError::MissingGeneratedPassword)?;
+    Ok(Some(generated_password.to_vec()))
 }
 
 /// Standard extended operations backend implementation
@@ -84,31 +224,25 @@ impl StandardExtendedOpBackend {
 
     /// Handle Password Modify operation
     async fn handle_password_modify(&self, value: Option<&[u8]>) -> Result<Vec<u8>, String> {
-        let data = value.ok_or("Password modify requires request data")?;
-
-        // Parse password modify request (simplified)
-        // Real implementation would use BER/DER parsing
-        let request_str = String::from_utf8(data.to_vec())
-            .map_err(|e| format!("Invalid request encoding: {}", e))?;
-
-        // Extract user DN and passwords (simplified parsing)
-        // Format: "userIdentity=<dn>|oldPassword=<old>|newPassword=<new>"
-        // Use | as separator to avoid conflicts with DN commas
-        let parts: HashMap<String, String> = request_str
-            .split('|')
-            .filter_map(|part| {
-                let kv: Vec<&str> = part.splitn(2, '=').collect();
-                if kv.len() == 2 {
-                    Some((kv[0].trim().to_string(), kv[1].trim().to_string()))
-                } else {
-                    None
-                }
+        let request = parse_password_modify_request_value(value).map_err(|err| err.to_string())?;
+        let user_dn = request
+            .user_identity
+            .as_deref()
+            .ok_or("Password modify helper backend requires userIdentity")?;
+        let old_password = request
+            .old_password
+            .as_deref()
+            .map(|password| {
+                std::str::from_utf8(password)
+                    .map_err(|_| "Old password must be valid UTF-8".to_string())
             })
-            .collect();
-
-        let user_dn = parts.get("userIdentity").ok_or("Missing userIdentity")?;
-        let old_password = parts.get("oldPassword").map(|s| s.as_str());
-        let new_password = parts.get("newPassword").ok_or("Missing newPassword")?;
+            .transpose()?;
+        let new_password = request
+            .new_password
+            .as_deref()
+            .ok_or("Password modify helper backend requires newPasswd")?;
+        let new_password = std::str::from_utf8(new_password)
+            .map_err(|_| "New password must be valid UTF-8".to_string())?;
 
         // Modify password
         self.password_modifier
@@ -209,11 +343,6 @@ impl ExtendedOpParser for StandardExtendedOpParser {
 
     fn validate_operation(&self, operation: &ParsedOperation) -> Result<(), String> {
         match &operation.operation_type {
-            ExtendedOperationType::PasswordModify => {
-                if !operation.parameters.contains_key("value") {
-                    return Err("Password modify requires value parameter".to_string());
-                }
-            }
             ExtendedOperationType::Cancel => {
                 if !operation.parameters.contains_key("value") {
                     return Err("Cancel requires value parameter (message ID)".to_string());
@@ -365,10 +494,16 @@ mod tests {
             Arc::new(MockOperationCanceller),
         );
 
-        let request =
-            b"userIdentity=cn=testuser,dc=example,dc=org|oldPassword=old123|newPassword=new456";
+        let request = PasswordModifyRequest {
+            user_identity: Some("cn=testuser,dc=example,dc=org".to_string()),
+            old_password: Some(b"old123".to_vec()),
+            new_password: Some(b"new456".to_vec()),
+        };
+        let request = encode_password_modify_request_value(&request)
+            .unwrap()
+            .unwrap();
         let result = backend
-            .execute_operation(oids::PASSWORD_MODIFY, Some(request))
+            .execute_operation(oids::PASSWORD_MODIFY, Some(&request))
             .await;
         if let Err(ref e) = result {
             eprintln!("Password modify failed: {}", e);
@@ -413,6 +548,67 @@ mod tests {
         assert_eq!(parsed.oid, oids::PASSWORD_MODIFY);
         assert_eq!(parsed.operation_type, ExtendedOperationType::PasswordModify);
         assert!(!parsed.requires_delegation);
+    }
+
+    #[test]
+    fn parse_password_modify_request_value_accepts_absent_value() {
+        let parsed = parse_password_modify_request_value(None).unwrap();
+        assert_eq!(parsed, PasswordModifyRequest::default());
+    }
+
+    #[test]
+    fn parse_password_modify_request_value_round_trips_all_fields() {
+        let encoded = encode_password_modify_request_value(&PasswordModifyRequest {
+            user_identity: Some("cn=testuser,dc=example,dc=org".to_string()),
+            old_password: Some(b"old123".to_vec()),
+            new_password: Some(b"new456".to_vec()),
+        })
+        .unwrap()
+        .unwrap();
+
+        let parsed = parse_password_modify_request_value(Some(&encoded)).unwrap();
+        assert_eq!(
+            parsed.user_identity.as_deref(),
+            Some("cn=testuser,dc=example,dc=org")
+        );
+        assert_eq!(parsed.old_password.as_deref(), Some(b"old123".as_ref()));
+        assert_eq!(parsed.new_password.as_deref(), Some(b"new456".as_ref()));
+    }
+
+    #[test]
+    fn parse_password_modify_request_value_rejects_empty_sequence() {
+        let encoded = rasn::ber::encode(&PasswordModifyRequestValue {
+            user_identity: None,
+            old_password: None,
+            new_password: None,
+        })
+        .unwrap();
+
+        let err = parse_password_modify_request_value(Some(&encoded)).unwrap_err();
+        assert_eq!(err, PasswordModifyCodecError::EmptyRequestValue);
+    }
+
+    #[test]
+    fn encode_and_decode_password_modify_response_value_round_trip() {
+        let encoded = encode_password_modify_response_value(Some(b"generated-secret")).unwrap();
+        let decoded = decode_password_modify_response_value(encoded.as_deref()).unwrap();
+        assert_eq!(decoded.as_deref(), Some(b"generated-secret".as_ref()));
+    }
+
+    #[test]
+    fn encode_password_modify_request_value_omits_empty_request() {
+        let encoded =
+            encode_password_modify_request_value(&PasswordModifyRequest::default()).unwrap();
+        assert!(encoded.is_none());
+    }
+
+    #[test]
+    fn parser_allows_password_modify_without_request_value() {
+        let parser = StandardExtendedOpParser::new();
+        let parsed = parser.parse_request(oids::PASSWORD_MODIFY, None).unwrap();
+        assert_eq!(parsed.oid, oids::PASSWORD_MODIFY);
+        assert!(!parsed.requires_delegation);
+        assert!(parser.validate_operation(&parsed).is_ok());
     }
 
     #[test]

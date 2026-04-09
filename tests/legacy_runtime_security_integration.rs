@@ -8,7 +8,10 @@ use ldap_parser::parse_ldap_messages;
 use opendr::aci::AciEngine;
 use opendr::audit::{AuditLevel, AuditLogger};
 use opendr::backend::{DirectoryBackend, MockBackend};
-use opendr::extended_ops::oids;
+use opendr::extended_ops::{
+    decode_password_modify_response_value, encode_password_modify_request_value, oids,
+    PasswordModifyRequest,
+};
 use opendr::server::{
     self, LegacyAuditConfig, LegacySecurityConfig, LegacyServerConfig, ServerError,
 };
@@ -164,6 +167,19 @@ async fn spawn_plain_runtime_server() -> RuntimeServer {
 }
 
 async fn spawn_ldaps_runtime_server() -> RuntimeServer {
+    spawn_ldaps_runtime_server_with(
+        vec![(ADMIN_DN.to_string(), ADMIN_PASSWORD.as_bytes().to_vec())],
+        None,
+        Some(ADMIN_DN.to_string()),
+    )
+    .await
+}
+
+async fn spawn_ldaps_runtime_server_with(
+    credentials: Vec<(String, Vec<u8>)>,
+    access_control: Option<Arc<AciEngine>>,
+    root_dn: Option<String>,
+) -> RuntimeServer {
     let tempdir = tempfile::tempdir().unwrap();
     let audit_log_path = tempdir.path().join("audit.log");
     let cert_path = tempdir.path().join("server.crt");
@@ -172,11 +188,8 @@ async fn spawn_ldaps_runtime_server() -> RuntimeServer {
     std::fs::write(&cert_path, &cert_pem).unwrap();
     std::fs::write(&key_path, &key_pem).unwrap();
 
-    let backend: Arc<dyn DirectoryBackend> = Arc::new(MockBackend::from_credentials([(
-        ADMIN_DN.to_string(),
-        ADMIN_PASSWORD.as_bytes().to_vec(),
-    )]));
-    let security = build_security_config(&audit_log_path, None, Some(ADMIN_DN.to_string())).await;
+    let backend: Arc<dyn DirectoryBackend> = Arc::new(MockBackend::from_credentials(credentials));
+    let security = build_security_config(&audit_log_path, access_control, root_dn).await;
     let tls_handler = build_tls_handler(&cert_path, &key_path);
     let port = reserve_port();
     let addr = format!("127.0.0.1:{port}");
@@ -310,6 +323,27 @@ fn encode_whoami_request(message_id: u32) -> Vec<u8> {
     let request = RasnExtendedRequest {
         request_name: oids::WHO_AM_I.as_bytes().to_vec().into(),
         request_value: None,
+    };
+    let message = RasnLdapMessage::new(message_id, RasnProtocolOp::ExtendedReq(request));
+    der::encode(&message).unwrap()
+}
+
+fn encode_password_modify_request(
+    message_id: u32,
+    user_identity: Option<&str>,
+    old_password: Option<&str>,
+    new_password: Option<&str>,
+) -> Vec<u8> {
+    let request_value = encode_password_modify_request_value(&PasswordModifyRequest {
+        user_identity: user_identity.map(str::to_string),
+        old_password: old_password.map(|value| value.as_bytes().to_vec()),
+        new_password: new_password.map(|value| value.as_bytes().to_vec()),
+    })
+    .unwrap()
+    .map(Into::into);
+    let request = RasnExtendedRequest {
+        request_name: oids::PASSWORD_MODIFY.as_bytes().to_vec().into(),
+        request_value,
     };
     let message = RasnLdapMessage::new(message_id, RasnProtocolOp::ExtendedReq(request));
     der::encode(&message).unwrap()
@@ -464,6 +498,353 @@ async fn ldaps_runtime_accepts_sasl_plain_and_whoami_returns_bound_dn_with_audit
     )
     .await;
     assert!(audit.contains("PLAIN"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn plaintext_runtime_rejects_password_modify_without_confidentiality() {
+    let server = spawn_plain_runtime_server_with(
+        vec![(USER_DN.to_string(), USER_PASSWORD.as_bytes().to_vec())],
+        None,
+        Some(USER_DN.to_string()),
+    )
+    .await;
+    let mut stream = connect_with_retry(server.port).await;
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, USER_DN, USER_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let response = send_message(
+        &mut stream,
+        &encode_password_modify_request(2, None, Some(USER_PASSWORD), Some("updated-secret")),
+    )
+    .await;
+    let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+    assert_eq!(messages.len(), 1);
+    match &messages[0].protocol_op {
+        ProtocolOp::ExtendedResponse(result) => {
+            assert_eq!(
+                result.result.result_code,
+                ParserResultCode::ConfidentialityRequired
+            );
+            assert_eq!(result.response_name, None);
+            assert_eq!(result.response_value, None);
+        }
+        other => panic!("unexpected password modify response: {:?}", other),
+    }
+
+    drop(stream);
+    let audit = wait_for_audit_content(
+        &server.audit_log_path,
+        &[
+            "\"action\":\"password_modify\"",
+            "\"success\":false",
+            "Password Modify requires confidentiality protection",
+        ],
+    )
+    .await;
+    assert!(!audit.contains(USER_PASSWORD));
+    assert!(!audit.contains("updated-secret"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ldaps_runtime_password_modify_self_service_updates_credentials_and_redacts_audit() {
+    let server = spawn_ldaps_runtime_server_with(
+        vec![(USER_DN.to_string(), USER_PASSWORD.as_bytes().to_vec())],
+        None,
+        Some(ADMIN_DN.to_string()),
+    )
+    .await;
+    let cert_pem = server.cert_pem.clone().unwrap();
+
+    let tcp_stream = connect_with_retry(server.port).await;
+    let connector = trusted_tls_connector(&cert_pem);
+    let mut stream = connector
+        .connect(localhost_server_name(), tcp_stream)
+        .await
+        .unwrap();
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, USER_DN, USER_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let new_password = "UpdatedUserSecret123!";
+    let response = send_message(
+        &mut stream,
+        &encode_password_modify_request(2, None, Some(USER_PASSWORD), Some(new_password)),
+    )
+    .await;
+    let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+    assert_eq!(messages.len(), 1);
+    match &messages[0].protocol_op {
+        ProtocolOp::ExtendedResponse(result) => {
+            assert_eq!(result.result.result_code, ParserResultCode::Success);
+            assert_eq!(result.response_name, None);
+            assert_eq!(result.response_value, None);
+        }
+        other => panic!("unexpected password modify response: {:?}", other),
+    }
+
+    drop(stream);
+    let audit = wait_for_audit_content(
+        &server.audit_log_path,
+        &[
+            "\"action\":\"password_modify\"",
+            "\"success\":true",
+            "\"mode\":\"self_service\"",
+            USER_DN,
+        ],
+    )
+    .await;
+    assert!(!audit.contains(USER_PASSWORD));
+    assert!(!audit.contains(new_password));
+
+    let tcp_stream = connect_with_retry(server.port).await;
+    let connector = trusted_tls_connector(&cert_pem);
+    let mut stream = connector
+        .connect(localhost_server_name(), tcp_stream)
+        .await
+        .unwrap();
+
+    let old_bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(3, USER_DN, USER_PASSWORD),
+    )
+    .await;
+    let (_, old_bind_messages) = parse_ldap_messages(&old_bind_response).unwrap();
+    match &old_bind_messages[0].protocol_op {
+        ProtocolOp::BindResponse(bind_result) => {
+            assert_eq!(
+                bind_result.result.result_code,
+                ParserResultCode::InvalidCredentials
+            );
+        }
+        other => panic!("unexpected bind response: {:?}", other),
+    }
+
+    let new_bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(4, USER_DN, new_password),
+    )
+    .await;
+    assert_bind_success(&new_bind_response);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ldaps_runtime_password_modify_rejects_wrong_old_password() {
+    let server = spawn_ldaps_runtime_server_with(
+        vec![(USER_DN.to_string(), USER_PASSWORD.as_bytes().to_vec())],
+        None,
+        Some(ADMIN_DN.to_string()),
+    )
+    .await;
+    let cert_pem = server.cert_pem.clone().unwrap();
+
+    let tcp_stream = connect_with_retry(server.port).await;
+    let connector = trusted_tls_connector(&cert_pem);
+    let mut stream = connector
+        .connect(localhost_server_name(), tcp_stream)
+        .await
+        .unwrap();
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, USER_DN, USER_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let attempted_password = "CandidateSecret789!";
+    let response = send_message(
+        &mut stream,
+        &encode_password_modify_request(
+            2,
+            None,
+            Some("wrong-old-secret"),
+            Some(attempted_password),
+        ),
+    )
+    .await;
+    let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+    assert_eq!(messages.len(), 1);
+    match &messages[0].protocol_op {
+        ProtocolOp::ExtendedResponse(result) => {
+            assert_eq!(
+                result.result.result_code,
+                ParserResultCode::InvalidCredentials
+            );
+            assert_eq!(result.response_name, None);
+            assert_eq!(result.response_value, None);
+        }
+        other => panic!("unexpected password modify response: {:?}", other),
+    }
+
+    drop(stream);
+    let audit = wait_for_audit_content(
+        &server.audit_log_path,
+        &[
+            "\"action\":\"password_modify\"",
+            "\"success\":false",
+            "\"mode\":\"self_service\"",
+            "invalid credentials",
+        ],
+    )
+    .await;
+    assert!(!audit.contains("wrong-old-secret"));
+    assert!(!audit.contains(attempted_password));
+
+    let tcp_stream = connect_with_retry(server.port).await;
+    let connector = trusted_tls_connector(&cert_pem);
+    let mut stream = connector
+        .connect(localhost_server_name(), tcp_stream)
+        .await
+        .unwrap();
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(3, USER_DN, USER_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ldaps_runtime_password_modify_admin_reset_returns_generated_password() {
+    let server = spawn_ldaps_runtime_server_with(
+        vec![
+            (ADMIN_DN.to_string(), ADMIN_PASSWORD.as_bytes().to_vec()),
+            (OTHER_DN.to_string(), OTHER_PASSWORD.as_bytes().to_vec()),
+        ],
+        None,
+        Some(ADMIN_DN.to_string()),
+    )
+    .await;
+    let cert_pem = server.cert_pem.clone().unwrap();
+
+    let tcp_stream = connect_with_retry(server.port).await;
+    let connector = trusted_tls_connector(&cert_pem);
+    let mut stream = connector
+        .connect(localhost_server_name(), tcp_stream)
+        .await
+        .unwrap();
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, ADMIN_DN, ADMIN_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let response = send_message(
+        &mut stream,
+        &encode_password_modify_request(2, Some(OTHER_DN), None, None),
+    )
+    .await;
+    let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+    assert_eq!(messages.len(), 1);
+    let generated_password = match &messages[0].protocol_op {
+        ProtocolOp::ExtendedResponse(result) => {
+            assert_eq!(result.result.result_code, ParserResultCode::Success);
+            assert_eq!(result.response_name, None);
+            let response_value = decode_password_modify_response_value(
+                result.response_value.as_ref().map(|value| value.as_ref()),
+            )
+            .unwrap()
+            .expect("generated password response value");
+            String::from_utf8(response_value).unwrap()
+        }
+        other => panic!("unexpected password modify response: {:?}", other),
+    };
+
+    drop(stream);
+    let audit = wait_for_audit_content(
+        &server.audit_log_path,
+        &[
+            "\"action\":\"password_modify\"",
+            "\"success\":true",
+            "\"mode\":\"admin_reset\"",
+            OTHER_DN,
+        ],
+    )
+    .await;
+    assert!(!audit.contains(&generated_password));
+
+    let tcp_stream = connect_with_retry(server.port).await;
+    let connector = trusted_tls_connector(&cert_pem);
+    let mut stream = connector
+        .connect(localhost_server_name(), tcp_stream)
+        .await
+        .unwrap();
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(3, OTHER_DN, &generated_password),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn ldaps_runtime_password_modify_rejects_malformed_request_value() {
+    let server = spawn_ldaps_runtime_server_with(
+        vec![(USER_DN.to_string(), USER_PASSWORD.as_bytes().to_vec())],
+        None,
+        Some(ADMIN_DN.to_string()),
+    )
+    .await;
+    let cert_pem = server.cert_pem.clone().unwrap();
+
+    let tcp_stream = connect_with_retry(server.port).await;
+    let connector = trusted_tls_connector(&cert_pem);
+    let mut stream = connector
+        .connect(localhost_server_name(), tcp_stream)
+        .await
+        .unwrap();
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, USER_DN, USER_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let request = RasnExtendedRequest {
+        request_name: oids::PASSWORD_MODIFY.as_bytes().to_vec().into(),
+        request_value: Some(vec![0x01, 0x01, 0x00].into()),
+    };
+    let message = RasnLdapMessage::new(2, RasnProtocolOp::ExtendedReq(request));
+    let response = send_message(&mut stream, &der::encode(&message).unwrap()).await;
+    let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+    assert_eq!(messages.len(), 1);
+    match &messages[0].protocol_op {
+        ProtocolOp::ExtendedResponse(result) => {
+            assert_eq!(result.result.result_code, ParserResultCode::ProtocolError);
+            assert_eq!(result.response_name, None);
+            assert_eq!(result.response_value, None);
+        }
+        other => panic!("unexpected password modify response: {:?}", other),
+    }
 
     server.shutdown().await;
 }

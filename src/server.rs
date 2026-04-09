@@ -13,6 +13,7 @@ use ldap_parser::ldap::{
 };
 use ldap_parser::parse_ldap_messages;
 use log::{error, info, warn};
+use rand::distributions::{Alphanumeric, DistString};
 use rasn::error::EncodeError;
 use rasn_ldap::ResultCode;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -27,6 +28,9 @@ use crate::backend::{
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
+use crate::extended_ops::{
+    encode_password_modify_response_value, oids, parse_password_modify_request_value,
+};
 use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
 use crate::ldap_controls::{ControlRegistry, ControlValidationError, LdapControl, RequestControls};
 use crate::metrics::{MetricsCollector, OperationType};
@@ -96,6 +100,7 @@ impl ConnectionSession {
 }
 
 const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
+const PASSWORD_MODIFY_OID: &str = oids::PASSWORD_MODIFY;
 const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
 const SUBSCHEMA_DN: &str = "cn=Subschema";
 
@@ -1331,6 +1336,7 @@ async fn process_message_with_session(
         ProtocolOp::ExtendedRequest(request) => {
             handle_extended_request_with_session(
                 socket,
+                backend,
                 message_id,
                 request,
                 session,
@@ -2358,6 +2364,7 @@ fn active_runtime_supported_extensions(
     if starttls_available && !connection_is_secure {
         supported.push(START_TLS_OID.to_string());
     }
+    supported.push(PASSWORD_MODIFY_OID.to_string());
     supported.push(WHO_AM_I_OID.to_string());
     supported
 }
@@ -2876,6 +2883,47 @@ async fn log_modify_audit_event(
         Some(dn),
         error_message,
         vec![("attributes".to_string(), attribute_names.join(","))],
+    )
+    .await;
+}
+
+async fn log_password_modify_audit_event(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    target_dn: Option<&str>,
+    mode: &str,
+    generated_password: bool,
+    success: bool,
+    error_message: Option<&str>,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_modifications {
+        return;
+    }
+
+    log_generic_audit_event(
+        request_context,
+        session,
+        if success {
+            AuditLevel::Info
+        } else {
+            AuditLevel::Warning
+        },
+        AuditEventType::DataModification,
+        "password_modify",
+        success,
+        target_dn,
+        error_message,
+        vec![
+            ("attribute".to_string(), "userPassword".to_string()),
+            ("mode".to_string(), mode.to_string()),
+            (
+                "generated_password".to_string(),
+                generated_password.to_string(),
+            ),
+        ],
     )
     .await;
 }
@@ -3476,10 +3524,12 @@ pub async fn handle_extended_request(
     message_id: u32,
     request: ExtendedRequest<'_>,
 ) -> Result<(), ServerError> {
+    let backend = crate::backend::MockBackend::default();
     let mut session = ConnectionSession::default();
     let request_controls = RequestControls::default();
     handle_extended_request_with_session(
         socket,
+        &backend,
         message_id,
         request,
         &mut session,
@@ -3492,6 +3542,7 @@ pub async fn handle_extended_request(
 
 async fn handle_extended_request_with_session(
     socket: &mut ConnectionStream,
+    backend: &dyn DirectoryBackend,
     message_id: u32,
     request: ExtendedRequest<'_>,
     session: &mut ConnectionSession,
@@ -3623,6 +3674,325 @@ async fn handle_extended_request_with_session(
             },
             None,
             Vec::new(),
+        )
+        .await;
+        return Ok(());
+    }
+
+    if oid == PASSWORD_MODIFY_OID {
+        if !socket.is_secure() {
+            log_password_modify_audit_event(
+                request_context,
+                session,
+                session.bound_dn(),
+                "unknown",
+                false,
+                false,
+                Some("Password Modify requires confidentiality protection"),
+            )
+            .await;
+            return send_result(
+                socket,
+                message_id,
+                ResponseOp::Extended,
+                ResultCode::ConfidentialityRequired,
+                "",
+                "Password Modify requires confidentiality protection",
+            )
+            .await;
+        }
+
+        let Some(bound_dn) = session.bound_dn() else {
+            log_password_modify_audit_event(
+                request_context,
+                session,
+                None,
+                "unknown",
+                false,
+                false,
+                Some("Password Modify requires an authenticated session"),
+            )
+            .await;
+            return send_result(
+                socket,
+                message_id,
+                ResponseOp::Extended,
+                ResultCode::UnwillingToPerform,
+                "",
+                "Password Modify requires an authenticated session",
+            )
+            .await;
+        };
+
+        let request_value =
+            match parse_password_modify_request_value(request.request_value.as_deref()) {
+                Ok(request_value) => request_value,
+                Err(err) => {
+                    log_password_modify_audit_event(
+                        request_context,
+                        session,
+                        session.bound_dn(),
+                        "unknown",
+                        false,
+                        false,
+                        Some("Malformed Password Modify request"),
+                    )
+                    .await;
+                    return send_result(
+                        socket,
+                        message_id,
+                        ResponseOp::Extended,
+                        ResultCode::ProtocolError,
+                        "",
+                        &err.to_string(),
+                    )
+                    .await;
+                }
+            };
+
+        let target_dn = request_value
+            .user_identity
+            .clone()
+            .unwrap_or_else(|| bound_dn.to_string());
+        let is_self_service = bound_dn.eq_ignore_ascii_case(&target_dn);
+        let mode = if is_self_service {
+            "self_service"
+        } else {
+            "admin_reset"
+        };
+
+        if is_self_service {
+            if !is_root_dn(session, request_context) {
+                let Some(old_password) = request_value.old_password.as_deref() else {
+                    log_password_modify_audit_event(
+                        request_context,
+                        session,
+                        Some(&target_dn),
+                        mode,
+                        false,
+                        false,
+                        Some("Self-service password changes require oldPasswd"),
+                    )
+                    .await;
+                    return send_result(
+                        socket,
+                        message_id,
+                        ResponseOp::Extended,
+                        ResultCode::UnwillingToPerform,
+                        "",
+                        "Self-service password changes require oldPasswd",
+                    )
+                    .await;
+                };
+
+                match backend.authenticate(&target_dn, old_password).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log_password_modify_audit_event(
+                            request_context,
+                            session,
+                            Some(&target_dn),
+                            mode,
+                            false,
+                            false,
+                            Some("invalid credentials"),
+                        )
+                        .await;
+                        return send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::Extended,
+                            ResultCode::InvalidCredentials,
+                            "",
+                            "invalid credentials",
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        log_password_modify_audit_event(
+                            request_context,
+                            session,
+                            Some(&target_dn),
+                            mode,
+                            false,
+                            false,
+                            Some(diagnostic_for_error(&err)),
+                        )
+                        .await;
+                        return send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::Extended,
+                            map_backend_error(&err),
+                            "",
+                            diagnostic_for_error(&err),
+                        )
+                        .await;
+                    }
+                }
+            }
+        } else if !is_root_dn(session, request_context) {
+            let has_access_control = request_context
+                .security
+                .as_ref()
+                .and_then(|security| security.access_control.as_ref())
+                .is_some();
+            if !has_access_control {
+                log_password_modify_audit_event(
+                    request_context,
+                    session,
+                    Some(&target_dn),
+                    mode,
+                    false,
+                    false,
+                    Some("Password resets require root or explicit write authorization"),
+                )
+                .await;
+                return send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::Extended,
+                    ResultCode::InsufficientAccessRights,
+                    "",
+                    "Password resets require root or explicit write authorization",
+                )
+                .await;
+            }
+
+            if !authorize_operation(
+                socket,
+                Some(backend),
+                message_id,
+                ResponseOp::Extended,
+                session,
+                request_context,
+                Permission::Modify,
+                "password_modify",
+                &target_dn,
+                Some("userPassword"),
+            )
+            .await?
+            {
+                return Ok(());
+            }
+        }
+
+        let (new_password, generated_password) = match request_value.new_password {
+            Some(new_password) => (new_password, false),
+            None => (
+                Alphanumeric
+                    .sample_string(&mut rand::thread_rng(), 24)
+                    .into_bytes(),
+                true,
+            ),
+        };
+        let new_password_string = match String::from_utf8(new_password.clone()) {
+            Ok(password) => password,
+            Err(_) => {
+                log_password_modify_audit_event(
+                    request_context,
+                    session,
+                    Some(&target_dn),
+                    mode,
+                    generated_password,
+                    false,
+                    Some("newPasswd must be valid UTF-8"),
+                )
+                .await;
+                return send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::Extended,
+                    ResultCode::ProtocolError,
+                    "",
+                    "newPasswd must be valid UTF-8",
+                )
+                .await;
+            }
+        };
+
+        match backend
+            .modify_entry_with_actor(
+                &target_dn,
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "userPassword".to_string(),
+                    values: vec![new_password_string],
+                }],
+                session.bound_dn().map(str::to_string),
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(err) => {
+                log_password_modify_audit_event(
+                    request_context,
+                    session,
+                    Some(&target_dn),
+                    mode,
+                    generated_password,
+                    false,
+                    Some(diagnostic_for_error(&err)),
+                )
+                .await;
+                return send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::Extended,
+                    map_backend_error(&err),
+                    "",
+                    diagnostic_for_error(&err),
+                )
+                .await;
+            }
+        }
+
+        let response_value = match encode_password_modify_response_value(
+            generated_password.then_some(new_password.as_slice()),
+        ) {
+            Ok(response_value) => response_value,
+            Err(err) => {
+                error!("failed to encode password modify response: {err}");
+                log_password_modify_audit_event(
+                    request_context,
+                    session,
+                    Some(&target_dn),
+                    mode,
+                    generated_password,
+                    false,
+                    Some("Failed to encode Password Modify response"),
+                )
+                .await;
+                return send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::Extended,
+                    ResultCode::OperationsError,
+                    "",
+                    "Failed to encode Password Modify response",
+                )
+                .await;
+            }
+        };
+
+        send_extended_response(
+            socket,
+            message_id,
+            ResultCode::Success,
+            "",
+            "",
+            None,
+            response_value,
+        )
+        .await?;
+        log_password_modify_audit_event(
+            request_context,
+            session,
+            Some(&target_dn),
+            mode,
+            generated_password,
+            true,
+            None,
         )
         .await;
         return Ok(());
@@ -4300,12 +4670,14 @@ mod tests {
         };
         let (server_stream, mut client_stream) = connected_stream_pair().await;
         let mut server_stream = ConnectionStream::Plain(server_stream);
+        let backend = MockBackend::default();
         let mut session = ConnectionSession::default();
         session.bind("cn=admin,dc=example,dc=org".to_string());
         let request_controls = RequestControls::default();
 
         handle_extended_request_with_session(
             &mut server_stream,
+            &backend,
             5,
             request,
             &mut session,
@@ -4784,7 +5156,11 @@ mod tests {
         );
         assert_eq!(
             attributes.get("supportedExtension").unwrap(),
-            &vec![START_TLS_OID.to_string(), WHO_AM_I_OID.to_string()]
+            &vec![
+                START_TLS_OID.to_string(),
+                PASSWORD_MODIFY_OID.to_string(),
+                WHO_AM_I_OID.to_string(),
+            ]
         );
         assert!(!attributes.contains_key("supportedControl"));
 
@@ -4833,7 +5209,7 @@ mod tests {
 
         assert_eq!(
             attributes.get("supportedExtension").unwrap(),
-            &vec![WHO_AM_I_OID.to_string()]
+            &vec![PASSWORD_MODIFY_OID.to_string(), WHO_AM_I_OID.to_string()]
         );
     }
 

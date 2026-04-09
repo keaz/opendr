@@ -12,8 +12,8 @@ use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::connection_fsm::{ConnectionFsmImpl, TlsHandler};
 use opendr::extended_op_fsm::{ExtendedOpBackend, ExtendedOpMetrics, ExtendedOpParser};
 use opendr::extended_ops::{
-    oids, ExtendedOpMetricsCollector, OperationCanceller, PasswordModifier,
-    StandardExtendedOpBackend, StandardExtendedOpParser,
+    encode_password_modify_request_value, oids, ExtendedOpMetricsCollector, OperationCanceller,
+    PasswordModifier, PasswordModifyRequest, StandardExtendedOpBackend, StandardExtendedOpParser,
 };
 use opendr::fsm::{ConnectionEvent, ConnectionState, SaslEvent, SaslFsm, StateMachine};
 use opendr::sasl_fsm::{CredentialVerifier, SaslFsmImpl, SaslMechanismHandler};
@@ -263,9 +263,15 @@ async fn test_extended_op_password_modify() {
         Arc::new(TestOperationCanceller),
     );
 
-    let request = b"userIdentity=cn=alice,dc=example,dc=org|oldPassword=old123|newPassword=new456";
+    let request = encode_password_modify_request_value(&PasswordModifyRequest {
+        user_identity: Some("cn=alice,dc=example,dc=org".to_string()),
+        old_password: Some(b"old123".to_vec()),
+        new_password: Some(b"new456".to_vec()),
+    })
+    .unwrap()
+    .unwrap();
     let result = backend
-        .execute_operation(oids::PASSWORD_MODIFY, Some(request))
+        .execute_operation(oids::PASSWORD_MODIFY, Some(&request))
         .await;
     assert!(result.is_ok());
 }
@@ -808,9 +814,15 @@ async fn test_extended_op_with_access_control() {
         Arc::new(TestOperationCanceller),
     );
 
-    let request = b"userIdentity=cn=alice,dc=example,dc=org|oldPassword=old123|newPassword=new456";
+    let request = encode_password_modify_request_value(&PasswordModifyRequest {
+        user_identity: Some("cn=alice,dc=example,dc=org".to_string()),
+        old_password: Some(b"old123".to_vec()),
+        new_password: Some(b"new456".to_vec()),
+    })
+    .unwrap()
+    .unwrap();
     let result = backend
-        .execute_operation(oids::PASSWORD_MODIFY, Some(request))
+        .execute_operation(oids::PASSWORD_MODIFY, Some(&request))
         .await;
     assert!(result.is_ok());
 }
