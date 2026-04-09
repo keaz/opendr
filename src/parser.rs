@@ -141,6 +141,70 @@ pub fn encode_result_response_with_controls(
     encode_message(message_id, protocol_op, controls)
 }
 
+pub fn encode_result_response_with_referrals(
+    message_id: u32,
+    op: ResponseOp,
+    result_code: ResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+    referrals: &[String],
+    controls: &[LdapControl],
+) -> Result<Vec<u8>, EncodeError> {
+    let matched_dn_bytes = matched_dn.into().into_bytes();
+    let diagnostic_bytes = diagnostic_message.into().into_bytes();
+    let referral_values = (!referrals.is_empty()).then(|| {
+        referrals
+            .iter()
+            .map(|referral| referral.as_bytes().to_vec().into())
+            .collect()
+    });
+
+    let protocol_op = match op {
+        ResponseOp::Extended => {
+            let response = rasn_ldap::ExtendedResponse {
+                result_code,
+                matched_dn: matched_dn_bytes.into(),
+                diagnostic_message: diagnostic_bytes.into(),
+                referral: referral_values,
+                response_name: None,
+                response_value: None,
+            };
+            rasn_ldap::ProtocolOp::ExtendedResp(response)
+        }
+        _ => {
+            let mut result = rasn_ldap::LdapResult::new(
+                result_code,
+                matched_dn_bytes.into(),
+                diagnostic_bytes.into(),
+            );
+            result.referral = referral_values;
+            match op {
+                ResponseOp::SearchDone => {
+                    rasn_ldap::ProtocolOp::SearchResDone(rasn_ldap::SearchResultDone(result))
+                }
+                ResponseOp::Modify => {
+                    rasn_ldap::ProtocolOp::ModifyResponse(rasn_ldap::ModifyResponse(result))
+                }
+                ResponseOp::Add => {
+                    rasn_ldap::ProtocolOp::AddResponse(rasn_ldap::AddResponse(result))
+                }
+                ResponseOp::Delete => {
+                    rasn_ldap::ProtocolOp::DelResponse(rasn_ldap::DelResponse(result))
+                }
+                ResponseOp::ModifyDn => {
+                    rasn_ldap::ProtocolOp::ModDnResponse(rasn_ldap::ModifyDnResponse(result))
+                }
+                ResponseOp::Compare => {
+                    rasn_ldap::ProtocolOp::CompareResponse(rasn_ldap::CompareResponse(result))
+                }
+                ResponseOp::Extended => unreachable!("extended responses handled above"),
+            }
+        }
+    };
+
+    encode_message(message_id, protocol_op, controls)
+}
+
 pub fn encode_extended_response(
     message_id: u32,
     result_code: ResultCode,

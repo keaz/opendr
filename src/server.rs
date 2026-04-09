@@ -38,11 +38,14 @@ use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
     encode_bind_response, encode_custom_extended_response, encode_custom_search_result_done,
     encode_extended_response_with_controls, encode_intermediate_response,
-    encode_result_response_with_controls, encode_search_entry_with_controls, CustomResultCode,
+    encode_result_response_with_controls, encode_result_response_with_referrals,
+    encode_search_entry_with_controls, encode_search_reference_with_controls, CustomResultCode,
     ResponseOp,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::real_time_propagation::is_dn_in_scope;
+use crate::referral::LdapReferralResolver;
+use crate::referral_fsm::ReferralResolver;
 use crate::replication::RenameChange;
 use crate::schema::LdapSchema;
 use crate::search_controls::{
@@ -59,6 +62,8 @@ use crate::sync_controls::{
 };
 use crate::tls::RustlsTlsHandler;
 use uuid::Uuid;
+
+const MANAGE_DSA_IT_OID: &str = "2.16.840.1.113730.3.4.2";
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -1607,6 +1612,7 @@ fn active_runtime_control_registry() -> ControlRegistry {
         .register_response_control(PAGED_RESULTS_OID)
         .register_request_control(SERVER_SIDE_SORT_REQUEST_OID)
         .register_response_control(SERVER_SIDE_SORT_RESPONSE_OID)
+        .register_request_control(MANAGE_DSA_IT_OID)
         .register_request_control(SYNC_REQUEST_OID)
         .register_response_control(SYNC_STATE_OID)
         .register_response_control(SYNC_DONE_OID);
@@ -1784,6 +1790,7 @@ async fn validate_message_controls(
 #[derive(Debug)]
 struct SearchResultSet {
     entries: Vec<DirectoryEntry>,
+    references: Vec<Vec<String>>,
     size_limit_hit: bool,
     time_limit_hit: bool,
 }
@@ -1794,6 +1801,7 @@ struct SearchExecutionError {
     diagnostic: String,
     target_dn: String,
     alias_dereference_failure: bool,
+    referral_processing_failure: bool,
 }
 
 #[derive(Debug)]
@@ -1830,6 +1838,11 @@ enum SyncRequestError {
     ProtocolError(String),
     InvalidCookie(String),
     Unsupported(String),
+}
+
+#[derive(Debug)]
+enum ManageDsaItRequestError {
+    ProtocolError(String),
 }
 
 impl PagedSearchRequestError {
@@ -1913,6 +1926,25 @@ fn parse_sync_request_control(
         request,
         critical: control.criticality(),
     }))
+}
+
+fn parse_manage_dsa_it_request(
+    request_controls: &RequestControls,
+) -> Result<bool, ManageDsaItRequestError> {
+    let control = request_controls
+        .singleton(MANAGE_DSA_IT_OID)
+        .map_err(|err| ManageDsaItRequestError::ProtocolError(err.to_string()))?;
+    let Some(control) = control else {
+        return Ok(false);
+    };
+
+    if control.value().is_some() {
+        return Err(ManageDsaItRequestError::ProtocolError(
+            "ManageDsaIT control must not include a controlValue".to_string(),
+        ));
+    }
+
+    Ok(true)
 }
 
 fn parse_paged_results_request(
@@ -2759,6 +2791,29 @@ async fn send_result_with_controls(
     Ok(())
 }
 
+async fn send_result_with_referrals(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    op: ResponseOp,
+    result_code: ResultCode,
+    matched_dn: impl Into<String>,
+    diagnostic_message: impl Into<String>,
+    referrals: &[String],
+    controls: &[LdapControl],
+) -> Result<(), ServerError> {
+    let encoded = encode_result_response_with_referrals(
+        message_id,
+        op,
+        result_code,
+        matched_dn,
+        diagnostic_message,
+        referrals,
+        controls,
+    )?;
+    socket.write_all(&encoded).await?;
+    Ok(())
+}
+
 async fn send_extended_response(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -2837,6 +2892,17 @@ async fn send_search_entry_with_controls(
 ) -> Result<(), ServerError> {
     let encoded =
         encode_search_entry_with_controls(message_id, entry, attributes, types_only, controls)?;
+    socket.write_all(&encoded).await?;
+    Ok(())
+}
+
+async fn send_search_reference_with_controls(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    referrals: &[String],
+    controls: &[LdapControl],
+) -> Result<(), ServerError> {
+    let encoded = encode_search_reference_with_controls(message_id, referrals, controls)?;
     socket.write_all(&encoded).await?;
     Ok(())
 }
@@ -3303,6 +3369,26 @@ async fn handle_search_request_with_context_and_registry(
         return Ok(());
     }
 
+    let manage_dsa_it = match parse_manage_dsa_it_request(request_controls) {
+        Ok(manage_dsa_it) => manage_dsa_it,
+        Err(ManageDsaItRequestError::ProtocolError(diagnostic)) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                ResultCode::ProtocolError,
+                &base_dn,
+                diagnostic,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if manage_dsa_it {
+        increment_control_counter(request_context, "ldap_manage_dsa_it_requests_total", 1);
+    }
+
     if let Some(control) = paged_results.as_ref() {
         if control.size == 0 && control.cookie.is_empty() {
             let err = PagedSearchRequestError::ProtocolError(
@@ -3423,6 +3509,70 @@ async fn handle_search_request_with_context_and_registry(
         }
     };
 
+    if !manage_dsa_it && request.scope == ldap_parser::ldap::SearchScope::BaseObject {
+        if let Some(base_entry) = backend.get_entry(&effective_base_dn).await.map_err(|err| {
+            ServerError::Io(std::io::Error::other(format!(
+                "failed to load search base {}: {}",
+                effective_base_dn, err
+            )))
+        })? {
+            if entry_is_referral(&base_entry) {
+                match referral_urls_for_entry(&base_entry) {
+                    Ok(referrals) => {
+                        increment_control_counter(
+                            request_context,
+                            "ldap_referral_results_total",
+                            1,
+                        );
+                        log_generic_audit_event(
+                            request_context,
+                            session,
+                            AuditLevel::Info,
+                            AuditEventType::Authorization,
+                            "search_referral",
+                            true,
+                            Some(effective_base_dn.as_str()),
+                            Some("base search resolved to referral"),
+                            vec![("referral_count".to_string(), referrals.len().to_string())],
+                        )
+                        .await;
+                        send_result_with_referrals(
+                            socket,
+                            message_id,
+                            ResponseOp::SearchDone,
+                            ResultCode::Referral,
+                            &effective_base_dn,
+                            "search base is a referral",
+                            &referrals,
+                            &[],
+                        )
+                        .await?;
+                        operation_registry.finish(message_id, FinishedOperationState::Completed);
+                        return Ok(());
+                    }
+                    Err(diagnostic) => {
+                        increment_control_counter(
+                            request_context,
+                            "ldap_referral_processing_failures_total",
+                            1,
+                        );
+                        send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::SearchDone,
+                            ResultCode::OperationsError,
+                            &effective_base_dn,
+                            diagnostic,
+                        )
+                        .await?;
+                        operation_registry.finish(message_id, FinishedOperationState::Completed);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(sync_request) = requested_sync.as_ref() {
         return handle_sync_search_request(
             socket,
@@ -3432,6 +3582,7 @@ async fn handle_search_request_with_context_and_registry(
             &effective_base_dn,
             &attribute_selection,
             sync_request,
+            manage_dsa_it,
             session,
             operation_registry,
             request_context,
@@ -3590,6 +3741,7 @@ async fn handle_search_request_with_context_and_registry(
         &effective_base_dn,
         &request,
         deref_aliases,
+        manage_dsa_it,
         search_deadline,
     )
     .await
@@ -3608,6 +3760,24 @@ async fn handle_search_request_with_context_and_registry(
                     AuditLevel::Warning,
                     AuditEventType::Authorization,
                     "search_alias_deref",
+                    false,
+                    Some(err.target_dn.as_str()),
+                    Some(err.diagnostic.as_str()),
+                    Vec::new(),
+                )
+                .await;
+            } else if err.referral_processing_failure {
+                increment_control_counter(
+                    request_context,
+                    "ldap_referral_processing_failures_total",
+                    1,
+                );
+                log_generic_audit_event(
+                    request_context,
+                    session,
+                    AuditLevel::Warning,
+                    AuditEventType::Authorization,
+                    "search_referral",
                     false,
                     Some(err.target_dn.as_str()),
                     Some(err.diagnostic.as_str()),
@@ -3641,49 +3811,53 @@ async fn handle_search_request_with_context_and_registry(
 
     if let Some(control) = paged_results.as_ref() {
         let page_size = control.size as usize;
-        let mut entries = search_result_set.entries;
+        let SearchResultSet {
+            mut entries,
+            references,
+            size_limit_hit,
+            time_limit_hit,
+        } = search_result_set;
         let total_size = entries.len();
-        let (page_entries, response_cookie, result_code, diagnostic) =
-            if search_result_set.time_limit_hit {
-                (
-                    entries.into_iter().take(page_size).collect::<Vec<_>>(),
-                    Vec::new(),
-                    ResultCode::TimeLimitExceeded,
-                    "time limit exceeded",
-                )
-            } else if entries.len() > page_size {
-                let remaining_entries = entries.split_off(page_size);
-                let cursor = PagedSearchCursor {
-                    signature: search_signature
-                        .clone()
-                        .expect("paged search signature must exist"),
-                    total_size,
-                    remaining_entries,
-                    completion_code: if search_result_set.size_limit_hit {
-                        ResultCode::SizeLimitExceeded
-                    } else {
-                        ResultCode::Success
-                    },
-                    completion_diagnostic: if search_result_set.size_limit_hit {
-                        "size limit exceeded"
-                    } else {
-                        ""
-                    },
-                };
-                let cookie = operation_registry.remember_paged_search(cursor);
-                operation_registry.attach_paged_search_to_operation(message_id, cookie.clone());
-                increment_control_counter(request_context, "ldap_paged_search_sequences_total", 1);
-                (entries, cookie, ResultCode::Success, "")
-            } else if search_result_set.size_limit_hit {
-                (
-                    entries,
-                    Vec::new(),
-                    ResultCode::SizeLimitExceeded,
-                    "size limit exceeded",
-                )
-            } else {
-                (entries, Vec::new(), ResultCode::Success, "")
+        let (page_entries, response_cookie, result_code, diagnostic) = if time_limit_hit {
+            (
+                entries.into_iter().take(page_size).collect::<Vec<_>>(),
+                Vec::new(),
+                ResultCode::TimeLimitExceeded,
+                "time limit exceeded",
+            )
+        } else if entries.len() > page_size {
+            let remaining_entries = entries.split_off(page_size);
+            let cursor = PagedSearchCursor {
+                signature: search_signature
+                    .clone()
+                    .expect("paged search signature must exist"),
+                total_size,
+                remaining_entries,
+                completion_code: if size_limit_hit {
+                    ResultCode::SizeLimitExceeded
+                } else {
+                    ResultCode::Success
+                },
+                completion_diagnostic: if size_limit_hit {
+                    "size limit exceeded"
+                } else {
+                    ""
+                },
             };
+            let cookie = operation_registry.remember_paged_search(cursor);
+            operation_registry.attach_paged_search_to_operation(message_id, cookie.clone());
+            increment_control_counter(request_context, "ldap_paged_search_sequences_total", 1);
+            (entries, cookie, ResultCode::Success, "")
+        } else if size_limit_hit {
+            (
+                entries,
+                Vec::new(),
+                ResultCode::SizeLimitExceeded,
+                "size limit exceeded",
+            )
+        } else {
+            (entries, Vec::new(), ResultCode::Success, "")
+        };
 
         let (returned, time_limit_hit) = emit_search_entries(
             socket,
@@ -3694,6 +3868,7 @@ async fn handle_search_request_with_context_and_registry(
             search_deadline,
         )
         .await?;
+        emit_search_references(socket, message_id, &references, request_context).await?;
         increment_control_counter(request_context, "ldap_paged_search_pages_total", 1);
         if time_limit_hit && !response_cookie.is_empty() {
             operation_registry.remove_paged_search(response_cookie.as_slice());
@@ -3753,6 +3928,13 @@ async fn handle_search_request_with_context_and_registry(
             &attribute_selection,
             request.types_only,
             search_deadline,
+        )
+        .await?;
+        emit_search_references(
+            socket,
+            message_id,
+            &search_result_set.references,
+            request_context,
         )
         .await?;
         let (result_code, diagnostic) = if search_result_set.time_limit_hit || emit_time_limit_hit {
@@ -3818,6 +4000,7 @@ async fn collect_search_result_set(
     effective_base_dn: &str,
     request: &SearchRequest<'_>,
     deref_aliases: ldap_parser::ldap::DerefAliases,
+    manage_dsa_it: bool,
     search_deadline: Option<Instant>,
 ) -> Result<SearchResultSet, SearchExecutionError> {
     let search_hint = extract_search_hint(&request.filter);
@@ -3829,9 +4012,11 @@ async fn collect_search_result_set(
             diagnostic: diagnostic_for_error(&err).to_string(),
             target_dn: effective_base_dn.to_string(),
             alias_dereference_failure: false,
+            referral_processing_failure: false,
         })?;
 
     let mut collected = Vec::new();
+    let mut references = Vec::new();
     let mut size_limit_hit = false;
     let mut time_limit_hit = false;
     let mut returned_dns = HashSet::new();
@@ -3851,7 +4036,21 @@ async fn collect_search_result_set(
                 diagnostic,
                 target_dn: entry.dn.clone(),
                 alias_dereference_failure: true,
+                referral_processing_failure: false,
             })?;
+
+        if entry_is_referral(&entry) && !manage_dsa_it {
+            let referral_urls =
+                referral_urls_for_entry(&entry).map_err(|diagnostic| SearchExecutionError {
+                    result_code: ResultCode::OperationsError,
+                    diagnostic,
+                    target_dn: entry.dn.clone(),
+                    alias_dereference_failure: false,
+                    referral_processing_failure: true,
+                })?;
+            references.push(referral_urls);
+            continue;
+        }
 
         if !entry_matches_filter(&entry, &request.filter) {
             continue;
@@ -3879,6 +4078,7 @@ async fn collect_search_result_set(
 
     Ok(SearchResultSet {
         entries: collected,
+        references,
         size_limit_hit,
         time_limit_hit,
     })
@@ -3913,6 +4113,25 @@ async fn emit_search_entries(
     }
 
     Ok((returned, false))
+}
+
+async fn emit_search_references(
+    socket: &mut (impl AsyncWrite + Unpin),
+    message_id: u32,
+    references: &[Vec<String>],
+    request_context: &RequestContext,
+) -> Result<(), ServerError> {
+    for referrals in references {
+        send_search_reference_with_controls(socket, message_id, referrals, &[]).await?;
+    }
+    if !references.is_empty() {
+        increment_control_counter(
+            request_context,
+            "ldap_search_references_total",
+            references.len() as u64,
+        );
+    }
+    Ok(())
 }
 
 fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
@@ -3956,6 +4175,48 @@ fn alias_target_dn(entry: &DirectoryEntry) -> Option<&str> {
         .get("aliasedobjectname")
         .and_then(|values| values.first())
         .map(String::as_str)
+}
+
+fn entry_is_referral(entry: &DirectoryEntry) -> bool {
+    entry
+        .attributes
+        .get("objectclass")
+        .map(|values| {
+            values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case("referral"))
+        })
+        .unwrap_or(false)
+        && entry
+            .attributes
+            .get("ref")
+            .is_some_and(|values| !values.is_empty())
+}
+
+fn referral_urls_for_entry(entry: &DirectoryEntry) -> Result<Vec<String>, String> {
+    let urls = entry
+        .attributes
+        .get("ref")
+        .cloned()
+        .ok_or_else(|| format!("referral entry {} is missing ref URLs", entry.dn))?;
+    if urls.is_empty() {
+        return Err(format!(
+            "referral entry {} does not contain any ref URLs",
+            entry.dn
+        ));
+    }
+
+    let resolver = LdapReferralResolver::default();
+    for url in &urls {
+        resolver.validate_referral_url(url).map_err(|err| {
+            format!(
+                "referral entry {} contains invalid LDAP URL {}: {}",
+                entry.dn, url, err
+            )
+        })?;
+    }
+
+    Ok(urls)
 }
 
 fn normalize_search_dn(dn: &str) -> String {
@@ -4324,6 +4585,7 @@ async fn handle_sync_search_request(
     base_dn: &str,
     attribute_selection: &[String],
     sync_request: &RequestedSyncControl,
+    manage_dsa_it: bool,
     connection_session: &ConnectionSession,
     operation_registry: &mut ConnectionOperationRegistry,
     request_context: &RequestContext,
@@ -4381,6 +4643,7 @@ async fn handle_sync_search_request(
             base_dn,
             request,
             request.deref_aliases,
+            manage_dsa_it,
             search_deadline,
         )
         .await
@@ -6418,7 +6681,7 @@ mod tests {
         ResultCode as ParserResultCode, SaslCredentials, SearchRequest, SearchScope,
     };
     use ldap_parser::ldap::{Change, Operation};
-    use rasn::der;
+    use rasn::{ber, der};
     use rasn_ldap::{
         AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
         Control as RasnControl, ExtendedRequest as RasnExtendedRequest,
@@ -6658,6 +6921,27 @@ mod tests {
             .collect()
     }
 
+    fn referral_entry(dn: &str, urls: &[&str]) -> DirectoryEntry {
+        DirectoryEntry::new(
+            dn,
+            HashMap::from([
+                (
+                    "objectclass".to_string(),
+                    vec![
+                        "top".to_string(),
+                        "extensibleObject".to_string(),
+                        "referral".to_string(),
+                    ],
+                ),
+                (
+                    "ref".to_string(),
+                    urls.iter().map(|url| (*url).to_string()).collect(),
+                ),
+                ("cn".to_string(), vec!["referral".to_string()]),
+            ]),
+        )
+    }
+
     fn sync_search_request() -> SearchRequest<'static> {
         SearchRequest {
             base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
@@ -6684,6 +6968,10 @@ mod tests {
                 .unwrap(),
             ),
         )])
+    }
+
+    fn manage_dsa_it_request_controls() -> RequestControls {
+        RequestControls::new(vec![LdapControl::new(MANAGE_DSA_IT_OID, true, None)])
     }
 
     fn sync_state_response(message: &ldap_parser::ldap::LdapMessage<'_>) -> SyncStateControl {
@@ -7809,6 +8097,7 @@ mod tests {
         let mut supported_controls = attributes.get("supportedControl").unwrap().clone();
         supported_controls.sort();
         let mut expected_controls = vec![
+            MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
             SERVER_SIDE_SORT_RESPONSE_OID.to_string(),
@@ -9429,5 +9718,182 @@ mod tests {
             }
             other => panic!("unexpected response: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn base_search_referral_returns_referral_result_urls() {
+        let backend = MockBackend::new();
+        let entry = referral_entry(
+            "ou=remote,dc=example,dc=org",
+            &[
+                "ldap://remote.example.org/dc=remote,dc=org",
+                "ldaps://backup.example.org/dc=remote,dc=org",
+            ],
+        );
+        backend.add_entry(entry, Vec::new()).await.unwrap();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_controls(
+            &mut server_stream,
+            &backend,
+            61,
+            search_request_for_base("ou=remote,dc=example,dc=org", &[]),
+            &RequestControls::default(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let decoded: RasnLdapMessage = ber::decode(&response).unwrap();
+        match decoded.protocol_op {
+            RasnProtocolOp::SearchResDone(done) => {
+                assert_eq!(done.0.result_code, ResultCode::Referral);
+                let referrals = done.0.referral.expect("referral URLs");
+                let urls: Vec<String> = referrals
+                    .iter()
+                    .map(|value| String::from_utf8(value.to_vec()).expect("valid UTF-8 URL"))
+                    .collect();
+                assert_eq!(
+                    urls,
+                    vec![
+                        "ldap://remote.example.org/dc=remote,dc=org".to_string(),
+                        "ldaps://backup.example.org/dc=remote,dc=org".to_string(),
+                    ]
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn subtree_search_emits_search_result_reference_for_referral_entry() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                referral_entry(
+                    "ou=remote,dc=example,dc=org",
+                    &["ldap://remote.example.org/dc=remote,dc=org??sub"],
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_controls(
+            &mut server_stream,
+            &backend,
+            62,
+            subtree_search_request("dc=example,dc=org", &[]),
+            &RequestControls::default(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultReference(_))));
+        let reference = messages
+            .iter()
+            .find_map(|message| match &message.protocol_op {
+                ProtocolOp::SearchResultReference(refs) => Some(
+                    refs.iter()
+                        .map(|url| url.0.as_ref().to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .expect("search result reference");
+        assert_eq!(
+            reference,
+            vec!["ldap://remote.example.org/dc=remote,dc=org??sub".to_string()]
+        );
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+    }
+
+    #[tokio::test]
+    async fn manage_dsa_it_base_search_returns_referral_object_as_entry() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                referral_entry(
+                    "ou=remote,dc=example,dc=org",
+                    &["ldap://remote.example.org/dc=remote,dc=org"],
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_controls(
+            &mut server_stream,
+            &backend,
+            63,
+            search_request_for_base("ou=remote,dc=example,dc=org", &["ref", "objectClass"]),
+            &manage_dsa_it_request_controls(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                let attributes = search_entry_attribute_map(entry);
+                assert_eq!(
+                    attributes.get("ref").unwrap(),
+                    &vec!["ldap://remote.example.org/dc=remote,dc=org".to_string()]
+                );
+                assert!(attributes
+                    .get("objectclass")
+                    .unwrap()
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case("referral")));
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert!(!messages
+            .iter()
+            .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultReference(_))));
+        assert!(matches!(
+            &messages[1].protocol_op,
+            ProtocolOp::SearchResultDone(done) if done.result_code == ParserResultCode::Success
+        ));
+    }
+
+    #[tokio::test]
+    async fn manage_dsa_it_control_rejects_control_value() {
+        let backend = MockBackend::new();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::new(vec![LdapControl::new(
+            MANAGE_DSA_IT_OID,
+            true,
+            Some(vec![0x04, 0x00]),
+        )]);
+
+        handle_search_request_with_controls(
+            &mut server_stream,
+            &backend,
+            64,
+            search_request_for_base("dc=example,dc=org", &[]),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0].protocol_op,
+            ProtocolOp::SearchResultDone(done) if done.result_code == ParserResultCode::ProtocolError
+        ));
     }
 }

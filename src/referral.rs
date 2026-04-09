@@ -1,8 +1,8 @@
-//! Concrete implementations for LDAP referral and chaining functionality
+//! Concrete helpers for LDAP referral and chaining functionality.
 //!
-//! This module provides production-ready implementations of the referral traits
-//! defined in the ReferralFSM. These implementations handle real LDAP connections,
-//! URL parsing, and request forwarding to remote DSAs.
+//! The shipped runtime uses this module today for RFC 4516 referral URL parsing
+//! and validation. Server-side chaining and proxying remain helper-level building
+//! blocks and are not yet enabled in the active network runtime.
 
 use crate::referral_fsm::{
     ChainHandler, NetworkClient, ProxyHandler, ReferralResolver, ResolvedEndpoint,
@@ -14,9 +14,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use url::Url;
 
-/// Production implementation of ReferralResolver
-///
-/// Parses LDAP URLs and resolves them to DSA endpoints
+/// Referral URL parser and resolver used by the active runtime.
 pub struct LdapReferralResolver {
     /// Default port for non-TLS connections
     default_port: u16,
@@ -107,9 +105,10 @@ impl ReferralResolver for LdapReferralResolver {
     }
 }
 
-/// Production implementation of ChainHandler
+/// Helper implementation of ChainHandler.
 ///
-/// Handles server-to-server LDAP request forwarding with hop count tracking
+/// Hop-count enforcement is implemented here, but actual network-layer chaining
+/// is still not wired into the active runtime.
 pub struct LdapChainHandler {
     /// Maximum hop depth allowed
     max_depth: u32,
@@ -175,11 +174,9 @@ impl ChainHandler for LdapChainHandler {
         // Add hop count to request
         let _modified_request = self.add_hop_count_to_request(request, hop_count);
 
-        // Forward request to target DSA
-        // In production, this would use the NetworkClient
-        // For now, we return a simple error indicating forwarding is needed
+        // Forward request to target DSA once chaining is enabled in the runtime.
         Err(format!(
-            "Chaining to '{}' with hop count {} not yet implemented in network layer",
+            "Chaining to '{}' with hop count {} is not enabled in the active runtime",
             target, hop_count
         ))
     }
@@ -189,9 +186,9 @@ impl ChainHandler for LdapChainHandler {
     }
 }
 
-/// Production implementation of ProxyHandler
+/// Helper implementation of ProxyHandler.
 ///
-/// Handles transparent proxying of client requests to other DSAs
+/// Transparent request proxying is not yet enabled in the active runtime.
 pub struct LdapProxyHandler {
     /// Connection timeout in milliseconds
     timeout_ms: u64,
@@ -232,15 +229,8 @@ impl Default for LdapProxyHandler {
 #[async_trait]
 impl ProxyHandler for LdapProxyHandler {
     async fn proxy_request(&self, target: &str, _request: &[u8]) -> Result<Vec<u8>, String> {
-        // Forward request to target DSA transparently
-        // In production, this would:
-        // 1. Establish connection to target (or reuse from pool)
-        // 2. Send the request as-is
-        // 3. Return the response
-        //
-        // For now, we return an error indicating proxying needs network implementation
         Err(format!(
-            "Proxying to '{}' not yet implemented in network layer",
+            "Proxying to '{}' is not enabled in the active runtime",
             target
         ))
     }
