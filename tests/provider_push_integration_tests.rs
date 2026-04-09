@@ -4,11 +4,13 @@
 //! Testing refreshAndPersist mode support and push-based replication.
 
 use opendr::backend::{DirectoryBackend, MockBackend};
-use opendr::change_observer::ChangeObserverImpl;
+use opendr::change_observer::{ChangeObserver, ChangeObserverImpl};
+use opendr::csn::Csn;
 use opendr::provider_push_integration::{ProviderPushConfig, ProviderPushCoordinator};
 use opendr::push_manager::{PushManager, PushManagerConfig};
-use opendr::replication_provider_fsm::{ConsumerConnection, SyncMode};
+use opendr::replication_provider_fsm::{ChangeType, ChangelogEntry, ConsumerConnection, SyncMode};
 use opendr::server;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -29,6 +31,24 @@ async fn create_test_coordinator() -> ProviderPushCoordinator {
         ..ProviderPushConfig::default()
     };
     ProviderPushCoordinator::new(push_manager, config)
+}
+
+async fn create_test_coordinator_with_handles_and_config(
+    config: ProviderPushConfig,
+) -> (
+    ProviderPushCoordinator,
+    Arc<ChangeObserverImpl>,
+    Arc<RwLock<PushManager>>,
+) {
+    let observer = Arc::new(ChangeObserverImpl::new());
+    let push_config = PushManagerConfig::default();
+    let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
+
+    (
+        ProviderPushCoordinator::new(push_manager.clone(), config),
+        observer,
+        push_manager,
+    )
 }
 
 async fn create_coordinator_with_config(config: ProviderPushConfig) -> ProviderPushCoordinator {
@@ -257,6 +277,113 @@ async fn test_register_consumer_with_filter() {
 
     coordinator.stop().await.unwrap();
     test_server.stop().await;
+}
+
+#[tokio::test]
+async fn test_register_consumer_with_invalid_filter_fails_explicitly() {
+    println!("\n=== Test: Register Consumer with Invalid Filter Fails ===");
+    let (coordinator, _observer, _push_manager) =
+        create_test_coordinator_with_handles_and_config(ProviderPushConfig {
+            connect_on_registration: false,
+            ..ProviderPushConfig::default()
+        })
+        .await;
+    coordinator.start().await.unwrap();
+
+    let result = coordinator
+        .register_persistent_consumer(
+            "consumer-invalid".to_string(),
+            create_test_connection(
+                "ldap://127.0.0.1:389".to_string(),
+                SyncMode::RefreshAndPersist,
+            ),
+            "dc=example,dc=com".to_string(),
+            Some("(objectClass=person".to_string()),
+            "csn-20251008000000000000#001#000001#000000".to_string(),
+        )
+        .await;
+
+    assert!(result.is_err(), "invalid filter registration must fail");
+    assert!(
+        result.unwrap_err().contains("invalid LDAP filter syntax"),
+        "registration must fail explicitly instead of broadening delivery"
+    );
+
+    coordinator.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_push_routing_only_delivers_matching_filtered_consumer() {
+    println!("\n=== Test: Push Routing Delivers Only Matching Filtered Consumer ===");
+    let observer = Arc::new(ChangeObserverImpl::new());
+    let push_config = PushManagerConfig {
+        max_retries: 0,
+        retry_delay: Duration::from_millis(10),
+        ..PushManagerConfig::default()
+    };
+    let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
+    let coordinator = ProviderPushCoordinator::new(
+        push_manager.clone(),
+        ProviderPushConfig {
+            connect_on_registration: false,
+            ..ProviderPushConfig::default()
+        },
+    );
+    coordinator.start().await.unwrap();
+
+    coordinator
+        .register_persistent_consumer(
+            "consumer-person".to_string(),
+            create_test_connection("not-a-url".to_string(), SyncMode::RefreshAndPersist),
+            "dc=example,dc=com".to_string(),
+            Some("(objectClass=person)".to_string()),
+            "csn-20251008000000000000#001#000001#000000".to_string(),
+        )
+        .await
+        .unwrap();
+    coordinator
+        .register_persistent_consumer(
+            "consumer-group".to_string(),
+            create_test_connection("not-a-url".to_string(), SyncMode::RefreshAndPersist),
+            "dc=example,dc=com".to_string(),
+            Some("(objectClass=group)".to_string()),
+            "csn-20251008000000000001#001#000001#000000".to_string(),
+        )
+        .await
+        .unwrap();
+
+    let mut attributes = HashMap::new();
+    attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+    attributes.insert("cn".to_string(), vec!["Alice".to_string()]);
+    let entry = opendr::backend::DirectoryEntry::new("cn=alice,dc=example,dc=com", attributes);
+    let change = ChangelogEntry::new(
+        Csn::new(1),
+        ChangeType::Add,
+        entry.dn.clone(),
+        serde_json::to_vec(&entry).unwrap(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), observer.notify_change(&change))
+        .await
+        .expect("filtered push routing timed out")
+        .unwrap();
+    sleep(Duration::from_millis(150)).await;
+
+    let manager = push_manager.read().await;
+    let person_stats = manager.get_consumer_stats("consumer-person").await.unwrap();
+    let group_stats = manager.get_consumer_stats("consumer-group").await.unwrap();
+    let push_stats = manager.get_stats().await;
+
+    assert_eq!(person_stats.changes_pushed, 0);
+    assert_eq!(person_stats.changes_failed, 1);
+    assert_eq!(person_stats.changes_filtered, 0);
+    assert_eq!(group_stats.changes_pushed, 0);
+    assert_eq!(group_stats.changes_failed, 0);
+    assert_eq!(group_stats.changes_filtered, 1);
+    assert_eq!(push_stats.total_changes_pushed, 0);
+    assert_eq!(push_stats.total_changes_failed, 1);
+    assert_eq!(push_stats.total_changes_filtered, 1);
+    assert_eq!(push_stats.total_filter_errors, 0);
 }
 
 #[tokio::test]

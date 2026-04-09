@@ -59,6 +59,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use crate::change_observer::{ChangeCallback, ChangeObserver};
+use crate::ldap_filter_eval::{compile_filter, prepare_change, CompiledLdapFilter, PreparedChange};
 use crate::persistent_connection::{DirectoryEntry, PersistentConsumer, SyncState};
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 
@@ -103,6 +104,8 @@ pub struct ConsumerPushStats {
     pub consumer_id: String,
     pub changes_pushed: u64,
     pub changes_failed: u64,
+    pub changes_filtered: u64,
+    pub filter_errors: u64,
     pub retries: u64,
     pub last_push: Option<Instant>,
     pub last_error: Option<String>,
@@ -115,6 +118,8 @@ impl ConsumerPushStats {
             consumer_id,
             changes_pushed: 0,
             changes_failed: 0,
+            changes_filtered: 0,
+            filter_errors: 0,
             retries: 0,
             last_push: None,
             last_error: None,
@@ -128,6 +133,8 @@ impl ConsumerPushStats {
 pub struct PushManagerStats {
     pub total_changes_pushed: u64,
     pub total_changes_failed: u64,
+    pub total_changes_filtered: u64,
+    pub total_filter_errors: u64,
     pub total_retries: u64,
     pub active_consumers: usize,
     pub started_at: Option<Instant>,
@@ -141,6 +148,9 @@ pub struct PushManagerStats {
 pub struct PushManager {
     /// Registered persistent consumers (consumer_id -> PersistentConsumer)
     consumers: Arc<RwLock<HashMap<String, Arc<PersistentConsumer>>>>,
+
+    /// Routing metadata compiled from DN scopes and LDAP filters.
+    consumer_routes: Arc<RwLock<HashMap<String, ConsumerRouting>>>,
 
     /// Per-consumer statistics
     consumer_stats: Arc<RwLock<HashMap<String, ConsumerPushStats>>>,
@@ -174,6 +184,7 @@ impl PushManager {
 
         Self {
             consumers: Arc::new(RwLock::new(HashMap::new())),
+            consumer_routes: Arc::new(RwLock::new(HashMap::new())),
             consumer_stats: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(PushManagerStats::default())),
             config,
@@ -203,6 +214,7 @@ impl PushManager {
         let callback: Arc<dyn ChangeCallback> = Arc::new(PushManagerCallback {
             push_manager: Arc::new(RwLock::new(PushManagerState {
                 consumers: self.consumers.clone(),
+                consumer_routes: self.consumer_routes.clone(),
                 consumer_stats: self.consumer_stats.clone(),
                 stats: self.stats.clone(),
                 config: self.config.clone(),
@@ -256,6 +268,14 @@ impl PushManager {
     ) -> Result<(), String> {
         info!("Registering persistent consumer: {}", consumer_id);
 
+        let route = ConsumerRouting {
+            base_dn: consumer.base_dn().to_string(),
+            compiled_filter: match consumer.filter.as_deref() {
+                Some(filter) => Some(compile_filter(filter)?),
+                None => None,
+            },
+        };
+
         let mut consumers = self.consumers.write().await;
         if consumers.contains_key(&consumer_id) {
             return Err(format!("Consumer {} already registered", consumer_id));
@@ -263,6 +283,10 @@ impl PushManager {
 
         consumers.insert(consumer_id.clone(), Arc::new(consumer));
         drop(consumers);
+
+        let mut consumer_routes = self.consumer_routes.write().await;
+        consumer_routes.insert(consumer_id.clone(), route);
+        drop(consumer_routes);
 
         // Initialize stats
         let mut consumer_stats = self.consumer_stats.write().await;
@@ -299,6 +323,10 @@ impl PushManager {
         drop(consumers);
 
         if removed {
+            let mut consumer_routes = self.consumer_routes.write().await;
+            consumer_routes.remove(consumer_id);
+            drop(consumer_routes);
+
             // Update overall stats
             let mut stats = self.stats.write().await;
             stats.active_consumers = stats.active_consumers.saturating_sub(1);
@@ -343,9 +371,16 @@ impl PushManager {
 /// Internal state for the PushManager callback
 struct PushManagerState {
     consumers: Arc<RwLock<HashMap<String, Arc<PersistentConsumer>>>>,
+    consumer_routes: Arc<RwLock<HashMap<String, ConsumerRouting>>>,
     consumer_stats: Arc<RwLock<HashMap<String, ConsumerPushStats>>>,
     stats: Arc<RwLock<PushManagerStats>>,
     config: PushManagerConfig,
+}
+
+#[derive(Debug, Clone)]
+struct ConsumerRouting {
+    base_dn: String,
+    compiled_filter: Option<CompiledLdapFilter>,
 }
 
 /// Callback implementation for receiving change notifications
@@ -363,6 +398,7 @@ impl ChangeCallback for PushManagerCallback {
 
         let state = self.push_manager.read().await;
         let consumers = state.consumers.read().await.clone();
+        let routes = state.consumer_routes.read().await.clone();
         let config = state.config.clone();
         drop(state);
 
@@ -372,14 +408,53 @@ impl ChangeCallback for PushManagerCallback {
         }
 
         info!(
-            "Pushing change {} to {} consumers",
+            "Evaluating change {} for {} consumers",
             change.dn,
             consumers.len()
         );
 
+        let requires_entry_snapshot = routes.values().any(|route| route.compiled_filter.is_some());
+        let scope_prepared = prepare_change(change, false);
+        let attribute_prepared = if requires_entry_snapshot {
+            Some(prepare_change(change, true))
+        } else {
+            None
+        };
+
         // Push to all consumers in parallel
         let mut tasks = vec![];
+        let mut filtered_count = 0;
+        let mut filter_error_count = 0;
         for (consumer_id, consumer) in consumers.iter() {
+            let Some(route) = routes.get(consumer_id).cloned() else {
+                let error = format!("missing routing metadata for consumer {}", consumer_id);
+                record_filter_error(&self.push_manager, consumer_id, &error).await;
+                filter_error_count += 1;
+                continue;
+            };
+
+            let prepared_change = if route.compiled_filter.is_some() {
+                attribute_prepared
+                    .as_ref()
+                    .expect("attribute-prepared change must exist when filters require snapshots")
+            } else {
+                &scope_prepared
+            };
+
+            match should_route_change(prepared_change, &route) {
+                Ok(true) => {}
+                Ok(false) => {
+                    record_filtered_change(&self.push_manager, consumer_id).await;
+                    filtered_count += 1;
+                    continue;
+                }
+                Err(error_message) => {
+                    record_filter_error(&self.push_manager, consumer_id, &error_message).await;
+                    filter_error_count += 1;
+                    continue;
+                }
+            }
+
             let consumer_id = consumer_id.clone();
             let consumer = consumer.clone();
             let change = change.clone();
@@ -404,32 +479,34 @@ impl ChangeCallback for PushManagerCallback {
 
         // Wait for all pushes to complete
         let mut success_count = 0;
-        let mut error_count = 0;
+        let mut push_error_count = 0;
 
         for task in tasks {
             match task.await {
                 Ok(Ok(())) => success_count += 1,
                 Ok(Err(e)) => {
-                    error_count += 1;
+                    push_error_count += 1;
                     error!("Push task failed: {}", e);
                 }
                 Err(e) => {
-                    error_count += 1;
+                    push_error_count += 1;
                     error!("Push task panicked: {}", e);
                 }
             }
         }
 
-        if error_count > 0 {
+        if push_error_count > 0 || filter_error_count > 0 {
             warn!(
-                "Push completed with errors: {}/{} succeeded",
+                "Push completed with issues: {}/{} succeeded, {} filtered, {} filter errors",
                 success_count,
-                success_count + error_count
+                success_count + push_error_count,
+                filtered_count,
+                filter_error_count
             );
         } else {
             debug!(
-                "Push completed successfully to all {} consumers",
-                success_count
+                "Push completed successfully: {} delivered, {} filtered",
+                success_count, filtered_count
             );
         }
 
@@ -446,6 +523,39 @@ async fn push_change_to_consumer_wrapper(
     config: &PushManagerConfig,
 ) -> Result<(), String> {
     push_change_to_consumer(consumer_id, consumer, change, &push_manager, config).await
+}
+
+fn should_route_change(
+    prepared_change: &Result<PreparedChange, String>,
+    route: &ConsumerRouting,
+) -> Result<bool, String> {
+    let prepared_change = prepared_change.as_ref().map_err(Clone::clone)?;
+    prepared_change.matches(&route.base_dn, route.compiled_filter.as_ref())
+}
+
+async fn record_filtered_change(push_manager: &Arc<RwLock<PushManagerState>>, consumer_id: &str) {
+    let state = push_manager.read().await;
+    if let Some(stats) = state.consumer_stats.write().await.get_mut(consumer_id) {
+        stats.changes_filtered += 1;
+    }
+    state.stats.write().await.total_changes_filtered += 1;
+}
+
+async fn record_filter_error(
+    push_manager: &Arc<RwLock<PushManagerState>>,
+    consumer_id: &str,
+    error_message: &str,
+) {
+    let state = push_manager.read().await;
+    if let Some(stats) = state.consumer_stats.write().await.get_mut(consumer_id) {
+        stats.filter_errors += 1;
+        stats.last_error = Some(error_message.to_string());
+    }
+    state.stats.write().await.total_filter_errors += 1;
+    warn!(
+        "Skipping change delivery for consumer {} because filter evaluation failed: {}",
+        consumer_id, error_message
+    );
 }
 
 /// Push a change to a specific consumer with retry logic
@@ -680,6 +790,8 @@ mod tests {
         let stats = manager.get_stats().await;
         assert_eq!(stats.total_changes_pushed, 0);
         assert_eq!(stats.total_changes_failed, 0);
+        assert_eq!(stats.total_changes_filtered, 0);
+        assert_eq!(stats.total_filter_errors, 0);
         assert_eq!(stats.active_consumers, 0);
         assert!(stats.started_at.is_none());
     }
@@ -735,6 +847,75 @@ mod tests {
         assert_eq!(stats.consumer_id, "consumer-1");
         assert_eq!(stats.changes_pushed, 0);
         assert_eq!(stats.changes_failed, 0);
+        assert_eq!(stats.changes_filtered, 0);
+        assert_eq!(stats.filter_errors, 0);
         assert!(stats.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_register_consumer_rejects_invalid_filter() {
+        let observer = Arc::new(ChangeObserverImpl::new());
+        let config = PushManagerConfig::default();
+        let mut manager = PushManager::new(observer, config);
+
+        let consumer = PersistentConsumer::with_filter_lazy(
+            "consumer-1".to_string(),
+            "ldap://127.0.0.1:389".to_string(),
+            "dc=example,dc=com".to_string(),
+            "(objectClass=person".to_string(),
+            vec!["*".to_string()],
+            Duration::from_secs(30),
+        );
+
+        let result = manager
+            .register_consumer("consumer-1".to_string(), consumer)
+            .await;
+        assert!(result.is_err());
+        assert_eq!(manager.consumer_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_push_manager_filters_non_matching_changes() {
+        let observer = Arc::new(ChangeObserverImpl::new());
+        let config = PushManagerConfig::default();
+        let mut manager = PushManager::new(observer.clone(), config);
+        manager.start().await.unwrap();
+
+        let consumer = PersistentConsumer::with_filter_lazy(
+            "consumer-1".to_string(),
+            "ldap://127.0.0.1:389".to_string(),
+            "dc=example,dc=com".to_string(),
+            "(objectClass=person)".to_string(),
+            vec!["*".to_string()],
+            Duration::from_secs(30),
+        );
+
+        manager
+            .register_consumer("consumer-1".to_string(), consumer)
+            .await
+            .unwrap();
+
+        let mut attributes = std::collections::HashMap::new();
+        attributes.insert("objectclass".to_string(), vec!["group".to_string()]);
+        attributes.insert("cn".to_string(), vec!["admins".to_string()]);
+        let entry = crate::backend::DirectoryEntry::new("cn=admins,dc=example,dc=com", attributes);
+        let change = ChangelogEntry::new(
+            Csn::new(1),
+            ChangeType::Add,
+            entry.dn.clone(),
+            serde_json::to_vec(&entry).unwrap(),
+        );
+
+        observer.notify_change(&change).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stats = manager.get_consumer_stats("consumer-1").await.unwrap();
+        assert_eq!(stats.changes_pushed, 0);
+        assert_eq!(stats.changes_failed, 0);
+        assert_eq!(stats.changes_filtered, 1);
+
+        let manager_stats = manager.get_stats().await;
+        assert_eq!(manager_stats.total_changes_filtered, 1);
+        assert_eq!(manager_stats.total_filter_errors, 0);
     }
 }

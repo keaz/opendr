@@ -73,6 +73,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::change_observer::{ChangeCallback, ChangeObserver};
+use crate::ldap_filter_eval::{
+    compile_filter, is_dn_in_scope as ldap_dn_in_scope, prepare_change, CompiledLdapFilter,
+    PreparedChange,
+};
 use crate::push_manager::PushManager;
 use crate::replication_provider_fsm::ChangelogEntry;
 
@@ -122,6 +126,9 @@ pub struct ConsumerFilter {
 
     /// Optional LDAP filter (only matching entries are sent)
     pub filter: Option<String>,
+
+    /// Compiled LDAP filter used during change evaluation.
+    pub(crate) compiled_filter: Option<CompiledLdapFilter>,
 
     /// Filter statistics
     pub stats: FilterStats,
@@ -203,6 +210,9 @@ pub struct PropagationStats {
     /// Changes filtered out
     pub changes_filtered: u64,
 
+    /// Filter evaluation errors
+    pub filter_errors: u64,
+
     /// Average propagation latency
     pub avg_latency_ms: f64,
 
@@ -222,6 +232,7 @@ impl PropagationStats {
             total_changes: 0,
             changes_propagated: 0,
             changes_filtered: 0,
+            filter_errors: 0,
             avg_latency_ms: 0.0,
             started_at: None,
         }
@@ -365,10 +376,16 @@ impl RealTimePropagationEngine {
             consumer_id, base_dn, filter
         );
 
+        let compiled_filter = match filter.as_deref() {
+            Some(filter_text) => Some(compile_filter(filter_text)?),
+            None => None,
+        };
+
         let consumer_filter = ConsumerFilter {
             consumer_id: consumer_id.clone(),
             base_dn,
             filter,
+            compiled_filter,
             stats: FilterStats::new(),
         };
 
@@ -463,6 +480,15 @@ impl ChangeCallback for PropagationCallback {
 
         // Get all consumer filters
         let filters = state.consumer_filters.read().await.clone();
+        let requires_entry_snapshot = filters
+            .values()
+            .any(|filter| filter.compiled_filter.is_some());
+        let scope_prepared = prepare_change(change, false);
+        let attribute_prepared = if requires_entry_snapshot {
+            Some(prepare_change(change, true))
+        } else {
+            None
+        };
 
         if filters.is_empty() {
             debug!("No consumer filters registered");
@@ -472,34 +498,51 @@ impl ChangeCallback for PropagationCallback {
         // Filter and route change to matching consumers
         let mut matched_consumers = 0;
         let mut filtered_out = 0;
+        let mut filter_errors = 0;
 
         for (consumer_id, filter) in filters.iter() {
-            let matches = evaluate_filter(change, filter);
+            let prepared = if filter.compiled_filter.is_some() {
+                attribute_prepared
+                    .as_ref()
+                    .expect("attribute-prepared change must exist when filters require snapshots")
+            } else {
+                &scope_prepared
+            };
 
-            // Update filter stats
-            {
-                let mut filters = state.consumer_filters.write().await;
-                if let Some(f) = filters.get_mut(consumer_id) {
-                    if matches {
+            match evaluate_filter(prepared, filter) {
+                Ok(true) => {
+                    matched_consumers += 1;
+                    let mut filters = state.consumer_filters.write().await;
+                    if let Some(f) = filters.get_mut(consumer_id) {
                         f.stats.record_match();
-                    } else {
+                    }
+                    debug!(
+                        "Change {} matches filter for consumer {}",
+                        change.dn, consumer_id
+                    );
+                }
+                Ok(false) => {
+                    filtered_out += 1;
+                    let mut filters = state.consumer_filters.write().await;
+                    if let Some(f) = filters.get_mut(consumer_id) {
                         f.stats.record_miss();
                     }
+                    debug!(
+                        "Change {} filtered out for consumer {}",
+                        change.dn, consumer_id
+                    );
                 }
-            }
-
-            if matches {
-                matched_consumers += 1;
-                debug!(
-                    "Change {} matches filter for consumer {}",
-                    change.dn, consumer_id
-                );
-            } else {
-                filtered_out += 1;
-                debug!(
-                    "Change {} filtered out for consumer {}",
-                    change.dn, consumer_id
-                );
+                Err(err) => {
+                    filter_errors += 1;
+                    let mut filters = state.consumer_filters.write().await;
+                    if let Some(f) = filters.get_mut(consumer_id) {
+                        f.stats.record_error();
+                    }
+                    warn!(
+                        "Failed to evaluate change {} for consumer {}: {}",
+                        change.dn, consumer_id, err
+                    );
+                }
             }
         }
 
@@ -508,6 +551,7 @@ impl ChangeCallback for PropagationCallback {
             let mut stats = state.stats.write().await;
             stats.changes_propagated += matched_consumers;
             stats.changes_filtered += filtered_out;
+            stats.filter_errors += filter_errors;
 
             // Update average latency
             let latency_ms = start.elapsed().as_millis() as f64;
@@ -517,8 +561,8 @@ impl ChangeCallback for PropagationCallback {
 
         let elapsed = start.elapsed();
         debug!(
-            "Change routing completed in {:?}: {} consumers matched, {} filtered out",
-            elapsed, matched_consumers, filtered_out
+            "Change routing completed in {:?}: {} consumers matched, {} filtered out, {} errors",
+            elapsed, matched_consumers, filtered_out, filter_errors
         );
 
         Ok(())
@@ -529,34 +573,19 @@ impl ChangeCallback for PropagationCallback {
 ///
 /// # Arguments
 ///
-/// * `change` - The changelog entry to evaluate
+/// * `prepared_change` - The prepared changelog entry to evaluate
 /// * `filter` - Consumer filter criteria
 ///
 /// # Returns
 ///
 /// * `true` if change matches filter
 /// * `false` if change doesn't match
-fn evaluate_filter(change: &ChangelogEntry, filter: &ConsumerFilter) -> bool {
-    // Check if DN is within scope
-    if !is_dn_in_scope(&change.dn, &filter.base_dn) {
-        return false;
-    }
-
-    // If no LDAP filter specified, DN scope match is sufficient
-    if filter.filter.is_none() {
-        return true;
-    }
-
-    // TODO: Implement full LDAP filter evaluation
-    // For now, we'll do simple filter matching
-    // In production, would use ldap_parser to evaluate filter against entry attributes
-
-    // Simplified filter evaluation (checks if filter is present)
-    // Real implementation would need to:
-    // 1. Parse LDAP filter
-    // 2. Deserialize entry from change_data
-    // 3. Evaluate filter against entry attributes
-    true
+fn evaluate_filter(
+    prepared_change: &Result<PreparedChange, String>,
+    filter: &ConsumerFilter,
+) -> Result<bool, String> {
+    let prepared_change = prepared_change.as_ref().map_err(Clone::clone)?;
+    prepared_change.matches(&filter.base_dn, filter.compiled_filter.as_ref())
 }
 
 /// Check if a DN is within the scope of a base DN
@@ -585,25 +614,7 @@ fn evaluate_filter(change: &ChangelogEntry, filter: &ConsumerFilter) -> bool {
 /// ));
 /// ```
 pub fn is_dn_in_scope(dn: &str, base_dn: &str) -> bool {
-    if dn == base_dn {
-        return true;
-    }
-
-    // Convert to lowercase for case-insensitive comparison
-    let dn_lower = dn.to_lowercase();
-    let base_dn_lower = base_dn.to_lowercase();
-
-    // Check if dn ends with base_dn
-    if dn_lower.ends_with(&base_dn_lower) {
-        // Ensure there's a separator (comma) before base_dn
-        let prefix_len = dn_lower.len() - base_dn_lower.len();
-        if prefix_len > 0 {
-            // Check the character before base_dn
-            return &dn_lower[prefix_len - 1..prefix_len] == ",";
-        }
-    }
-
-    false
+    ldap_dn_in_scope(dn, base_dn)
 }
 
 #[cfg(test)]

@@ -541,6 +541,137 @@ async fn test_filter_with_ldap_filter_string() {
 }
 
 #[tokio::test]
+async fn test_register_consumer_filter_rejects_invalid_filter() {
+    let observer = Arc::new(ChangeObserverImpl::new());
+    let push_config = PushManagerConfig::default();
+    let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
+    let config = PropagationConfig::default();
+
+    let engine = RealTimePropagationEngine::new(observer, push_manager, config);
+    engine.start().await.unwrap();
+
+    let result = engine
+        .register_consumer_filter(
+            "consumer-invalid".to_string(),
+            "dc=example,dc=com".to_string(),
+            Some("(objectClass=person".to_string()),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("invalid LDAP filter syntax"));
+}
+
+#[tokio::test]
+async fn test_propagation_evaluates_ldap_filter_against_change_snapshot() {
+    let observer = Arc::new(ChangeObserverImpl::new());
+    let push_config = PushManagerConfig::default();
+    let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
+
+    let config = PropagationConfig {
+        enable_filtering: true,
+        ..PropagationConfig::default()
+    };
+
+    let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
+    engine.start().await.unwrap();
+    engine
+        .register_consumer_filter(
+            "consumer-1".to_string(),
+            "dc=example,dc=com".to_string(),
+            Some("(objectClass=person)".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let person_entry = create_test_entry("cn=alice,dc=example,dc=com", "Alice");
+    let person_change = ChangelogEntry::new(
+        opendr::csn::Csn::new(1),
+        ChangeType::Add,
+        person_entry.dn.clone(),
+        serde_json::to_vec(&person_entry).unwrap(),
+    );
+    observer.notify_change(&person_change).await.unwrap();
+
+    let mut group_attributes = HashMap::new();
+    group_attributes.insert("cn".to_string(), vec!["admins".to_string()]);
+    group_attributes.insert("objectclass".to_string(), vec!["group".to_string()]);
+    let group_entry = DirectoryEntry::new("cn=admins,dc=example,dc=com", group_attributes);
+    let group_change = ChangelogEntry::new(
+        opendr::csn::Csn::new(2),
+        ChangeType::Add,
+        group_entry.dn.clone(),
+        serde_json::to_vec(&group_entry).unwrap(),
+    );
+    observer.notify_change(&group_change).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let filter = engine.get_consumer_filter("consumer-1").await.unwrap();
+    assert_eq!(filter.stats.total_evaluated, 2);
+    assert_eq!(filter.stats.matches, 1);
+    assert_eq!(filter.stats.misses, 1);
+    assert_eq!(filter.stats.errors, 0);
+
+    let stats = engine.get_stats().await;
+    assert_eq!(stats.total_changes, 2);
+    assert_eq!(stats.changes_propagated, 1);
+    assert_eq!(stats.changes_filtered, 1);
+    assert_eq!(stats.filter_errors, 0);
+}
+
+#[tokio::test]
+async fn test_propagation_records_filter_errors_for_rename_changes() {
+    let observer = Arc::new(ChangeObserverImpl::new());
+    let push_config = PushManagerConfig::default();
+    let push_manager = Arc::new(RwLock::new(PushManager::new(observer.clone(), push_config)));
+
+    let config = PropagationConfig {
+        enable_filtering: true,
+        ..PropagationConfig::default()
+    };
+
+    let engine = RealTimePropagationEngine::new(observer.clone(), push_manager, config);
+    engine.start().await.unwrap();
+    engine
+        .register_consumer_filter(
+            "consumer-1".to_string(),
+            "dc=example,dc=com".to_string(),
+            Some("(objectClass=person)".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let rename_payload = serde_json::json!({
+        "new_rdn": "cn=alice",
+        "delete_old": true,
+        "new_superior": "ou=people,dc=example,dc=com",
+        "actor_dn": null
+    });
+    let rename_change = ChangelogEntry::new(
+        opendr::csn::Csn::new(3),
+        ChangeType::Rename,
+        "cn=alice,ou=staging,dc=example,dc=com".to_string(),
+        serde_json::to_vec(&rename_payload).unwrap(),
+    );
+    observer.notify_change(&rename_change).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let filter = engine.get_consumer_filter("consumer-1").await.unwrap();
+    assert_eq!(filter.stats.total_evaluated, 1);
+    assert_eq!(filter.stats.matches, 0);
+    assert_eq!(filter.stats.misses, 0);
+    assert_eq!(filter.stats.errors, 1);
+
+    let stats = engine.get_stats().await;
+    assert_eq!(stats.total_changes, 1);
+    assert_eq!(stats.changes_propagated, 0);
+    assert_eq!(stats.changes_filtered, 0);
+    assert_eq!(stats.filter_errors, 1);
+}
+
+#[tokio::test]
 async fn test_propagation_latency_tracking() {
     let observer = Arc::new(ChangeObserverImpl::new());
     let push_config = PushManagerConfig::default();

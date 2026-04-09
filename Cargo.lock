@@ -1429,6 +1429,7 @@ dependencies = [
  "hmac",
  "hostname",
  "lazy_static",
+ "lber",
  "ldap-parser",
  "ldap3",
  "lmdb",

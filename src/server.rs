@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use ldap_parser::filter::{Filter, Substring, SubstringFilter};
+use ldap_parser::filter::Filter;
 use ldap_parser::ldap::{
     AddRequest, AuthenticationChoice, BindRequest, Change, CompareRequest, ExtendedRequest,
     ModDnRequest, ModifyRequest, ProtocolOp, SearchRequest,
@@ -3115,89 +3115,7 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
 }
 
 fn entry_matches_filter(entry: &DirectoryEntry, filter: &Filter<'_>) -> bool {
-    match filter {
-        Filter::And(filters) => filters.iter().all(|f| entry_matches_filter(entry, f)),
-        Filter::Or(filters) => filters.iter().any(|f| entry_matches_filter(entry, f)),
-        Filter::Not(filter) => !entry_matches_filter(entry, filter),
-        Filter::EqualityMatch(ava) => attribute_values(entry, ava.attribute_desc.0.as_ref())
-            .map(|values| {
-                let assertion = bytes_to_string(ava.assertion_value);
-                values.iter().any(|candidate| candidate == &assertion)
-            })
-            .unwrap_or(false),
-        Filter::Substrings(substring) => attribute_values(entry, substring.filter_type.0.as_ref())
-            .map(|values| matches_substrings(values, substring))
-            .unwrap_or(false),
-        Filter::GreaterOrEqual(ava) => attribute_values(entry, ava.attribute_desc.0.as_ref())
-            .map(|values| {
-                let assertion = bytes_to_string(ava.assertion_value);
-                values.iter().any(|candidate| candidate >= &assertion)
-            })
-            .unwrap_or(false),
-        Filter::LessOrEqual(ava) => attribute_values(entry, ava.attribute_desc.0.as_ref())
-            .map(|values| {
-                let assertion = bytes_to_string(ava.assertion_value);
-                values.iter().any(|candidate| candidate <= &assertion)
-            })
-            .unwrap_or(false),
-        Filter::Present(attribute) => attribute_values(entry, attribute.0.as_ref()).is_some(),
-        Filter::ApproxMatch(ava) => attribute_values(entry, ava.attribute_desc.0.as_ref())
-            .map(|values| {
-                let assertion = bytes_to_string(ava.assertion_value);
-                values
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(&assertion))
-            })
-            .unwrap_or(false),
-        Filter::ExtensibleMatch(_) => false,
-    }
-}
-
-fn matches_substrings(values: &[String], filter: &SubstringFilter<'_>) -> bool {
-    if filter.substrings.is_empty() {
-        return values.iter().any(|value| value.is_empty());
-    }
-
-    values
-        .iter()
-        .any(|value| substring_matches(value, &filter.substrings))
-}
-
-fn substring_matches(value: &str, substrings: &[Substring<'_>]) -> bool {
-    let mut remainder = value;
-
-    for substring in substrings {
-        match substring {
-            Substring::Initial(segment) => {
-                let segment = bytes_to_string(segment.0.as_ref());
-                if !remainder.starts_with(&segment) {
-                    return false;
-                }
-                remainder = &remainder[segment.len()..];
-            }
-            Substring::Any(segment) => {
-                let segment = bytes_to_string(segment.0.as_ref());
-                if segment.is_empty() {
-                    continue;
-                }
-                if let Some(index) = remainder.find(&segment) {
-                    remainder = &remainder[index + segment.len()..];
-                } else {
-                    return false;
-                }
-            }
-            Substring::Final(segment) => {
-                let segment = bytes_to_string(segment.0.as_ref());
-                return remainder.ends_with(&segment);
-            }
-        }
-    }
-
-    true
-}
-
-fn attribute_values<'a>(entry: &'a DirectoryEntry, attribute: &str) -> Option<&'a Vec<String>> {
-    entry.attributes.get(&attribute.to_lowercase())
+    crate::ldap_filter_eval::matches_search_filter(entry, filter)
 }
 
 fn convert_modifications(changes: Vec<Change<'_>>) -> Vec<Modification> {
@@ -3276,7 +3194,7 @@ mod tests {
     use crate::schema::LdapSchema;
     use ldap_parser::filter::{
         Attribute as FilterAttribute, AttributeValue, AttributeValueAssertion, Filter,
-        PartialAttribute,
+        PartialAttribute, SubstringFilter,
     };
     use ldap_parser::ldap::LdapString;
     use ldap_parser::ldap::{
