@@ -2,12 +2,12 @@
 //!
 //! Tests that schema validation is actually called during write operations
 
-use opendr::write_fsm::{
-    WriteFsmImpl, WriteFsmConfig, WriteBackend, SchemaValidator, AciChecker,
-    WriteEntry, Modification,
-};
-use opendr::fsm::{StateMachine, WriteOperation, WriteEvent, WriteState};
 use async_trait::async_trait;
+use opendr::fsm::{StateMachine, WriteEvent, WriteOperation, WriteResultCode, WriteState};
+use opendr::write_fsm::{
+    AciChecker, Modification, SchemaValidator, WriteBackend, WriteEntry, WriteFsmConfig,
+    WriteFsmImpl,
+};
 use std::sync::{Arc, Mutex};
 
 /// Mock write backend for testing
@@ -36,11 +36,23 @@ impl WriteBackend for MockWriteBackend {
         Ok(())
     }
 
-    async fn modify_entry(&self, _txn_id: &str, _dn: &str, _modifications: &[Modification]) -> Result<(), String> {
+    async fn modify_entry(
+        &self,
+        _txn_id: &str,
+        _dn: &str,
+        _modifications: &[Modification],
+    ) -> Result<(), String> {
         Ok(())
     }
 
-    async fn modify_dn(&self, _txn_id: &str, _dn: &str, _new_rdn: &str, _delete_old: bool, _new_superior: Option<&str>) -> Result<(), String> {
+    async fn modify_dn(
+        &self,
+        _txn_id: &str,
+        _dn: &str,
+        _new_rdn: &str,
+        _delete_old: bool,
+        _new_superior: Option<&str>,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -49,7 +61,7 @@ impl WriteBackend for MockWriteBackend {
     }
 
     async fn entry_exists(&self, _dn: &str) -> Result<bool, String> {
-        Ok(true)
+        Ok(false)
     }
 }
 
@@ -97,7 +109,10 @@ impl TrackingSchemaValidator {
 #[async_trait]
 impl SchemaValidator for TrackingSchemaValidator {
     async fn validate_entry(&self, entry: &WriteEntry) -> Result<(), String> {
-        self.validate_entry_calls.lock().unwrap().push(entry.dn.clone());
+        self.validate_entry_calls
+            .lock()
+            .unwrap()
+            .push(entry.dn.clone());
 
         if self.should_fail {
             return Err(format!("Schema validation failed for: {}", entry.dn));
@@ -106,8 +121,15 @@ impl SchemaValidator for TrackingSchemaValidator {
         Ok(())
     }
 
-    async fn validate_modifications(&self, dn: &str, _modifications: &[Modification]) -> Result<(), String> {
-        self.validate_modifications_calls.lock().unwrap().push(dn.to_string());
+    async fn validate_modifications(
+        &self,
+        dn: &str,
+        _modifications: &[Modification],
+    ) -> Result<(), String> {
+        self.validate_modifications_calls
+            .lock()
+            .unwrap()
+            .push(dn.to_string());
 
         if self.should_fail {
             return Err(format!("Modification validation failed for: {}", dn));
@@ -116,8 +138,16 @@ impl SchemaValidator for TrackingSchemaValidator {
         Ok(())
     }
 
-    async fn validate_dn_modification(&self, dn: &str, _new_rdn: &str, _new_superior: Option<&str>) -> Result<(), String> {
-        self.validate_dn_modification_calls.lock().unwrap().push(dn.to_string());
+    async fn validate_dn_modification(
+        &self,
+        dn: &str,
+        _new_rdn: &str,
+        _new_superior: Option<&str>,
+    ) -> Result<(), String> {
+        self.validate_dn_modification_calls
+            .lock()
+            .unwrap()
+            .push(dn.to_string());
 
         if self.should_fail {
             return Err(format!("DN modification validation failed for: {}", dn));
@@ -137,7 +167,11 @@ pub struct MockAciChecker;
 
 #[async_trait]
 impl AciChecker for MockAciChecker {
-    async fn check_write_permission(&self, _user_dn: Option<&str>, _operation: &WriteOperation) -> Result<(), String> {
+    async fn check_write_permission(
+        &self,
+        _user_dn: Option<&str>,
+        _operation: &WriteOperation,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -154,10 +188,13 @@ async fn test_schema_validation_is_called_for_add() {
     let entry = b"dn: cn=test,dc=example,dc=com\nobjectClass: person\ncn: test\nsn: user\n";
 
     // Start write operation
-    let _result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
-        dn: "cn=test,dc=example,dc=com".to_string(),
-        entry: entry.to_vec(),
-    })).await.unwrap();
+    let _result = fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+            dn: "cn=test,dc=example,dc=com".to_string(),
+            entry: entry.to_vec(),
+        }))
+        .await
+        .unwrap();
 
     // Handle validation complete - this should trigger schema validation
     let result = fsm.handle_event(WriteEvent::ValidationComplete).await;
@@ -181,10 +218,13 @@ async fn test_schema_validation_failure_for_add() {
     let entry = b"dn: cn=test,dc=example,dc=com\nobjectClass: invalidClass\n";
 
     // Start write operation
-    let _result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
-        dn: "cn=test,dc=example,dc=com".to_string(),
-        entry: entry.to_vec(),
-    })).await.unwrap();
+    let _result = fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+            dn: "cn=test,dc=example,dc=com".to_string(),
+            entry: entry.to_vec(),
+        }))
+        .await
+        .unwrap();
 
     // Handle validation complete - this should trigger schema validation and fail
     let result = fsm.handle_event(WriteEvent::ValidationComplete).await;
@@ -208,10 +248,13 @@ async fn test_schema_validation_is_called_for_modify() {
     let modifications = b"add: mail\nmail: test@example.com\n";
 
     // Start modify operation
-    let _result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Modify {
-        dn: "cn=test,dc=example,dc=com".to_string(),
-        changes: modifications.to_vec(),
-    })).await.unwrap();
+    let _result = fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Modify {
+            dn: "cn=test,dc=example,dc=com".to_string(),
+            changes: modifications.to_vec(),
+        }))
+        .await
+        .unwrap();
 
     // Handle validation complete - this should trigger schema validation
     let result = fsm.handle_event(WriteEvent::ValidationComplete).await;
@@ -233,12 +276,15 @@ async fn test_schema_validation_is_called_for_modifydn() {
     let mut fsm = WriteFsmImpl::new(backend, schema_validator, aci_checker);
 
     // Start modifydn operation
-    let _result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::ModifyDn {
-        dn: "cn=test,dc=example,dc=com".to_string(),
-        new_rdn: "cn=newtest".to_string(),
-        delete_old: true,
-        new_superior: None,
-    })).await.unwrap();
+    let _result = fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::ModifyDn {
+            dn: "cn=test,dc=example,dc=com".to_string(),
+            new_rdn: "cn=newtest".to_string(),
+            delete_old: true,
+            new_superior: None,
+        }))
+        .await
+        .unwrap();
 
     // Handle validation complete - this should trigger schema validation
     let result = fsm.handle_event(WriteEvent::ValidationComplete).await;
@@ -258,7 +304,7 @@ async fn test_schema_validation_skipped_when_disabled() {
     let aci_checker = Box::new(MockAciChecker);
 
     let config = WriteFsmConfig {
-        strict_schema_validation: false,  // Disable schema validation
+        strict_schema_validation: false, // Disable schema validation
         enable_aci_checks: false,
         ..Default::default()
     };
@@ -268,18 +314,30 @@ async fn test_schema_validation_skipped_when_disabled() {
     let entry = b"dn: cn=test,dc=example,dc=com\nobjectClass: person\ncn: test\nsn: user\n";
 
     // Start write operation
-    let _result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
-        dn: "cn=test,dc=example,dc=com".to_string(),
-        entry: entry.to_vec(),
-    })).await.unwrap();
+    let _result = fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+            dn: "cn=test,dc=example,dc=com".to_string(),
+            entry: entry.to_vec(),
+        }))
+        .await
+        .unwrap();
 
     // Handle validation complete - schema validation should be skipped
     let _result = fsm.handle_event(WriteEvent::ValidationComplete).await;
 
     // Verify schema validation was NOT called
     let calls = validator_clone.lock().unwrap();
-    assert_eq!(calls.len(), 0, "Schema validator should NOT be called when disabled");
-    assert_eq!(fsm.current_state(), &WriteState::InTransaction);
+    assert_eq!(
+        calls.len(),
+        0,
+        "Schema validator should NOT be called when disabled"
+    );
+    assert_eq!(
+        fsm.current_state(),
+        &WriteState::Completed {
+            result_code: WriteResultCode::Success,
+        }
+    );
 }
 
 #[tokio::test]
@@ -296,10 +354,13 @@ async fn test_schema_validation_with_real_ldap_schema_validator() {
     let entry = b"dn: cn=John Doe,dc=example,dc=com\nobjectClass: top\nobjectClass: person\ncn: John Doe\nsn: Doe\n";
 
     // Start write operation
-    let _result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
-        dn: "cn=John Doe,dc=example,dc=com".to_string(),
-        entry: entry.to_vec(),
-    })).await.unwrap();
+    let _result = fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+            dn: "cn=John Doe,dc=example,dc=com".to_string(),
+            entry: entry.to_vec(),
+        }))
+        .await
+        .unwrap();
 
     // Handle validation complete - should pass with real schema
     let result = fsm.handle_event(WriteEvent::ValidationComplete).await;
@@ -318,17 +379,24 @@ async fn test_schema_validation_with_real_ldap_schema_validator_failure() {
     let mut fsm = WriteFsmImpl::new(backend, schema_validator, aci_checker);
 
     // Invalid entry - missing required attribute 'sn'
-    let entry = b"dn: cn=John Doe,dc=example,dc=com\nobjectClass: top\nobjectClass: person\ncn: John Doe\n";
+    let entry =
+        b"dn: cn=John Doe,dc=example,dc=com\nobjectClass: top\nobjectClass: person\ncn: John Doe\n";
 
     // Start write operation
-    let _result = fsm.handle_event(WriteEvent::StartWrite(WriteOperation::Add {
-        dn: "cn=John Doe,dc=example,dc=com".to_string(),
-        entry: entry.to_vec(),
-    })).await.unwrap();
+    let _result = fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+            dn: "cn=John Doe,dc=example,dc=com".to_string(),
+            entry: entry.to_vec(),
+        }))
+        .await
+        .unwrap();
 
     // Handle validation complete - should fail due to missing 'sn'
     let result = fsm.handle_event(WriteEvent::ValidationComplete).await;
 
-    assert!(result.is_err(), "Entry missing required 'sn' should fail validation");
+    assert!(
+        result.is_err(),
+        "Entry missing required 'sn' should fail validation"
+    );
     assert!(matches!(fsm.current_state(), WriteState::Failed { .. }));
 }
