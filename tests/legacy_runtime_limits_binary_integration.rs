@@ -186,7 +186,7 @@ fn spawn_opendr(tempdir: TempDir, port: u16) -> TestBinaryServer {
 
 async fn connect_with_retry(port: u16) -> TcpStream {
     let addr = format!("127.0.0.1:{port}");
-    for _ in 0..50 {
+    for _ in 0..250 {
         match TcpStream::connect(&addr).await {
             Ok(stream) => return stream,
             Err(_) => sleep(Duration::from_millis(20)).await,

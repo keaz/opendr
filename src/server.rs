@@ -2291,7 +2291,10 @@ async fn handle_modify_request_with_context(
         return Ok(());
     }
 
-    match backend.modify_entry(&dn, modifications).await {
+    match backend
+        .modify_entry_with_actor(&dn, modifications, session.bound_dn().map(str::to_string))
+        .await
+    {
         Ok(()) => {
             log_modify_audit_event(
                 request_context,
@@ -2413,7 +2416,10 @@ async fn handle_add_request_with_context(
         return Ok(());
     }
 
-    match backend.add_entry(entry, password).await {
+    match backend
+        .add_entry_with_actor(entry, password, session.bound_dn().map(str::to_string))
+        .await
+    {
         Ok(()) => {
             if let Some(security) = request_context.security.as_ref() {
                 if security.audit_config.log_modifications {
@@ -2624,7 +2630,13 @@ async fn handle_moddn_request_with_context(
     let new_dn = compute_new_dn(&dn, &new_rdn, new_superior.as_deref());
 
     match backend
-        .rename_entry(&dn, &new_rdn, delete_old, new_superior)
+        .rename_entry_with_actor(
+            &dn,
+            &new_rdn,
+            delete_old,
+            new_superior,
+            session.bound_dn().map(str::to_string),
+        )
         .await
     {
         Ok(()) => {
@@ -3240,14 +3252,16 @@ mod tests {
     use crate::config::ServerConfig;
     use crate::replication::REPLICATION_STREAM_ATTRIBUTE;
     use crate::replication_service::ReplicationService;
+    use crate::schema::LdapSchema;
     use ldap_parser::filter::{
         Attribute as FilterAttribute, AttributeValue, AttributeValueAssertion, Filter,
         PartialAttribute,
     };
     use ldap_parser::ldap::LdapString;
     use ldap_parser::ldap::{
-        AuthenticationChoice, BindRequest, CompareRequest, DerefAliases, ExtendedRequest, LdapDN,
-        LdapOID, ResultCode as ParserResultCode, SaslCredentials, SearchRequest, SearchScope,
+        AddRequest, AuthenticationChoice, BindRequest, CompareRequest, DerefAliases,
+        ExtendedRequest, LdapDN, LdapOID, ModDnRequest, ModifyRequest, RelativeLdapDN,
+        ResultCode as ParserResultCode, SaslCredentials, SearchRequest, SearchScope,
     };
     use ldap_parser::ldap::{Change, Operation};
     use rasn::der;
@@ -3697,6 +3711,202 @@ mod tests {
             }
             other => panic!("unexpected response: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_add_uses_bound_dn_for_operational_attrs() {
+        let backend = MockBackend::new();
+        let mut session = ConnectionSession::default();
+        session.bind("cn=admin,dc=example,dc=org".to_string());
+        let schema = LdapSchema::default();
+        let request = AddRequest {
+            entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            attributes: vec![
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("objectClass".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"person".to_vec()))],
+                },
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("cn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"Alice".to_vec()))],
+                },
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("sn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"User".to_vec()))],
+                },
+            ],
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_add_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            8,
+            request,
+            &session,
+            &RequestContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::AddResponse(add_response) => {
+                assert_eq!(add_response.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let stored = backend
+            .get_entry("cn=Alice,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.operational_attributes.creators_name.as_deref(),
+            Some("cn=admin,dc=example,dc=org")
+        );
+        assert_eq!(
+            stored.operational_attributes.modifiers_name.as_deref(),
+            Some("cn=admin,dc=example,dc=org")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_modify_uses_bound_dn_for_operational_attrs() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry_with_actor(
+                DirectoryEntry::new(
+                    "cn=Alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Alice".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+                Some("cn=creator,dc=example,dc=org".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let mut session = ConnectionSession::default();
+        session.bind("cn=modifier,dc=example,dc=org".to_string());
+        let request = ModifyRequest {
+            object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            changes: vec![Change {
+                operation: Operation(2),
+                modification: PartialAttribute {
+                    attr_type: LdapString(Cow::Owned("cn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"Alice Updated".to_vec()))],
+                },
+            }],
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_modify_request_with_context(
+            &mut server_stream,
+            &backend,
+            9,
+            request,
+            &session,
+            &RequestContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::ModifyResponse(modify_response) => {
+                assert_eq!(
+                    modify_response.result.result_code,
+                    ParserResultCode::Success
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let stored = backend
+            .get_entry("cn=Alice,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.operational_attributes.creators_name.as_deref(),
+            Some("cn=creator,dc=example,dc=org")
+        );
+        assert_eq!(
+            stored.operational_attributes.modifiers_name.as_deref(),
+            Some("cn=modifier,dc=example,dc=org")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_moddn_uses_bound_dn_for_operational_attrs() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry_with_actor(
+                DirectoryEntry::new(
+                    "cn=Alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Alice".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+                Some("cn=creator,dc=example,dc=org".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let mut session = ConnectionSession::default();
+        session.bind("cn=renamer,dc=example,dc=org".to_string());
+        let request = ModDnRequest {
+            entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            newrdn: RelativeLdapDN(Cow::Owned("cn=Alice Renamed".to_string())),
+            deleteoldrdn: true,
+            newsuperior: None,
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_moddn_request_with_context(
+            &mut server_stream,
+            &backend,
+            10,
+            request,
+            &session,
+            &RequestContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::ModDnResponse(moddn_response) => {
+                assert_eq!(moddn_response.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let stored = backend
+            .get_entry("cn=Alice Renamed,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.operational_attributes.creators_name.as_deref(),
+            Some("cn=creator,dc=example,dc=org")
+        );
+        assert_eq!(
+            stored.operational_attributes.modifiers_name.as_deref(),
+            Some("cn=renamer,dc=example,dc=org")
+        );
     }
 
     #[tokio::test]

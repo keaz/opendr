@@ -35,7 +35,7 @@ use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, SearchCandidateHint,
 };
 use crate::change_observer::ChangeObserver;
-use crate::replication::{encode_rename_change, ChangelogTracker};
+use crate::replication::{encode_rename_change_with_actor, ChangelogTracker};
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 
 #[cfg(test)]
@@ -107,18 +107,27 @@ impl ChangelogBackendWrapper {
         change_type: ChangeType,
         dn: String,
         change_data: Vec<u8>,
+        originator: Option<String>,
     ) -> Option<crate::csn::Csn> {
         if let Some(ref changelog) = self.changelog {
-            let csn = changelog.record_change(change_type.clone(), dn.clone(), change_data.clone());
+            let csn = changelog.record_change_with_originator(
+                change_type.clone(),
+                dn.clone(),
+                change_data.clone(),
+                originator.clone(),
+            );
 
             // Notify observer if present (for push-based replication)
             if let Some(ref observer) = self.observer {
-                let changelog_entry = crate::replication_provider_fsm::ChangelogEntry::new(
+                let mut changelog_entry = crate::replication_provider_fsm::ChangelogEntry::new(
                     csn.clone(),
                     change_type,
                     dn,
                     change_data,
                 );
+                if let Some(originator) = originator.clone() {
+                    changelog_entry = changelog_entry.with_originator(originator);
+                }
                 let observer_entry = changelog_entry.clone();
 
                 // Spawn async task to notify observer without blocking
@@ -133,12 +142,15 @@ impl ChangelogBackendWrapper {
                     let _ = sender.send(changelog_entry);
                 }
             } else if let Some(ref sender) = self.replication_sender {
-                let changelog_entry = crate::replication_provider_fsm::ChangelogEntry::new(
+                let mut changelog_entry = crate::replication_provider_fsm::ChangelogEntry::new(
                     csn.clone(),
                     change_type,
                     dn,
                     change_data,
                 );
+                if let Some(originator) = originator {
+                    changelog_entry = changelog_entry.with_originator(originator);
+                }
                 let _ = sender.send(changelog_entry);
             }
 
@@ -175,15 +187,28 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         entry: DirectoryEntry,
         password: Vec<u8>,
     ) -> Result<(), BackendError> {
-        // Record DN and serialized entry before adding
+        self.add_entry_with_actor(entry, password, None).await
+    }
+
+    async fn add_entry_with_actor(
+        &self,
+        entry: DirectoryEntry,
+        password: Vec<u8>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
         let dn = entry.dn.clone();
-        let entry_data = Self::serialize_entry(&entry);
 
-        // Perform the add operation
-        self.backend.add_entry(entry, password).await?;
+        self.backend
+            .add_entry_with_actor(entry, password, actor_dn.clone())
+            .await?;
 
-        // Record to changelog after successful add
-        self.record_change(ChangeType::Add, dn, entry_data);
+        let entry_data = if let Ok(Some(stored_entry)) = self.backend.get_entry(&dn).await {
+            Self::serialize_entry(&stored_entry)
+        } else {
+            Vec::new()
+        };
+
+        self.record_change(ChangeType::Add, dn, entry_data, actor_dn);
 
         Ok(())
     }
@@ -198,13 +223,22 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         dn: &str,
         modifications: Vec<Modification>,
     ) -> Result<(), BackendError> {
-        // Perform the modify operation
-        self.backend.modify_entry(dn, modifications.clone()).await?;
+        self.modify_entry_with_actor(dn, modifications, None).await
+    }
 
-        // Get the updated entry for changelog
+    async fn modify_entry_with_actor(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        self.backend
+            .modify_entry_with_actor(dn, modifications.clone(), actor_dn.clone())
+            .await?;
+
         if let Ok(Some(entry)) = self.backend.get_entry(dn).await {
             let entry_data = Self::serialize_entry(&entry);
-            self.record_change(ChangeType::Modify, dn.to_string(), entry_data);
+            self.record_change(ChangeType::Modify, dn.to_string(), entry_data, actor_dn);
         }
 
         Ok(())
@@ -222,7 +256,7 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         self.backend.delete_entry(dn).await?;
 
         // Record to changelog after successful delete
-        self.record_change(ChangeType::Delete, dn.to_string(), entry_data);
+        self.record_change(ChangeType::Delete, dn.to_string(), entry_data, None);
 
         Ok(())
     }
@@ -274,16 +308,38 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         delete_old: bool,
         new_superior: Option<String>,
     ) -> Result<(), BackendError> {
-        // Perform the rename operation
+        self.rename_entry_with_actor(dn, new_rdn, delete_old, new_superior, None)
+            .await
+    }
+
+    async fn rename_entry_with_actor(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old: bool,
+        new_superior: Option<String>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
         self.backend
-            .rename_entry(dn, new_rdn, delete_old, new_superior.clone())
+            .rename_entry_with_actor(
+                dn,
+                new_rdn,
+                delete_old,
+                new_superior.clone(),
+                actor_dn.clone(),
+            )
             .await?;
 
-        // Record to changelog after successful rename
         self.record_change(
             ChangeType::Rename,
             dn.to_string(),
-            encode_rename_change(new_rdn, delete_old, new_superior.as_deref()),
+            encode_rename_change_with_actor(
+                new_rdn,
+                delete_old,
+                new_superior.as_deref(),
+                actor_dn.as_deref(),
+            ),
+            actor_dn,
         );
 
         Ok(())
@@ -332,6 +388,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_entry_with_actor_records_originator_and_stamped_entry() {
+        let backend = Arc::new(MockBackend::new());
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+        let actor = "cn=admin,dc=example,dc=com".to_string();
+
+        wrapper
+            .add_entry_with_actor(
+                create_test_entry("cn=test,dc=example,dc=com"),
+                vec![],
+                Some(actor.clone()),
+            )
+            .await
+            .unwrap();
+
+        let entries = changelog.get_all();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].originator.as_deref(), Some(actor.as_str()));
+
+        let stored: DirectoryEntry = serde_json::from_slice(&entries[0].change_data).unwrap();
+        assert_eq!(
+            stored.operational_attributes.creators_name,
+            Some(actor.clone())
+        );
+        assert_eq!(stored.operational_attributes.modifiers_name, Some(actor));
+    }
+
+    #[tokio::test]
     async fn test_modify_entry_records_to_changelog() {
         let backend = MockBackend::new();
         let entry = create_test_entry("cn=test,dc=example,dc=com");
@@ -356,6 +440,42 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
         assert!(matches!(entries[0].change_type, ChangeType::Modify));
+    }
+
+    #[tokio::test]
+    async fn test_modify_entry_with_actor_records_originator() {
+        let backend = MockBackend::new();
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        backend
+            .add_entry_with_actor(
+                entry.clone(),
+                vec![],
+                Some("cn=creator,dc=example,dc=com".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let backend = Arc::new(backend);
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+        let actor = "cn=modifier,dc=example,dc=com".to_string();
+
+        wrapper
+            .modify_entry_with_actor(
+                "cn=test,dc=example,dc=com",
+                vec![Modification {
+                    operation: crate::backend::ModifyOperation::Replace,
+                    attribute: "cn".to_string(),
+                    values: vec!["Modified User".to_string()],
+                }],
+                Some(actor.clone()),
+            )
+            .await
+            .unwrap();
+
+        let entries = changelog.get_all();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].originator.as_deref(), Some(actor.as_str()));
     }
 
     #[tokio::test]
@@ -407,8 +527,39 @@ mod tests {
                 new_rdn: "cn=renamed".to_string(),
                 delete_old: true,
                 new_superior: None,
+                actor_dn: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn test_rename_entry_with_actor_records_originator_in_payload() {
+        let backend = MockBackend::new();
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        backend.add_entry(entry.clone(), vec![]).await.unwrap();
+
+        let backend = Arc::new(backend);
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+        let actor = "cn=renamer,dc=example,dc=com".to_string();
+
+        wrapper
+            .rename_entry_with_actor(
+                "cn=test,dc=example,dc=com",
+                "cn=renamed",
+                true,
+                None,
+                Some(actor.clone()),
+            )
+            .await
+            .unwrap();
+
+        let entries = changelog.get_all();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].originator.as_deref(), Some(actor.as_str()));
+
+        let payload: RenameChange = serde_json::from_slice(&entries[0].change_data).unwrap();
+        assert_eq!(payload.actor_dn, Some(actor));
     }
 
     #[tokio::test]

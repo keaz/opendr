@@ -32,11 +32,23 @@ mock! {
         async fn get_entry(&self, dn: &str) -> Result<Option<DirectoryEntry>, BackendError>;
         async fn add_entry(&self, entry: DirectoryEntry, password: Vec<u8>)
             -> Result<(), BackendError>;
+        async fn add_entry_with_actor(
+            &self,
+            entry: DirectoryEntry,
+            password: Vec<u8>,
+            actor_dn: Option<String>,
+        ) -> Result<(), BackendError>;
         async fn delete_entry(&self, dn: &str) -> Result<(), BackendError>;
         async fn modify_entry(
             &self,
             dn: &str,
             modifications: Vec<Modification>,
+        ) -> Result<(), BackendError>;
+        async fn modify_entry_with_actor(
+            &self,
+            dn: &str,
+            modifications: Vec<Modification>,
+            actor_dn: Option<String>,
         ) -> Result<(), BackendError>;
         async fn compare_attribute(
             &self,
@@ -50,6 +62,14 @@ mock! {
             new_rdn: &str,
             delete_old: bool,
             new_superior: Option<String>,
+        ) -> Result<(), BackendError>;
+        async fn rename_entry_with_actor(
+            &self,
+            dn: &str,
+            new_rdn: &str,
+            delete_old: bool,
+            new_superior: Option<String>,
+            actor_dn: Option<String>,
         ) -> Result<(), BackendError>;
         async fn search_entries(
             &self,
@@ -349,15 +369,16 @@ async fn search_backend_error_returns_result_code() {
 async fn modify_success_returns_success_response() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_modify_entry()
-        .withf(|dn, modifications| {
+        .expect_modify_entry_with_actor()
+        .withf(|dn, modifications, actor_dn| {
             dn == "cn=Alice,dc=example,dc=org"
                 && modifications.len() == 1
                 && modifications[0].operation == ModifyOperation::Replace
                 && modifications[0].attribute == "cn"
                 && modifications[0].values == ["Alice Updated"]
+                && actor_dn.is_none()
         })
-        .return_once(|_, _| Ok(()));
+        .return_once(|_, _, _| Ok(()));
 
     let request = ModifyRequest {
         object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
@@ -395,8 +416,8 @@ async fn modify_success_returns_success_response() {
 async fn modify_backend_error_returns_mapping() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_modify_entry()
-        .returning(|_, _| Err(BackendError::NotFound));
+        .expect_modify_entry_with_actor()
+        .returning(|_, _, _| Err(BackendError::NotFound));
 
     let request = ModifyRequest {
         object: LdapDN(Cow::Owned("cn=Missing,dc=example,dc=org".to_string())),
@@ -431,8 +452,8 @@ async fn modify_backend_error_returns_mapping() {
 async fn add_success_persists_entry() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_add_entry()
-        .withf(|entry, password| {
+        .expect_add_entry_with_actor()
+        .withf(|entry, password, actor_dn| {
             entry.dn == "cn=Alice,dc=example,dc=org"
                 && entry
                     .attributes
@@ -440,8 +461,9 @@ async fn add_success_persists_entry() {
                     .map(|values| values == &["Alice".to_string()])
                     .unwrap_or(false)
                 && password == b"secret"
+                && actor_dn.is_none()
         })
-        .return_once(|_, _| Ok(()));
+        .return_once(|_, _, _| Ok(()));
 
     let request = AddRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
@@ -470,8 +492,8 @@ async fn add_success_persists_entry() {
 async fn add_existing_entry_returns_error() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_add_entry()
-        .returning(|_, _| Err(BackendError::AlreadyExists));
+        .expect_add_entry_with_actor()
+        .returning(|_, _, _| Err(BackendError::AlreadyExists));
 
     let request = AddRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
@@ -563,14 +585,15 @@ async fn delete_missing_entry_returns_error() {
 async fn moddn_successful_rename_returns_success() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_rename_entry()
-        .withf(|dn, new_rdn, delete_old, superior| {
+        .expect_rename_entry_with_actor()
+        .withf(|dn, new_rdn, delete_old, superior, actor_dn| {
             dn == "cn=Alice,dc=example,dc=org"
                 && new_rdn == "cn=Bob"
                 && *delete_old
                 && superior.is_none()
+                && actor_dn.is_none()
         })
-        .return_once(|_, _, _, _| Ok(()));
+        .return_once(|_, _, _, _, _| Ok(()));
 
     let request = ModDnRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
@@ -600,8 +623,8 @@ async fn moddn_successful_rename_returns_success() {
 async fn moddn_conflict_returns_error() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_rename_entry()
-        .returning(|_, _, _, _| Err(BackendError::AlreadyExists));
+        .expect_rename_entry_with_actor()
+        .returning(|_, _, _, _, _| Err(BackendError::AlreadyExists));
 
     let request = ModDnRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),

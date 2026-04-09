@@ -258,11 +258,24 @@ impl ChangelogTracker {
     /// # Returns
     /// * CSN assigned to this change
     pub fn record_change(&self, change_type: ChangeType, dn: String, change_data: Vec<u8>) -> Csn {
+        self.record_change_with_originator(change_type, dn, change_data, None)
+    }
+
+    pub fn record_change_with_originator(
+        &self,
+        change_type: ChangeType,
+        dn: String,
+        change_data: Vec<u8>,
+        originator: Option<String>,
+    ) -> Csn {
         // Generate new CSN for this change
         let csn = self.csn_generator.generate();
         let csn_str = csn.to_string();
 
-        let entry = ChangelogEntry::new(csn.clone(), change_type, dn, change_data);
+        let mut entry = ChangelogEntry::new(csn.clone(), change_type, dn, change_data);
+        if let Some(originator) = originator {
+            entry = entry.with_originator(originator);
+        }
 
         let mut entries = self.entries.lock().unwrap();
         entries.insert(csn_str, entry);
@@ -448,17 +461,30 @@ pub(crate) struct RenameChange {
     pub new_rdn: String,
     pub delete_old: bool,
     pub new_superior: Option<String>,
+    #[serde(default)]
+    pub actor_dn: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn encode_rename_change(
     new_rdn: &str,
     delete_old: bool,
     new_superior: Option<&str>,
 ) -> Vec<u8> {
+    encode_rename_change_with_actor(new_rdn, delete_old, new_superior, None)
+}
+
+pub(crate) fn encode_rename_change_with_actor(
+    new_rdn: &str,
+    delete_old: bool,
+    new_superior: Option<&str>,
+    actor_dn: Option<&str>,
+) -> Vec<u8> {
     serde_json::to_vec(&RenameChange {
         new_rdn: new_rdn.to_string(),
         delete_old,
         new_superior: new_superior.map(str::to_string),
+        actor_dn: actor_dn.map(str::to_string),
     })
     .unwrap_or_default()
 }
@@ -1464,7 +1490,15 @@ impl BatchProcessor for BatchProcessorImpl {
                         message: format!("Failed to deserialize entry data for {dn}: {e}"),
                     })?;
                 let password = replicated_password(&dir_entry);
-                match self.backend.add_entry(dir_entry.clone(), password).await {
+                match self
+                    .backend
+                    .add_entry_with_actor(
+                        dir_entry.clone(),
+                        password,
+                        dir_entry.operational_attributes.creators_name.clone(),
+                    )
+                    .await
+                {
                     Ok(_) => {
                         info!("Replicated ADD: {}", dn);
                     }
@@ -1526,7 +1560,15 @@ impl BatchProcessor for BatchProcessorImpl {
                     })
                     .collect();
 
-                match self.backend.modify_entry(dn, modifications).await {
+                match self
+                    .backend
+                    .modify_entry_with_actor(
+                        dn,
+                        modifications,
+                        dir_entry.operational_attributes.modifiers_name.clone(),
+                    )
+                    .await
+                {
                     Ok(_) => {
                         info!("Replicated MODIFY: {}", dn);
                     }
@@ -1556,11 +1598,12 @@ impl BatchProcessor for BatchProcessorImpl {
                     replication_target_dn(dn, &rename.new_rdn, rename.new_superior.as_deref());
                 match self
                     .backend
-                    .rename_entry(
+                    .rename_entry_with_actor(
                         dn,
                         &rename.new_rdn,
                         rename.delete_old,
                         rename.new_superior.clone(),
+                        rename.actor_dn.clone(),
                     )
                     .await
                 {
@@ -2114,7 +2157,9 @@ impl ChangeListener for LdapChangeListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackendError, DirectoryBackend, DirectoryEntry, MockBackend};
+    use crate::backend::{
+        BackendError, DirectoryBackend, DirectoryEntry, MockBackend, OperationalAttributes,
+    };
     use ldap_parser::ldap::SearchScope;
     use std::collections::HashMap;
     use tokio::sync::broadcast;
@@ -2408,6 +2453,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_batch_processor_add_replays_creator_metadata() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = BatchProcessorImpl::new(backend.clone());
+        let creator = "cn=creator,dc=example,dc=org".to_string();
+        let csn = crate::csn::CsnGenerator::new(11).generate();
+        let replicated = DirectoryEntry::with_operational_attrs(
+            "cn=user1,dc=example,dc=org",
+            HashMap::from([
+                ("cn".to_string(), vec!["user1".to_string()]),
+                ("sn".to_string(), vec!["User".to_string()]),
+            ]),
+            OperationalAttributes::for_new_entry(csn, Some(creator.clone())),
+        );
+        let encoded = encode_change_bytes(
+            &ChangeType::Add,
+            &replicated.dn,
+            serde_json::to_vec(&replicated).unwrap().as_slice(),
+        );
+
+        batch_processor.apply_entry(&encoded).await.unwrap();
+
+        let stored = backend
+            .get_entry("cn=user1,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.operational_attributes.creators_name,
+            Some(creator.clone())
+        );
+        assert_eq!(stored.operational_attributes.modifiers_name, Some(creator));
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_modify_replays_modifier_metadata() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = BatchProcessorImpl::new(backend.clone());
+        let creator = "cn=creator,dc=example,dc=org".to_string();
+        let modifier = "cn=modifier,dc=example,dc=org".to_string();
+        backend
+            .add_entry_with_actor(
+                DirectoryEntry::new(
+                    "cn=user1,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["user1".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+                Some(creator.clone()),
+            )
+            .await
+            .unwrap();
+
+        let updated = DirectoryEntry::with_operational_attrs(
+            "cn=user1,dc=example,dc=org",
+            HashMap::from([
+                ("cn".to_string(), vec!["user1-updated".to_string()]),
+                ("sn".to_string(), vec!["User".to_string()]),
+            ]),
+            OperationalAttributes {
+                entry_csn: Some(crate::csn::CsnGenerator::new(12).generate()),
+                create_timestamp: Some("20260409000000Z".to_string()),
+                modify_timestamp: Some("20260409000001Z".to_string()),
+                creators_name: Some(creator.clone()),
+                modifiers_name: Some(modifier.clone()),
+            },
+        );
+        let encoded = encode_change_bytes(
+            &ChangeType::Modify,
+            &updated.dn,
+            serde_json::to_vec(&updated).unwrap().as_slice(),
+        );
+
+        batch_processor.apply_entry(&encoded).await.unwrap();
+
+        let stored = backend
+            .get_entry("cn=user1,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.operational_attributes.creators_name, Some(creator));
+        assert_eq!(stored.operational_attributes.modifiers_name, Some(modifier));
+    }
+
+    #[tokio::test]
     async fn test_batch_processor_delete_missing_entry_is_idempotent() {
         let backend = Arc::new(MockBackend::new());
         let batch_processor = BatchProcessorImpl::new(backend);
@@ -2461,6 +2592,50 @@ mod tests {
         );
 
         batch_processor.apply_entry(&encoded).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_rename_replays_modifier_metadata() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = BatchProcessorImpl::new(backend.clone());
+        backend
+            .add_entry_with_actor(
+                DirectoryEntry::new(
+                    "cn=original,dc=example,dc=org",
+                    HashMap::from([("cn".to_string(), vec!["original".to_string()])]),
+                ),
+                Vec::new(),
+                Some("cn=creator,dc=example,dc=org".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let encoded = encode_change_bytes(
+            &ChangeType::Rename,
+            "cn=original,dc=example,dc=org",
+            &encode_rename_change_with_actor(
+                "cn=renamed",
+                true,
+                None,
+                Some("cn=renamer,dc=example,dc=org"),
+            ),
+        );
+
+        batch_processor.apply_entry(&encoded).await.unwrap();
+
+        let stored = backend
+            .get_entry("cn=renamed,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.operational_attributes.modifiers_name.as_deref(),
+            Some("cn=renamer,dc=example,dc=org")
+        );
+        assert_eq!(
+            stored.operational_attributes.creators_name.as_deref(),
+            Some("cn=creator,dc=example,dc=org")
+        );
     }
 
     #[tokio::test]

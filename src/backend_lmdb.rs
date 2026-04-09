@@ -224,6 +224,332 @@ impl LmdbBackend {
         })
     }
 
+    async fn add_entry_internal(
+        &self,
+        mut entry: DirectoryEntry,
+        password: Vec<u8>,
+        actor_dn: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let _lock = self.write_lock.write().await;
+
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+
+        let normalized_dn = Self::normalize_dn(&entry.dn);
+
+        if txn.get(self.dn_index_db, &normalized_dn.as_bytes()).is_ok() {
+            return Err(BackendError::AlreadyExists);
+        }
+
+        let csn = self.csn_generator.generate();
+        entry.operational_attributes = crate::backend::OperationalAttributes::for_new_entry(
+            csn.clone(),
+            actor_dn.map(str::to_string),
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let stored_entry = StoredEntry {
+            dn: entry.dn.clone(),
+            attributes: entry.attributes,
+            created_at: now,
+            modified_at: now,
+            operational_attributes: entry.operational_attributes.clone(),
+        };
+
+        let entry_bytes = bincode::serialize(&stored_entry)
+            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
+
+        txn.put(
+            self.entries_db,
+            &entry.dn.as_bytes(),
+            &entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+
+        if let Some(password_hash) = Self::password_hash_from_bytes(&password) {
+            txn.put(
+                self.passwords_db,
+                &entry.dn.as_bytes(),
+                &password_hash.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+        }
+
+        txn.put(
+            self.dn_index_db,
+            &normalized_dn.as_bytes(),
+            &entry.dn.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
+
+        self.update_attribute_indexes(&mut txn, &entry.dn, &stored_entry.attributes)?;
+
+        let csn_string = csn.to_ldap_string();
+        txn.put(
+            self.metadata_db,
+            &b"context_csn",
+            &csn_string.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn modify_entry_internal(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let _lock = self.write_lock.write().await;
+
+        let mut entry = self.get_entry_internal(dn)?.ok_or(BackendError::NotFound)?;
+        let old_attributes = entry.attributes.clone();
+
+        for modification in modifications {
+            let attribute = modification.attribute.to_lowercase();
+            match modification.operation {
+                ModifyOperation::Add => {
+                    let existing = entry.attributes.entry(attribute).or_default();
+                    for value in modification.values {
+                        if !existing.contains(&value) {
+                            existing.push(value);
+                        }
+                    }
+                }
+                ModifyOperation::Delete => {
+                    if modification.values.is_empty() {
+                        entry.attributes.remove(&attribute);
+                    } else if let Some(existing) = entry.attributes.get_mut(&attribute) {
+                        existing.retain(|v| !modification.values.contains(v));
+                        if existing.is_empty() {
+                            entry.attributes.remove(&attribute);
+                        }
+                    }
+                }
+                ModifyOperation::Replace => {
+                    if modification.values.is_empty() {
+                        entry.attributes.remove(&attribute);
+                    } else {
+                        entry.attributes.insert(attribute, modification.values);
+                    }
+                }
+            }
+        }
+
+        entry.modified_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let csn = self.csn_generator.generate();
+        entry
+            .operational_attributes
+            .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
+
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+
+        let entry_bytes = bincode::serialize(&entry)
+            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
+
+        txn.put(
+            self.entries_db,
+            &entry.dn.as_bytes(),
+            &entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+
+        if let Some(password_value) = entry
+            .attributes
+            .get("userpassword")
+            .and_then(|values| values.first())
+        {
+            let password_hash = Self::password_hash_from_value(password_value);
+            txn.put(
+                self.passwords_db,
+                &entry.dn.as_bytes(),
+                &password_hash.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+        } else {
+            txn.del(self.passwords_db, &entry.dn.as_bytes(), None)
+                .or_else(|e| match e {
+                    lmdb::Error::NotFound => Ok(()),
+                    _ => Err(BackendError::Storage(
+                        "Failed to delete password".to_string(),
+                    )),
+                })?;
+        }
+
+        self.remove_attribute_indexes(&mut txn, &entry.dn, &old_attributes)?;
+        self.update_attribute_indexes(&mut txn, &entry.dn, &entry.attributes)?;
+
+        let csn_string = csn.to_ldap_string();
+        txn.put(
+            self.metadata_db,
+            &b"context_csn",
+            &csn_string.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn rename_entry_internal(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old: bool,
+        new_superior: Option<String>,
+        actor_dn: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let _lock = self.write_lock.write().await;
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+        let normalized_dn = Self::normalize_dn(dn);
+        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
+            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        };
+        let entry_bytes = txn
+            .get(self.entries_db, &actual_dn.as_bytes())
+            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
+        let entry: StoredEntry = bincode::deserialize(entry_bytes)
+            .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
+
+        let new_dn = if let Some(superior) = new_superior {
+            format!("{},{}", new_rdn, superior)
+        } else if let Some((_, rest)) = actual_dn.split_once(',') {
+            format!("{},{}", new_rdn, rest)
+        } else {
+            new_rdn.to_string()
+        };
+        let normalized_new_dn = Self::normalize_dn(&new_dn);
+
+        if txn
+            .get(self.dn_index_db, &normalized_new_dn.as_bytes())
+            .is_ok()
+        {
+            return Err(BackendError::AlreadyExists);
+        }
+
+        let password_hash = txn
+            .get(self.passwords_db, &actual_dn.as_bytes())
+            .map(|password| String::from_utf8_lossy(password).to_string())
+            .ok();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let csn = self.csn_generator.generate();
+
+        let mut new_entry = entry.to_directory_entry();
+        new_entry.dn = new_dn.clone();
+        new_entry
+            .operational_attributes
+            .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
+
+        if delete_old {
+            if let Some((attr, _)) = actual_dn.split_once('=') {
+                new_entry.attributes.remove(&attr.trim().to_lowercase());
+            }
+        }
+
+        if let Some((attr, val)) = new_rdn.split_once('=') {
+            let attr_lower = attr.trim().to_lowercase();
+            let val_str = val.trim().to_string();
+            new_entry
+                .attributes
+                .entry(attr_lower)
+                .or_default()
+                .push(val_str);
+        }
+        let new_stored_entry = StoredEntry {
+            dn: new_dn.clone(),
+            attributes: new_entry.attributes.clone(),
+            created_at: entry.created_at,
+            modified_at: now,
+            operational_attributes: new_entry.operational_attributes,
+        };
+        let new_entry_bytes = bincode::serialize(&new_stored_entry)
+            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
+
+        self.remove_attribute_indexes(&mut txn, &actual_dn, &entry.attributes)?;
+        txn.del(self.entries_db, &actual_dn.as_bytes(), None)
+            .map_err(|e| BackendError::Storage(format!("Failed to delete entry: {}", e)))?;
+        txn.del(self.dn_index_db, &normalized_dn.as_bytes(), None)
+            .map_err(|e| BackendError::Storage(format!("Failed to delete DN index: {}", e)))?;
+        txn.del(self.passwords_db, &actual_dn.as_bytes(), None)
+            .or_else(|e| match e {
+                lmdb::Error::NotFound => Ok(()),
+                _ => Err(BackendError::Storage(
+                    "Failed to delete password".to_string(),
+                )),
+            })?;
+
+        txn.put(
+            self.entries_db,
+            &new_dn.as_bytes(),
+            &new_entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+        txn.put(
+            self.dn_index_db,
+            &normalized_new_dn.as_bytes(),
+            &new_dn.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
+        if let Some(password_hash) = password_hash {
+            txn.put(
+                self.passwords_db,
+                &new_dn.as_bytes(),
+                &password_hash.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+        }
+        self.update_attribute_indexes(&mut txn, &new_dn, &new_stored_entry.attributes)?;
+        let csn_string = csn.to_ldap_string();
+        txn.put(
+            self.metadata_db,
+            &b"context_csn",
+            &csn_string.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Set a pre-hashed password for an entry (used during initialization)
     ///
     /// # Arguments
@@ -800,96 +1126,20 @@ impl DirectoryBackend for LmdbBackend {
 
     async fn add_entry(
         &self,
-        mut entry: DirectoryEntry,
+        entry: DirectoryEntry,
         password: Vec<u8>,
     ) -> Result<(), BackendError> {
-        let _lock = self.write_lock.write().await;
+        self.add_entry_internal(entry, password, None).await
+    }
 
-        let mut txn = self
-            .env
-            .begin_rw_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
-
-        let normalized_dn = Self::normalize_dn(&entry.dn);
-
-        // Check if entry already exists
-        if txn.get(self.dn_index_db, &normalized_dn.as_bytes()).is_ok() {
-            return Err(BackendError::AlreadyExists);
-        }
-
-        // Generate CSN for this entry
-        let csn = self.csn_generator.generate();
-
-        // Set operational attributes (entryCSN, createTimestamp, modifyTimestamp, creatorsName)
-        // TODO: Get creator DN from authentication context (for now, use None)
-        entry.operational_attributes = crate::backend::OperationalAttributes::for_new_entry(
-            csn.clone(),
-            None, // creator_dn - should come from auth context
-        );
-
-        // Create stored entry
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let stored_entry = StoredEntry {
-            dn: entry.dn.clone(),
-            attributes: entry.attributes,
-            created_at: now,
-            modified_at: now,
-            operational_attributes: entry.operational_attributes.clone(),
-        };
-
-        let entry_bytes = bincode::serialize(&stored_entry)
-            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-
-        // Write entry
-        txn.put(
-            self.entries_db,
-            &entry.dn.as_bytes(),
-            &entry_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
-
-        // Hash and write password (if provided)
-        if let Some(password_hash) = Self::password_hash_from_bytes(&password) {
-            txn.put(
-                self.passwords_db,
-                &entry.dn.as_bytes(),
-                &password_hash.as_bytes(),
-                WriteFlags::empty(),
-            )
-            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
-        }
-
-        // Update DN index
-        txn.put(
-            self.dn_index_db,
-            &normalized_dn.as_bytes(),
-            &entry.dn.as_bytes(),
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
-
-        // Update attribute indexes
-        self.update_attribute_indexes(&mut txn, &entry.dn, &stored_entry.attributes)?;
-
-        // Update contextCSN with the new CSN
-        let csn_string = csn.to_ldap_string();
-        txn.put(
-            self.metadata_db,
-            &b"context_csn",
-            &csn_string.as_bytes(),
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
-
-        txn.commit()
-            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
-
-        Ok(())
+    async fn add_entry_with_actor(
+        &self,
+        entry: DirectoryEntry,
+        password: Vec<u8>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        self.add_entry_internal(entry, password, actor_dn.as_deref())
+            .await
     }
 
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
@@ -947,100 +1197,17 @@ impl DirectoryBackend for LmdbBackend {
         dn: &str,
         modifications: Vec<Modification>,
     ) -> Result<(), BackendError> {
-        let _lock = self.write_lock.write().await;
+        self.modify_entry_internal(dn, modifications, None).await
+    }
 
-        let mut entry = self.get_entry_internal(dn)?.ok_or(BackendError::NotFound)?;
-
-        // Save old attributes for index updates
-        let old_attributes = entry.attributes.clone();
-
-        // Apply modifications
-        for modification in modifications {
-            let attribute = modification.attribute.to_lowercase();
-            match modification.operation {
-                ModifyOperation::Add => {
-                    let existing = entry.attributes.entry(attribute).or_default();
-                    for value in modification.values {
-                        if !existing.contains(&value) {
-                            existing.push(value);
-                        }
-                    }
-                }
-                ModifyOperation::Delete => {
-                    if modification.values.is_empty() {
-                        entry.attributes.remove(&attribute);
-                    } else if let Some(existing) = entry.attributes.get_mut(&attribute) {
-                        existing.retain(|v| !modification.values.contains(v));
-                        if existing.is_empty() {
-                            entry.attributes.remove(&attribute);
-                        }
-                    }
-                }
-                ModifyOperation::Replace => {
-                    if modification.values.is_empty() {
-                        entry.attributes.remove(&attribute);
-                    } else {
-                        entry.attributes.insert(attribute, modification.values);
-                    }
-                }
-            }
-        }
-
-        // Update modification timestamp
-        entry.modified_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // Write updated entry
-        let mut txn = self
-            .env
-            .begin_rw_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
-
-        let entry_bytes = bincode::serialize(&entry)
-            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-
-        txn.put(
-            self.entries_db,
-            &entry.dn.as_bytes(),
-            &entry_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
-
-        if let Some(password_value) = entry
-            .attributes
-            .get("userpassword")
-            .and_then(|values| values.first())
-        {
-            let password_hash = Self::password_hash_from_value(password_value);
-            txn.put(
-                self.passwords_db,
-                &entry.dn.as_bytes(),
-                &password_hash.as_bytes(),
-                WriteFlags::empty(),
-            )
-            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
-        } else {
-            txn.del(self.passwords_db, &entry.dn.as_bytes(), None)
-                .or_else(|e| match e {
-                    lmdb::Error::NotFound => Ok(()),
-                    _ => Err(BackendError::Storage(
-                        "Failed to delete password".to_string(),
-                    )),
-                })?;
-        }
-
-        // Update attribute indexes
-        // Remove old indexed values and add new ones
-        self.remove_attribute_indexes(&mut txn, &entry.dn, &old_attributes)?;
-        self.update_attribute_indexes(&mut txn, &entry.dn, &entry.attributes)?;
-
-        txn.commit()
-            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
-
-        Ok(())
+    async fn modify_entry_with_actor(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        self.modify_entry_internal(dn, modifications, actor_dn.as_deref())
+            .await
     }
 
     async fn compare_attribute(
@@ -1066,135 +1233,20 @@ impl DirectoryBackend for LmdbBackend {
         delete_old: bool,
         new_superior: Option<String>,
     ) -> Result<(), BackendError> {
-        let _lock = self.write_lock.write().await;
-        let mut txn = self
-            .env
-            .begin_rw_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
-        let normalized_dn = Self::normalize_dn(dn);
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
-            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
-        };
-        let entry_bytes = txn
-            .get(self.entries_db, &actual_dn.as_bytes())
-            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
-        let entry: StoredEntry = bincode::deserialize(entry_bytes)
-            .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
+        self.rename_entry_internal(dn, new_rdn, delete_old, new_superior, None)
+            .await
+    }
 
-        // Compute new DN
-        let new_dn = if let Some(superior) = new_superior {
-            format!("{},{}", new_rdn, superior)
-        } else if let Some((_, rest)) = actual_dn.split_once(',') {
-            format!("{},{}", new_rdn, rest)
-        } else {
-            new_rdn.to_string()
-        };
-        let normalized_new_dn = Self::normalize_dn(&new_dn);
-
-        // Check if new DN already exists
-        if txn
-            .get(self.dn_index_db, &normalized_new_dn.as_bytes())
-            .is_ok()
-        {
-            return Err(BackendError::AlreadyExists);
-        }
-
-        let password_hash = txn
-            .get(self.passwords_db, &actual_dn.as_bytes())
-            .map(|password| String::from_utf8_lossy(password).to_string())
-            .ok();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let csn = self.csn_generator.generate();
-
-        let mut new_entry = entry.to_directory_entry();
-        new_entry.dn = new_dn.clone();
-        new_entry
-            .operational_attributes
-            .for_modified_entry(csn.clone(), None);
-
-        // Handle RDN attribute updates
-        if delete_old {
-            // Remove old RDN attributes (simplified)
-            if let Some((attr, _)) = actual_dn.split_once('=') {
-                new_entry.attributes.remove(&attr.trim().to_lowercase());
-            }
-        }
-
-        // Add new RDN attributes
-        if let Some((attr, val)) = new_rdn.split_once('=') {
-            let attr_lower = attr.trim().to_lowercase();
-            let val_str = val.trim().to_string();
-            new_entry
-                .attributes
-                .entry(attr_lower)
-                .or_default()
-                .push(val_str);
-        }
-        let new_stored_entry = StoredEntry {
-            dn: new_dn.clone(),
-            attributes: new_entry.attributes.clone(),
-            created_at: entry.created_at,
-            modified_at: now,
-            operational_attributes: new_entry.operational_attributes,
-        };
-        let new_entry_bytes = bincode::serialize(&new_stored_entry)
-            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-
-        self.remove_attribute_indexes(&mut txn, &actual_dn, &entry.attributes)?;
-        txn.del(self.entries_db, &actual_dn.as_bytes(), None)
-            .map_err(|e| BackendError::Storage(format!("Failed to delete entry: {}", e)))?;
-        txn.del(self.dn_index_db, &normalized_dn.as_bytes(), None)
-            .map_err(|e| BackendError::Storage(format!("Failed to delete DN index: {}", e)))?;
-        txn.del(self.passwords_db, &actual_dn.as_bytes(), None)
-            .or_else(|e| match e {
-                lmdb::Error::NotFound => Ok(()),
-                _ => Err(BackendError::Storage(
-                    "Failed to delete password".to_string(),
-                )),
-            })?;
-
-        txn.put(
-            self.entries_db,
-            &new_dn.as_bytes(),
-            &new_entry_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
-        txn.put(
-            self.dn_index_db,
-            &normalized_new_dn.as_bytes(),
-            &new_dn.as_bytes(),
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
-        if let Some(password_hash) = password_hash {
-            txn.put(
-                self.passwords_db,
-                &new_dn.as_bytes(),
-                &password_hash.as_bytes(),
-                WriteFlags::empty(),
-            )
-            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
-        }
-        self.update_attribute_indexes(&mut txn, &new_dn, &new_stored_entry.attributes)?;
-        let csn_string = csn.to_ldap_string();
-        txn.put(
-            self.metadata_db,
-            &b"context_csn",
-            &csn_string.as_bytes(),
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
-
-        txn.commit()
-            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
-
-        Ok(())
+    async fn rename_entry_with_actor(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old: bool,
+        new_superior: Option<String>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        self.rename_entry_internal(dn, new_rdn, delete_old, new_superior, actor_dn.as_deref())
+            .await
     }
 
     async fn search_entries(

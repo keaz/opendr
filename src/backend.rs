@@ -57,7 +57,9 @@ impl OperationalAttributes {
     pub fn for_modified_entry(&mut self, csn: Csn, modifier_dn: Option<String>) {
         self.entry_csn = Some(csn);
         self.modify_timestamp = Some(Self::current_timestamp());
-        self.modifiers_name = modifier_dn;
+        if let Some(modifier_dn) = modifier_dn {
+            self.modifiers_name = Some(modifier_dn);
+        }
     }
 
     /// Get current timestamp in LDAP GeneralizedTime format (RFC 4517)
@@ -198,6 +200,16 @@ pub trait DirectoryBackend: Send + Sync {
     async fn add_entry(&self, entry: DirectoryEntry, password: Vec<u8>)
         -> Result<(), BackendError>;
 
+    async fn add_entry_with_actor(
+        &self,
+        entry: DirectoryEntry,
+        password: Vec<u8>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        let _ = actor_dn;
+        self.add_entry(entry, password).await
+    }
+
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError>;
 
     async fn modify_entry(
@@ -205,6 +217,16 @@ pub trait DirectoryBackend: Send + Sync {
         dn: &str,
         modifications: Vec<Modification>,
     ) -> Result<(), BackendError>;
+
+    async fn modify_entry_with_actor(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        let _ = actor_dn;
+        self.modify_entry(dn, modifications).await
+    }
 
     async fn compare_attribute(
         &self,
@@ -220,6 +242,19 @@ pub trait DirectoryBackend: Send + Sync {
         delete_old: bool,
         new_superior: Option<String>,
     ) -> Result<(), BackendError>;
+
+    async fn rename_entry_with_actor(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old: bool,
+        new_superior: Option<String>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        let _ = actor_dn;
+        self.rename_entry(dn, new_rdn, delete_old, new_superior)
+            .await
+    }
 
     async fn search_entries(
         &self,
@@ -379,6 +414,103 @@ impl MockBackend {
             csn_generator: Arc::new(crate::csn::CsnGenerator::new(replica_id)),
         }
     }
+
+    async fn add_entry_internal(
+        &self,
+        mut entry: DirectoryEntry,
+        password: Vec<u8>,
+        actor_dn: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let mut entries = self.entries.write().await;
+        if entries.contains_key(&entry.dn) {
+            return Err(BackendError::AlreadyExists);
+        }
+
+        let csn = self.csn_generator.generate();
+        entry.operational_attributes =
+            OperationalAttributes::for_new_entry(csn.clone(), actor_dn.map(str::to_string));
+
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
+        drop(context_csn);
+
+        entries.insert(entry.dn.clone(), StoredEntry { password, entry });
+
+        Ok(())
+    }
+
+    async fn modify_entry_internal(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let mut entries = self.entries.write().await;
+        let stored = entries.get_mut(dn).ok_or(BackendError::NotFound)?;
+
+        let csn = self.csn_generator.generate();
+        stored
+            .entry
+            .operational_attributes
+            .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
+
+        for modification in modifications {
+            apply_modification(&mut stored.entry, &mut stored.password, &modification);
+        }
+
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
+
+        Ok(())
+    }
+
+    async fn rename_entry_internal(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old: bool,
+        new_superior: Option<String>,
+        actor_dn: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let mut entries = self.entries.write().await;
+        let Some(_) = entries.get(dn) else {
+            return Err(BackendError::NotFound);
+        };
+
+        let target_dn = compute_new_dn(dn, new_rdn, new_superior.as_deref());
+
+        if entries.contains_key(&target_dn) {
+            return Err(BackendError::AlreadyExists);
+        }
+
+        let renames = plan_dn_renames(&entries, dn, &target_dn)?;
+        let csn = self.csn_generator.generate();
+
+        for (old_dn, new_dn) in renames {
+            if let Some(mut stored) = entries.remove(&old_dn) {
+                update_entry_for_rename(
+                    &mut stored.entry,
+                    &mut stored.password,
+                    dn,
+                    new_rdn,
+                    &old_dn,
+                    &new_dn,
+                    delete_old,
+                );
+                stored.entry.dn = new_dn.clone();
+                stored
+                    .entry
+                    .operational_attributes
+                    .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
+                entries.insert(new_dn, stored);
+            }
+        }
+
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
+
+        Ok(())
+    }
 }
 
 impl Default for MockBackend {
@@ -407,26 +539,20 @@ impl DirectoryBackend for MockBackend {
 
     async fn add_entry(
         &self,
-        mut entry: DirectoryEntry,
+        entry: DirectoryEntry,
         password: Vec<u8>,
     ) -> Result<(), BackendError> {
-        let mut entries = self.entries.write().await;
-        if entries.contains_key(&entry.dn) {
-            return Err(BackendError::AlreadyExists);
-        }
+        self.add_entry_internal(entry, password, None).await
+    }
 
-        // Generate CSN for this entry and update contextCSN
-        let csn = self.csn_generator.generate();
-        entry.operational_attributes = OperationalAttributes::for_new_entry(csn.clone(), None);
-
-        // Update contextCSN
-        let mut context_csn = self.context_csn.write().await;
-        *context_csn = Some(csn);
-        drop(context_csn);
-
-        entries.insert(entry.dn.clone(), StoredEntry { password, entry });
-
-        Ok(())
+    async fn add_entry_with_actor(
+        &self,
+        entry: DirectoryEntry,
+        password: Vec<u8>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        self.add_entry_internal(entry, password, actor_dn.as_deref())
+            .await
     }
 
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
@@ -446,25 +572,17 @@ impl DirectoryBackend for MockBackend {
         dn: &str,
         modifications: Vec<Modification>,
     ) -> Result<(), BackendError> {
-        let mut entries = self.entries.write().await;
-        let stored = entries.get_mut(dn).ok_or(BackendError::NotFound)?;
+        self.modify_entry_internal(dn, modifications, None).await
+    }
 
-        // Generate new CSN for this modification
-        let csn = self.csn_generator.generate();
-        stored
-            .entry
-            .operational_attributes
-            .for_modified_entry(csn.clone(), None);
-
-        for modification in modifications {
-            apply_modification(&mut stored.entry, &mut stored.password, &modification);
-        }
-
-        // Update contextCSN
-        let mut context_csn = self.context_csn.write().await;
-        *context_csn = Some(csn);
-
-        Ok(())
+    async fn modify_entry_with_actor(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        self.modify_entry_internal(dn, modifications, actor_dn.as_deref())
+            .await
     }
 
     async fn compare_attribute(
@@ -494,50 +612,20 @@ impl DirectoryBackend for MockBackend {
         delete_old: bool,
         new_superior: Option<String>,
     ) -> Result<(), BackendError> {
-        let mut entries = self.entries.write().await;
-        let Some(_) = entries.get(dn) else {
-            return Err(BackendError::NotFound);
-        };
+        self.rename_entry_internal(dn, new_rdn, delete_old, new_superior, None)
+            .await
+    }
 
-        let target_dn = compute_new_dn(dn, new_rdn, new_superior.as_deref());
-
-        if entries.contains_key(&target_dn) {
-            return Err(BackendError::AlreadyExists);
-        }
-
-        let renames = plan_dn_renames(&entries, dn, &target_dn)?;
-
-        // Generate CSN for rename operation
-        let csn = self.csn_generator.generate();
-
-        for (old_dn, new_dn) in renames {
-            if let Some(mut stored) = entries.remove(&old_dn) {
-                update_entry_for_rename(
-                    &mut stored.entry,
-                    &mut stored.password,
-                    dn,
-                    new_rdn,
-                    &old_dn,
-                    &new_dn,
-                    delete_old,
-                );
-                stored.entry.dn = new_dn.clone();
-
-                // Update operational attributes for renamed entry
-                stored
-                    .entry
-                    .operational_attributes
-                    .for_modified_entry(csn.clone(), None);
-
-                entries.insert(new_dn, stored);
-            }
-        }
-
-        // Update contextCSN
-        let mut context_csn = self.context_csn.write().await;
-        *context_csn = Some(csn);
-
-        Ok(())
+    async fn rename_entry_with_actor(
+        &self,
+        dn: &str,
+        new_rdn: &str,
+        delete_old: bool,
+        new_superior: Option<String>,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        self.rename_entry_internal(dn, new_rdn, delete_old, new_superior, actor_dn.as_deref())
+            .await
     }
 
     async fn search_entries(
