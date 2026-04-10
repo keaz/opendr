@@ -95,24 +95,24 @@ impl From<EncodeError> for ServerError {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ConnectionSession {
+pub(crate) struct ConnectionSession {
     bound_dn: Option<String>,
 }
 
 impl ConnectionSession {
-    fn bind(&mut self, dn: String) {
+    pub(crate) fn bind(&mut self, dn: String) {
         self.bound_dn = Some(dn);
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.bound_dn = None;
     }
 
-    fn is_authenticated(&self) -> bool {
+    pub(crate) fn is_authenticated(&self) -> bool {
         self.bound_dn.is_some()
     }
 
-    fn bound_dn(&self) -> Option<&str> {
+    pub(crate) fn bound_dn(&self) -> Option<&str> {
         self.bound_dn.as_deref()
     }
 }
@@ -144,7 +144,7 @@ enum FinishedOperationState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CancelRequestOutcome {
+pub(crate) enum CancelRequestOutcome {
     Accepted,
     NoSuchOperation,
     TooLate,
@@ -234,7 +234,7 @@ impl PagedSearchCursor {
 }
 
 #[derive(Debug, Default)]
-struct ConnectionOperationRegistry {
+pub(crate) struct ConnectionOperationRegistry {
     active: HashMap<u32, RegisteredOperation>,
     finished: HashMap<u32, FinishedOperationState>,
     paged_searches: HashMap<Vec<u8>, PagedSearchCursor>,
@@ -254,7 +254,7 @@ impl ConnectionOperationRegistry {
         );
     }
 
-    fn request_cancel(&mut self, message_id: u32) -> CancelRequestOutcome {
+    pub(crate) fn request_cancel(&mut self, message_id: u32) -> CancelRequestOutcome {
         if let Some(operation) = self.active.get_mut(&message_id) {
             if !operation.cancellable {
                 return CancelRequestOutcome::CannotCancel;
@@ -278,7 +278,7 @@ impl ConnectionOperationRegistry {
         CancelRequestOutcome::NoSuchOperation
     }
 
-    fn request_abandon(&mut self, message_id: u32) -> bool {
+    pub(crate) fn request_abandon(&mut self, message_id: u32) -> bool {
         let Some(operation) = self.active.get_mut(&message_id) else {
             return false;
         };
@@ -302,7 +302,7 @@ impl ConnectionOperationRegistry {
         self.finished.insert(message_id, outcome);
     }
 
-    fn clear_paged_searches(&mut self) {
+    pub(crate) fn clear_paged_searches(&mut self) {
         self.paged_searches.clear();
         self.active_paged_searches.clear();
     }
@@ -414,11 +414,27 @@ pub struct LegacySecurityConfig {
 }
 
 #[derive(Clone, Default)]
-struct RequestContext {
+pub(crate) struct RequestContext {
     client_ip: Option<IpAddr>,
     session_id: Option<ConnectionId>,
     security: Option<Arc<LegacySecurityConfig>>,
     metrics: Option<Arc<MetricsCollector>>,
+}
+
+impl RequestContext {
+    pub(crate) fn new(
+        client_ip: Option<IpAddr>,
+        session_id: Option<ConnectionId>,
+        security: Option<Arc<LegacySecurityConfig>>,
+        metrics: Option<Arc<MetricsCollector>>,
+    ) -> Self {
+        Self {
+            client_ip,
+            session_id,
+            security,
+            metrics,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2249,7 +2265,7 @@ fn is_root_dn(session: &ConnectionSession, request_context: &RequestContext) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn log_generic_audit_event(
+pub(crate) async fn log_generic_audit_event(
     request_context: &RequestContext,
     session: &ConnectionSession,
     level: AuditLevel,
@@ -2289,7 +2305,7 @@ async fn log_generic_audit_event(
     logger.log_event(event).await;
 }
 
-async fn log_simple_bind_success(request_context: &RequestContext, user_dn: &str) {
+pub(crate) async fn log_simple_bind_success(request_context: &RequestContext, user_dn: &str) {
     let Some(security) = request_context.security.as_ref() else {
         return;
     };
@@ -2304,7 +2320,11 @@ async fn log_simple_bind_success(request_context: &RequestContext, user_dn: &str
         .await;
 }
 
-async fn log_simple_bind_failure(request_context: &RequestContext, user_dn: &str, reason: &str) {
+pub(crate) async fn log_simple_bind_failure(
+    request_context: &RequestContext,
+    user_dn: &str,
+    reason: &str,
+) {
     let Some(security) = request_context.security.as_ref() else {
         return;
     };
@@ -2346,7 +2366,7 @@ async fn log_sasl_bind(
         .await;
 }
 
-async fn log_anonymous_bind(request_context: &RequestContext) {
+pub(crate) async fn log_anonymous_bind(request_context: &RequestContext) {
     let session = ConnectionSession::default();
     if let Some(security) = request_context.security.as_ref() {
         if security.audit_config.log_authentication {
@@ -2953,11 +2973,16 @@ async fn try_handle_virtual_search_request(
     }
 
     if base_dn.is_empty() {
-        let attributes = match build_root_dse_attributes(
+        let supported_control_oids = active_runtime_control_registry().supported_control_oids();
+        let supported_sasl_mechanisms = crate::search_protocol::supported_sasl_mechanisms();
+        let attributes = match crate::search_protocol::build_root_dse_attributes(
             backend,
-            runtime_config,
+            &runtime_config.naming_contexts,
+            &runtime_config.subschema_dn,
             connection_is_secure,
             starttls_available,
+            &supported_control_oids,
+            &supported_sasl_mechanisms,
         )
         .await
         {
@@ -2998,7 +3023,7 @@ async fn try_handle_virtual_search_request(
     }
 
     if base_dn.eq_ignore_ascii_case(&runtime_config.subschema_dn) {
-        let attributes = build_subschema_attributes(schema);
+        let attributes = crate::search_protocol::build_subschema_attributes(schema);
         send_virtual_search_entry(
             socket,
             message_id,
@@ -3024,101 +3049,6 @@ async fn try_handle_virtual_search_request(
     Ok(false)
 }
 
-async fn build_root_dse_attributes(
-    backend: &dyn DirectoryBackend,
-    runtime_config: &LegacyServerConfig,
-    connection_is_secure: bool,
-    starttls_available: bool,
-) -> Result<Vec<(String, Vec<String>)>, BackendError> {
-    let mut attributes = vec![("supportedLDAPVersion".to_string(), vec!["3".to_string()])];
-
-    if !runtime_config.naming_contexts.is_empty() {
-        attributes.push((
-            "namingContexts".to_string(),
-            runtime_config.naming_contexts.clone(),
-        ));
-    }
-
-    attributes.push((
-        "subschemaSubentry".to_string(),
-        vec![runtime_config.subschema_dn.clone()],
-    ));
-
-    let supported_extensions =
-        active_runtime_supported_extensions(connection_is_secure, starttls_available);
-    if !supported_extensions.is_empty() {
-        attributes.push(("supportedExtension".to_string(), supported_extensions));
-    }
-
-    let supported_controls = active_runtime_control_registry().supported_control_oids();
-    if !supported_controls.is_empty() {
-        attributes.push(("supportedControl".to_string(), supported_controls));
-    }
-
-    let supported_sasl = active_runtime_supported_sasl_mechanisms();
-    if !supported_sasl.is_empty() {
-        attributes.push(("supportedSASLMechanisms".to_string(), supported_sasl));
-    }
-
-    if let Some(context_csn) = backend.get_context_csn().await? {
-        attributes.push(("contextCSN".to_string(), vec![context_csn.to_ldap_string()]));
-    }
-
-    Ok(attributes)
-}
-
-fn build_subschema_attributes(schema: &LdapSchema) -> Vec<(String, Vec<String>)> {
-    let mut attributes = vec![
-        (
-            "objectClass".to_string(),
-            vec![
-                "top".to_string(),
-                "subentry".to_string(),
-                "subschema".to_string(),
-            ],
-        ),
-        ("cn".to_string(), vec!["Subschema".to_string()]),
-    ];
-
-    let attribute_types = schema
-        .attribute_types_unique_sorted()
-        .into_iter()
-        .map(|attribute| attribute.to_schema_description())
-        .collect::<Vec<_>>();
-    if !attribute_types.is_empty() {
-        attributes.push(("attributeTypes".to_string(), attribute_types));
-    }
-
-    let object_classes = schema
-        .object_classes_unique_sorted()
-        .into_iter()
-        .map(|object_class| object_class.to_schema_description())
-        .collect::<Vec<_>>();
-    if !object_classes.is_empty() {
-        attributes.push(("objectClasses".to_string(), object_classes));
-    }
-
-    attributes
-}
-
-fn active_runtime_supported_extensions(
-    connection_is_secure: bool,
-    starttls_available: bool,
-) -> Vec<String> {
-    let mut supported = Vec::new();
-    if starttls_available && !connection_is_secure {
-        supported.push(START_TLS_OID.to_string());
-    }
-    supported.push(CANCEL_OID.to_string());
-    supported.push(PASSWORD_MODIFY_OID.to_string());
-    supported.push(WHO_AM_I_OID.to_string());
-    supported
-}
-
-fn active_runtime_supported_sasl_mechanisms() -> Vec<String> {
-    vec!["PLAIN".to_string()]
-}
-
 async fn send_virtual_search_entry(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -3128,7 +3058,10 @@ async fn send_virtual_search_entry(
     types_only: bool,
 ) -> Result<(), ServerError> {
     let synthetic_entry = DirectoryEntry::new(dn, HashMap::new());
-    let selected_attributes = select_virtual_attributes(available_attributes, requested_attributes);
+    let selected_attributes = crate::search_protocol::select_virtual_attributes(
+        available_attributes,
+        requested_attributes,
+    );
     send_search_entry_with_controls(
         socket,
         message_id,
@@ -3138,34 +3071,6 @@ async fn send_virtual_search_entry(
         &[],
     )
     .await
-}
-
-fn select_virtual_attributes(
-    available_attributes: &[(String, Vec<String>)],
-    requested_attributes: &[String],
-) -> Vec<(String, Vec<String>)> {
-    if requested_attributes
-        .iter()
-        .any(|attribute| attribute.eq_ignore_ascii_case("1.1"))
-    {
-        return Vec::new();
-    }
-
-    let include_all = requested_attributes.is_empty()
-        || requested_attributes
-            .iter()
-            .any(|attribute| attribute == "*" || attribute == "+");
-
-    available_attributes
-        .iter()
-        .filter(|(name, _)| {
-            include_all
-                || requested_attributes
-                    .iter()
-                    .any(|attribute| attribute.eq_ignore_ascii_case(name))
-        })
-        .cloned()
-        .collect()
 }
 
 fn map_backend_error(err: &BackendError) -> ResultCode {
@@ -3274,7 +3179,7 @@ async fn handle_search_request_with_context(
     .await
 }
 
-async fn handle_search_request_with_context_and_registry(
+pub(crate) async fn handle_search_request_with_context_and_registry(
     socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
@@ -5437,7 +5342,7 @@ async fn log_modify_audit_event(
     .await;
 }
 
-async fn log_password_modify_audit_event(
+pub(crate) async fn log_password_modify_audit_event(
     request_context: &RequestContext,
     session: &ConnectionSession,
     target_dn: Option<&str>,
@@ -5498,7 +5403,7 @@ pub async fn handle_modify_request(
     .await
 }
 
-async fn handle_modify_request_with_context(
+pub(crate) async fn handle_modify_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
@@ -5603,7 +5508,7 @@ pub async fn handle_add_request(
     .await
 }
 
-async fn handle_add_request_with_context(
+pub(crate) async fn handle_add_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
@@ -5740,7 +5645,7 @@ pub async fn handle_delete_request(
     .await
 }
 
-async fn handle_delete_request_with_context(
+pub(crate) async fn handle_delete_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
@@ -5845,7 +5750,7 @@ pub async fn handle_moddn_request(
     .await
 }
 
-async fn handle_moddn_request_with_context(
+pub(crate) async fn handle_moddn_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
@@ -5965,7 +5870,7 @@ pub async fn handle_compare_request(
     .await
 }
 
-async fn handle_compare_request_with_context(
+pub(crate) async fn handle_compare_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,

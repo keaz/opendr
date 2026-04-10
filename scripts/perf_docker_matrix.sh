@@ -16,6 +16,7 @@ ROOT_PASSWORD="PerfRootSecret123!"
 OPENDR_IMAGE="opendr:docker-perf"
 OPENDJ_IMAGE="openidentityplatform/opendj:5.0.4"
 PRODUCTS="opendr,opendj"
+OPENDR_RUNTIME="legacy"
 
 CURRENT_CONTAINER=""
 CURRENT_OUTPUT_DIR=""
@@ -37,6 +38,7 @@ Options:
   --base-dn DN             Benchmark base DN (default: dc=example,dc=com)
   --root-password VALUE    Root password used for both products
   --opendr-image TAG       Local OpenDR image tag (default: opendr:docker-perf)
+  --opendr-runtime VALUE   OpenDR server runtime: legacy or fsm (default: legacy)
   --opendj-image TAG       OpenDJ image tag (default: openidentityplatform/opendj:5.0.4)
   --help                   Show this help text
 EOF
@@ -84,6 +86,10 @@ while [[ $# -gt 0 ]]; do
       OPENDR_IMAGE="$2"
       shift 2
       ;;
+    --opendr-runtime)
+      OPENDR_RUNTIME="$2"
+      shift 2
+      ;;
     --opendj-image)
       OPENDJ_IMAGE="$2"
       shift 2
@@ -109,6 +115,11 @@ case "${OUTPUT_DIR}" in
   /*) ;;
   *) OUTPUT_DIR="${REPO_ROOT}/${OUTPUT_DIR}" ;;
 esac
+
+if [[ "${OPENDR_RUNTIME}" != "legacy" && "${OPENDR_RUNTIME}" != "fsm" ]]; then
+  echo "--opendr-runtime must be legacy or fsm" >&2
+  exit 1
+fi
 
 declare -a LOAD_PROFILES
 case "${PROFILE_SET}" in
@@ -410,6 +421,7 @@ write_run_metadata() {
   "warmup_iterations": ${warmup_iterations},
   "cpu_limit": "${CPU_LIMIT}",
   "memory_limit": "${MEMORY_LIMIT}",
+  "opendr_runtime": "${OPENDR_RUNTIME}",
   "sample_interval_seconds": ${SAMPLE_INTERVAL}
 }
 EOF
@@ -542,6 +554,7 @@ run_profile() {
         --memory="${MEMORY_LIMIT}" \
         -p "127.0.0.1:${ldap_port}:1389" \
         -v "${data_dir}:/var/lib/opendr/data" \
+        -e OPENDR_RUNTIME="${OPENDR_RUNTIME}" \
         -e OPENDR_BASE_DN="${BASE_DN}" \
         -e OPENDR_ROOT_USER_DN="cn=admin" \
         -e OPENDR_ROOT_PASSWORD="${ROOT_PASSWORD}" \

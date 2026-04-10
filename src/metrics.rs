@@ -109,6 +109,17 @@ pub enum FsmType {
     BackendTxn,
 }
 
+/// Resource events that should be surfaced to observability and future FSM hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceEventType {
+    ConnectionRejected,
+    OperationRejected,
+    MemoryRejected,
+    RateLimitBlocked,
+    RateLimitAllowed,
+    IdleConnectionEvicted,
+}
+
 impl FsmType {
     /// Get the FSM type name as a string
     pub fn as_str(&self) -> &str {
@@ -264,6 +275,69 @@ struct ConnectionMetrics {
     failed_connections: AtomicU64,
 }
 
+/// Resource event metrics used to bridge connection/resource/rate-limit state into monitoring.
+#[derive(Debug, Default)]
+struct ResourceMetrics {
+    connection_rejections: AtomicU64,
+    operation_rejections: AtomicU64,
+    memory_rejections: AtomicU64,
+    rate_limit_blocks: AtomicU64,
+    rate_limit_allows: AtomicU64,
+    idle_connection_evictions: AtomicU64,
+}
+
+impl ResourceMetrics {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record_event(&self, event: ResourceEventType) {
+        match event {
+            ResourceEventType::ConnectionRejected => {
+                self.connection_rejections.fetch_add(1, Ordering::Relaxed);
+            }
+            ResourceEventType::OperationRejected => {
+                self.operation_rejections.fetch_add(1, Ordering::Relaxed);
+            }
+            ResourceEventType::MemoryRejected => {
+                self.memory_rejections.fetch_add(1, Ordering::Relaxed);
+            }
+            ResourceEventType::RateLimitBlocked => {
+                self.rate_limit_blocks.fetch_add(1, Ordering::Relaxed);
+            }
+            ResourceEventType::RateLimitAllowed => {
+                self.rate_limit_allows.fetch_add(1, Ordering::Relaxed);
+            }
+            ResourceEventType::IdleConnectionEvicted => {
+                self.idle_connection_evictions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn get_stats(&self) -> ResourceStats {
+        ResourceStats {
+            connection_rejections: self.connection_rejections.load(Ordering::Relaxed),
+            operation_rejections: self.operation_rejections.load(Ordering::Relaxed),
+            memory_rejections: self.memory_rejections.load(Ordering::Relaxed),
+            rate_limit_blocks: self.rate_limit_blocks.load(Ordering::Relaxed),
+            rate_limit_allows: self.rate_limit_allows.load(Ordering::Relaxed),
+            idle_connection_evictions: self.idle_connection_evictions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Resource event statistics for observability scaffolding.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceStats {
+    pub connection_rejections: u64,
+    pub operation_rejections: u64,
+    pub memory_rejections: u64,
+    pub rate_limit_blocks: u64,
+    pub rate_limit_allows: u64,
+    pub idle_connection_evictions: u64,
+}
+
 impl ConnectionMetrics {
     fn new() -> Self {
         Self::default()
@@ -386,6 +460,8 @@ pub struct MetricsCollector {
     operations: HashMap<OperationType, OperationMetrics>,
     /// Connection metrics
     connections: ConnectionMetrics,
+    /// Resource metrics
+    resources: ResourceMetrics,
     /// FSM state distribution
     fsm_states: FsmStateTracker,
     /// Custom counters
@@ -406,6 +482,7 @@ impl MetricsCollector {
             start_time: Instant::now(),
             operations,
             connections: ConnectionMetrics::new(),
+            resources: ResourceMetrics::new(),
             fsm_states: FsmStateTracker::new(),
             custom_counters: RwLock::new(HashMap::new()),
             custom_gauges: RwLock::new(HashMap::new()),
@@ -464,9 +541,19 @@ impl MetricsCollector {
         self.connections.connection_failed();
     }
 
+    /// Record a resource-related event for future FSM and monitoring hooks.
+    pub fn record_resource_event(&self, event: ResourceEventType) {
+        self.resources.record_event(event);
+    }
+
     /// Get connection statistics
     pub fn get_connection_stats(&self) -> ConnectionStats {
         self.connections.get_stats()
+    }
+
+    /// Get resource event statistics.
+    pub fn get_resource_stats(&self) -> ResourceStats {
+        self.resources.get_stats()
     }
 
     /// Record FSM state
@@ -554,6 +641,60 @@ impl MetricsCollector {
         output.push_str("# HELP ldap_connections_failed Total failed connection attempts\n");
         output.push_str("# TYPE ldap_connections_failed counter\n");
         output.push_str(&format!("ldap_connections_failed {}\n", conn_stats.failed));
+        output.push('\n');
+
+        // Resource event metrics
+        let resource_stats = self.get_resource_stats();
+        output.push_str("# HELP ldap_resource_connection_rejections_total Connection rejections due to resource limits\n");
+        output.push_str("# TYPE ldap_resource_connection_rejections_total counter\n");
+        output.push_str(&format!(
+            "ldap_resource_connection_rejections_total {}\n",
+            resource_stats.connection_rejections
+        ));
+        output.push('\n');
+
+        output.push_str("# HELP ldap_resource_operation_rejections_total Operation rejections due to resource limits\n");
+        output.push_str("# TYPE ldap_resource_operation_rejections_total counter\n");
+        output.push_str(&format!(
+            "ldap_resource_operation_rejections_total {}\n",
+            resource_stats.operation_rejections
+        ));
+        output.push('\n');
+
+        output.push_str("# HELP ldap_resource_memory_rejections_total Memory rejections due to resource limits\n");
+        output.push_str("# TYPE ldap_resource_memory_rejections_total counter\n");
+        output.push_str(&format!(
+            "ldap_resource_memory_rejections_total {}\n",
+            resource_stats.memory_rejections
+        ));
+        output.push('\n');
+
+        output.push_str(
+            "# HELP ldap_resource_rate_limit_blocks_total Requests blocked by rate limiting\n",
+        );
+        output.push_str("# TYPE ldap_resource_rate_limit_blocks_total counter\n");
+        output.push_str(&format!(
+            "ldap_resource_rate_limit_blocks_total {}\n",
+            resource_stats.rate_limit_blocks
+        ));
+        output.push('\n');
+
+        output.push_str(
+            "# HELP ldap_resource_rate_limit_allows_total Requests allowed by rate limiting\n",
+        );
+        output.push_str("# TYPE ldap_resource_rate_limit_allows_total counter\n");
+        output.push_str(&format!(
+            "ldap_resource_rate_limit_allows_total {}\n",
+            resource_stats.rate_limit_allows
+        ));
+        output.push('\n');
+
+        output.push_str("# HELP ldap_resource_idle_connection_evictions_total Idle connections evicted by cleanup\n");
+        output.push_str("# TYPE ldap_resource_idle_connection_evictions_total counter\n");
+        output.push_str(&format!(
+            "ldap_resource_idle_connection_evictions_total {}\n",
+            resource_stats.idle_connection_evictions
+        ));
         output.push('\n');
 
         // Operation metrics
@@ -663,6 +804,24 @@ impl MetricsCollector {
             details.push(format!("Failed connections: {}", conn_stats.failed));
         }
 
+        let resource_stats = self.get_resource_stats();
+        if resource_stats.connection_rejections > 0
+            || resource_stats.operation_rejections > 0
+            || resource_stats.memory_rejections > 0
+            || resource_stats.rate_limit_blocks > 0
+            || resource_stats.idle_connection_evictions > 0
+        {
+            details.push(format!(
+                "Resource events: connection_rejections={}, operation_rejections={}, memory_rejections={}, rate_limit_blocks={}, rate_limit_allows={}, idle_connection_evictions={}",
+                resource_stats.connection_rejections,
+                resource_stats.operation_rejections,
+                resource_stats.memory_rejections,
+                resource_stats.rate_limit_blocks,
+                resource_stats.rate_limit_allows,
+                resource_stats.idle_connection_evictions
+            ));
+        }
+
         // Check operation health
         let mut has_failed_ops = false;
         for (op_type, stats) in self.get_all_operation_stats() {
@@ -754,6 +913,7 @@ impl Default for MetricsCollector {
             start_time: Instant::now(),
             operations,
             connections: ConnectionMetrics::new(),
+            resources: ResourceMetrics::new(),
             fsm_states: FsmStateTracker::new(),
             custom_counters: RwLock::new(HashMap::new()),
             custom_gauges: RwLock::new(HashMap::new()),
@@ -786,6 +946,14 @@ mod tests {
         assert_eq!(conn_stats.active, 0);
         assert_eq!(conn_stats.closed, 0);
         assert_eq!(conn_stats.failed, 0);
+
+        let resource_stats = metrics.get_resource_stats();
+        assert_eq!(resource_stats.connection_rejections, 0);
+        assert_eq!(resource_stats.operation_rejections, 0);
+        assert_eq!(resource_stats.memory_rejections, 0);
+        assert_eq!(resource_stats.rate_limit_blocks, 0);
+        assert_eq!(resource_stats.rate_limit_allows, 0);
+        assert_eq!(resource_stats.idle_connection_evictions, 0);
     }
 
     #[test]
@@ -883,6 +1051,34 @@ mod tests {
 
         let stats = metrics.get_connection_stats();
         assert_eq!(stats.failed, 1);
+    }
+
+    #[test]
+    fn test_resource_metrics_and_export() {
+        let metrics = MetricsCollector::new();
+
+        metrics.record_resource_event(ResourceEventType::ConnectionRejected);
+        metrics.record_resource_event(ResourceEventType::OperationRejected);
+        metrics.record_resource_event(ResourceEventType::MemoryRejected);
+        metrics.record_resource_event(ResourceEventType::RateLimitBlocked);
+        metrics.record_resource_event(ResourceEventType::RateLimitAllowed);
+        metrics.record_resource_event(ResourceEventType::IdleConnectionEvicted);
+
+        let stats = metrics.get_resource_stats();
+        assert_eq!(stats.connection_rejections, 1);
+        assert_eq!(stats.operation_rejections, 1);
+        assert_eq!(stats.memory_rejections, 1);
+        assert_eq!(stats.rate_limit_blocks, 1);
+        assert_eq!(stats.rate_limit_allows, 1);
+        assert_eq!(stats.idle_connection_evictions, 1);
+
+        let output = metrics.export_prometheus();
+        assert!(output.contains("ldap_resource_connection_rejections_total 1"));
+        assert!(output.contains("ldap_resource_operation_rejections_total 1"));
+        assert!(output.contains("ldap_resource_memory_rejections_total 1"));
+        assert!(output.contains("ldap_resource_rate_limit_blocks_total 1"));
+        assert!(output.contains("ldap_resource_rate_limit_allows_total 1"));
+        assert!(output.contains("ldap_resource_idle_connection_evictions_total 1"));
     }
 
     #[test]

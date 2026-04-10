@@ -21,23 +21,28 @@
 //! The runtime maintains a mapping of LDAP message IDs to operation FSM instances,
 //! allowing concurrent operations to be processed independently.
 
-use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use ldap_parser::ldap::LdapMessage;
 use tokio::net::TcpStream;
 
 use crate::auth_fsm::{AuthFsmImpl, AuthUserInfo, AuthenticationBackend};
 use crate::backend::{DirectoryBackend, DirectoryEntry};
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::compare_fsm::CompareFsmImpl;
-use crate::connection_fsm::{ConnectionFsmImpl, TlsHandler};
+use crate::connection_fsm::{ConnectionFsmImpl, ConnectionTransport, TlsHandler};
 use crate::extended_op_fsm::ExtendedOpFsmImpl;
-use crate::fsm::{AuthState, SaslFsm, StateMachine};
+use crate::fsm::{AuthState, ConnectionFsm, SaslFsm, StateMachine};
+use crate::fsm_operation_registry::{FsmOperationRegistry, OperationInfo};
+use crate::fsm_request::{build_request_context, FsmRequestContext, FsmRequestRejection};
 use crate::sasl_fsm::SaslFsmImpl;
 use crate::search_fsm::SearchFsmImpl;
 use crate::write_fsm::{SchemaValidator, WriteFsmImpl};
+
+pub use crate::fsm_operation_registry::OperationType;
 
 struct DirectoryAuthenticationBackend {
     backend: Arc<dyn DirectoryBackend>,
@@ -163,29 +168,6 @@ impl OperationFsm {
     }
 }
 
-/// Information about an operation tracked by the runtime
-#[derive(Debug, Clone)]
-pub struct OperationInfo {
-    /// LDAP message ID for this operation
-    pub message_id: i32,
-    /// When this operation was created
-    pub created_at: Instant,
-    /// Type of operation
-    pub operation_type: OperationType,
-}
-
-/// Types of LDAP operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperationType {
-    Search,
-    Add,
-    Modify,
-    ModifyDN,
-    Delete,
-    Compare,
-    Extended,
-}
-
 /// Complete set of FSMs for a single LDAP connection
 ///
 /// This structure manages all FSM instances associated with one client connection.
@@ -202,17 +184,14 @@ pub struct ConnectionFsmSet {
     /// Authentication FSM (Simple or SASL)
     auth: AuthenticationFsm,
 
-    /// Active operation FSMs, keyed by LDAP message ID
-    operations: HashMap<i32, OperationFsm>,
+    /// Active operation FSMs and metadata, keyed by LDAP message ID.
+    operations: FsmOperationRegistry<OperationFsm>,
 
     /// Backend for directory operations
     backend: Arc<dyn DirectoryBackend>,
 
     /// Schema validator for write operations
     schema_validator: Arc<dyn SchemaValidator>,
-
-    /// Metadata about operations
-    operation_info: HashMap<i32, OperationInfo>,
 }
 
 impl ConnectionFsmSet {
@@ -249,18 +228,38 @@ impl ConnectionFsmSet {
         tls_handler: Option<Box<dyn TlsHandler>>,
         schema_validator: Option<Arc<dyn SchemaValidator>>,
     ) -> Self {
-        // Get address info before moving stream
-        let remote_addr = stream
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+        Self::new_with_transport_and_schema_validator(
+            ConnectionTransport::plain(stream),
+            backend,
+            tls_handler,
+            schema_validator,
+        )
+    }
 
-        // Create connection FSM with the stream
-        let connection = if let Some(tls) = tls_handler {
-            ConnectionFsmImpl::new_with_stream(stream, remote_addr.clone(), Some(tls))
-        } else {
-            ConnectionFsmImpl::new_with_stream(stream, remote_addr, None)
-        };
+    /// Create a new ConnectionFsmSet with an already established transport.
+    pub fn new_with_transport(
+        transport: ConnectionTransport,
+        backend: Arc<dyn DirectoryBackend>,
+        tls_handler: Option<Box<dyn TlsHandler>>,
+    ) -> Self {
+        Self::new_with_transport_and_schema_validator(transport, backend, tls_handler, None)
+    }
+
+    /// Create a new ConnectionFsmSet with an already established transport and schema validator.
+    pub fn new_with_transport_and_schema_validator(
+        transport: ConnectionTransport,
+        backend: Arc<dyn DirectoryBackend>,
+        tls_handler: Option<Box<dyn TlsHandler>>,
+        schema_validator: Option<Arc<dyn SchemaValidator>>,
+    ) -> Self {
+        // Get address info before moving stream
+        let remote_addr = transport
+            .tcp_ref()
+            .and_then(|stream| stream.peer_addr().ok())
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let connection = ConnectionFsmImpl::new_with_transport(transport, remote_addr, tls_handler);
 
         // Create BER decoder FSM
         let decoder = BerDecoderFsmImpl::new();
@@ -280,10 +279,9 @@ impl ConnectionFsmSet {
             connection,
             decoder,
             auth,
-            operations: HashMap::new(),
+            operations: FsmOperationRegistry::default(),
             backend,
             schema_validator,
-            operation_info: HashMap::new(),
         }
     }
 
@@ -332,6 +330,32 @@ impl ConnectionFsmSet {
         self.auth.is_authenticated()
     }
 
+    /// Build the shared request context used by the FSM dispatcher.
+    pub fn build_request_context(
+        &self,
+        connection_id: u64,
+        client_ip: Option<IpAddr>,
+        message: &LdapMessage<'_>,
+    ) -> Result<FsmRequestContext, FsmRequestRejection> {
+        build_request_context(
+            message,
+            connection_id,
+            client_ip,
+            self.authenticated_dn(),
+            self.connection.is_secure(),
+        )
+    }
+
+    /// Get a reference to the operation registry.
+    pub fn operation_registry(&self) -> &FsmOperationRegistry<OperationFsm> {
+        &self.operations
+    }
+
+    /// Get a mutable reference to the operation registry.
+    pub fn operation_registry_mut(&mut self) -> &mut FsmOperationRegistry<OperationFsm> {
+        &mut self.operations
+    }
+
     /// Create a new operation FSM for the given message ID
     ///
     /// # Arguments
@@ -348,19 +372,8 @@ impl ConnectionFsmSet {
         operation: OperationFsm,
         operation_type: OperationType,
     ) -> Result<(), String> {
-        if self.operations.contains_key(&message_id) {
-            return Err(format!("Message ID {} already in use", message_id));
-        }
-
-        let info = OperationInfo {
-            message_id,
-            created_at: Instant::now(),
-            operation_type,
-        };
-
-        self.operations.insert(message_id, operation);
-        self.operation_info.insert(message_id, info);
-        Ok(())
+        self.operations
+            .add_operation(message_id, operation, operation_type)
     }
 
     /// Get a mutable reference to an operation FSM by message ID
@@ -372,12 +385,12 @@ impl ConnectionFsmSet {
     /// * `Some(&mut OperationFsm)` if found
     /// * `None` if not found
     pub fn get_operation_mut(&mut self, message_id: i32) -> Option<&mut OperationFsm> {
-        self.operations.get_mut(&message_id)
+        self.operations.get_mut(message_id)
     }
 
     /// Get a reference to an operation FSM by message ID
     pub fn get_operation(&self, message_id: i32) -> Option<&OperationFsm> {
-        self.operations.get(&message_id)
+        self.operations.get(message_id)
     }
 
     /// Remove and return a completed operation FSM
@@ -389,8 +402,7 @@ impl ConnectionFsmSet {
     /// * `Some(OperationFsm)` if found and removed
     /// * `None` if not found
     pub fn remove_operation(&mut self, message_id: i32) -> Option<OperationFsm> {
-        self.operation_info.remove(&message_id);
-        self.operations.remove(&message_id)
+        self.operations.remove(message_id)
     }
 
     /// Clean up all terminal (completed) operations
@@ -400,18 +412,7 @@ impl ConnectionFsmSet {
     /// # Returns
     /// The number of operations cleaned up
     pub fn cleanup_terminal_operations(&mut self) -> usize {
-        let terminal_ids: Vec<i32> = self
-            .operations
-            .iter()
-            .filter(|(_, op)| op.is_terminal())
-            .map(|(id, _)| *id)
-            .collect();
-
-        let count = terminal_ids.len();
-        for id in terminal_ids {
-            self.remove_operation(id);
-        }
-        count
+        self.operations.cleanup_where(OperationFsm::is_terminal)
     }
 
     /// Get the number of active operations
@@ -421,7 +422,7 @@ impl ConnectionFsmSet {
 
     /// Get information about all active operations
     pub fn active_operations(&self) -> Vec<OperationInfo> {
-        self.operation_info.values().cloned().collect()
+        self.operations.active_operations()
     }
 
     /// Get a reference to the backend
@@ -448,19 +449,8 @@ impl ConnectionFsmSet {
         &mut self,
         max_operation_age: std::time::Duration,
     ) -> usize {
-        let now = Instant::now();
-        let timed_out_ids: Vec<i32> = self
-            .operation_info
-            .iter()
-            .filter(|(_, info)| now.duration_since(info.created_at) > max_operation_age)
-            .map(|(id, _)| *id)
-            .collect();
-
-        let count = timed_out_ids.len();
-        for id in timed_out_ids {
-            self.remove_operation(id);
-        }
-        count
+        self.operations
+            .cleanup_timed_out_operations(max_operation_age)
     }
 
     /// Get all operations that are approaching timeout
@@ -476,17 +466,8 @@ impl ConnectionFsmSet {
         warning_threshold: std::time::Duration,
         max_operation_age: std::time::Duration,
     ) -> Vec<i32> {
-        let now = Instant::now();
-        let warning_age = max_operation_age.saturating_sub(warning_threshold);
-
-        self.operation_info
-            .iter()
-            .filter(|(_, info)| {
-                let age = now.duration_since(info.created_at);
-                age > warning_age && age < max_operation_age
-            })
-            .map(|(id, _)| *id)
-            .collect()
+        self.operations
+            .get_operations_approaching_timeout(warning_threshold, max_operation_age)
     }
 }
 
@@ -496,6 +477,7 @@ mod tests {
     use crate::backend::MockBackend;
     use crate::fsm::AuthEvent;
     use crate::fsm::StateMachine;
+    use std::collections::HashMap;
 
     #[test]
     fn test_authentication_fsm_anonymous() {

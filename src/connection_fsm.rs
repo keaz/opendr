@@ -43,11 +43,118 @@
 
 use async_trait::async_trait;
 use std::fmt;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 // Note: AsyncRead and AsyncWrite are used in tests
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::server::TlsStream;
 
 use crate::fsm::{ConnectionEvent, ConnectionFsm, ConnectionInfo, ConnectionState, StateMachine};
+
+/// Transport wrapper for plain and TLS-wrapped LDAP connections.
+pub enum ConnectionTransport {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+    Closed,
+}
+
+impl ConnectionTransport {
+    pub fn plain(stream: TcpStream) -> Self {
+        Self::Plain(stream)
+    }
+
+    pub fn tls(stream: TlsStream<TcpStream>) -> Self {
+        Self::Tls(Box::new(stream))
+    }
+
+    pub fn is_secure(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+
+    pub fn tcp_ref(&self) -> Option<&TcpStream> {
+        match self {
+            Self::Plain(stream) => Some(stream),
+            Self::Tls(stream) => Some(stream.get_ref().0),
+            Self::Closed => None,
+        }
+    }
+
+    pub fn into_plain(self) -> Result<TcpStream, Self> {
+        match self {
+            Self::Plain(stream) => Ok(stream),
+            other => Err(other),
+        }
+    }
+}
+
+impl fmt::Debug for ConnectionTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain(_) => f.write_str("ConnectionTransport::Plain(..)"),
+            Self::Tls(_) => f.write_str("ConnectionTransport::Tls(..)"),
+            Self::Closed => f.write_str("ConnectionTransport::Closed"),
+        }
+    }
+}
+
+impl AsyncRead for ConnectionTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Closed => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection is closed",
+            ))),
+        }
+    }
+}
+
+impl AsyncWrite for ConnectionTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Closed => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection is closed",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Closed => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection is closed",
+            ))),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Closed => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection is closed",
+            ))),
+        }
+    }
+}
 
 /// Errors specific to connection FSM operations
 #[derive(Debug, thiserror::Error)]
@@ -96,11 +203,42 @@ pub trait TlsHandler: Send + Sync {
     /// * `Err(String)` with error description if failed
     async fn perform_handshake(&self, stream: &mut TcpStream) -> Result<(), String>;
 
+    /// Upgrade a plain TCP stream to the secure transport used by the FSM runtime.
+    async fn upgrade_transport(
+        &self,
+        mut stream: TcpStream,
+    ) -> Result<ConnectionTransport, String> {
+        self.perform_handshake(&mut stream).await?;
+        Ok(ConnectionTransport::plain(stream))
+    }
+
     /// Check if TLS is supported by this handler
     fn supports_tls(&self) -> bool;
 
     /// Get TLS protocol version after successful handshake
     fn protocol_version(&self) -> String;
+}
+
+#[async_trait]
+impl<T> TlsHandler for Arc<T>
+where
+    T: TlsHandler + ?Sized,
+{
+    async fn perform_handshake(&self, stream: &mut TcpStream) -> Result<(), String> {
+        (**self).perform_handshake(stream).await
+    }
+
+    async fn upgrade_transport(&self, stream: TcpStream) -> Result<ConnectionTransport, String> {
+        (**self).upgrade_transport(stream).await
+    }
+
+    fn supports_tls(&self) -> bool {
+        (**self).supports_tls()
+    }
+
+    fn protocol_version(&self) -> String {
+        (**self).protocol_version()
+    }
 }
 
 /// Trait for network operations
@@ -182,8 +320,8 @@ pub struct ConnectionFsmImpl {
     /// Current state of the connection FSM
     state: ConnectionState,
 
-    /// The TCP stream (if connected)
-    stream: Option<TcpStream>,
+    /// The active transport (plain TCP or TLS) if connected.
+    stream: Option<ConnectionTransport>,
 
     /// Target address for connection
     target_addr: String,
@@ -260,16 +398,25 @@ impl ConnectionFsmImpl {
         remote_addr: String,
         tls_handler: Option<Box<dyn TlsHandler>>,
     ) -> Self {
+        Self::new_with_transport(ConnectionTransport::plain(stream), remote_addr, tls_handler)
+    }
+
+    /// Create a new ConnectionFsm with an already established transport.
+    pub fn new_with_transport(
+        transport: ConnectionTransport,
+        remote_addr: String,
+        tls_handler: Option<Box<dyn TlsHandler>>,
+    ) -> Self {
         // Use a no-op TLS handler if none provided
         let tls = tls_handler.unwrap_or_else(|| Box::new(NoOpTlsHandler));
 
         Self {
             state: ConnectionState::Connected,
-            stream: Some(stream),
+            is_secure: transport.is_secure(),
+            stream: Some(transport),
             target_addr: remote_addr,
             tls_handler: tls,
             network_handler: Box::new(DefaultNetworkHandler),
-            is_secure: false,
             connect_start: Some(Instant::now()),
             connect_timeout: Duration::from_secs(30),
         }
@@ -289,7 +436,7 @@ impl ConnectionFsmImpl {
 
                 // Establish TCP connection
                 let stream = self.network_handler.connect(&self.target_addr).await?;
-                self.stream = Some(stream);
+                self.stream = Some(ConnectionTransport::plain(stream));
                 self.state = ConnectionState::Connected;
 
                 Ok(Some(self.connection_info()))
@@ -327,15 +474,27 @@ impl ConnectionFsmImpl {
 
                 self.state = ConnectionState::StartTlsNegotiation;
 
-                // Perform TLS handshake
-                if let Some(ref mut stream) = self.stream {
-                    match self.tls_handler.perform_handshake(stream).await {
-                        Ok(()) => {
+                if let Some(transport) = self.stream.take() {
+                    let plain_stream = match transport.into_plain() {
+                        Ok(stream) => stream,
+                        Err(transport) => {
+                            self.stream = Some(transport);
+                            self.state = ConnectionState::Error;
+                            return Err(ConnectionFsmError::TlsHandshakeFailed {
+                                reason: "connection already uses TLS".to_string(),
+                            });
+                        }
+                    };
+
+                    match self.tls_handler.upgrade_transport(plain_stream).await {
+                        Ok(upgraded) => {
+                            self.stream = Some(upgraded);
                             self.state = ConnectionState::Secure;
                             self.is_secure = true;
                             Ok(Some(self.connection_info()))
                         }
                         Err(reason) => {
+                            self.stream = Some(ConnectionTransport::Closed);
                             self.state = ConnectionState::Error;
                             Err(ConnectionFsmError::TlsHandshakeFailed { reason })
                         }
@@ -390,9 +549,9 @@ impl ConnectionFsmImpl {
             ConnectionState::Connected | ConnectionState::Secure => {
                 self.state = ConnectionState::Closing;
 
-                // Close the stream if it exists
-                if let Some(stream) = self.stream.take() {
-                    drop(stream); // Dropping TcpStream closes the connection
+                // Close the transport if it exists.
+                if let Some(transport) = self.stream.take() {
+                    drop(transport);
                 }
 
                 self.state = ConnectionState::Closed;
@@ -510,7 +669,7 @@ impl StateMachine for ConnectionFsmImpl {
 
 #[async_trait]
 impl ConnectionFsm for ConnectionFsmImpl {
-    type Stream = TcpStream;
+    type Stream = ConnectionTransport;
 
     fn stream(&self) -> Option<&Self::Stream> {
         self.stream.as_ref()
@@ -526,13 +685,25 @@ impl ConnectionFsm for ConnectionFsmImpl {
 
     fn connection_info(&self) -> ConnectionInfo {
         let (local_addr, remote_addr) = if let Some(ref stream) = self.stream {
+            let Some(tcp_stream) = stream.tcp_ref() else {
+                return ConnectionInfo {
+                    remote_addr: self.target_addr.clone(),
+                    local_addr: "unknown".to_string(),
+                    is_secure: self.is_secure,
+                    protocol_version: if self.is_secure {
+                        self.tls_handler.protocol_version()
+                    } else {
+                        "TCP".to_string()
+                    },
+                };
+            };
             let local = self
                 .network_handler
-                .local_addr(stream)
+                .local_addr(tcp_stream)
                 .unwrap_or_else(|_| "unknown".to_string());
             let remote = self
                 .network_handler
-                .remote_addr(stream)
+                .remote_addr(tcp_stream)
                 .unwrap_or_else(|_| self.target_addr.clone());
             (local, remote)
         } else {

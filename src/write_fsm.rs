@@ -625,6 +625,19 @@ pub trait WriteMetrics: Send + Sync {
     }
 }
 
+/// Trait for write-side audit hooks.
+pub trait WriteAudit: Send + Sync {
+    fn record_write_start(&self, user_dn: Option<&str>, operation: &WriteOperation);
+    fn record_write_success(&self, user_dn: Option<&str>, operation: &WriteOperation);
+    fn record_write_failure(&self, user_dn: Option<&str>, operation: &WriteOperation, error: &str);
+    fn record_write_rollback(
+        &self,
+        user_dn: Option<&str>,
+        operation: &WriteOperation,
+        reason: &str,
+    );
+}
+
 /// Configuration for the Write FSM
 #[derive(Debug, Clone)]
 pub struct WriteFsmConfig {
@@ -777,6 +790,12 @@ pub struct WriteFsmImpl {
     /// Metrics collector (optional)
     metrics: Option<Box<dyn WriteMetrics>>,
 
+    /// Audit hook (optional)
+    audit: Option<Box<dyn WriteAudit>>,
+
+    /// Default authenticated user DN to attach to new write sessions
+    default_user_dn: Option<String>,
+
     /// FSM configuration
     config: WriteFsmConfig,
 
@@ -808,6 +827,8 @@ impl WriteFsmImpl {
             schema_validator,
             aci_checker,
             metrics: None,
+            audit: None,
+            default_user_dn: None,
             config: WriteFsmConfig::default(),
             total_writes: 0,
             successful_writes: 0,
@@ -838,6 +859,8 @@ impl WriteFsmImpl {
             schema_validator,
             aci_checker,
             metrics: None,
+            audit: None,
+            default_user_dn: None,
             config,
             total_writes: 0,
             successful_writes: 0,
@@ -857,6 +880,18 @@ impl WriteFsmImpl {
         self
     }
 
+    /// Set the authenticated user DN that should be attached to new sessions.
+    pub fn with_user_dn(mut self, user_dn: impl Into<String>) -> Self {
+        self.default_user_dn = Some(user_dn.into());
+        self
+    }
+
+    /// Set the audit hook used for write lifecycle events.
+    pub fn with_audit(mut self, audit: Box<dyn WriteAudit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
     /// Get write statistics
     ///
     /// # Returns
@@ -870,14 +905,21 @@ impl WriteFsmImpl {
     }
 
     fn mark_failed(&mut self, error: impl Into<String>) {
-        self.state = WriteState::Failed {
-            error: error.into(),
-        };
+        let error = error.into();
+        if let (Some(audit), Some(session)) = (&self.audit, self.session.as_ref()) {
+            audit.record_write_failure(session.user_dn.as_deref(), &session.operation, &error);
+        }
+
+        self.state = WriteState::Failed { error };
         self.failed_writes += 1;
     }
 
     fn record_success(&mut self) {
         if let Some(session) = &self.session {
+            if let Some(ref audit) = self.audit {
+                audit.record_write_success(session.user_dn.as_deref(), &session.operation);
+            }
+
             if let Some(ref metrics) = self.metrics {
                 metrics.record_write_complete(
                     &session.operation,
@@ -1132,6 +1174,9 @@ impl WriteFsmImpl {
             .map_err(|message| WriteFsmError::TransactionError { message })?;
 
         if let Some(session) = &mut self.session {
+            if let Some(ref audit) = self.audit {
+                audit.record_write_rollback(session.user_dn.as_deref(), &session.operation, reason);
+            }
             session.can_rollback = false;
         }
 
@@ -1262,12 +1307,15 @@ impl WriteFsmImpl {
         self.validate_write_operation(&operation)?;
 
         // Create new session
-        let mut session = WriteSession::new(operation.clone(), None); // User DN would be set from context
+        let mut session = WriteSession::new(operation.clone(), self.default_user_dn.clone());
         session.validation_start = Some(Instant::now());
 
         // Record metrics
         if let Some(ref metrics) = self.metrics {
             metrics.record_write_start(session.user_dn.as_deref(), &operation);
+        }
+        if let Some(ref audit) = self.audit {
+            audit.record_write_start(session.user_dn.as_deref(), &operation);
         }
 
         self.session = Some(session);
@@ -1592,6 +1640,13 @@ impl WriteFsmImpl {
         &mut self,
         error_message: String,
     ) -> Result<Option<Vec<u8>>, WriteFsmError> {
+        if let (Some(audit), Some(session)) = (&self.audit, self.session.as_ref()) {
+            audit.record_write_failure(
+                session.user_dn.as_deref(),
+                &session.operation,
+                &error_message,
+            );
+        }
         self.state = WriteState::Failed {
             error: error_message.clone(),
         };
@@ -2042,6 +2097,60 @@ mod tests {
             self.call_log.lock().unwrap().push(format!(
                 "record_write_rollback({:?}, {})",
                 operation, reason
+            ));
+        }
+    }
+
+    /// Mock write audit hook for testing.
+    #[derive(Debug)]
+    pub struct MockWriteAudit {
+        pub call_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockWriteAudit {
+        pub fn new() -> Self {
+            Self {
+                call_log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl WriteAudit for MockWriteAudit {
+        fn record_write_start(&self, user_dn: Option<&str>, operation: &WriteOperation) {
+            self.call_log.lock().unwrap().push(format!(
+                "record_write_start({:?}, {:?})",
+                user_dn, operation
+            ));
+        }
+
+        fn record_write_success(&self, user_dn: Option<&str>, operation: &WriteOperation) {
+            self.call_log.lock().unwrap().push(format!(
+                "record_write_success({:?}, {:?})",
+                user_dn, operation
+            ));
+        }
+
+        fn record_write_failure(
+            &self,
+            user_dn: Option<&str>,
+            operation: &WriteOperation,
+            error: &str,
+        ) {
+            self.call_log.lock().unwrap().push(format!(
+                "record_write_failure({:?}, {:?}, {})",
+                user_dn, operation, error
+            ));
+        }
+
+        fn record_write_rollback(
+            &self,
+            user_dn: Option<&str>,
+            operation: &WriteOperation,
+            reason: &str,
+        ) {
+            self.call_log.lock().unwrap().push(format!(
+                "record_write_rollback({:?}, {:?}, {})",
+                user_dn, operation, reason
             ));
         }
     }
@@ -2518,6 +2627,46 @@ mod tests {
         assert!(calls.iter().any(|call| {
             call.contains("record_write_complete(Add { dn: \"cn=test,dc=example,dc=org\"")
                 && call.contains("Success")
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_write_with_user_dn_and_audit_hooks() {
+        let backend = Box::new(MockWriteBackend::new());
+        let schema_validator = Box::new(MockSchemaValidator::new());
+        let aci_checker = Box::new(MockAciChecker::new());
+        let audit = Box::new(MockWriteAudit::new());
+        let audit_log = audit.call_log.clone();
+
+        let mut fsm = WriteFsmImpl::new(backend, schema_validator, aci_checker)
+            .with_user_dn("cn=admin,dc=example,dc=org")
+            .with_audit(audit);
+
+        let _result = fsm
+            .handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+                dn: "cn=audit,dc=example,dc=org".to_string(),
+                entry:
+                    b"dn: cn=audit,dc=example,dc=org\nobjectClass: person\ncn: audit\nsn: user\n"
+                        .to_vec(),
+            }))
+            .await
+            .unwrap();
+
+        let _ = fsm
+            .handle_event(WriteEvent::ValidationComplete)
+            .await
+            .unwrap();
+        let _ = fsm
+            .handle_event(WriteEvent::SchemaCheckComplete)
+            .await
+            .unwrap();
+
+        let calls = audit_log.lock().unwrap();
+        assert!(calls.iter().any(|call| {
+            call.contains("record_write_start(Some(\"cn=admin,dc=example,dc=org\")")
+        }));
+        assert!(calls.iter().any(|call| {
+            call.contains("record_write_success(Some(\"cn=admin,dc=example,dc=org\")")
         }));
     }
 

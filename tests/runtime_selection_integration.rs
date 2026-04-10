@@ -9,7 +9,7 @@ fn test_default_runtime_is_legacy() {
 }
 
 #[test]
-fn test_fsm_runtime_is_rejected_for_shipped_binary() {
+fn test_fsm_runtime_is_accepted_for_shipped_binary() {
     let toml = r#"
 [server]
 runtime = "fsm"
@@ -17,12 +17,7 @@ runtime = "fsm"
 
     let config = ServerConfig::from_toml_str(toml).unwrap();
     assert!(config.validate().is_ok());
-
-    let error = config
-        .validate_for_shipped_binary()
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("not supported by the shipped opendr binary"));
+    assert!(config.validate_for_shipped_binary().is_ok());
 }
 
 #[test]
@@ -38,6 +33,21 @@ runtime = "legacy"
 
     let serialized = config.to_toml_string().unwrap();
     assert!(serialized.contains("runtime = \"legacy\""));
+}
+
+#[test]
+fn test_fsm_runtime_round_trips_through_toml() {
+    let toml = r#"
+[server]
+runtime = "fsm"
+"#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    assert_eq!(config.server.runtime, "fsm");
+    assert!(config.validate_for_shipped_binary().is_ok());
+
+    let serialized = config.to_toml_string().unwrap();
+    assert!(serialized.contains("runtime = \"fsm\""));
 }
 
 #[test]

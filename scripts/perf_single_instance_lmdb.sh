@@ -17,6 +17,7 @@ PROFILE="release"
 NAME_PREFIX="perfbench"
 LDAP_PORT=""
 OUTPUT_DIR=""
+SERVER_RUNTIME="legacy"
 
 SERVER_PID=""
 SAMPLER_PID=""
@@ -37,6 +38,7 @@ Options:
   --name-prefix VALUE       Prefix for benchmark DNs (default: perfbench)
   --port PORT               LDAP port for the temporary single instance
   --profile VALUE           Cargo profile to build/use: release or debug (default: release)
+  --runtime VALUE           Server runtime to benchmark: legacy or fsm (default: legacy)
   --help                    Show this help text
 EOF
 }
@@ -87,6 +89,10 @@ while [[ $# -gt 0 ]]; do
       PROFILE="$2"
       shift 2
       ;;
+    --runtime)
+      SERVER_RUNTIME="$2"
+      shift 2
+      ;;
     --help)
       usage
       exit 0
@@ -111,6 +117,11 @@ esac
 
 if [[ "${PROFILE}" != "release" && "${PROFILE}" != "debug" ]]; then
   echo "--profile must be release or debug" >&2
+  exit 1
+fi
+
+if [[ "${SERVER_RUNTIME}" != "legacy" && "${SERVER_RUNTIME}" != "fsm" ]]; then
+  echo "--runtime must be legacy or fsm" >&2
   exit 1
 fi
 
@@ -205,7 +216,7 @@ write_server_config() {
 
   cat > "${CONFIG_DIR}/server.toml" <<EOF
 [server]
-runtime = "legacy"
+runtime = "${SERVER_RUNTIME}"
 bind_address = "127.0.0.1"
 ldap_port = ${LDAP_PORT}
 ldaps_port = ${LDAPS_PORT}
@@ -423,6 +434,7 @@ cat > "${REPORT_MD}" <<EOF
 - Runtime directory: \`${RUNTIME_DIR}\`
 - Server log: \`${SERVER_LOG}\`
 - LDAP URL: \`ldap://127.0.0.1:${LDAP_PORT}\`
+- Server runtime: \`${SERVER_RUNTIME}\`
 - Base DN: \`${BASE_DN}\`
 - Root DN: \`${ROOT_DN}\`
 - Preloaded users: ${PRELOADED_USERS}

@@ -8,6 +8,7 @@ use opendr::audit::{AuditConfig, AuditFormat, AuditLevel, AuditLogger};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::{IndexConfig, LmdbBackend};
 use opendr::config::ServerConfig;
+use opendr::fsm_server;
 use opendr::metrics::MetricsCollector;
 use opendr::monitoring_runtime::{spawn_monitoring_server, ComponentStatus, RuntimeHealthRegistry};
 use opendr::replication_service::ReplicationService;
@@ -331,6 +332,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bind_addr = config.ldap_bind_address();
     let ldaps_bind_addr = config.ldaps_bind_address();
     println!("Starting LDAP server on {}", bind_addr);
+    let fsm_server_config = config.to_fsm_server_config();
     let legacy_server_config = server::LegacyServerConfig::from_server_config(&config);
     let legacy_security_config = build_legacy_security_config(&config).await?;
     let tls_handler = if config.tls.enabled {
@@ -369,8 +371,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ldap_backend = backend.clone();
     let ldap_metrics = monitoring_metrics.clone();
     let ldap_runtime_config = legacy_server_config.clone();
+    let ldap_fsm_runtime_config = fsm_server_config.clone();
+    let ldap_fsm_runtime_context = fsm_server::FsmServerRuntimeContext {
+        legacy_runtime_config: legacy_server_config.clone(),
+        metrics: monitoring_metrics.clone(),
+        security: legacy_security_config.clone(),
+        tls_handler: tls_handler.clone(),
+    };
     let ldap_tls_handler = tls_handler.clone();
     let ldap_security = legacy_security_config.clone();
+    let ldap_shutdown = shutdown.clone();
     let ldap_server_task = tokio::spawn(async move {
         let result = match selected_runtime.as_str() {
             "legacy" => {
@@ -382,6 +392,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     ldap_runtime_config,
                     ldap_tls_handler,
                     ldap_security,
+                )
+                .await
+            }
+            "fsm" => {
+                fsm_server::run_with_shutdown_and_context(
+                    &bind_addr,
+                    ldap_backend,
+                    ldap_fsm_runtime_config,
+                    ldap_fsm_runtime_context,
+                    Some(ldap_shutdown),
                 )
                 .await
             }
@@ -401,20 +421,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let ldaps_backend = backend.clone();
         let ldaps_metrics = monitoring_metrics.clone();
         let ldaps_runtime_config = legacy_server_config.clone();
+        let ldaps_fsm_runtime_config = fsm_server_config.clone();
+        let ldaps_fsm_runtime_context = fsm_server::FsmServerRuntimeContext {
+            legacy_runtime_config: legacy_server_config.clone(),
+            metrics: monitoring_metrics.clone(),
+            security: legacy_security_config.clone(),
+            tls_handler: Some(tls_handler.clone()),
+        };
         let ldaps_security = legacy_security_config.clone();
+        let ldaps_runtime = config.server.runtime.clone();
+        let ldaps_shutdown = shutdown.clone();
         println!("Starting LDAPS server on {}", ldaps_bind_addr);
         Some(tokio::spawn(async move {
-            if let Err(e) = server::run_tls_with_metrics_and_config_and_security(
-                &ldaps_bind_addr,
-                ldaps_backend,
-                ldaps_shutdown_rx,
-                ldaps_metrics,
-                ldaps_runtime_config,
-                tls_handler,
-                ldaps_security,
-            )
-            .await
-            {
+            let result = match ldaps_runtime.as_str() {
+                "legacy" => {
+                    server::run_tls_with_metrics_and_config_and_security(
+                        &ldaps_bind_addr,
+                        ldaps_backend,
+                        ldaps_shutdown_rx,
+                        ldaps_metrics,
+                        ldaps_runtime_config,
+                        tls_handler,
+                        ldaps_security,
+                    )
+                    .await
+                }
+                "fsm" => {
+                    fsm_server::run_tls_with_shutdown_and_context(
+                        &ldaps_bind_addr,
+                        ldaps_backend,
+                        ldaps_fsm_runtime_config,
+                        ldaps_fsm_runtime_context,
+                        Some(ldaps_shutdown),
+                    )
+                    .await
+                }
+                unsupported => Err(std::io::Error::other(format!(
+                    "server.runtime = {:?} is not supported by the shipped opendr binary",
+                    unsupported
+                ))
+                .into()),
+            };
+
+            if let Err(e) = result {
                 eprintln!("LDAPS server error: {}", e);
             }
         }))

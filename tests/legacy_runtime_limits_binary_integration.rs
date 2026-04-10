@@ -48,6 +48,7 @@ fn reserve_port() -> u16 {
 
 fn write_runtime_fixture(
     tempdir: &TempDir,
+    runtime: &str,
     ldap_port: u16,
     resource_overrides: &str,
     rate_limit_overrides: &str,
@@ -129,7 +130,7 @@ fn write_runtime_fixture(
     let server_toml = format!(
         r#"
 [server]
-runtime = "legacy"
+runtime = "{runtime}"
 bind_address = "127.0.0.1"
 ldap_port = {ldap_port}
 base_dn = "dc=example,dc=org"
@@ -263,6 +264,7 @@ fn assert_bind_result_code(response: &[u8], expected: ldap_parser::ldap::ResultC
 }
 
 fn runtime_fixture(
+    runtime: &str,
     resource_overrides: &str,
     rate_limit_overrides: &str,
     operation_limit_overrides: &str,
@@ -271,6 +273,7 @@ fn runtime_fixture(
     let port = reserve_port();
     write_runtime_fixture(
         &tempdir,
+        runtime,
         port,
         resource_overrides,
         rate_limit_overrides,
@@ -282,21 +285,12 @@ fn runtime_fixture(
 #[tokio::test]
 async fn legacy_runtime_enforces_connection_and_rate_limits() {
     {
-        let server = runtime_fixture("max_connections = 1\nmax_connections_per_ip = 1", "", "");
-
-        let mut first_client = connect_with_retry(server.port).await;
-        sleep(Duration::from_millis(100)).await;
-
-        let mut second_client = connect_with_retry(server.port).await;
-        let rejection = read_response_bytes(&mut second_client).await;
-        assert_unavailable_rejection(&rejection);
-
-        let bind_response = send_bind_request(&mut first_client, 1).await;
-        assert_bind_result_code(&bind_response, ldap_parser::ldap::ResultCode::Success);
-    }
-
-    {
-        let server = runtime_fixture("max_connections = 8\nmax_connections_per_ip = 1", "", "");
+        let server = runtime_fixture(
+            "legacy",
+            "max_connections = 1\nmax_connections_per_ip = 1",
+            "",
+            "",
+        );
 
         let mut first_client = connect_with_retry(server.port).await;
         sleep(Duration::from_millis(100)).await;
@@ -311,6 +305,26 @@ async fn legacy_runtime_enforces_connection_and_rate_limits() {
 
     {
         let server = runtime_fixture(
+            "legacy",
+            "max_connections = 8\nmax_connections_per_ip = 1",
+            "",
+            "",
+        );
+
+        let mut first_client = connect_with_retry(server.port).await;
+        sleep(Duration::from_millis(100)).await;
+
+        let mut second_client = connect_with_retry(server.port).await;
+        let rejection = read_response_bytes(&mut second_client).await;
+        assert_unavailable_rejection(&rejection);
+
+        let bind_response = send_bind_request(&mut first_client, 1).await;
+        assert_bind_result_code(&bind_response, ldap_parser::ldap::ResultCode::Success);
+    }
+
+    {
+        let server = runtime_fixture(
+            "legacy",
             "",
             "enabled = true\nglobal_requests_per_second = 100\nper_client_requests_per_second = 1\nwindow_duration_secs = 1\nadaptive_enabled = false\nauto_ban_threshold = 100",
             "bind = 1",
@@ -334,7 +348,7 @@ async fn legacy_runtime_enforces_connection_and_rate_limits() {
 fn legacy_runtime_rejects_unsupported_burst_size() {
     let tempdir = tempfile::tempdir().unwrap();
     let port = reserve_port();
-    write_runtime_fixture(&tempdir, port, "", "burst_size = 5", "");
+    write_runtime_fixture(&tempdir, "legacy", port, "", "burst_size = 5", "");
 
     let output = Command::new(opendr_binary())
         .current_dir(tempdir.path())
@@ -357,4 +371,13 @@ fn legacy_runtime_rejects_unsupported_burst_size() {
         combined_output.contains("legacy runtime"),
         "expected startup failure to mention legacy runtime, got: {combined_output}"
     );
+}
+
+#[tokio::test]
+async fn fsm_runtime_accepts_basic_bind_requests() {
+    let server = runtime_fixture("fsm", "", "", "");
+    let mut client = connect_with_retry(server.port).await;
+
+    let bind_response = send_bind_request(&mut client, 1).await;
+    assert_bind_result_code(&bind_response, ldap_parser::ldap::ResultCode::Success);
 }

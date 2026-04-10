@@ -77,6 +77,11 @@ pub(crate) fn matches_search_filter(entry: &DirectoryEntry, filter: &Filter<'_>)
         .unwrap_or(false)
 }
 
+pub(crate) fn matches_filter_string(entry: &DirectoryEntry, filter: &str) -> Result<bool, String> {
+    let compiled = compile_filter(filter)?;
+    Ok(compiled.matches(entry))
+}
+
 pub(crate) fn prepare_change(
     change: &ChangelogEntry,
     require_entry_snapshot: bool,
