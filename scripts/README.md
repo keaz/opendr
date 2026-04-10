@@ -100,6 +100,41 @@ If tests fail:
 ✅ Object class validation works
 ✅ Structural class requirements work
 
+### perf_single_instance_lmdb.sh
+
+**Purpose**: End-to-end performance run for a single OpenDR instance backed by LMDB.
+
+**What it measures**:
+1. LDAP operation latency and throughput for bind, search, compare, modify, password modify, add, modifyDN, and delete
+2. Server CPU usage sampled during the benchmark run
+3. Server memory usage (RSS) sampled during the benchmark run
+4. LMDB database size on disk before and after the run
+5. Number of LDAP records before fixture setup, after preload, and after the benchmark sequence
+
+**Implementation notes**:
+- Starts an isolated OpenDR runtime under `target/perf/...`
+- Uses the `lmdb` backend
+- Enables StartTLS automatically so Password Modify can be exercised without disabling confidentiality checks
+- Writes a combined markdown report plus raw JSON metrics
+
+**Usage**:
+```bash
+# Default single-instance LMDB run
+./scripts/perf_single_instance_lmdb.sh
+
+# Smaller smoke run
+./scripts/perf_single_instance_lmdb.sh \
+  --preloaded-users 200 \
+  --read-iterations 50 \
+  --write-iterations 25
+```
+
+**Artifacts**:
+- Markdown report: `target/perf/.../report.md`
+- Raw LDAP metrics: `target/perf/.../ldap-benchmark-results.json`
+- Resource samples: `target/perf/.../server-resource-samples.csv`
+- Server log: `target/perf/.../server.log`
+
 ## Installing ldap-utils
 
 ### Ubuntu/Debian
