@@ -366,6 +366,63 @@ async fn search_backend_error_returns_result_code() {
 }
 
 #[tokio::test]
+async fn base_object_search_uses_get_entry_fast_path() {
+    let mut backend = MockDirectory::new();
+    let mut attributes = HashMap::new();
+    attributes.insert("cn".to_string(), vec!["Alice".to_string()]);
+    attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+    let entry = DirectoryEntry::new("cn=Alice,dc=example,dc=org", attributes);
+
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
+        .times(1)
+        .return_once(|_| Ok(Some(entry)));
+    backend.expect_search_entries_with_hint().times(0);
+
+    let request = SearchRequest {
+        base_object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+        scope: SearchScope::BaseObject,
+        deref_aliases: DerefAliases(0),
+        size_limit: 0,
+        time_limit: 0,
+        types_only: false,
+        filter: Filter::EqualityMatch(AttributeValueAssertion {
+            attribute_desc: LdapString(Cow::Owned("cn".to_string())),
+            assertion_value: b"Alice",
+        }),
+        attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
+    };
+
+    let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+    server::handle_search_request(&mut server_stream, &backend, 12, request)
+        .await
+        .unwrap();
+
+    let data = read_response(&mut client_stream).await;
+    let (_, messages) = parse_ldap_messages(&data).unwrap();
+    assert_eq!(messages.len(), 2);
+
+    match &messages[0].protocol_op {
+        ProtocolOp::SearchResultEntry(entry_response) => {
+            assert_eq!(
+                entry_response.object_name.0.as_ref(),
+                "cn=Alice,dc=example,dc=org"
+            );
+        }
+        other => panic!("unexpected response: {:?}", other),
+    }
+
+    match &messages[1].protocol_op {
+        ProtocolOp::SearchResultDone(result) => {
+            assert_eq!(result.result_code, ldap_parser::ldap::ResultCode::Success);
+        }
+        other => panic!("unexpected completion: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn modify_success_returns_success_response() {
     let mut backend = MockDirectory::new();
     backend

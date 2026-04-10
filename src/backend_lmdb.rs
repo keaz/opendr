@@ -23,9 +23,10 @@
 //! - Indexed attribute lookups
 //! - DN normalization for fast case-insensitive searches
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -41,6 +42,9 @@ use crate::backend::{
 };
 use crate::csn::CsnGenerator;
 
+const LMDB_SET_RANGE_OP: u32 = 17;
+const DEFAULT_ENTRY_CACHE_CAPACITY: usize = 1000;
+
 /// Serialized entry structure for LMDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredEntry {
@@ -55,6 +59,131 @@ struct StoredEntry {
     /// Operational attributes (entryCSN, timestamps, etc.)
     #[serde(default)]
     pub operational_attributes: crate::backend::OperationalAttributes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryCacheStats {
+    pub capacity: usize,
+    pub len: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+#[derive(Default)]
+struct EntryCacheState {
+    entries: HashMap<String, StoredEntry>,
+    lru: VecDeque<String>,
+}
+
+struct EntryCache {
+    capacity: usize,
+    state: Mutex<EntryCacheState>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl EntryCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(EntryCacheState::default()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    fn get(&self, normalized_dn: &str) -> Option<StoredEntry> {
+        if self.capacity == 0 {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let entry = state.entries.get(normalized_dn).cloned();
+        match entry {
+            Some(entry) => {
+                Self::touch_key(&mut state.lru, normalized_dn);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(entry)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn insert(&self, entry: StoredEntry) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        let normalized_dn = entry.dn.to_lowercase().trim().to_string();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        if !state.entries.contains_key(&normalized_dn) && state.entries.len() == self.capacity {
+            while let Some(oldest_key) = state.lru.pop_front() {
+                if oldest_key == normalized_dn {
+                    continue;
+                }
+                if state.entries.remove(&oldest_key).is_some() {
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+
+        state.entries.insert(normalized_dn.clone(), entry);
+        Self::touch_key(&mut state.lru, &normalized_dn);
+    }
+
+    fn invalidate(&self, normalized_dn: &str) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.entries.remove(normalized_dn).is_some() {
+            Self::remove_key(&mut state.lru, normalized_dn);
+        }
+    }
+
+    fn stats(&self) -> EntryCacheStats {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        EntryCacheStats {
+            capacity: self.capacity,
+            len: state.entries.len(),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    fn touch_key(lru: &mut VecDeque<String>, normalized_dn: &str) {
+        Self::remove_key(lru, normalized_dn);
+        lru.push_back(normalized_dn.to_string());
+    }
+
+    fn remove_key(lru: &mut VecDeque<String>, normalized_dn: &str) {
+        if let Some(position) = lru.iter().position(|existing| existing == normalized_dn) {
+            lru.remove(position);
+        }
+    }
 }
 
 impl StoredEntry {
@@ -99,13 +228,14 @@ pub struct LmdbBackend {
     dn_index_db: Database,
     /// Metadata database (for contextCSN, etc.)
     metadata_db: Database,
-    /// Attribute indexes: map from "attr:value" -> DN
-    /// One database per indexed attribute
+    /// Attribute indexes: one database per indexed attribute
     attr_indexes: Arc<RwLock<HashMap<String, Database>>>,
     /// Index configuration
     index_config: IndexConfig,
     /// Lock for write operations (reads are lock-free in LMDB)
     write_lock: Arc<RwLock<()>>,
+    /// Bounded cache for hot exact-DN reads.
+    entry_cache: Arc<EntryCache>,
     /// Database directory path
     _db_path: PathBuf,
     /// Configured maximum reader slots
@@ -158,6 +288,24 @@ impl LmdbBackend {
         index_config: IndexConfig,
         max_readers: u32,
     ) -> Result<Self, BackendError> {
+        Self::new_with_runtime_and_cache_config(
+            path,
+            max_size_mb,
+            replica_id,
+            index_config,
+            max_readers,
+            DEFAULT_ENTRY_CACHE_CAPACITY,
+        )
+    }
+
+    pub fn new_with_runtime_and_cache_config<P: AsRef<Path>>(
+        path: P,
+        max_size_mb: usize,
+        replica_id: u16,
+        index_config: IndexConfig,
+        max_readers: u32,
+        entry_cache_capacity: usize,
+    ) -> Result<Self, BackendError> {
         let db_path = path.as_ref().to_path_buf();
 
         // Create directory if it doesn't exist
@@ -192,12 +340,10 @@ impl LmdbBackend {
             .create_db(Some("metadata"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create metadata db: {}", e)))?;
 
-        // Create attribute index databases
-        // Note: Using DUPSORT for indices to allow multiple DNs per attribute value
+        // Create attribute index databases.
         let mut attr_indexes = HashMap::new();
         for attr in &index_config.indexed_attributes {
             let db_name = format!("idx_{}", attr.to_lowercase());
-            // Create without DUP_SORT to avoid complexity - store value:DN as key
             let db = env
                 .create_db(Some(&db_name), lmdb::DatabaseFlags::empty())
                 .map_err(|e| {
@@ -218,6 +364,7 @@ impl LmdbBackend {
             attr_indexes: Arc::new(RwLock::new(attr_indexes)),
             index_config,
             write_lock: Arc::new(RwLock::new(())),
+            entry_cache: Arc::new(EntryCache::new(entry_cache_capacity)),
             _db_path: db_path,
             max_readers,
             csn_generator,
@@ -413,6 +560,7 @@ impl LmdbBackend {
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
+        self.entry_cache.invalidate(&Self::normalize_dn(&entry.dn));
         Ok(())
     }
 
@@ -547,6 +695,8 @@ impl LmdbBackend {
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
+        self.entry_cache.invalidate(&normalized_dn);
+        self.entry_cache.invalidate(&normalized_new_dn);
         Ok(())
     }
 
@@ -601,13 +751,15 @@ impl LmdbBackend {
 
     /// Get entry by DN with read transaction (optimized for concurrency)
     fn get_entry_internal(&self, dn: &str) -> Result<Option<StoredEntry>, BackendError> {
+        let normalized_dn = Self::normalize_dn(dn);
+        if let Some(entry) = self.entry_cache.get(&normalized_dn) {
+            return Ok(Some(entry));
+        }
+
         let txn = self
             .env
             .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
-
-        // Try normalized DN first for fast case-insensitive lookup
-        let normalized_dn = Self::normalize_dn(dn);
 
         // Check DN index for actual DN
         let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
@@ -627,6 +779,7 @@ impl LmdbBackend {
                 let entry: StoredEntry = bincode::deserialize(bytes).map_err(|e| {
                     BackendError::Storage(format!("Failed to deserialize entry: {}", e))
                 })?;
+                self.entry_cache.insert(entry.clone());
                 Ok(Some(entry))
             }
             Err(lmdb::Error::NotFound) => Ok(None),
@@ -867,11 +1020,62 @@ impl LmdbBackend {
         }
     }
 
+    fn equality_index_key(value: &str, dn: &str) -> String {
+        format!("{}:{}", value, dn)
+    }
+
+    fn equality_index_prefix(value: &str) -> String {
+        format!("{}:", value)
+    }
+
+    fn collect_index_dns_by_prefix(
+        cursor: &mut lmdb::RoCursor<'_>,
+        prefix: &[u8],
+    ) -> Result<Vec<String>, BackendError> {
+        let prefix_bytes = prefix;
+        let first_key = match cursor.get(Some(prefix), None, LMDB_SET_RANGE_OP) {
+            Ok((Some(key), _)) => key,
+            Ok((None, _)) => return Ok(Vec::new()),
+            Err(lmdb::Error::NotFound) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(BackendError::Storage(format!(
+                    "Failed to seek attribute index cursor: {}",
+                    e
+                )))
+            }
+        };
+
+        if !first_key.starts_with(prefix_bytes) {
+            return Ok(Vec::new());
+        }
+
+        let prefix = std::str::from_utf8(prefix)
+            .map_err(|e| BackendError::Storage(format!("Invalid index prefix encoding: {}", e)))?;
+        let mut results = Vec::new();
+        let first_key = std::str::from_utf8(first_key)
+            .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
+        if let Some(dn) = first_key.strip_prefix(prefix) {
+            results.push(dn.to_string());
+        }
+
+        for (key, _value) in cursor.iter() {
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let key = std::str::from_utf8(key)
+                .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
+            if let Some(dn) = key.strip_prefix(prefix) {
+                results.push(dn.to_string());
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Update attribute indexes for an entry
     ///
     /// This method updates the attribute indexes when an entry is added or modified.
-    /// For each indexed attribute in the entry, it creates an index entry mapping
-    /// "value:dn" -> "" (using composite key to allow multiple DNs per value).
+    /// For each indexed attribute, it creates an index entry mapping `value:dn` -> ``.
     fn update_attribute_indexes(
         &self,
         txn: &mut lmdb::RwTransaction,
@@ -888,10 +1092,9 @@ impl LmdbBackend {
 
             // Check if this attribute is indexed
             if let Some(index_db) = indexes.get(&attr_lower) {
-                // Index each value with a composite key "value:dn"
                 for value in values {
                     let value_lower = value.to_lowercase();
-                    let index_key = format!("{}:{}", value_lower, dn);
+                    let index_key = Self::equality_index_key(&value_lower, dn);
                     txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
                         .map_err(|e| {
                             BackendError::Storage(format!(
@@ -925,10 +1128,9 @@ impl LmdbBackend {
 
             // Check if this attribute is indexed
             if let Some(index_db) = indexes.get(&attr_lower) {
-                // Remove each value from index using composite key
                 for value in values {
                     let value_lower = value.to_lowercase();
-                    let index_key = format!("{}:{}", value_lower, dn);
+                    let index_key = Self::equality_index_key(&value_lower, dn);
                     txn.del(*index_db, &index_key.as_bytes(), None)
                         .or_else(|e| match e {
                             lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
@@ -975,28 +1177,11 @@ impl LmdbBackend {
             .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
-        let mut results = Vec::new();
-
-        // Use cursor to iterate over all DNs for this attribute value
-        // Keys are "value:dn", so we need to find all keys starting with "value:"
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
-
-        let search_prefix = format!("{}:", value_lower);
-
-        // Iterate through all entries and filter by prefix
-        for (key, _value) in cursor.iter() {
-            let key_str = String::from_utf8_lossy(key);
-            if key_str.starts_with(&search_prefix) {
-                // Extract DN from "value:dn" format
-                if let Some(dn) = key_str.strip_prefix(&search_prefix) {
-                    results.push(dn.to_string());
-                }
-            }
-        }
-
-        Ok(results)
+        let search_prefix = Self::equality_index_prefix(&value_lower);
+        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes())
     }
 
     fn search_present_by_index(&self, attribute: &str) -> Result<Vec<String>, BackendError> {
@@ -1070,6 +1255,14 @@ impl LmdbBackend {
 
     pub fn configured_max_readers(&self) -> u32 {
         self.max_readers
+    }
+
+    pub fn configured_entry_cache_capacity(&self) -> usize {
+        self.entry_cache.stats().capacity
+    }
+
+    pub fn entry_cache_stats(&self) -> EntryCacheStats {
+        self.entry_cache.stats()
     }
 }
 
@@ -1189,6 +1382,7 @@ impl DirectoryBackend for LmdbBackend {
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
+        self.entry_cache.invalidate(&normalized_dn);
         Ok(())
     }
 
@@ -1254,8 +1448,8 @@ impl DirectoryBackend for LmdbBackend {
         base_dn: &str,
         scope: SearchScope,
     ) -> Result<Vec<DirectoryEntry>, BackendError> {
-        let entries = self.search_entries_internal(base_dn, scope)?;
-        Ok(entries
+        Ok(self
+            .search_entries_internal(base_dn, scope)?
             .into_iter()
             .map(|e| e.to_directory_entry())
             .collect())
@@ -1528,6 +1722,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_attribute_index_exact_value_prefix_boundary() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        let mut john_attributes = HashMap::new();
+        john_attributes.insert("cn".to_string(), vec!["john".to_string()]);
+        let john = DirectoryEntry::new("uid=john,dc=example,dc=org", john_attributes);
+        backend.add_entry(john, vec![]).await.unwrap();
+
+        let mut johnny_attributes = HashMap::new();
+        johnny_attributes.insert("cn".to_string(), vec!["johnny".to_string()]);
+        let johnny = DirectoryEntry::new("uid=johnny,dc=example,dc=org", johnny_attributes);
+        backend.add_entry(johnny, vec![]).await.unwrap();
+
+        let results = backend.search_by_index("cn", "john").unwrap();
+        assert_eq!(results, vec!["uid=john,dc=example,dc=org".to_string()]);
+
+        let results = backend.search_by_index("cn", "johnny").unwrap();
+        assert_eq!(results, vec!["uid=johnny,dc=example,dc=org".to_string()]);
+    }
+
+    #[tokio::test]
     async fn test_attribute_index_multiple_entries() {
         let dir = tempdir().unwrap();
         let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
@@ -1544,6 +1760,39 @@ mod tests {
         // Search should return all entries with ou=Engineering
         let results = backend.search_by_index("ou", "Engineering").unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_presence_index_returns_each_dn_once_for_multivalue_attributes() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        let mut alice_attributes = HashMap::new();
+        alice_attributes.insert(
+            "mail".to_string(),
+            vec![
+                "alice@example.org".to_string(),
+                "alice.secondary@example.org".to_string(),
+            ],
+        );
+        let alice = DirectoryEntry::new("uid=alice,dc=example,dc=org", alice_attributes);
+        backend.add_entry(alice, vec![]).await.unwrap();
+
+        let mut bob_attributes = HashMap::new();
+        bob_attributes.insert("mail".to_string(), vec!["bob@example.org".to_string()]);
+        let bob = DirectoryEntry::new("uid=bob,dc=example,dc=org", bob_attributes);
+        backend.add_entry(bob, vec![]).await.unwrap();
+
+        let mut results = backend.search_present_by_index("mail").unwrap();
+        results.sort();
+
+        assert_eq!(
+            results,
+            vec![
+                "uid=alice,dc=example,dc=org".to_string(),
+                "uid=bob,dc=example,dc=org".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1654,6 +1903,10 @@ mod tests {
         let backend = LmdbBackend::new_with_runtime_config(dir.path(), 100, 1, config, 64).unwrap();
 
         assert_eq!(backend.configured_max_readers(), 64);
+        assert_eq!(
+            backend.configured_entry_cache_capacity(),
+            DEFAULT_ENTRY_CACHE_CAPACITY
+        );
         assert!(backend.is_indexed("departmentNumber"));
         assert!(!backend.is_indexed("cn"));
 
@@ -1664,6 +1917,203 @@ mod tests {
 
         let results = backend.search_by_index("departmentNumber", "42").unwrap();
         assert_eq!(results, vec!["uid=test,dc=example,dc=org".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_entry_cache_records_hits_on_repeated_exact_dn_reads() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
+            let mut attributes = HashMap::new();
+            attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+            let entry = DirectoryEntry::new("uid=cached,dc=example,dc=org", attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+        }
+
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(backend.entry_cache_stats().len, 0);
+
+        backend
+            .get_entry("uid=cached,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        let after_first_read = backend.entry_cache_stats();
+        assert_eq!(after_first_read.hits, 0);
+        assert_eq!(after_first_read.misses, 1);
+        assert_eq!(after_first_read.len, 1);
+
+        backend
+            .get_entry("UID=CACHED,DC=EXAMPLE,DC=ORG")
+            .await
+            .unwrap()
+            .unwrap();
+        let after_second_read = backend.entry_cache_stats();
+        assert_eq!(after_second_read.hits, 1);
+        assert_eq!(after_second_read.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn test_entry_cache_updates_after_modify() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
+            let mut attributes = HashMap::new();
+            attributes.insert("cn".to_string(), vec!["before".to_string()]);
+            let entry = DirectoryEntry::new("uid=modify,dc=example,dc=org", attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+        }
+
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        backend
+            .get_entry("uid=modify,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .modify_entry(
+                "uid=modify,dc=example,dc=org",
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "cn".to_string(),
+                    values: vec!["after".to_string()],
+                }],
+            )
+            .await
+            .unwrap();
+
+        let updated = backend
+            .get_entry("uid=modify,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.attributes["cn"], vec!["after".to_string()]);
+
+        let stats = backend.entry_cache_stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.len, 1);
+    }
+
+    #[tokio::test]
+    async fn test_entry_cache_evicts_oldest_entry_when_capacity_is_reached() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
+            for uid in ["one", "two"] {
+                let mut attributes = HashMap::new();
+                attributes.insert("cn".to_string(), vec![uid.to_string()]);
+                let entry = DirectoryEntry::new(format!("uid={uid},dc=example,dc=org"), attributes);
+                backend.add_entry(entry, vec![]).await.unwrap();
+            }
+        }
+
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            1,
+        )
+        .unwrap();
+
+        backend
+            .get_entry("uid=one,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .get_entry("uid=two,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        let stats_after_fill = backend.entry_cache_stats();
+        assert_eq!(stats_after_fill.len, 1);
+        assert_eq!(stats_after_fill.evictions, 1);
+
+        backend
+            .get_entry("uid=one,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        let stats_after_reload = backend.entry_cache_stats();
+        assert_eq!(stats_after_reload.misses, 3);
+        assert_eq!(stats_after_reload.evictions, 2);
+    }
+
+    #[tokio::test]
+    async fn test_search_paths_do_not_populate_exact_dn_entry_cache() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
+            for uid in ["alice", "bob"] {
+                let mut attributes = HashMap::new();
+                attributes.insert("cn".to_string(), vec![uid.to_string()]);
+                let entry = DirectoryEntry::new(
+                    format!("uid={uid},ou=people,dc=example,dc=org"),
+                    attributes,
+                );
+                backend.add_entry(entry, vec![]).await.unwrap();
+            }
+        }
+
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            4,
+        )
+        .unwrap();
+
+        let subtree_entries = backend
+            .search_entries("ou=people,dc=example,dc=org", SearchScope(2))
+            .await
+            .unwrap();
+        assert_eq!(subtree_entries.len(), 2);
+        assert_eq!(backend.entry_cache_stats().len, 0);
+
+        let hinted_entries = backend
+            .search_entries_with_hint(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Equality {
+                    attribute: "cn".to_string(),
+                    value: "alice".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hinted_entries.len(), 1);
+        assert_eq!(backend.entry_cache_stats().len, 0);
     }
 
     #[tokio::test]

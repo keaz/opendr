@@ -7,6 +7,7 @@ use rasn_ldap::{ResultCode, SearchResultEntry};
 use crate::backend::DirectoryEntry;
 use crate::ldap_controls::LdapControl;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseOp {
     SearchDone,
     Modify,

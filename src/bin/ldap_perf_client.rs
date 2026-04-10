@@ -26,6 +26,9 @@ struct Args {
     bind_dn: String,
 
     #[arg(long)]
+    admin_whoami_expected: Option<String>,
+
+    #[arg(long)]
     password: String,
 
     #[arg(long)]
@@ -131,6 +134,11 @@ async fn run(args: Args) -> AppResult<()> {
     )?;
 
     let total_start = Instant::now();
+    progress("connect.setup");
+    let admin_whoami_expected = args
+        .admin_whoami_expected
+        .clone()
+        .unwrap_or_else(|| format!("dn:{}", args.bind_dn));
     let dns = ScenarioDns {
         benchmark_root_dn: format!("ou={},{}", args.name_prefix, args.base_dn),
         users_ou_dn: format!("ou=users,ou={},{}", args.name_prefix, args.base_dn),
@@ -145,8 +153,11 @@ async fn run(args: Args) -> AppResult<()> {
 
     let mut admin_setup = connect(&args.url, args.starttls, args.insecure).await?;
     simple_bind(&mut admin_setup, &args.bind_dn, &args.password).await?;
+    progress("fixture.count.before_setup");
     let records_before_setup = count_entries(&mut admin_setup, &args.base_dn).await?;
+    progress("fixture.tree");
     create_benchmark_tree(&mut admin_setup, &dns).await?;
+    progress("fixture.preload");
     preload_users(
         &mut admin_setup,
         &dns,
@@ -155,19 +166,27 @@ async fn run(args: Args) -> AppResult<()> {
         &args.name_prefix,
     )
     .await?;
+    progress("fixture.count.after_setup");
     let records_after_setup = count_entries(&mut admin_setup, &args.base_dn).await?;
     admin_setup.unbind().await?;
 
+    progress("connect.benchmark_clients");
     let mut anonymous_client = connect(&args.url, args.starttls, args.insecure).await?;
     let mut admin_ops = connect(&args.url, args.starttls, args.insecure).await?;
     simple_bind(&mut admin_ops, &args.bind_dn, &args.password).await?;
     let mut admin_bind_client = connect(&args.url, args.starttls, args.insecure).await?;
     let mut user_bind_client = connect(&args.url, args.starttls, args.insecure).await?;
     let mut password_client = connect(&args.url, args.starttls, args.insecure).await?;
-    simple_bind(&mut password_client, &dns.control_user_dn, &args.user_password).await?;
+    simple_bind(
+        &mut password_client,
+        &dns.control_user_dn,
+        &args.user_password,
+    )
+    .await?;
 
     let mut benchmarks = Vec::new();
 
+    progress("benchmark.root_dse");
     for _ in 0..args.warmup_iterations {
         verify_root_dse(&mut anonymous_client, &args.base_dn, false).await?;
     }
@@ -184,6 +203,7 @@ async fn run(args: Args) -> AppResult<()> {
         root_dse_started,
     ));
 
+    progress("benchmark.bind_admin");
     for _ in 0..args.warmup_iterations {
         simple_bind(&mut admin_bind_client, &args.bind_dn, &args.password).await?;
     }
@@ -200,14 +220,25 @@ async fn run(args: Args) -> AppResult<()> {
         admin_bind_started,
     ));
 
+    progress("benchmark.bind_fixture_user");
     for _ in 0..args.warmup_iterations {
-        simple_bind(&mut user_bind_client, &dns.control_user_dn, &args.user_password).await?;
+        simple_bind(
+            &mut user_bind_client,
+            &dns.control_user_dn,
+            &args.user_password,
+        )
+        .await?;
     }
     let mut user_bind_latencies = Vec::with_capacity(args.read_iterations);
     let user_bind_started = Instant::now();
     for _ in 0..args.read_iterations {
         let started = Instant::now();
-        simple_bind(&mut user_bind_client, &dns.control_user_dn, &args.user_password).await?;
+        simple_bind(
+            &mut user_bind_client,
+            &dns.control_user_dn,
+            &args.user_password,
+        )
+        .await?;
         user_bind_latencies.push(elapsed_ms(started.elapsed().as_secs_f64()));
     }
     benchmarks.push(build_benchmark_stats(
@@ -216,14 +247,15 @@ async fn run(args: Args) -> AppResult<()> {
         user_bind_started,
     ));
 
+    progress("benchmark.whoami_admin");
     for _ in 0..args.warmup_iterations {
-        verify_whoami(&mut admin_ops, &args.bind_dn).await?;
+        verify_whoami(&mut admin_ops, &admin_whoami_expected).await?;
     }
     let mut whoami_latencies = Vec::with_capacity(args.read_iterations);
     let whoami_started = Instant::now();
     for _ in 0..args.read_iterations {
         let started = Instant::now();
-        verify_whoami(&mut admin_ops, &args.bind_dn).await?;
+        verify_whoami(&mut admin_ops, &admin_whoami_expected).await?;
         whoami_latencies.push(elapsed_ms(started.elapsed().as_secs_f64()));
     }
     benchmarks.push(build_benchmark_stats(
@@ -232,6 +264,7 @@ async fn run(args: Args) -> AppResult<()> {
         whoami_started,
     ));
 
+    progress("benchmark.search_base_fixture_user");
     for _ in 0..args.warmup_iterations {
         let entry = search_single_entry(
             &mut admin_ops,
@@ -270,6 +303,7 @@ async fn run(args: Args) -> AppResult<()> {
         base_search_started,
     ));
 
+    progress("benchmark.search_subtree_fixture_users");
     for _ in 0..args.warmup_iterations {
         let entries = search_entries(
             &mut admin_ops,
@@ -316,6 +350,7 @@ async fn run(args: Args) -> AppResult<()> {
         subtree_search_started,
     ));
 
+    progress("benchmark.compare_fixture_user_sn");
     for _ in 0..args.warmup_iterations {
         let equal = admin_ops
             .compare(&dns.control_user_dn, "sn", "BenchmarkUser0")
@@ -340,6 +375,7 @@ async fn run(args: Args) -> AppResult<()> {
         compare_started,
     ));
 
+    progress("benchmark.modify_fixture_user_description");
     let mut modify_fixture_latencies = Vec::with_capacity(args.write_iterations);
     let modify_fixture_started = Instant::now();
     for index in 0..args.write_iterations {
@@ -362,6 +398,7 @@ async fn run(args: Args) -> AppResult<()> {
         modify_fixture_started,
     ));
 
+    progress("benchmark.password_modify_fixture_user");
     let mut current_password = args.user_password.clone();
     let mut next_password = args.updated_user_password.clone();
     let mut password_modify_latencies = Vec::with_capacity(args.write_iterations);
@@ -397,6 +434,7 @@ async fn run(args: Args) -> AppResult<()> {
     }
     password_client.unbind().await?;
 
+    progress("benchmark.add_entries");
     let mut write_dns = Vec::with_capacity(args.write_iterations);
 
     let mut add_latencies = Vec::with_capacity(args.write_iterations);
@@ -414,9 +452,15 @@ async fn run(args: Args) -> AppResult<()> {
                         string_set(["top", "person", "organizationalPerson", "inetOrgPerson"]),
                     ),
                     ("uid".to_string(), string_set([uid.clone()])),
-                    ("cn".to_string(), string_set([format!("Write User {index}")])),
+                    (
+                        "cn".to_string(),
+                        string_set([format!("Write User {index}")]),
+                    ),
                     ("sn".to_string(), string_set([format!("WriteUser{index}")])),
-                    ("mail".to_string(), string_set([format!("{uid}@example.com")])),
+                    (
+                        "mail".to_string(),
+                        string_set([format!("{uid}@example.com")]),
+                    ),
                 ],
             )
             .await?
@@ -424,8 +468,13 @@ async fn run(args: Args) -> AppResult<()> {
         write_dns.push(dn);
         add_latencies.push(elapsed_ms(started.elapsed().as_secs_f64()));
     }
-    benchmarks.push(build_benchmark_stats("add_entries", add_latencies, add_started));
+    benchmarks.push(build_benchmark_stats(
+        "add_entries",
+        add_latencies,
+        add_started,
+    ));
 
+    progress("benchmark.modify_entries");
     let mut modify_entries_latencies = Vec::with_capacity(args.write_iterations);
     let modify_entries_started = Instant::now();
     for index in 0..args.write_iterations {
@@ -437,12 +486,10 @@ async fn run(args: Args) -> AppResult<()> {
         admin_ops
             .modify(
                 &dn,
-                vec![
-                    Mod::Replace(
-                        "description".to_string(),
-                        string_set([format!("Modified in iteration {index}")]),
-                    ),
-                ],
+                vec![Mod::Replace(
+                    "description".to_string(),
+                    string_set([format!("Modified in iteration {index}")]),
+                )],
             )
             .await?
             .success()?;
@@ -454,6 +501,7 @@ async fn run(args: Args) -> AppResult<()> {
         modify_entries_started,
     ));
 
+    progress("benchmark.modifydn_entries");
     let mut modifydn_latencies = Vec::with_capacity(args.write_iterations);
     let modifydn_started = Instant::now();
     for index in 0..args.write_iterations {
@@ -465,7 +513,12 @@ async fn run(args: Args) -> AppResult<()> {
         let new_dn = format!("uid={new_uid},{}", dns.moved_ou_dn);
         let started = Instant::now();
         admin_ops
-            .modifydn(&current_dn, &format!("uid={new_uid}"), true, Some(&dns.moved_ou_dn))
+            .modifydn(
+                &current_dn,
+                &format!("uid={new_uid}"),
+                true,
+                Some(&dns.moved_ou_dn),
+            )
             .await?
             .success()?;
         write_dns[index] = new_dn;
@@ -477,6 +530,7 @@ async fn run(args: Args) -> AppResult<()> {
         modifydn_started,
     ));
 
+    progress("benchmark.delete_entries");
     let mut delete_latencies = Vec::with_capacity(args.write_iterations);
     let delete_started = Instant::now();
     for index in 0..args.write_iterations {
@@ -494,6 +548,7 @@ async fn run(args: Args) -> AppResult<()> {
         delete_started,
     ));
 
+    progress("fixture.count.after_benchmark");
     let records_after_benchmark = count_entries(&mut admin_ops, &args.base_dn).await?;
 
     anonymous_client.unbind().await?;
@@ -572,8 +627,14 @@ async fn preload_users(
                     string_set(["top", "person", "organizationalPerson", "inetOrgPerson"]),
                 ),
                 ("uid".to_string(), string_set([uid.clone()])),
-                ("cn".to_string(), string_set([format!("Benchmark User {index}")])),
-                ("sn".to_string(), string_set([format!("BenchmarkUser{index}")])),
+                (
+                    "cn".to_string(),
+                    string_set([format!("Benchmark User {index}")]),
+                ),
+                (
+                    "sn".to_string(),
+                    string_set([format!("BenchmarkUser{index}")]),
+                ),
                 (
                     "description".to_string(),
                     string_set([format!("Benchmark fixture user {index}")]),
@@ -617,11 +678,7 @@ async fn add_organizational_unit(ldap: &mut Ldap, dn: &str) -> AppResult<()> {
     Ok(())
 }
 
-async fn verify_root_dse(
-    ldap: &mut Ldap,
-    base_dn: &str,
-    expect_starttls: bool,
-) -> AppResult<()> {
+async fn verify_root_dse(ldap: &mut Ldap, base_dn: &str, expect_starttls: bool) -> AppResult<()> {
     let (entries, _result) = ldap
         .search(
             "",
@@ -658,15 +715,13 @@ async fn verify_root_dse(
     Ok(())
 }
 
-async fn verify_whoami(ldap: &mut Ldap, expected_dn: &str) -> AppResult<()> {
+async fn verify_whoami(ldap: &mut Ldap, expected_authzid: &str) -> AppResult<()> {
     let (exop, _result) = ldap.extended(WhoAmI).await?.success()?;
     let whoami: WhoAmIResp = exop.parse();
     ensure(
-        whoami
-            .authzid
-            .eq_ignore_ascii_case(&format!("dn:{expected_dn}")),
+        whoami.authzid.eq_ignore_ascii_case(expected_authzid),
         format!(
-            "WhoAmI mismatch: expected dn:{expected_dn}, got {}",
+            "WhoAmI mismatch: expected {expected_authzid}, got {}",
             whoami.authzid
         ),
     )?;
@@ -742,7 +797,7 @@ fn build_benchmark_stats(
 }
 
 fn print_human_summary(report: &BenchmarkReport) {
-    println!("# OpenDR LDAP Single-Instance Perf Summary");
+    println!("# LDAP Single-Instance Perf Summary");
     println!();
     println!("## Fixture");
     println!("- Server URL: `{}`", report.server_url);
@@ -756,7 +811,10 @@ fn print_human_summary(report: &BenchmarkReport) {
         "- Records before setup: {}",
         report.fixture.records_before_setup
     );
-    println!("- Records after setup: {}", report.fixture.records_after_setup);
+    println!(
+        "- Records after setup: {}",
+        report.fixture.records_after_setup
+    );
     println!(
         "- Records after benchmark: {}",
         report.fixture.records_after_benchmark
@@ -802,6 +860,12 @@ fn percentile(samples: &[f64], quantile: f64) -> f64 {
 
 fn elapsed_ms(seconds: f64) -> f64 {
     seconds * 1000.0
+}
+
+fn progress(step: &str) {
+    if std::env::var_os("LDAP_PERF_PROGRESS").is_some() {
+        eprintln!("progress: {step}");
+    }
 }
 
 fn string_set<I, S>(values: I) -> HashSet<String>

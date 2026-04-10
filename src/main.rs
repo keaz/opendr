@@ -136,12 +136,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         Vec::new()
                     },
                 };
-                let mut backend = LmdbBackend::new_with_runtime_config(
+                println!(
+                    "LMDB entry cache capacity: {}",
+                    config.performance.cache_size
+                );
+                let mut backend = LmdbBackend::new_with_runtime_and_cache_config(
                     &config.backend.data_directory,
                     max_size_mb,
                     replica_id,
                     index_config,
                     config.backend.lmdb_max_readers,
+                    config.performance.cache_size,
                 )?;
 
                 // Initialize with base structure if needed

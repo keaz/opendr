@@ -10,7 +10,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use opendr::backend::{DirectoryBackend, DirectoryEntry, Modification, ModifyOperation};
+use ldap_parser::ldap::SearchScope;
+use opendr::backend::{
+    DirectoryBackend, DirectoryEntry, Modification, ModifyOperation, SearchCandidateHint,
+};
 use opendr::backend_lmdb::{IndexConfig, LmdbBackend};
 use tempfile::TempDir;
 
@@ -434,4 +437,68 @@ async fn test_objectclass_indexing() {
         .search_by_index("objectclass", "organizationalUnit")
         .unwrap();
     assert_eq!(results.len(), 1); // Only Entry 1
+}
+
+#[tokio::test]
+async fn test_objectclass_hint_search_handles_large_result_sets() {
+    let temp_dir = TempDir::new().unwrap();
+    let backend = create_test_backend(&temp_dir);
+
+    let users_ou = "ou=users,dc=example,dc=org";
+    let mut ou_attributes = HashMap::new();
+    ou_attributes.insert(
+        "objectclass".to_string(),
+        vec!["top".to_string(), "organizationalUnit".to_string()],
+    );
+    ou_attributes.insert("ou".to_string(), vec!["users".to_string()]);
+    backend
+        .add_entry(
+            DirectoryEntry::new(users_ou.to_string(), ou_attributes),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    for i in 0..1000 {
+        let uid = format!("user{i:04}");
+        let dn = format!("uid={uid},{users_ou}");
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "objectclass".to_string(),
+            vec![
+                "top".to_string(),
+                "person".to_string(),
+                "organizationalPerson".to_string(),
+                "inetOrgPerson".to_string(),
+            ],
+        );
+        attributes.insert("uid".to_string(), vec![uid.clone()]);
+        attributes.insert("cn".to_string(), vec![format!("User {i}")]);
+        attributes.insert("sn".to_string(), vec![format!("User{i}")]);
+        attributes.insert("mail".to_string(), vec![format!("{uid}@example.com")]);
+        backend
+            .add_entry(DirectoryEntry::new(dn, attributes), vec![])
+            .await
+            .unwrap();
+    }
+
+    let started = Instant::now();
+    let results = backend
+        .search_entries_with_hint(
+            users_ou,
+            SearchScope(2),
+            Some(SearchCandidateHint::Equality {
+                attribute: "objectclass".to_string(),
+                value: "inetOrgPerson".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1000);
+    assert!(
+        started.elapsed().as_secs() < 5,
+        "large objectClass hint search took too long: {:?}",
+        started.elapsed()
+    );
 }

@@ -184,6 +184,9 @@ pub async fn run_with_shutdown(
         tokio::select! {
             accept_result = listener.accept() => {
                 let (socket, client_addr) = accept_result?;
+                if let Err(err) = socket.set_nodelay(true) {
+                    warn!("Failed to enable TCP_NODELAY for {:?}: {}", client_addr, err);
+                }
 
                 // Check if we're shutting down
                 if let Some(ref shutdown_coord) = shutdown {

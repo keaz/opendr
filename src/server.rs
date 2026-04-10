@@ -672,6 +672,9 @@ async fn run_plain_listener(
                         return Err(err.into());
                     }
                 };
+                if let Err(err) = socket.set_nodelay(true) {
+                    warn!("Failed to enable TCP_NODELAY for {:?}: {}", addr, err);
+                }
 
                 let conn_id = match pool.acquire_connection(addr).await {
                     Some(conn_id) => conn_id,
@@ -823,6 +826,9 @@ pub async fn run_tls_with_metrics_and_config_and_security(
                         return Err(err.into());
                     }
                 };
+                if let Err(err) = socket.set_nodelay(true) {
+                    warn!("Failed to enable TCP_NODELAY for LDAPS {:?}: {}", addr, err);
+                }
 
                 let conn_id = match pool.acquire_connection(addr).await {
                     Some(conn_id) => conn_id,
@@ -2787,7 +2793,15 @@ async fn send_result_with_controls(
         diagnostic_message,
         controls,
     )?;
+    let op_name = response_op_name(op);
+    trace_search(format_args!(
+        "send_result_with_controls start op={op_name} message_id={message_id} bytes={}",
+        encoded.len()
+    ));
     socket.write_all(&encoded).await?;
+    trace_search(format_args!(
+        "send_result_with_controls complete op={op_name} message_id={message_id}"
+    ));
     Ok(())
 }
 
@@ -3509,13 +3523,19 @@ async fn handle_search_request_with_context_and_registry(
         }
     };
 
-    if !manage_dsa_it && request.scope == ldap_parser::ldap::SearchScope::BaseObject {
-        if let Some(base_entry) = backend.get_entry(&effective_base_dn).await.map_err(|err| {
+    let base_object_entry = if request.scope == ldap_parser::ldap::SearchScope::BaseObject {
+        backend.get_entry(&effective_base_dn).await.map_err(|err| {
             ServerError::Io(std::io::Error::other(format!(
                 "failed to load search base {}: {}",
                 effective_base_dn, err
             )))
-        })? {
+        })?
+    } else {
+        None
+    };
+
+    if !manage_dsa_it && request.scope == ldap_parser::ldap::SearchScope::BaseObject {
+        if let Some(base_entry) = base_object_entry.as_ref() {
             if entry_is_referral(&base_entry) {
                 match referral_urls_for_entry(&base_entry) {
                     Ok(referrals) => {
@@ -3739,6 +3759,7 @@ async fn handle_search_request_with_context_and_registry(
     let mut search_result_set = match collect_search_result_set(
         backend,
         &effective_base_dn,
+        base_object_entry,
         &request,
         deref_aliases,
         manage_dsa_it,
@@ -3998,12 +4019,30 @@ async fn handle_search_request_with_context_and_registry(
 async fn collect_search_result_set(
     backend: &dyn DirectoryBackend,
     effective_base_dn: &str,
+    base_object_entry: Option<DirectoryEntry>,
     request: &SearchRequest<'_>,
     deref_aliases: ldap_parser::ldap::DerefAliases,
     manage_dsa_it: bool,
     search_deadline: Option<Instant>,
 ) -> Result<SearchResultSet, SearchExecutionError> {
+    if request.scope == ldap_parser::ldap::SearchScope::BaseObject {
+        return collect_base_object_search_result_set(
+            backend,
+            effective_base_dn,
+            base_object_entry,
+            request,
+            deref_aliases,
+            manage_dsa_it,
+            search_deadline,
+        )
+        .await;
+    }
+
     let search_hint = extract_search_hint(&request.filter);
+    trace_search(format_args!(
+        "collect_search_result_set start base={effective_base_dn} scope={} hint={:?}",
+        request.scope.0, search_hint
+    ));
     let entries = backend
         .search_entries_with_hint(effective_base_dn, request.scope, search_hint)
         .await
@@ -4014,6 +4053,10 @@ async fn collect_search_result_set(
             alias_dereference_failure: false,
             referral_processing_failure: false,
         })?;
+    trace_search(format_args!(
+        "collect_search_result_set loaded {} candidate entries for base={effective_base_dn}",
+        entries.len()
+    ));
 
     let mut collected = Vec::new();
     let mut references = Vec::new();
@@ -4084,6 +4127,107 @@ async fn collect_search_result_set(
     })
 }
 
+async fn collect_base_object_search_result_set(
+    backend: &dyn DirectoryBackend,
+    effective_base_dn: &str,
+    base_object_entry: Option<DirectoryEntry>,
+    request: &SearchRequest<'_>,
+    deref_aliases: ldap_parser::ldap::DerefAliases,
+    manage_dsa_it: bool,
+    search_deadline: Option<Instant>,
+) -> Result<SearchResultSet, SearchExecutionError> {
+    trace_search(format_args!(
+        "collect_search_result_set base-object fast path base={effective_base_dn}"
+    ));
+
+    if let Some(deadline) = search_deadline {
+        if Instant::now() >= deadline {
+            return Ok(SearchResultSet {
+                entries: Vec::new(),
+                references: Vec::new(),
+                size_limit_hit: false,
+                time_limit_hit: true,
+            });
+        }
+    }
+
+    let entry = match base_object_entry {
+        Some(entry) => Some(entry),
+        None => backend
+            .get_entry(effective_base_dn)
+            .await
+            .map_err(|err| SearchExecutionError {
+                result_code: map_backend_error(&err),
+                diagnostic: diagnostic_for_error(&err).to_string(),
+                target_dn: effective_base_dn.to_string(),
+                alias_dereference_failure: false,
+                referral_processing_failure: false,
+            })?,
+    };
+    let Some(entry) = entry else {
+        return Ok(SearchResultSet {
+            entries: Vec::new(),
+            references: Vec::new(),
+            size_limit_hit: false,
+            time_limit_hit: false,
+        });
+    };
+
+    if let Some(deadline) = search_deadline {
+        if Instant::now() >= deadline {
+            return Ok(SearchResultSet {
+                entries: Vec::new(),
+                references: Vec::new(),
+                size_limit_hit: false,
+                time_limit_hit: true,
+            });
+        }
+    }
+
+    let entry = resolve_search_candidate_entry(backend, &entry, deref_aliases)
+        .await
+        .map_err(|(result_code, diagnostic)| SearchExecutionError {
+            result_code,
+            diagnostic,
+            target_dn: entry.dn.clone(),
+            alias_dereference_failure: true,
+            referral_processing_failure: false,
+        })?;
+
+    if entry_is_referral(&entry) && !manage_dsa_it {
+        let referral_urls =
+            referral_urls_for_entry(&entry).map_err(|diagnostic| SearchExecutionError {
+                result_code: ResultCode::OperationsError,
+                diagnostic,
+                target_dn: entry.dn.clone(),
+                alias_dereference_failure: false,
+                referral_processing_failure: true,
+            })?;
+        return Ok(SearchResultSet {
+            entries: Vec::new(),
+            references: vec![referral_urls],
+            size_limit_hit: false,
+            time_limit_hit: false,
+        });
+    }
+
+    if !entry_matches_filter(&entry, &request.filter) {
+        return Ok(SearchResultSet {
+            entries: Vec::new(),
+            references: Vec::new(),
+            size_limit_hit: false,
+            time_limit_hit: false,
+        });
+    }
+
+    Ok(SearchResultSet {
+        entries: vec![entry],
+        references: Vec::new(),
+        size_limit_hit: false,
+        time_limit_hit: false,
+    })
+}
+
 async fn emit_search_entries(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -4092,26 +4236,98 @@ async fn emit_search_entries(
     types_only: bool,
     search_deadline: Option<Instant>,
 ) -> Result<(usize, bool), ServerError> {
-    let mut returned = 0usize;
-    for entry in entries {
-        if let Some(deadline) = search_deadline {
-            if Instant::now() >= deadline {
-                return Ok((returned, true));
+    const SEARCH_ENTRY_WRITE_BATCH_BYTES: usize = 64 * 1024;
+
+    trace_search(format_args!(
+        "emit_search_entries start count={}",
+        entries.len()
+    ));
+
+    // Preserve partial-result time limit behavior by checking the deadline around
+    // each individual write when the client requested a time-limited search.
+    if search_deadline.is_some() {
+        let mut returned = 0usize;
+        for entry in entries {
+            if let Some(deadline) = search_deadline {
+                if Instant::now() >= deadline {
+                    trace_search(format_args!(
+                        "emit_search_entries deadline hit after {} entries",
+                        returned
+                    ));
+                    return Ok((returned, true));
+                }
+            }
+
+            let attributes = select_attributes(entry, attribute_selection);
+            send_search_entry_with_controls(
+                socket,
+                message_id,
+                entry,
+                &attributes,
+                types_only,
+                &[],
+            )
+            .await?;
+            returned += 1;
+
+            if returned % 100 == 0 || returned == entries.len() {
+                trace_search(format_args!(
+                    "emit_search_entries progress returned={returned}/{}",
+                    entries.len()
+                ));
+            }
+
+            if let Some(deadline) = search_deadline {
+                if Instant::now() >= deadline {
+                    trace_search(format_args!(
+                        "emit_search_entries deadline hit after send {} entries",
+                        returned
+                    ));
+                    return Ok((returned, true));
+                }
             }
         }
 
-        let attributes = select_attributes(entry, attribute_selection);
-        send_search_entry_with_controls(socket, message_id, entry, &attributes, types_only, &[])
-            .await?;
-        returned += 1;
+        trace_search(format_args!(
+            "emit_search_entries complete returned={returned}"
+        ));
+        return Ok((returned, false));
+    }
 
-        if let Some(deadline) = search_deadline {
-            if Instant::now() >= deadline {
-                return Ok((returned, true));
-            }
+    let mut returned = 0usize;
+    let mut pending_bytes = Vec::with_capacity(SEARCH_ENTRY_WRITE_BATCH_BYTES);
+    let mut pending_entries = 0usize;
+    for entry in entries {
+        let attributes = select_attributes(entry, attribute_selection);
+        let encoded =
+            encode_search_entry_with_controls(message_id, entry, &attributes, types_only, &[])?;
+        pending_bytes.extend_from_slice(&encoded);
+        pending_entries += 1;
+
+        if pending_bytes.len() >= SEARCH_ENTRY_WRITE_BATCH_BYTES {
+            socket.write_all(&pending_bytes).await?;
+            returned += pending_entries;
+            pending_bytes.clear();
+            pending_entries = 0;
+        }
+
+        let progress_returned = returned + pending_entries;
+        if progress_returned % 100 == 0 || progress_returned == entries.len() {
+            trace_search(format_args!(
+                "emit_search_entries progress returned={progress_returned}/{}",
+                entries.len()
+            ));
         }
     }
 
+    if !pending_bytes.is_empty() {
+        socket.write_all(&pending_bytes).await?;
+        returned += pending_entries;
+    }
+
+    trace_search(format_args!(
+        "emit_search_entries complete returned={returned}"
+    ));
     Ok((returned, false))
 }
 
@@ -4145,6 +4361,24 @@ fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
             attribute: attribute.0.as_ref().to_string(),
         }),
         _ => None,
+    }
+}
+
+fn trace_search(message: std::fmt::Arguments<'_>) {
+    if std::env::var_os("OPENDR_TRACE_SEARCH").is_some() {
+        eprintln!("trace_search: {message}");
+    }
+}
+
+fn response_op_name(op: ResponseOp) -> &'static str {
+    match op {
+        ResponseOp::SearchDone => "SearchDone",
+        ResponseOp::Modify => "Modify",
+        ResponseOp::Add => "Add",
+        ResponseOp::Delete => "Delete",
+        ResponseOp::ModifyDn => "ModifyDn",
+        ResponseOp::Compare => "Compare",
+        ResponseOp::Extended => "Extended",
     }
 }
 
@@ -4637,10 +4871,25 @@ async fn handle_sync_search_request(
     let mut control_decoder = BerDecoderFsmImpl::new();
     let mut control_buffer = vec![0_u8; 4096];
 
+    let mut receiver = if sync_request.request.mode == SyncRefreshMode::RefreshAndPersist {
+        if let Some(receiver) = backend.subscribe_to_replication_changes() {
+            Some(receiver)
+        } else {
+            session
+                .send_unavailable("replication stream not available")
+                .await?;
+            operation_registry.finish(message_id, FinishedOperationState::Completed);
+            return Ok(());
+        }
+    } else {
+        None
+    };
+
     if cookie_csn.is_none() {
         let result_set = collect_search_result_set(
             backend,
             base_dn,
+            None,
             request,
             request.deref_aliases,
             manage_dsa_it,
@@ -4726,15 +4975,9 @@ async fn handle_sync_search_request(
         }
     }
 
-    let mut receiver = if let Some(receiver) = backend.subscribe_to_replication_changes() {
-        receiver
-    } else {
-        session
-            .send_unavailable("replication stream not available")
-            .await?;
-        operation_registry.finish(message_id, FinishedOperationState::Completed);
-        return Ok(());
-    };
+    let mut receiver = receiver
+        .take()
+        .expect("refreshAndPersist requests create a replication receiver before refresh");
 
     send_intermediate_response(
         session.socket,

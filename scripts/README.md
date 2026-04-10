@@ -135,6 +135,53 @@ If tests fail:
 - Resource samples: `target/perf/.../server-resource-samples.csv`
 - Server log: `target/perf/.../server.log`
 
+### perf_docker_matrix.sh
+
+**Purpose**: Run the same LDAP benchmark suite against Dockerized OpenDR and OpenDJ instances under fixed container limits.
+
+**What it does**:
+1. Builds the local OpenDR Docker image from `Dockerfile`
+2. Pulls `openidentityplatform/opendj:5.0.4`
+3. Runs both servers with `--cpus=2` and `--memory=4g`
+4. Executes the same StartTLS-enabled benchmark client against each load profile
+5. Captures latency, throughput, CPU, memory, database size, and record-count artifacts per run
+6. Produces a matrix-wide markdown and CSV comparison summary
+
+**Usage**:
+```bash
+# Full OpenDR vs OpenDJ matrix
+./scripts/perf_docker_matrix.sh
+
+# Smoke-only comparison
+./scripts/perf_docker_matrix.sh \
+  --profile-set smoke \
+  --output-dir target/perf/docker-matrix-smoke
+
+# OpenDR only, with a shorter timeout budget
+./scripts/perf_docker_matrix.sh \
+  --products opendr \
+  --benchmark-timeout 120
+```
+
+**Profiles**:
+- `smoke`: very small validation run
+- `standard`: light, moderate, heavy
+- `full`: light, moderate, heavy, stress
+
+**Key options**:
+- `--cpu`: container CPU limit, default `2`
+- `--memory`: container memory limit, default `4g`
+- `--benchmark-timeout`: per-profile timeout budget in seconds, default `180`
+- `--products`: comma-separated subset of `opendr,opendj`
+
+**Artifacts**:
+- Matrix summary: `target/perf/.../comparison-summary.md`
+- Matrix CSV: `target/perf/.../comparison-summary.csv`
+- Per-run report: `target/perf/.../<product>/<profile>/report.md`
+- Per-run raw metrics: `target/perf/.../<product>/<profile>/ldap-benchmark-results.json`
+- Per-run container stats: `target/perf/.../<product>/<profile>/container-stats-summary.json`
+- Per-run status: `target/perf/.../<product>/<profile>/run-status.json`
+
 ## Installing ldap-utils
 
 ### Ubuntu/Debian

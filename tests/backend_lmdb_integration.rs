@@ -10,7 +10,7 @@
 use base64::Engine;
 use ldap_parser::ldap::SearchScope;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, Modification, ModifyOperation};
-use opendr::backend_lmdb::LmdbBackend;
+use opendr::backend_lmdb::{IndexConfig, LmdbBackend};
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -197,6 +197,92 @@ async fn test_lmdb_concurrent_reads() {
     for handle in handles {
         handle.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_lmdb_entry_cache_hits_and_invalidation() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().to_path_buf();
+
+    {
+        let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Cache User".to_string()]);
+        attributes.insert("mail".to_string(), vec!["cache@example.org".to_string()]);
+        let entry = DirectoryEntry::new("uid=cache,dc=example,dc=org", attributes);
+        backend
+            .add_entry(entry, b"password".to_vec())
+            .await
+            .unwrap();
+    }
+
+    let backend = LmdbBackend::new_with_runtime_and_cache_config(
+        &db_path,
+        100,
+        1,
+        IndexConfig::default(),
+        126,
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(backend.configured_entry_cache_capacity(), 2);
+    assert_eq!(backend.entry_cache_stats().len, 0);
+
+    backend
+        .get_entry("uid=cache,dc=example,dc=org")
+        .await
+        .unwrap()
+        .unwrap();
+    let after_first_read = backend.entry_cache_stats();
+    assert_eq!(after_first_read.hits, 0);
+    assert_eq!(after_first_read.misses, 1);
+    assert_eq!(after_first_read.len, 1);
+
+    backend
+        .compare_attribute("uid=cache,dc=example,dc=org", "mail", "cache@example.org")
+        .await
+        .unwrap();
+    let after_compare = backend.entry_cache_stats();
+    assert_eq!(after_compare.hits, 1);
+    assert_eq!(after_compare.misses, 1);
+
+    backend
+        .modify_entry(
+            "uid=cache,dc=example,dc=org",
+            vec![Modification {
+                operation: ModifyOperation::Replace,
+                attribute: "mail".to_string(),
+                values: vec!["updated@example.org".to_string()],
+            }],
+        )
+        .await
+        .unwrap();
+
+    let updated = backend
+        .get_entry("uid=cache,dc=example,dc=org")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        updated.attributes.get("mail").unwrap(),
+        &vec!["updated@example.org".to_string()]
+    );
+
+    backend
+        .delete_entry("uid=cache,dc=example,dc=org")
+        .await
+        .unwrap();
+    let deleted = backend
+        .get_entry("uid=cache,dc=example,dc=org")
+        .await
+        .unwrap();
+    assert!(deleted.is_none());
+
+    let final_stats = backend.entry_cache_stats();
+    assert_eq!(final_stats.hits, 2);
+    assert_eq!(final_stats.misses, 3);
+    assert_eq!(final_stats.len, 0);
 }
 
 #[tokio::test]

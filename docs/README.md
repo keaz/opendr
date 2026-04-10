@@ -19,6 +19,9 @@ Complete guide for defining custom LDAP schemas. Covers OID management, schema f
 ### ⚡ [Schema Quick Start](./SCHEMA_QUICK_START.md)
 Quick start guide for schema definition. Get started with custom schemas in 5 minutes.
 
+### 📈 [Docker Perf Comparison](./DOCKER_PERF_COMPARISON.md)
+Measured OpenDR vs OpenDJ benchmark results under fixed Docker limits (`2` CPU / `4 GiB`) using the same LDAP perf client and load profiles.
+
 ### 📘 [WARP.md](../WARP.md)
 Development guide for working with the codebase, including build commands, testing strategies, and code navigation tips.
 

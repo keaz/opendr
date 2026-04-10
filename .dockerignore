@@ -1,0 +1,15 @@
+.git
+.github
+.vscode
+target
+data
+log
+logs
+certs
+tmp
+*.mdb
+*.log
+*.pem
+*.crt
+*.key
+target/perf
