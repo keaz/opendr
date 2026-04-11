@@ -25,13 +25,14 @@ impl SearchBackend for SearchBackendAdapter {
         &self,
         base_dn: &str,
         scope: i32,
-        _filter: &str,
+        filter: &str,
     ) -> Result<Vec<String>, String> {
         let search_scope = SearchScope(scope as u32);
+        let hint = crate::ldap_filter_eval::extract_search_candidate_hint_from_str(filter);
 
         let entries = self
             .backend
-            .search_entries(base_dn, search_scope)
+            .search_entries_with_hint(base_dn, search_scope, hint)
             .await
             .map_err(|e| format!("Backend search error: {}", e))?;
 

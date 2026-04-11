@@ -1,16 +1,13 @@
 use async_trait::async_trait;
 use ldap_parser::ldap::SearchScope;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::backend::OperationalAttributes;
-use crate::backend::{DirectoryBackend, DirectoryEntry};
-use crate::csn::Csn;
+use crate::backend::{DirectoryBackend, DirectoryEntry, OperationalAttributes};
 use crate::fsm::SearchResultCode;
 use crate::metrics::{FsmType, MetricsCollector, OperationType};
 use crate::operational_attrs::parse_attribute_request;
-use crate::parser::encode_search_entry;
+use crate::parser::encode_search_entry_parts_with_controls;
 use crate::search_fsm::{
     EntryFormatter, FilterMatcher, SearchBackend, SearchEntry, SearchFsmImpl, SearchMetrics,
 };
@@ -32,14 +29,15 @@ impl SearchBackend for ProductionSearchBackendAdapter {
         &self,
         base_dn: &str,
         scope: i32,
-        _filter: &str,
+        filter: &str,
     ) -> Result<Vec<String>, String> {
         let search_scope = SearchScope(scope as u32);
+        let hint = crate::ldap_filter_eval::extract_search_candidate_hint_from_str(filter);
         let entries = self
             .backend
-            .search_entries(base_dn, search_scope)
+            .search_entries_with_hint(base_dn, search_scope, hint)
             .await
-            .map_err(|e| format!("backend search_entries failed: {e}"))?;
+            .map_err(|e| format!("backend search_entries_with_hint failed: {e}"))?;
 
         Ok(entries.into_iter().map(|entry| entry.dn).collect())
     }
@@ -90,8 +88,7 @@ impl ProductionFilterMatcher {
 #[async_trait]
 impl FilterMatcher for ProductionFilterMatcher {
     async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String> {
-        let directory_entry = search_entry_to_directory_entry(entry);
-        crate::ldap_filter_eval::matches_filter_string(&directory_entry, filter)
+        crate::ldap_filter_eval::matches_search_entry_filter_string(entry, filter)
     }
 
     async fn validate_filter(&self, filter: &str) -> Result<(), String> {
@@ -140,14 +137,14 @@ impl EntryFormatter for ProductionEntryFormatter {
         entry: &SearchEntry,
         requested_attributes: &[String],
     ) -> Result<Vec<u8>, String> {
-        let directory_entry = search_entry_to_directory_entry(entry);
         let selected_attributes = project_search_entry_attributes(entry, requested_attributes);
 
-        encode_search_entry(
+        encode_search_entry_parts_with_controls(
             self.message_id,
-            &directory_entry,
+            &entry.dn,
             &selected_attributes,
             self.types_only,
+            &[],
         )
         .map_err(|e| format!("failed to encode search entry: {e:?}"))
     }
@@ -248,35 +245,6 @@ pub fn build_production_search_fsm_with_request(
     }
 
     fsm
-}
-
-fn search_entry_to_directory_entry(entry: &SearchEntry) -> DirectoryEntry {
-    let mut user_attrs = HashMap::new();
-    let mut operational_attrs = OperationalAttributes::new();
-
-    for (name, values) in &entry.attributes {
-        match name.to_lowercase().as_str() {
-            "entrycsn" => {
-                if let Some(value) = values.first() {
-                    operational_attrs.entry_csn = Csn::parse(value).ok();
-                }
-            }
-            "entryuuid" => operational_attrs.entry_uuid = values.first().cloned(),
-            "createtimestamp" => operational_attrs.create_timestamp = values.first().cloned(),
-            "modifytimestamp" => operational_attrs.modify_timestamp = values.first().cloned(),
-            "creatorsname" => operational_attrs.creators_name = values.first().cloned(),
-            "modifiersname" => operational_attrs.modifiers_name = values.first().cloned(),
-            _ => {
-                user_attrs.insert(name.clone(), values.clone());
-            }
-        }
-    }
-
-    if !entry.object_classes.is_empty() && !user_attrs.contains_key("objectclass") {
-        user_attrs.insert("objectclass".to_string(), entry.object_classes.clone());
-    }
-
-    DirectoryEntry::with_operational_attrs(entry.dn.clone(), user_attrs, operational_attrs)
 }
 
 fn directory_entry_to_search_entry(entry: &DirectoryEntry) -> SearchEntry {

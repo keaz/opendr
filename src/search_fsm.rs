@@ -97,6 +97,7 @@ use crate::fsm::{
 };
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -430,8 +431,6 @@ pub struct SearchFsmConfig {
     pub max_candidates: usize,
     /// Batch size for candidate processing
     pub candidate_batch_size: usize,
-    /// Enable search result caching
-    pub enable_caching: bool,
 }
 
 impl Default for SearchFsmConfig {
@@ -443,7 +442,6 @@ impl Default for SearchFsmConfig {
             max_time_limit: 300, // 5 minutes
             max_candidates: 50000,
             candidate_batch_size: 100,
-            enable_caching: false,
         }
     }
 }
@@ -453,6 +451,10 @@ impl Default for SearchFsmConfig {
 pub struct SearchSession {
     /// Search parameters
     pub params: SearchParams,
+    /// Shared filter string for candidate iteration.
+    pub filter: Arc<str>,
+    /// Shared requested attributes for candidate iteration.
+    pub attributes: Arc<[String]>,
     /// Start time of the search
     pub start_time: Instant,
     /// Candidate entry DNs to process
@@ -480,8 +482,12 @@ impl SearchSession {
     /// # Returns
     /// * New SearchSession instance
     pub fn new(params: SearchParams) -> Self {
+        let filter = Arc::<str>::from(params.filter.as_str());
+        let attributes = Arc::<[String]>::from(params.attributes.clone().into_boxed_slice());
         Self {
             params,
+            filter,
+            attributes,
             start_time: Instant::now(),
             candidates: Vec::new(),
             candidate_index: 0,
@@ -727,8 +733,8 @@ impl SearchFsmImpl {
 
                 (
                     candidate_dn,
-                    session.params.filter.clone(),
-                    session.params.attributes.clone(),
+                    session.filter.clone(),
+                    session.attributes.clone(),
                     session.candidates_found,
                     session.entries_sent,
                 )
@@ -739,7 +745,11 @@ impl SearchFsmImpl {
                 entries_sent,
             };
 
-            let entry = match self.backend.get_entry(&candidate_dn, &attributes).await {
+            let entry = match self
+                .backend
+                .get_entry(&candidate_dn, attributes.as_ref())
+                .await
+            {
                 Ok(entry) => entry,
                 Err(message) => {
                     return Err(self.fail_search(SearchFsmError::BackendError { message }));
@@ -753,7 +763,11 @@ impl SearchFsmImpl {
                 continue;
             };
 
-            let matches = match self.filter_matcher.matches_filter(&entry, &filter).await {
+            let matches = match self
+                .filter_matcher
+                .matches_filter(&entry, filter.as_ref())
+                .await
+            {
                 Ok(matches) => matches,
                 Err(message) => {
                     return Err(self.fail_search(SearchFsmError::FilterError { message }));
@@ -779,7 +793,10 @@ impl SearchFsmImpl {
                 return Err(SearchFsmError::SizeLimitExceeded);
             }
 
-            let formatted_entry = match self.entry_formatter.format_entry(&entry, &attributes).await
+            let formatted_entry = match self
+                .entry_formatter
+                .format_entry(&entry, attributes.as_ref())
+                .await
             {
                 Ok(formatted_entry) => formatted_entry,
                 Err(message) => {
@@ -1598,7 +1615,6 @@ mod tests {
             max_time_limit: 600,
             max_candidates: 10000,
             candidate_batch_size: 50,
-            enable_caching: true,
         };
 
         let fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);
@@ -1607,7 +1623,7 @@ mod tests {
         assert_eq!(fsm.config.default_size_limit, 50);
         assert_eq!(fsm.config.default_time_limit, 60);
         assert_eq!(fsm.config.max_size_limit, 5000);
-        assert!(fsm.config.enable_caching);
+        assert_eq!(fsm.config.candidate_batch_size, 50);
     }
 
     #[tokio::test]

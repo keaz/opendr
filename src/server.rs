@@ -4288,18 +4288,8 @@ async fn emit_search_references(
     Ok(())
 }
 
-fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
-    match filter {
-        Filter::And(filters) => filters.iter().find_map(extract_search_hint),
-        Filter::EqualityMatch(ava) => Some(SearchCandidateHint::Equality {
-            attribute: ava.attribute_desc.0.as_ref().to_string(),
-            value: bytes_to_string(ava.assertion_value),
-        }),
-        Filter::Present(attribute) => Some(SearchCandidateHint::Present {
-            attribute: attribute.0.as_ref().to_string(),
-        }),
-        _ => None,
-    }
+pub(crate) fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
+    crate::ldap_filter_eval::extract_search_candidate_hint(filter)
 }
 
 fn trace_search(message: std::fmt::Arguments<'_>) {

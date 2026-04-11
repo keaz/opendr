@@ -1,10 +1,12 @@
-use crate::backend::DirectoryEntry;
+use crate::backend::{DirectoryEntry, SearchCandidateHint};
 use crate::replication::RenameChange;
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
+use crate::search_fsm::SearchEntry;
 use lber::common::TagClass;
 use lber::structures::Tag;
 use ldap3::parse_filter;
 use ldap_parser::filter::{Filter, Substring};
+use std::collections::HashMap;
 
 const AND_FILTER: u64 = 0;
 const OR_FILTER: u64 = 1;
@@ -77,6 +79,18 @@ pub(crate) fn compile_filter(filter: &str) -> Result<CompiledLdapFilter, String>
     CompiledLdapFilter::from_tag(&tag)
 }
 
+pub(crate) fn extract_search_candidate_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
+    CompiledLdapFilter::from_search_filter(filter)
+        .ok()
+        .and_then(|compiled| compiled.search_candidate_hint())
+}
+
+pub(crate) fn extract_search_candidate_hint_from_str(filter: &str) -> Option<SearchCandidateHint> {
+    compile_filter(filter)
+        .ok()
+        .and_then(|compiled| compiled.search_candidate_hint())
+}
+
 pub(crate) fn matches_search_filter(entry: &DirectoryEntry, filter: &Filter<'_>) -> bool {
     CompiledLdapFilter::from_search_filter(filter)
         .map(|compiled| compiled.matches(entry))
@@ -86,6 +100,14 @@ pub(crate) fn matches_search_filter(entry: &DirectoryEntry, filter: &Filter<'_>)
 pub(crate) fn matches_filter_string(entry: &DirectoryEntry, filter: &str) -> Result<bool, String> {
     let compiled = compile_filter(filter)?;
     Ok(compiled.matches(entry))
+}
+
+pub(crate) fn matches_search_entry_filter_string(
+    entry: &SearchEntry,
+    filter: &str,
+) -> Result<bool, String> {
+    let compiled = compile_filter(filter)?;
+    Ok(compiled.matches_search_entry(entry))
 }
 
 pub(crate) fn prepare_change(
@@ -175,6 +197,20 @@ impl PreparedChange {
 }
 
 impl CompiledLdapFilter {
+    fn search_candidate_hint(&self) -> Option<SearchCandidateHint> {
+        match self {
+            Self::And(filters) => filters.iter().find_map(Self::search_candidate_hint),
+            Self::Equality { attribute, value } => Some(SearchCandidateHint::Equality {
+                attribute: attribute.clone(),
+                value: value.clone(),
+            }),
+            Self::Present { attribute } => Some(SearchCandidateHint::Present {
+                attribute: attribute.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     fn from_search_filter(filter: &Filter<'_>) -> Result<Self, String> {
         match filter {
             Filter::And(filters) => filters
@@ -306,24 +342,36 @@ impl CompiledLdapFilter {
     }
 
     fn matches(&self, entry: &DirectoryEntry) -> bool {
+        self.matches_attributes(&entry.dn, &entry.attributes)
+    }
+
+    fn matches_search_entry(&self, entry: &SearchEntry) -> bool {
+        self.matches_attributes(&entry.dn, &entry.attributes)
+    }
+
+    fn matches_attributes(&self, dn: &str, attributes: &HashMap<String, Vec<String>>) -> bool {
         match self {
-            Self::And(filters) => filters.iter().all(|filter| filter.matches(entry)),
-            Self::Or(filters) => filters.iter().any(|filter| filter.matches(entry)),
-            Self::Not(filter) => !filter.matches(entry),
-            Self::Equality { attribute, value } => attribute_values(entry, attribute)
+            Self::And(filters) => filters
+                .iter()
+                .all(|filter| filter.matches_attributes(dn, attributes)),
+            Self::Or(filters) => filters
+                .iter()
+                .any(|filter| filter.matches_attributes(dn, attributes)),
+            Self::Not(filter) => !filter.matches_attributes(dn, attributes),
+            Self::Equality { attribute, value } => attribute_values(attributes, attribute)
                 .map(|values| values.iter().any(|candidate| candidate == value))
                 .unwrap_or(false),
-            Self::Substrings { attribute, parts } => attribute_values(entry, attribute)
+            Self::Substrings { attribute, parts } => attribute_values(attributes, attribute)
                 .map(|values| matches_substrings(values, parts))
                 .unwrap_or(false),
-            Self::GreaterOrEqual { attribute, value } => attribute_values(entry, attribute)
+            Self::GreaterOrEqual { attribute, value } => attribute_values(attributes, attribute)
                 .map(|values| values.iter().any(|candidate| candidate >= value))
                 .unwrap_or(false),
-            Self::LessOrEqual { attribute, value } => attribute_values(entry, attribute)
+            Self::LessOrEqual { attribute, value } => attribute_values(attributes, attribute)
                 .map(|values| values.iter().any(|candidate| candidate <= value))
                 .unwrap_or(false),
-            Self::Present { attribute } => attribute_values(entry, attribute).is_some(),
-            Self::ApproxMatch { attribute, value } => attribute_values(entry, attribute)
+            Self::Present { attribute } => attribute_values(attributes, attribute).is_some(),
+            Self::ApproxMatch { attribute, value } => attribute_values(attributes, attribute)
                 .map(|values| {
                     values
                         .iter()
@@ -336,7 +384,8 @@ impl CompiledLdapFilter {
                 value,
                 dn_attributes,
             } => matches_extensible(
-                entry,
+                dn,
+                attributes,
                 attribute.as_deref(),
                 matching_rule.as_deref(),
                 value,
@@ -499,14 +548,15 @@ fn matches_substrings(values: &[String], parts: &[SubstringPart]) -> bool {
 }
 
 fn matches_extensible(
-    entry: &DirectoryEntry,
+    dn: &str,
+    attributes: &HashMap<String, Vec<String>>,
     attribute: Option<&str>,
     matching_rule: Option<&str>,
     assertion: &str,
     dn_attributes: bool,
 ) -> bool {
     if let Some(attribute) = attribute {
-        if attribute_values(entry, attribute)
+        if attribute_values(attributes, attribute)
             .map(|values| {
                 values
                     .iter()
@@ -518,12 +568,12 @@ fn matches_extensible(
         }
 
         return dn_attributes
-            && dn_attribute_values(&entry.dn, Some(attribute))
+            && dn_attribute_values(dn, Some(attribute))
                 .iter()
                 .any(|value| extensible_value_matches(value, assertion, matching_rule));
     }
 
-    if entry.attributes.values().any(|values| {
+    if attributes.values().any(|values| {
         values
             .iter()
             .any(|value| extensible_value_matches(value, assertion, matching_rule))
@@ -532,7 +582,7 @@ fn matches_extensible(
     }
 
     dn_attributes
-        && dn_attribute_values(&entry.dn, None)
+        && dn_attribute_values(dn, None)
             .iter()
             .any(|value| extensible_value_matches(value, assertion, matching_rule))
 }
@@ -609,8 +659,11 @@ fn substring_matches(value: &str, parts: &[SubstringPart]) -> bool {
     true
 }
 
-fn attribute_values<'a>(entry: &'a DirectoryEntry, attribute: &str) -> Option<&'a Vec<String>> {
-    entry.attributes.get(attribute)
+fn attribute_values<'a>(
+    attributes: &'a HashMap<String, Vec<String>>,
+    attribute: &str,
+) -> Option<&'a Vec<String>> {
+    attributes.get(attribute)
 }
 
 fn bytes_to_string(value: &[u8]) -> String {
