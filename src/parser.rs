@@ -268,6 +268,16 @@ pub fn encode_search_entry_with_controls(
     types_only: bool,
     controls: &[LdapControl],
 ) -> Result<Vec<u8>, EncodeError> {
+    encode_search_entry_parts_with_controls(message_id, &entry.dn, attributes, types_only, controls)
+}
+
+pub fn encode_search_entry_parts_with_controls(
+    message_id: u32,
+    dn: &str,
+    attributes: &[(String, Vec<String>)],
+    types_only: bool,
+    controls: &[LdapControl],
+) -> Result<Vec<u8>, EncodeError> {
     let partial_attributes: Vec<rasn_ldap::PartialAttribute> = attributes
         .iter()
         .map(|(name, values)| {
@@ -285,7 +295,7 @@ pub fn encode_search_entry_with_controls(
 
     let attributes: rasn_ldap::PartialAttributeList = partial_attributes.into_iter().collect();
 
-    let search_entry = SearchResultEntry::new(entry.dn.as_bytes().to_vec().into(), attributes);
+    let search_entry = SearchResultEntry::new(dn.as_bytes().to_vec().into(), attributes);
 
     encode_message(
         message_id,

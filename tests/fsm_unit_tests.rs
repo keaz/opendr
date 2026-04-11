@@ -37,6 +37,7 @@ use opendr::write_fsm::*;
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
@@ -252,8 +253,8 @@ impl SearchBackend for MockSearchBackend {
         &self,
         dn: &str,
         _attributes: &[String],
-    ) -> Result<Option<SearchEntry>, String> {
-        Ok(self.entries.get(dn).cloned())
+    ) -> Result<Option<Arc<SearchEntry>>, String> {
+        Ok(self.entries.get(dn).cloned().map(Arc::new))
     }
 }
 
@@ -261,7 +262,11 @@ struct MockFilterMatcher;
 
 #[async_trait]
 impl FilterMatcher for MockFilterMatcher {
-    async fn matches_filter(&self, _entry: &SearchEntry, _filter: &str) -> Result<bool, String> {
+    async fn matches_filter(
+        &mut self,
+        _entry: &SearchEntry,
+        _filter: &str,
+    ) -> Result<bool, String> {
         Ok(true)
     }
 }
@@ -271,7 +276,7 @@ struct MockEntryFormatter;
 #[async_trait]
 impl EntryFormatter for MockEntryFormatter {
     async fn format_entry(
-        &self,
+        &mut self,
         _entry: &SearchEntry,
         _attributes: &[String],
     ) -> Result<Vec<u8>, String> {

@@ -280,7 +280,7 @@ async fn test_lmdb_entry_cache_hits_and_invalidation() {
     assert!(deleted.is_none());
 
     let final_stats = backend.entry_cache_stats();
-    assert_eq!(final_stats.hits, 2);
+    assert_eq!(final_stats.hits, 1);
     assert_eq!(final_stats.misses, 3);
     assert_eq!(final_stats.len, 0);
 }

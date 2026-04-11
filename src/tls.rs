@@ -3,7 +3,7 @@
 //! This module provides TLS support for LDAP connections using rustls,
 //! implementing the TlsHandler trait defined in connection_fsm.
 
-use crate::connection_fsm::TlsHandler;
+use crate::connection_fsm::{ConnectionTransport, TlsHandler};
 use async_trait::async_trait;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{version, RootCertStore, ServerConfig, SupportedProtocolVersion};
@@ -190,6 +190,10 @@ impl RustlsTlsHandler {
             .map_err(|e| format!("TLS handshake failed: {}", e))
     }
 
+    pub async fn accept_transport(&self, stream: TcpStream) -> Result<ConnectionTransport, String> {
+        self.accept(stream).await.map(ConnectionTransport::tls)
+    }
+
     /// Create a test TLS handler for testing
     ///
     /// Note: This creates a minimal handler for testing the interface.
@@ -227,6 +231,10 @@ impl TlsHandler for RustlsTlsHandler {
             "RustlsTlsHandler::perform_handshake cannot perform a real TLS upgrade without consuming the stream; use RustlsTlsHandler::accept in the runtime path"
                 .to_string(),
         )
+    }
+
+    async fn upgrade_transport(&self, stream: TcpStream) -> Result<ConnectionTransport, String> {
+        self.accept_transport(stream).await
     }
 
     fn supports_tls(&self) -> bool {

@@ -85,7 +85,7 @@ bind_address = "127.0.0.1"          # Address to bind to
 ldap_port = 1389                     # LDAP port (non-TLS)
 ldaps_port = 1636                    # LDAPS port (TLS/SSL)
 hostname = "localhost"               # Server hostname
-runtime = "legacy"                  # Supported runtime for the shipped `opendr` binary
+runtime = "fsm"                      # Listener runtime: "fsm" or "legacy"
 replica_id = 1                       # Unique CSN replica ID for this server
 base_dn = "dc=example,dc=com"        # Base DN for directory
 root_user_dn = "cn=admin"            # Admin user DN
@@ -99,11 +99,18 @@ max_concurrent_operations = 100     # Max operations per connection
 
 **Key Settings:**
 - `ldap_port` and `ldaps_port` must be different
-- `runtime = "legacy"` is the only supported setting for the shipped `opendr` binary today
+- `runtime` accepts `"fsm"` and `"legacy"`; `fsm` is the default production listener runtime
 - `replica_id` must be non-zero, and must be unique per replicated node
 - `base_dn` cannot be empty
 - `root_password_env` and `root_password_file` let you inject the admin secret without storing it inline
 - `root_password` is still supported for local development, but production deployments should avoid committing it
+
+**FSM Runtime Rollout Checklist:**
+- Enable `runtime = "fsm"` only after the CI `FSM runtime parity gate`, broad tests, doctests, and Clippy pass for the release branch
+- Verify LDAP and LDAPS listeners start with the intended TLS configuration and that bind, search, write, compare, extended-op, and replication sync paths are healthy in the target environment
+- Monitor audit events, FSM metrics, operation latency, replication session counts, rate-limit counters, and TLS/startTLS errors during rollout
+- Keep `runtime = "legacy"` as the rollback setting; use it if FSM-specific listener errors, replication lag, failed sync sessions, or latency regressions appear after deployment
+- Re-run the parity suite and focused `ldap_ops_client` coverage before re-enabling FSM after any rollback
 
 ### 2. Backend Settings
 

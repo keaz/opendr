@@ -255,6 +255,14 @@ impl DirectoryBackend for ChangelogBackendWrapper {
     }
 
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
+        self.delete_entry_with_actor(dn, None).await
+    }
+
+    async fn delete_entry_with_actor(
+        &self,
+        dn: &str,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
         // Get entry before deletion for changelog
         let entry_data = if let Ok(Some(entry)) = self.backend.get_entry(dn).await {
             Self::serialize_entry(&entry)
@@ -263,10 +271,12 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         };
 
         // Perform the delete operation
-        self.backend.delete_entry(dn).await?;
+        self.backend
+            .delete_entry_with_actor(dn, actor_dn.clone())
+            .await?;
 
         // Record to changelog after successful delete
-        self.record_change(ChangeType::Delete, dn.to_string(), entry_data, None);
+        self.record_change(ChangeType::Delete, dn.to_string(), entry_data, actor_dn);
 
         Ok(())
     }
@@ -512,6 +522,28 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].dn, "cn=test,dc=example,dc=com");
         assert!(matches!(entries[0].change_type, ChangeType::Delete));
+    }
+
+    #[tokio::test]
+    async fn test_delete_entry_with_actor_records_originator() {
+        let backend = MockBackend::new();
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        backend.add_entry(entry, vec![]).await.unwrap();
+
+        let backend = Arc::new(backend);
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+        let actor = "cn=deleter,dc=example,dc=com".to_string();
+
+        wrapper
+            .delete_entry_with_actor("cn=test,dc=example,dc=com", Some(actor.clone()))
+            .await
+            .unwrap();
+
+        let entries = changelog.get_all();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].change_type, ChangeType::Delete));
+        assert_eq!(entries[0].originator.as_deref(), Some(actor.as_str()));
     }
 
     #[tokio::test]

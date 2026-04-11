@@ -21,6 +21,8 @@ jobs:
           components: rustfmt, clippy
       - name: Cargo fmt
         run: cargo fmt --check
+      - name: FSM runtime parity gate
+        run: cargo test --test runtime_selection_integration --test fsm_server_integration --test ldap_ops_client_integration --test tls_runtime_integration --test legacy_runtime_limits_binary_integration --no-fail-fast
       - name: Run tests
         run: cargo test --workspace --no-fail-fast
       - name: Run doctests

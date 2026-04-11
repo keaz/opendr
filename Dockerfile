@@ -32,9 +32,20 @@ COPY benches ./benches
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target-cache \
-    cargo build --release --target-dir /build/target-cache --bin opendr --bin opendr-setup \
+    cargo build --release --target-dir /build/target-cache --bin opendr --bin opendr-setup --bin ldap_perf_client \
     && install -D /build/target-cache/release/opendr /build/target/release/opendr \
-    && install -D /build/target-cache/release/opendr-setup /build/target/release/opendr-setup
+    && install -D /build/target-cache/release/opendr-setup /build/target/release/opendr-setup \
+    && install -D /build/target-cache/release/ldap_perf_client /build/target/release/ldap_perf_client
+
+FROM debian:bookworm-slim AS perf-client
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/ldap_perf_client /usr/local/bin/ldap_perf_client
+
+ENTRYPOINT ["/usr/local/bin/ldap_perf_client"]
 
 FROM debian:bookworm-slim
 

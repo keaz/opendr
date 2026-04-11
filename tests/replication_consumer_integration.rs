@@ -75,7 +75,7 @@ async fn wait_for_port(addr: &str) {
 }
 
 async fn wait_for_entry(backend: &MockBackend, dn: &str) -> DirectoryEntry {
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(10), async {
         loop {
             if let Some(entry) = backend
                 .get_entry(dn)

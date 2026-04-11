@@ -63,7 +63,7 @@ fn generate_test_certificate() -> (String, String) {
     (cert_pem, key_pem)
 }
 
-fn write_tls_fixture(tempdir: &TempDir, ldap_port: u16, ldaps_port: u16) {
+fn write_tls_fixture(tempdir: &TempDir, runtime: &str, ldap_port: u16, ldaps_port: u16) {
     let config_dir = tempdir.path().join("config");
     let cert_dir = tempdir.path().join("certs");
     let data_dir = tempdir.path().join("data");
@@ -79,7 +79,7 @@ fn write_tls_fixture(tempdir: &TempDir, ldap_port: u16, ldaps_port: u16) {
     let server_toml = format!(
         r#"
 [server]
-runtime = "legacy"
+runtime = "{runtime}"
 bind_address = "127.0.0.1"
 ldap_port = {ldap_port}
 ldaps_port = {ldaps_port}
@@ -155,11 +155,11 @@ async fn connect_with_retry(port: u16) -> TcpStream {
     panic!("failed to connect to LDAP server on port {port}");
 }
 
-async fn spawn_tls_runtime_server() -> TestBinaryServer {
+async fn spawn_tls_runtime_server(runtime: &str) -> TestBinaryServer {
     let tempdir = tempfile::tempdir().unwrap();
     let ldap_port = reserve_port();
     let ldaps_port = reserve_port();
-    write_tls_fixture(&tempdir, ldap_port, ldaps_port);
+    write_tls_fixture(&tempdir, runtime, ldap_port, ldaps_port);
     let server = spawn_opendr(tempdir, ldap_port);
     let stream = connect_with_retry(server.ldap_port).await;
     drop(stream);
@@ -168,7 +168,7 @@ async fn spawn_tls_runtime_server() -> TestBinaryServer {
 
 #[tokio::test]
 async fn ldap_ops_client_exercises_supported_operations_over_starttls() {
-    let server = spawn_tls_runtime_server().await;
+    let server = spawn_tls_runtime_server("legacy").await;
     let output = timeout(
         Duration::from_secs(60),
         TokioCommand::new(ldap_client_binary())
@@ -184,6 +184,48 @@ async fn ldap_ops_client_exercises_supported_operations_over_starttls() {
             .arg("dc=example,dc=org")
             .arg("--name-prefix")
             .arg("integration-client")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .expect("ldap_ops_client timed out")
+    .expect("failed to execute ldap_ops_client");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ldap_ops_client failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("All LDAP operations completed successfully."),
+        "client output did not contain success marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Verified Password Modify"),
+        "client output did not exercise Password Modify\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn ldap_ops_client_exercises_supported_operations_over_starttls_with_fsm() {
+    let server = spawn_tls_runtime_server("fsm").await;
+    let output = timeout(
+        Duration::from_secs(60),
+        TokioCommand::new(ldap_client_binary())
+            .arg("--url")
+            .arg(format!("ldap://127.0.0.1:{}", server.ldap_port))
+            .arg("--starttls")
+            .arg("--insecure")
+            .arg("--bind-dn")
+            .arg("cn=admin,dc=example,dc=org")
+            .arg("--password")
+            .arg("secret")
+            .arg("--base-dn")
+            .arg("dc=example,dc=org")
+            .arg("--name-prefix")
+            .arg("integration-client-fsm")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output(),

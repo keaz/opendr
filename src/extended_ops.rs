@@ -12,7 +12,7 @@ use rasn::types::OctetString;
 use rasn::{AsnType, Decode, Encode};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 /// OIDs for standard extended operations
 pub mod oids {
@@ -205,12 +205,43 @@ pub fn decode_password_modify_response_value(
     Ok(Some(generated_password.to_vec()))
 }
 
+/// Context available to extended operations.
+///
+/// The runtime can populate this with the current bound identity so helper
+/// backends can resolve WhoAmI and password targets without falling back to
+/// anonymous behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtendedOpContext {
+    pub bound_dn: Option<String>,
+}
+
+impl ExtendedOpContext {
+    pub fn new(bound_dn: impl Into<String>) -> Self {
+        Self {
+            bound_dn: Some(bound_dn.into()),
+        }
+    }
+
+    pub fn effective_identity(&self) -> Option<&str> {
+        self.bound_dn.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationCancelState {
+    Active,
+    Cancelled,
+    Completed,
+}
+
 /// Standard extended operations backend implementation
 pub struct StandardExtendedOpBackend {
     /// Password modifier for password modify operation
     password_modifier: Arc<dyn PasswordModifier>,
     /// Operation canceller
     operation_canceller: Arc<dyn OperationCanceller>,
+    /// Current extended-op context
+    context: Arc<RwLock<ExtendedOpContext>>,
 }
 
 /// Trait for modifying user passwords
@@ -257,7 +288,36 @@ impl StandardExtendedOpBackend {
         Self {
             password_modifier,
             operation_canceller,
+            context: Arc::new(RwLock::new(ExtendedOpContext::default())),
         }
+    }
+
+    /// Create a backend with an initial extended-op context.
+    pub fn with_context(
+        password_modifier: Arc<dyn PasswordModifier>,
+        operation_canceller: Arc<dyn OperationCanceller>,
+        context: ExtendedOpContext,
+    ) -> Self {
+        Self {
+            password_modifier,
+            operation_canceller,
+            context: Arc::new(RwLock::new(context)),
+        }
+    }
+
+    /// Update the current bound identity for WhoAmI and password modify.
+    pub fn set_bound_dn(&self, bound_dn: Option<String>) {
+        if let Ok(mut guard) = self.context.write() {
+            guard.bound_dn = bound_dn;
+        }
+    }
+
+    /// Snapshot the current extended-op context.
+    pub fn context(&self) -> ExtendedOpContext {
+        self.context
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     /// Handle StartTLS operation
@@ -268,30 +328,34 @@ impl StandardExtendedOpBackend {
     }
 
     /// Handle Password Modify operation
-    async fn handle_password_modify(&self, value: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    async fn handle_password_modify(
+        &self,
+        value: Option<&[u8]>,
+        bound_dn: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
         let request = parse_password_modify_request_value(value).map_err(|err| err.to_string())?;
-        let user_dn = request
+        let resolved_target = request
             .user_identity
             .as_deref()
-            .ok_or("Password modify helper backend requires userIdentity")?;
+            .or(bound_dn)
+            .ok_or("Password modify helper backend requires bound identity or userIdentity")?
+            .to_string();
         let old_password = request
             .old_password
-            .as_deref()
             .map(|password| {
-                std::str::from_utf8(password)
+                String::from_utf8(password)
                     .map_err(|_| "Old password must be valid UTF-8".to_string())
             })
             .transpose()?;
         let new_password = request
             .new_password
-            .as_deref()
             .ok_or("Password modify helper backend requires newPasswd")?;
-        let new_password = std::str::from_utf8(new_password)
+        let new_password = String::from_utf8(new_password)
             .map_err(|_| "New password must be valid UTF-8".to_string())?;
 
         // Modify password
         self.password_modifier
-            .modify_password(user_dn, old_password, new_password)
+            .modify_password(&resolved_target, old_password.as_deref(), &new_password)
             .await?;
 
         // Return success response
@@ -300,7 +364,10 @@ impl StandardExtendedOpBackend {
 
     /// Handle WhoAmI operation
     async fn handle_who_am_i(&self, user_dn: Option<&str>) -> Result<Vec<u8>, String> {
-        let dn = user_dn.unwrap_or("anonymous");
+        let context = self.context();
+        let dn = user_dn
+            .or_else(|| context.effective_identity())
+            .unwrap_or("anonymous");
         Ok(dn.as_bytes().to_vec())
     }
 
@@ -314,18 +381,30 @@ impl StandardExtendedOpBackend {
 
         Ok(vec![])
     }
+
+    /// Execute an extended operation using an explicit bound identity context.
+    pub async fn execute_operation_with_context(
+        &self,
+        oid: &str,
+        value: Option<&[u8]>,
+        user_dn: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        match oid {
+            oids::START_TLS => self.handle_start_tls(value).await,
+            oids::PASSWORD_MODIFY => self.handle_password_modify(value, user_dn).await,
+            oids::WHO_AM_I => self.handle_who_am_i(user_dn).await,
+            oids::CANCEL => self.handle_cancel(value).await,
+            _ => Err(format!("Unsupported operation OID: {}", oid)),
+        }
+    }
 }
 
 #[async_trait]
 impl ExtendedOpBackend for StandardExtendedOpBackend {
     async fn execute_operation(&self, oid: &str, value: Option<&[u8]>) -> Result<Vec<u8>, String> {
-        match oid {
-            oids::START_TLS => self.handle_start_tls(value).await,
-            oids::PASSWORD_MODIFY => self.handle_password_modify(value).await,
-            oids::WHO_AM_I => self.handle_who_am_i(None).await, // User DN would come from context
-            oids::CANCEL => self.handle_cancel(value).await,
-            _ => Err(format!("Unsupported operation OID: {}", oid)),
-        }
+        let context = self.context();
+        self.execute_operation_with_context(oid, value, context.effective_identity())
+            .await
     }
 
     fn is_operation_supported(&self, oid: &str) -> bool {
@@ -380,13 +459,10 @@ impl ExtendedOpParser for StandardExtendedOpParser {
     }
 
     fn validate_operation(&self, operation: &ParsedOperation) -> Result<(), String> {
-        match &operation.operation_type {
-            ExtendedOperationType::Cancel => {
-                if !operation.parameters.contains_key("value") {
-                    return Err("Cancel requires value parameter (message ID)".to_string());
-                }
-            }
-            _ => {}
+        if operation.operation_type == ExtendedOperationType::Cancel
+            && !operation.parameters.contains_key("value")
+        {
+            return Err("Cancel requires value parameter (message ID)".to_string());
         }
         Ok(())
     }
@@ -467,6 +543,84 @@ impl ExtendedOpMetrics for ExtendedOpMetricsCollector {
     }
 }
 
+/// In-memory operation canceller that tracks active, cancelled, and completed operations.
+#[derive(Debug, Clone, Default)]
+pub struct SharedOperationCanceller {
+    operations: Arc<Mutex<HashMap<i32, OperationCancelState>>>,
+}
+
+impl SharedOperationCanceller {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_operation(&self, message_id: i32) -> bool {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        operations
+            .insert(message_id, OperationCancelState::Active)
+            .is_none()
+    }
+
+    pub fn mark_completed(&self, message_id: i32) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        operations.insert(message_id, OperationCancelState::Completed);
+    }
+
+    pub fn mark_cancelled(&self, message_id: i32) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        operations.insert(message_id, OperationCancelState::Cancelled);
+    }
+
+    pub fn status(&self, message_id: i32) -> Option<OperationCancelState> {
+        let operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        operations.get(&message_id).copied()
+    }
+
+    pub fn is_cancelled(&self, message_id: i32) -> bool {
+        matches!(
+            self.status(message_id),
+            Some(OperationCancelState::Cancelled)
+        )
+    }
+}
+
+#[async_trait]
+impl OperationCanceller for SharedOperationCanceller {
+    async fn cancel_operation(&self, message_id: i32) -> Result<(), String> {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        match operations.get_mut(&message_id) {
+            Some(state) => match state {
+                OperationCancelState::Active => {
+                    *state = OperationCancelState::Cancelled;
+                    Ok(())
+                }
+                OperationCancelState::Cancelled => {
+                    Err(format!("Operation {message_id} is already cancelled"))
+                }
+                OperationCancelState::Completed => {
+                    Err(format!("Operation {message_id} has already completed"))
+                }
+            },
+            None => Err(format!("Operation {message_id} is not active")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +677,23 @@ mod tests {
 
         let result = backend.execute_operation(oids::WHO_AM_I, None).await;
         assert!(result.is_ok());
+        assert_eq!(String::from_utf8(result.unwrap()).unwrap(), "anonymous");
+    }
+
+    #[tokio::test]
+    async fn test_who_am_i_uses_bound_context() {
+        let backend = StandardExtendedOpBackend::with_context(
+            Arc::new(MockPasswordModifier),
+            Arc::new(MockOperationCanceller),
+            ExtendedOpContext::new("cn=testuser,dc=example,dc=org"),
+        );
+
+        let result = backend.execute_operation(oids::WHO_AM_I, None).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            String::from_utf8(result.unwrap()).unwrap(),
+            "cn=testuser,dc=example,dc=org"
+        );
     }
 
     #[tokio::test]
@@ -550,6 +721,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_password_modify_uses_bound_context_when_request_omits_identity() {
+        let backend = StandardExtendedOpBackend::with_context(
+            Arc::new(MockPasswordModifier),
+            Arc::new(MockOperationCanceller),
+            ExtendedOpContext::new("cn=testuser,dc=example,dc=org"),
+        );
+
+        let request = encode_password_modify_request_value(&PasswordModifyRequest {
+            user_identity: None,
+            old_password: Some(b"old123".to_vec()),
+            new_password: Some(b"new456".to_vec()),
+        })
+        .unwrap()
+        .unwrap();
+
+        let result = backend
+            .execute_operation(oids::PASSWORD_MODIFY, Some(&request))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_password_modify_fails_without_user_identity_or_context() {
+        let backend = StandardExtendedOpBackend::new(
+            Arc::new(MockPasswordModifier),
+            Arc::new(MockOperationCanceller),
+        );
+
+        let request = encode_password_modify_request_value(&PasswordModifyRequest {
+            user_identity: None,
+            old_password: Some(b"old123".to_vec()),
+            new_password: Some(b"new456".to_vec()),
+        })
+        .unwrap()
+        .unwrap();
+
+        let result = backend
+            .execute_operation(oids::PASSWORD_MODIFY, Some(&request))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("bound identity"));
+    }
+
+    #[tokio::test]
     async fn test_cancel_operation() {
         let backend = StandardExtendedOpBackend::new(
             Arc::new(MockPasswordModifier),
@@ -561,6 +776,21 @@ mod tests {
             .execute_operation(oids::CANCEL, Some(&message_id))
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_shared_operation_canceller_tracks_state() {
+        let canceller = SharedOperationCanceller::new();
+        assert!(canceller.register_operation(7));
+        assert_eq!(canceller.status(7), Some(OperationCancelState::Active));
+
+        assert!(canceller.cancel_operation(7).await.is_ok());
+        assert!(canceller.is_cancelled(7));
+        assert_eq!(canceller.status(7), Some(OperationCancelState::Cancelled));
+
+        canceller.mark_completed(11);
+        let err = canceller.cancel_operation(11).await.unwrap_err();
+        assert!(err.contains("completed"));
     }
 
     #[test]

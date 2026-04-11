@@ -146,6 +146,50 @@ pub struct RateLimitConfig {
     pub auto_ban_duration: Duration,
 }
 
+/// Detailed reason for a rate-limit decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitDecisionReason {
+    Allowed,
+    UnknownOperation,
+    Whitelisted,
+    Blacklisted,
+    ClientBanned,
+    GlobalLimitExceeded,
+    ClientLimitExceeded,
+    OperationLimitExceeded,
+}
+
+/// Structured rate-limit decision used by future runtime hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitDecision {
+    pub allowed: bool,
+    pub reason: RateLimitDecisionReason,
+}
+
+impl RateLimitDecision {
+    fn allowed(reason: RateLimitDecisionReason) -> Self {
+        Self {
+            allowed: true,
+            reason,
+        }
+    }
+
+    fn blocked(reason: RateLimitDecisionReason) -> Self {
+        Self {
+            allowed: false,
+            reason,
+        }
+    }
+}
+
+/// Point-in-time rate-limit snapshot for observability.
+#[derive(Debug, Clone)]
+pub struct RateLimitSnapshot {
+    pub config: RateLimitConfig,
+    pub stats: RateLimitStats,
+    pub current_multiplier: f64,
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         let mut operation_limits = HashMap::new();
@@ -338,9 +382,20 @@ impl RateLimiter {
 
     /// Check if a request should be allowed
     pub async fn check_rate_limit(&self, client_ip: IpAddr, operation: &str) -> bool {
+        self.check_rate_limit_detailed(client_ip, operation)
+            .await
+            .allowed
+    }
+
+    /// Check if a request should be allowed and return the reason.
+    pub async fn check_rate_limit_detailed(
+        &self,
+        client_ip: IpAddr,
+        operation: &str,
+    ) -> RateLimitDecision {
         let op = match OperationType::parse_name(operation) {
             Some(o) => o,
-            None => return true, // Unknown operation type - allow
+            None => return RateLimitDecision::allowed(RateLimitDecisionReason::UnknownOperation),
         };
 
         self.record_total_request().await;
@@ -349,13 +404,13 @@ impl RateLimiter {
         let config = self.config.read().await;
         if config.whitelist.contains(&client_ip) {
             self.record_allowed().await;
-            return true;
+            return RateLimitDecision::allowed(RateLimitDecisionReason::Whitelisted);
         }
 
         // Check blacklist
         if config.blacklist.contains(&client_ip) {
             self.record_blocked().await;
-            return false;
+            return RateLimitDecision::blocked(RateLimitDecisionReason::Blacklisted);
         }
         drop(config);
 
@@ -368,7 +423,7 @@ impl RateLimiter {
         // Check if client is banned
         if client.is_banned() {
             self.record_blocked().await;
-            return false;
+            return RateLimitDecision::blocked(RateLimitDecisionReason::ClientBanned);
         }
 
         // Clean old requests
@@ -380,7 +435,7 @@ impl RateLimiter {
             client.record_violation();
             self.check_auto_ban(client, &config).await;
             self.record_blocked().await;
-            return false;
+            return RateLimitDecision::blocked(RateLimitDecisionReason::GlobalLimitExceeded);
         }
 
         // Check per-client rate limit
@@ -392,7 +447,7 @@ impl RateLimiter {
             client.record_violation();
             self.check_auto_ban(client, &config).await;
             self.record_blocked().await;
-            return false;
+            return RateLimitDecision::blocked(RateLimitDecisionReason::ClientLimitExceeded);
         }
 
         // Check operation-specific limit
@@ -404,7 +459,7 @@ impl RateLimiter {
                 client.record_violation();
                 self.check_auto_ban(client, &config).await;
                 self.record_blocked().await;
-                return false;
+                return RateLimitDecision::blocked(RateLimitDecisionReason::OperationLimitExceeded);
             }
         }
 
@@ -423,7 +478,7 @@ impl RateLimiter {
         }
 
         self.record_allowed().await;
-        true
+        RateLimitDecision::allowed(RateLimitDecisionReason::Allowed)
     }
 
     /// Check global rate limit
@@ -553,6 +608,15 @@ impl RateLimiter {
     /// Get statistics
     pub async fn get_stats(&self) -> RateLimitStats {
         self.stats.read().await.clone()
+    }
+
+    /// Get a point-in-time rate-limit snapshot for observability.
+    pub async fn snapshot(&self) -> RateLimitSnapshot {
+        RateLimitSnapshot {
+            config: self.get_config().await,
+            stats: self.get_stats().await,
+            current_multiplier: *self.adaptive_multiplier.read().await,
+        }
     }
 
     /// Reset statistics
@@ -863,5 +927,39 @@ mod tests {
 
         let stats = limiter.get_stats().await;
         assert_eq!(stats.banned_clients, 0);
+    }
+
+    #[tokio::test]
+    async fn test_detailed_rate_limit_decisions_and_snapshot() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            per_client_requests_per_second: 1,
+            window_duration: Duration::from_millis(100),
+            adaptive_enabled: false,
+            ..Default::default()
+        });
+        let client_ip: IpAddr = "192.168.1.100".parse().unwrap();
+
+        let decision = limiter.check_rate_limit_detailed(client_ip, "search").await;
+        assert!(decision.allowed);
+        assert_eq!(decision.reason, RateLimitDecisionReason::Allowed);
+
+        let decision = limiter.check_rate_limit_detailed(client_ip, "search").await;
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason,
+            RateLimitDecisionReason::ClientLimitExceeded
+        );
+
+        let decision = limiter
+            .check_rate_limit_detailed(client_ip, "unknown-op")
+            .await;
+        assert!(decision.allowed);
+        assert_eq!(decision.reason, RateLimitDecisionReason::UnknownOperation);
+
+        let snapshot = limiter.snapshot().await;
+        assert_eq!(snapshot.stats.total_requests, 2);
+        assert_eq!(snapshot.stats.requests_allowed, 1);
+        assert_eq!(snapshot.stats.requests_blocked, 1);
+        assert_eq!(snapshot.current_multiplier, 1.0);
     }
 }

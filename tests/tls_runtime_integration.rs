@@ -67,6 +67,7 @@ fn generate_test_certificate() -> (String, String) {
 
 fn write_tls_fixture(
     tempdir: &TempDir,
+    runtime: &str,
     ldap_port: u16,
     ldaps_port: u16,
     tls_enabled: bool,
@@ -87,7 +88,7 @@ fn write_tls_fixture(
     let server_toml = format!(
         r#"
 [server]
-runtime = "legacy"
+runtime = "{runtime}"
 bind_address = "127.0.0.1"
 ldap_port = {ldap_port}
 ldaps_port = {ldaps_port}
@@ -152,13 +153,14 @@ fn spawn_opendr(
     }
 }
 
-fn tls_runtime_fixture(tls_enabled: bool) -> TestBinaryServer {
+fn tls_runtime_fixture(runtime: &str, tls_enabled: bool) -> TestBinaryServer {
     let tempdir = tempfile::tempdir().unwrap();
     let ldap_port = reserve_port();
     let ldaps_port = reserve_port();
     let (cert_pem, key_pem) = generate_test_certificate();
     write_tls_fixture(
         &tempdir,
+        runtime,
         ldap_port,
         ldaps_port,
         tls_enabled,
@@ -289,7 +291,7 @@ fn assert_starttls_success(response: &[u8]) {
 
 #[tokio::test]
 async fn ldaps_accepts_tls_and_allows_bind() {
-    let server = tls_runtime_fixture(true);
+    let server = tls_runtime_fixture("legacy", true);
 
     let stream = connect_with_retry(server.ldaps_port).await;
     let connector = trusted_tls_connector(&server.cert_pem);
@@ -304,7 +306,7 @@ async fn ldaps_accepts_tls_and_allows_bind() {
 
 #[tokio::test]
 async fn ldaps_rejects_untrusted_client_handshake() {
-    let server = tls_runtime_fixture(true);
+    let server = tls_runtime_fixture("legacy", true);
 
     let stream = connect_with_retry(server.ldaps_port).await;
     let connector = untrusted_tls_connector();
@@ -318,7 +320,7 @@ async fn ldaps_rejects_untrusted_client_handshake() {
 
 #[tokio::test]
 async fn starttls_upgrades_connection_and_allows_bind() {
-    let server = tls_runtime_fixture(true);
+    let server = tls_runtime_fixture("legacy", true);
 
     let mut stream = connect_with_retry(server.ldap_port).await;
     let starttls_response = send_starttls_request(&mut stream, 1).await;
@@ -336,7 +338,7 @@ async fn starttls_upgrades_connection_and_allows_bind() {
 
 #[tokio::test]
 async fn starttls_upgrade_fails_for_untrusted_server_certificate() {
-    let server = tls_runtime_fixture(true);
+    let server = tls_runtime_fixture("legacy", true);
 
     let mut stream = connect_with_retry(server.ldap_port).await;
     let starttls_response = send_starttls_request(&mut stream, 1).await;
@@ -349,4 +351,37 @@ async fn starttls_upgrade_fails_for_untrusted_server_certificate() {
         handshake.is_err(),
         "StartTLS handshake should fail when the client does not trust the server certificate"
     );
+}
+
+#[tokio::test]
+async fn fsm_ldaps_accepts_tls_and_allows_bind() {
+    let server = tls_runtime_fixture("fsm", true);
+
+    let stream = connect_with_retry(server.ldaps_port).await;
+    let connector = trusted_tls_connector(&server.cert_pem);
+    let mut tls_stream = connector
+        .connect(localhost_server_name(), stream)
+        .await
+        .expect("FSM LDAPS handshake should succeed with trusted server certificate");
+
+    let bind_response = send_bind_request(&mut tls_stream, 1).await;
+    assert_bind_success(&bind_response);
+}
+
+#[tokio::test]
+async fn fsm_starttls_upgrades_connection_and_allows_bind() {
+    let server = tls_runtime_fixture("fsm", true);
+
+    let mut stream = connect_with_retry(server.ldap_port).await;
+    let starttls_response = send_starttls_request(&mut stream, 1).await;
+    assert_starttls_success(&starttls_response);
+
+    let connector = trusted_tls_connector(&server.cert_pem);
+    let mut tls_stream = connector
+        .connect(localhost_server_name(), stream)
+        .await
+        .expect("FSM StartTLS upgrade should complete with trusted server certificate");
+
+    let bind_response = send_bind_request(&mut tls_stream, 2).await;
+    assert_bind_success(&bind_response);
 }

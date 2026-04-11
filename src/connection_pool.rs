@@ -116,8 +116,23 @@ pub struct PoolStatistics {
     /// Operations rejected due to limits
     pub rejected_operations: u64,
 
+    /// Memory updates rejected due to limits
+    pub rejected_memory_updates: u64,
+
     /// Connections by IP address
     pub connections_by_ip: HashMap<String, usize>,
+}
+
+/// Point-in-time resource snapshot for observability and future FSM hooks.
+#[derive(Debug, Clone)]
+pub struct ResourceSnapshot {
+    pub limits: ResourceLimits,
+    pub active_connections: usize,
+    pub total_operations: usize,
+    pub total_memory_usage: usize,
+    pub rejected_connections: u64,
+    pub rejected_operations: u64,
+    pub rejected_memory_updates: u64,
 }
 
 /// Connection pool manager
@@ -153,6 +168,7 @@ impl ConnectionPool {
                 total_memory_usage: 0,
                 rejected_connections: 0,
                 rejected_operations: 0,
+                rejected_memory_updates: 0,
                 connections_by_ip: HashMap::new(),
             })),
         }
@@ -300,6 +316,7 @@ impl ConnectionPool {
 
             // Check per-connection limit
             if new_usage > self.limits.max_memory_per_connection {
+                stats.rejected_memory_updates += 1;
                 return false;
             }
 
@@ -315,6 +332,7 @@ impl ConnectionPool {
             };
 
             if new_total > self.limits.max_total_memory {
+                stats.rejected_memory_updates += 1;
                 return false;
             }
 
@@ -366,6 +384,20 @@ impl ConnectionPool {
         self.stats.read().await.clone()
     }
 
+    /// Get a point-in-time resource snapshot including current limits and utilization.
+    pub async fn snapshot(&self) -> ResourceSnapshot {
+        let stats = self.get_statistics().await;
+        ResourceSnapshot {
+            limits: self.limits.clone(),
+            active_connections: stats.active_connections,
+            total_operations: stats.total_operations,
+            total_memory_usage: stats.total_memory_usage,
+            rejected_connections: stats.rejected_connections,
+            rejected_operations: stats.rejected_operations,
+            rejected_memory_updates: stats.rejected_memory_updates,
+        }
+    }
+
     /// Get connection count for an IP address
     pub async fn get_ip_connection_count(&self, addr: SocketAddr) -> usize {
         let connections_by_ip = self.connections_by_ip.read().await;
@@ -403,12 +435,39 @@ mod tests {
         let stats = pool.get_statistics().await;
         assert_eq!(stats.active_connections, 1);
         assert_eq!(stats.total_connections, 1);
+        assert_eq!(stats.rejected_memory_updates, 0);
 
         // Release connection
         pool.release_connection(conn_id).await;
 
         let stats = pool.get_statistics().await;
         assert_eq!(stats.active_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn test_resource_snapshot_tracks_limits_and_usage() {
+        let limits = ResourceLimits {
+            max_connections: 2,
+            max_connections_per_ip: 1,
+            max_operations_per_connection: 2,
+            max_memory_per_connection: 1000,
+            max_total_memory: 1500,
+            connection_idle_timeout: Duration::from_secs(10),
+        };
+        let pool = ConnectionPool::new(limits.clone());
+
+        let conn_id = pool.acquire_connection(test_addr(1234)).await.unwrap();
+        assert!(pool.start_operation(conn_id).await);
+        assert!(pool.update_memory_usage(conn_id, 500).await);
+
+        let snapshot = pool.snapshot().await;
+        assert_eq!(snapshot.limits.max_connections, limits.max_connections);
+        assert_eq!(snapshot.active_connections, 1);
+        assert_eq!(snapshot.total_operations, 1);
+        assert_eq!(snapshot.total_memory_usage, 500);
+        assert_eq!(snapshot.rejected_connections, 0);
+        assert_eq!(snapshot.rejected_operations, 0);
+        assert_eq!(snapshot.rejected_memory_updates, 0);
     }
 
     #[tokio::test]

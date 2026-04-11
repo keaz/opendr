@@ -84,7 +84,7 @@ async fn test_write_backend_adapter() {
         .unwrap();
 
     // Test validate_entry
-    let entry_data = b"dn: cn=newuser,dc=example,dc=org\ncn: newuser\nobjectClass: person\n";
+    let entry_data = b"dn: cn=newuser,dc=example,dc=org\ncn: newuser\nsn: User\nobjectClass: person\nuserPassword: password\n";
     adapter
         .validate_entry("cn=newuser,dc=example,dc=org", entry_data)
         .await
@@ -97,12 +97,23 @@ async fn test_write_backend_adapter() {
         .await
         .unwrap();
 
-    // Test entry_exists
+    // Staged mutation should not be visible before commit.
     let exists = adapter
         .entry_exists("cn=newuser,dc=example,dc=org")
         .await
         .unwrap();
-    assert!(exists, "Added entry should exist");
+    assert!(!exists, "Staged add should not exist before commit");
+    adapter.commit_transaction(&txn_id).await.unwrap();
+
+    let exists = adapter
+        .entry_exists("cn=newuser,dc=example,dc=org")
+        .await
+        .unwrap();
+    assert!(exists, "Committed add should exist");
+    assert!(backend
+        .authenticate("cn=newuser,dc=example,dc=org", b"password")
+        .await
+        .unwrap());
 
     // Test modify_entry
     let txn_id = adapter.begin_transaction().await.unwrap();
@@ -114,6 +125,26 @@ async fn test_write_backend_adapter() {
         .modify_entry(&txn_id, "cn=newuser,dc=example,dc=org", &modifications)
         .await
         .unwrap();
+    let staged = backend
+        .get_entry("cn=newuser,dc=example,dc=org")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !staged.attributes.contains_key("mail"),
+        "Staged modify should not be visible before commit"
+    );
+    adapter.commit_transaction(&txn_id).await.unwrap();
+
+    let modified = backend
+        .get_entry("cn=newuser,dc=example,dc=org")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        modified.attributes.get("mail"),
+        Some(&vec!["newuser@example.org".to_string()])
+    );
 
     // Test delete_entry
     let txn_id = adapter.begin_transaction().await.unwrap();
@@ -121,12 +152,41 @@ async fn test_write_backend_adapter() {
         .delete_entry(&txn_id, "cn=newuser,dc=example,dc=org")
         .await
         .unwrap();
+    let exists = adapter
+        .entry_exists("cn=newuser,dc=example,dc=org")
+        .await
+        .unwrap();
+    assert!(exists, "Staged delete should not be visible before commit");
+    adapter.commit_transaction(&txn_id).await.unwrap();
 
     let exists = adapter
         .entry_exists("cn=newuser,dc=example,dc=org")
         .await
         .unwrap();
     assert!(!exists, "Deleted entry should not exist");
+}
+
+#[tokio::test]
+async fn test_write_backend_adapter_rollback_discards_staged_add() {
+    let backend = Arc::new(MockBackend::default());
+    let adapter = WriteBackendAdapter::new(backend.clone());
+    let entry_data = b"dn: cn=rolledback,dc=example,dc=org\ncn: rolledback\nobjectClass: person\n";
+
+    let txn_id = adapter.begin_transaction().await.unwrap();
+    adapter
+        .add_entry(&txn_id, "cn=rolledback,dc=example,dc=org", entry_data)
+        .await
+        .unwrap();
+    adapter
+        .rollback_transaction(&txn_id, "discard staged add")
+        .await
+        .unwrap();
+
+    let exists = adapter
+        .entry_exists("cn=rolledback,dc=example,dc=org")
+        .await
+        .unwrap();
+    assert!(!exists, "Rolled back staged add should not exist");
 }
 
 #[tokio::test]
@@ -196,6 +256,7 @@ async fn test_write_backend_adapter_modify_dn() {
         .add_entry(&txn_id, "cn=oldname,dc=example,dc=org", entry_data)
         .await
         .unwrap();
+    adapter.commit_transaction(&txn_id).await.unwrap();
 
     // Test modify_dn (rename)
     let txn_id = adapter.begin_transaction().await.unwrap();
@@ -209,6 +270,7 @@ async fn test_write_backend_adapter_modify_dn() {
         )
         .await
         .unwrap();
+    adapter.commit_transaction(&txn_id).await.unwrap();
 
     // Verify old entry doesn't exist
     let old_exists = adapter
