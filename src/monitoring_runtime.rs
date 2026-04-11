@@ -71,8 +71,26 @@ impl RuntimeHealthRegistry {
             .insert(name.into(), ComponentReport { status, detail });
     }
 
-    async fn snapshot(&self) -> HashMap<String, ComponentReport> {
+    /// Remove a component from the runtime health registry.
+    pub async fn remove_component(&self, name: &str) -> Option<ComponentReport> {
+        self.components.write().await.remove(name)
+    }
+
+    /// Get a component report, if one exists.
+    pub async fn get_component(&self, name: &str) -> Option<ComponentReport> {
+        self.components.read().await.get(name).cloned()
+    }
+
+    /// Snapshot all registered components.
+    pub async fn snapshot(&self) -> HashMap<String, ComponentReport> {
         self.components.read().await.clone()
+    }
+
+    /// Return the current component names in the registry.
+    pub async fn component_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.components.read().await.keys().cloned().collect();
+        names.sort();
+        names
     }
 }
 
@@ -318,6 +336,35 @@ mod tests {
             .details
             .iter()
             .any(|detail| detail.contains("memory backend initialized")));
+    }
+
+    #[tokio::test]
+    async fn runtime_health_registry_supports_component_lifecycle() {
+        let registry = RuntimeHealthRegistry::new();
+
+        registry
+            .set_component("backend", ComponentStatus::Healthy, None)
+            .await;
+        registry
+            .set_component(
+                "rate_limiter",
+                ComponentStatus::Degraded,
+                Some("too many requests".to_string()),
+            )
+            .await;
+
+        assert_eq!(
+            registry.component_names().await,
+            vec!["backend".to_string(), "rate_limiter".to_string()]
+        );
+
+        let component = registry.get_component("rate_limiter").await.unwrap();
+        assert_eq!(component.status, ComponentStatus::Degraded);
+        assert_eq!(component.detail.as_deref(), Some("too many requests"));
+
+        let removed = registry.remove_component("backend").await;
+        assert!(removed.is_some());
+        assert!(registry.get_component("backend").await.is_none());
     }
 
     #[test]

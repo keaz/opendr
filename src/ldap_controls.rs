@@ -240,7 +240,7 @@ mod tests {
         ParsedControl {
             control_type: LdapOID(Cow::Borrowed(oid)),
             criticality,
-            control_value: value.map(|value| Cow::Borrowed(value)),
+            control_value: value.map(Cow::Borrowed),
         }
     }
 

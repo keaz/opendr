@@ -147,7 +147,6 @@ pub struct SearchFsmConfig {
     pub max_time_limit: u32,
     pub max_candidates: usize,
     pub candidate_batch_size: usize,
-    pub enable_caching: bool,
 }
 ```
 
@@ -189,9 +188,11 @@ SearchFsmConfig {
     max_time_limit: 300,           // Administrator max seconds (5 min)
     max_candidates: 50000,         // Max candidates to process
     candidate_batch_size: 100,     // Batch size for candidate processing
-    enable_caching: false,         // Enable result caching
 }
 ```
+
+### Caching Strategy
+Search FSM does not own a result cache. Production caching is delegated to the backend layer, such as LMDB's bounded exact-DN entry cache, because a safe FSM-level search result cache would need keys that include base DN, scope, normalized filter, requested attributes, `typesOnly`, controls, security context, and data freshness/version state. Keeping the FSM cache-free avoids stale result sets and cross-context leakage while still allowing backend implementations to cache exact-DN reads safely.
 
 ### Usage Patterns
 
@@ -223,7 +224,6 @@ let config = SearchFsmConfig {
     max_time_limit: 600,
     max_candidates: 10000,
     candidate_batch_size: 50,
-    enable_caching: true,
 };
 
 let fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);

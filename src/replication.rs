@@ -2113,48 +2113,9 @@ impl ChangeListener for LdapChangeListener {
                 }
             };
 
-            match search.next().await {
-                Ok(Some(entry)) => {
-                    listening.store(true, Ordering::SeqCst);
-                    if let Some(sender) = ready_tx.take() {
-                        let _ = sender.send(Ok(()));
-                    }
-
-                    if let Err(message) =
-                        forward_sync_stream_entry(entry, &base_dn, &change_tx, &stats).await
-                    {
-                        *last_error.lock().await = Some(message.clone());
-                        warn!("{}", message);
-                    }
-                }
-                Ok(None) => {
-                    let ldap_result = search.finish().await;
-                    let message = if ldap_result.rc == 0 {
-                        "LDAP replication stream ended before delivering sync results".to_string()
-                    } else {
-                        format!(
-                            "LDAP replication stream failed with rc {}: {}",
-                            ldap_result.rc, ldap_result.text
-                        )
-                    };
-                    *last_error.lock().await = Some(message.clone());
-                    error!("{}", message);
-                    if let Some(sender) = ready_tx.take() {
-                        let _ = sender.send(Err(message));
-                    }
-                    let _ = ldap.unbind().await;
-                    return;
-                }
-                Err(e) => {
-                    let message = format!("Failed to read initial LDAP sync result: {}", e);
-                    *last_error.lock().await = Some(message.clone());
-                    error!("{}", message);
-                    if let Some(sender) = ready_tx.take() {
-                        let _ = sender.send(Err(message));
-                    }
-                    let _ = ldap.unbind().await;
-                    return;
-                }
+            listening.store(true, Ordering::SeqCst);
+            if let Some(sender) = ready_tx.take() {
+                let _ = sender.send(Ok(()));
             }
 
             loop {

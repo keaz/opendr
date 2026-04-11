@@ -95,24 +95,24 @@ impl From<EncodeError> for ServerError {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ConnectionSession {
+pub(crate) struct ConnectionSession {
     bound_dn: Option<String>,
 }
 
 impl ConnectionSession {
-    fn bind(&mut self, dn: String) {
+    pub(crate) fn bind(&mut self, dn: String) {
         self.bound_dn = Some(dn);
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.bound_dn = None;
     }
 
-    fn is_authenticated(&self) -> bool {
+    pub(crate) fn is_authenticated(&self) -> bool {
         self.bound_dn.is_some()
     }
 
-    fn bound_dn(&self) -> Option<&str> {
+    pub(crate) fn bound_dn(&self) -> Option<&str> {
         self.bound_dn.as_deref()
     }
 }
@@ -144,7 +144,7 @@ enum FinishedOperationState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CancelRequestOutcome {
+pub(crate) enum CancelRequestOutcome {
     Accepted,
     NoSuchOperation,
     TooLate,
@@ -159,7 +159,7 @@ struct RegisteredOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SearchRequestSignature {
+pub(crate) struct SearchRequestSignature {
     base_dn: String,
     scope: u32,
     deref_aliases: u32,
@@ -172,7 +172,7 @@ struct SearchRequestSignature {
 }
 
 impl SearchRequestSignature {
-    fn from_request(
+    pub(crate) fn from_request(
         base_dn: &str,
         request: &SearchRequest<'_>,
         attribute_selection: &[String],
@@ -200,8 +200,8 @@ impl SearchRequestSignature {
 }
 
 #[derive(Debug, Clone)]
-struct PagedSearchCursor {
-    signature: SearchRequestSignature,
+pub(crate) struct PagedSearchCursor {
+    pub(crate) signature: SearchRequestSignature,
     total_size: usize,
     remaining_entries: Vec<DirectoryEntry>,
     completion_code: ResultCode,
@@ -209,11 +209,27 @@ struct PagedSearchCursor {
 }
 
 impl PagedSearchCursor {
-    fn total_size(&self) -> u32 {
+    pub(crate) fn new(
+        signature: SearchRequestSignature,
+        total_size: usize,
+        remaining_entries: Vec<DirectoryEntry>,
+        completion_code: ResultCode,
+        completion_diagnostic: &'static str,
+    ) -> Self {
+        Self {
+            signature,
+            total_size,
+            remaining_entries,
+            completion_code,
+            completion_diagnostic,
+        }
+    }
+
+    pub(crate) fn total_size(&self) -> u32 {
         u32::try_from(self.total_size).unwrap_or(u32::MAX)
     }
 
-    fn next_page(
+    pub(crate) fn next_page(
         &mut self,
         page_size: usize,
     ) -> (Vec<DirectoryEntry>, ResultCode, &'static str, bool) {
@@ -234,7 +250,7 @@ impl PagedSearchCursor {
 }
 
 #[derive(Debug, Default)]
-struct ConnectionOperationRegistry {
+pub(crate) struct ConnectionOperationRegistry {
     active: HashMap<u32, RegisteredOperation>,
     finished: HashMap<u32, FinishedOperationState>,
     paged_searches: HashMap<Vec<u8>, PagedSearchCursor>,
@@ -254,7 +270,7 @@ impl ConnectionOperationRegistry {
         );
     }
 
-    fn request_cancel(&mut self, message_id: u32) -> CancelRequestOutcome {
+    pub(crate) fn request_cancel(&mut self, message_id: u32) -> CancelRequestOutcome {
         if let Some(operation) = self.active.get_mut(&message_id) {
             if !operation.cancellable {
                 return CancelRequestOutcome::CannotCancel;
@@ -278,7 +294,7 @@ impl ConnectionOperationRegistry {
         CancelRequestOutcome::NoSuchOperation
     }
 
-    fn request_abandon(&mut self, message_id: u32) -> bool {
+    pub(crate) fn request_abandon(&mut self, message_id: u32) -> bool {
         let Some(operation) = self.active.get_mut(&message_id) else {
             return false;
         };
@@ -302,12 +318,12 @@ impl ConnectionOperationRegistry {
         self.finished.insert(message_id, outcome);
     }
 
-    fn clear_paged_searches(&mut self) {
+    pub(crate) fn clear_paged_searches(&mut self) {
         self.paged_searches.clear();
         self.active_paged_searches.clear();
     }
 
-    fn remember_paged_search(&mut self, cursor: PagedSearchCursor) -> Vec<u8> {
+    pub(crate) fn remember_paged_search(&mut self, cursor: PagedSearchCursor) -> Vec<u8> {
         loop {
             let cookie = Alphanumeric
                 .sample_string(&mut rand::thread_rng(), 24)
@@ -320,19 +336,19 @@ impl ConnectionOperationRegistry {
         }
     }
 
-    fn paged_search(&self, cookie: &[u8]) -> Option<&PagedSearchCursor> {
+    pub(crate) fn paged_search(&self, cookie: &[u8]) -> Option<&PagedSearchCursor> {
         self.paged_searches.get(cookie)
     }
 
-    fn paged_search_mut(&mut self, cookie: &[u8]) -> Option<&mut PagedSearchCursor> {
+    pub(crate) fn paged_search_mut(&mut self, cookie: &[u8]) -> Option<&mut PagedSearchCursor> {
         self.paged_searches.get_mut(cookie)
     }
 
-    fn remove_paged_search(&mut self, cookie: &[u8]) -> Option<PagedSearchCursor> {
+    pub(crate) fn remove_paged_search(&mut self, cookie: &[u8]) -> Option<PagedSearchCursor> {
         self.paged_searches.remove(cookie)
     }
 
-    fn attach_paged_search_to_operation(&mut self, message_id: u32, cookie: Vec<u8>) {
+    pub(crate) fn attach_paged_search_to_operation(&mut self, message_id: u32, cookie: Vec<u8>) {
         self.active_paged_searches.insert(message_id, cookie);
     }
 }
@@ -414,11 +430,27 @@ pub struct LegacySecurityConfig {
 }
 
 #[derive(Clone, Default)]
-struct RequestContext {
+pub(crate) struct RequestContext {
     client_ip: Option<IpAddr>,
     session_id: Option<ConnectionId>,
     security: Option<Arc<LegacySecurityConfig>>,
     metrics: Option<Arc<MetricsCollector>>,
+}
+
+impl RequestContext {
+    pub(crate) fn new(
+        client_ip: Option<IpAddr>,
+        session_id: Option<ConnectionId>,
+        security: Option<Arc<LegacySecurityConfig>>,
+        metrics: Option<Arc<MetricsCollector>>,
+    ) -> Self {
+        Self {
+            client_ip,
+            session_id,
+            security,
+            metrics,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -953,6 +985,7 @@ pub async fn handle_client(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_with_metrics_and_tls(
     mut socket: ConnectionStream,
     backend: Arc<dyn DirectoryBackend>,
@@ -1418,6 +1451,7 @@ pub async fn process_message(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_message_with_session(
     socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
@@ -1631,7 +1665,11 @@ fn control_metric_fragment(oid: &str) -> String {
         .collect()
 }
 
-fn increment_control_counter(request_context: &RequestContext, counter: &str, value: u64) {
+pub(crate) fn increment_control_counter(
+    request_context: &RequestContext,
+    counter: &str,
+    value: u64,
+) {
     if let Some(metrics) = request_context.metrics.as_ref() {
         metrics.increment_counter(counter, value);
     }
@@ -1834,13 +1872,13 @@ enum ServerSideSortRequestError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RequestedSyncControl {
-    request: SyncRequestControl,
-    critical: bool,
+pub(crate) struct RequestedSyncControl {
+    pub(crate) request: SyncRequestControl,
+    pub(crate) critical: bool,
 }
 
 #[derive(Debug)]
-enum SyncRequestError {
+pub(crate) enum SyncRequestError {
     ProtocolError(String),
     InvalidCookie(String),
     Unsupported(String),
@@ -1914,7 +1952,7 @@ fn sync_done_response_control(
     Ok(LdapControl::new(SYNC_DONE_OID, false, Some(value)))
 }
 
-fn parse_sync_request_control(
+pub(crate) fn parse_sync_request_control(
     request_controls: &RequestControls,
 ) -> Result<Option<RequestedSyncControl>, SyncRequestError> {
     let control = request_controls
@@ -2249,7 +2287,7 @@ fn is_root_dn(session: &ConnectionSession, request_context: &RequestContext) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn log_generic_audit_event(
+pub(crate) async fn log_generic_audit_event(
     request_context: &RequestContext,
     session: &ConnectionSession,
     level: AuditLevel,
@@ -2289,7 +2327,7 @@ async fn log_generic_audit_event(
     logger.log_event(event).await;
 }
 
-async fn log_simple_bind_success(request_context: &RequestContext, user_dn: &str) {
+pub(crate) async fn log_simple_bind_success(request_context: &RequestContext, user_dn: &str) {
     let Some(security) = request_context.security.as_ref() else {
         return;
     };
@@ -2304,7 +2342,11 @@ async fn log_simple_bind_success(request_context: &RequestContext, user_dn: &str
         .await;
 }
 
-async fn log_simple_bind_failure(request_context: &RequestContext, user_dn: &str, reason: &str) {
+pub(crate) async fn log_simple_bind_failure(
+    request_context: &RequestContext,
+    user_dn: &str,
+    reason: &str,
+) {
     let Some(security) = request_context.security.as_ref() else {
         return;
     };
@@ -2346,7 +2388,7 @@ async fn log_sasl_bind(
         .await;
 }
 
-async fn log_anonymous_bind(request_context: &RequestContext) {
+pub(crate) async fn log_anonymous_bind(request_context: &RequestContext) {
     let session = ConnectionSession::default();
     if let Some(security) = request_context.security.as_ref() {
         if security.audit_config.log_authentication {
@@ -2408,7 +2450,7 @@ async fn log_authz_denial(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn authorize_operation(
+pub(crate) async fn authorize_operation(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: Option<&dyn DirectoryBackend>,
     message_id: u32,
@@ -2489,6 +2531,7 @@ fn parse_sasl_plain_credentials(
     Ok((authzid, authcid, parts[2].to_vec()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_bind_request_with_session_and_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
@@ -2805,6 +2848,7 @@ async fn send_result_with_controls(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_result_with_referrals(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -2850,6 +2894,7 @@ async fn send_extended_response(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_extended_response_with_controls(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -2934,6 +2979,7 @@ async fn send_intermediate_response(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_handle_virtual_search_request(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
@@ -2953,11 +2999,16 @@ async fn try_handle_virtual_search_request(
     }
 
     if base_dn.is_empty() {
-        let attributes = match build_root_dse_attributes(
+        let supported_control_oids = active_runtime_control_registry().supported_control_oids();
+        let supported_sasl_mechanisms = crate::search_protocol::supported_sasl_mechanisms();
+        let attributes = match crate::search_protocol::build_root_dse_attributes(
             backend,
-            runtime_config,
+            &runtime_config.naming_contexts,
+            &runtime_config.subschema_dn,
             connection_is_secure,
             starttls_available,
+            &supported_control_oids,
+            &supported_sasl_mechanisms,
         )
         .await
         {
@@ -2998,7 +3049,7 @@ async fn try_handle_virtual_search_request(
     }
 
     if base_dn.eq_ignore_ascii_case(&runtime_config.subschema_dn) {
-        let attributes = build_subschema_attributes(schema);
+        let attributes = crate::search_protocol::build_subschema_attributes(schema);
         send_virtual_search_entry(
             socket,
             message_id,
@@ -3024,101 +3075,6 @@ async fn try_handle_virtual_search_request(
     Ok(false)
 }
 
-async fn build_root_dse_attributes(
-    backend: &dyn DirectoryBackend,
-    runtime_config: &LegacyServerConfig,
-    connection_is_secure: bool,
-    starttls_available: bool,
-) -> Result<Vec<(String, Vec<String>)>, BackendError> {
-    let mut attributes = vec![("supportedLDAPVersion".to_string(), vec!["3".to_string()])];
-
-    if !runtime_config.naming_contexts.is_empty() {
-        attributes.push((
-            "namingContexts".to_string(),
-            runtime_config.naming_contexts.clone(),
-        ));
-    }
-
-    attributes.push((
-        "subschemaSubentry".to_string(),
-        vec![runtime_config.subschema_dn.clone()],
-    ));
-
-    let supported_extensions =
-        active_runtime_supported_extensions(connection_is_secure, starttls_available);
-    if !supported_extensions.is_empty() {
-        attributes.push(("supportedExtension".to_string(), supported_extensions));
-    }
-
-    let supported_controls = active_runtime_control_registry().supported_control_oids();
-    if !supported_controls.is_empty() {
-        attributes.push(("supportedControl".to_string(), supported_controls));
-    }
-
-    let supported_sasl = active_runtime_supported_sasl_mechanisms();
-    if !supported_sasl.is_empty() {
-        attributes.push(("supportedSASLMechanisms".to_string(), supported_sasl));
-    }
-
-    if let Some(context_csn) = backend.get_context_csn().await? {
-        attributes.push(("contextCSN".to_string(), vec![context_csn.to_ldap_string()]));
-    }
-
-    Ok(attributes)
-}
-
-fn build_subschema_attributes(schema: &LdapSchema) -> Vec<(String, Vec<String>)> {
-    let mut attributes = vec![
-        (
-            "objectClass".to_string(),
-            vec![
-                "top".to_string(),
-                "subentry".to_string(),
-                "subschema".to_string(),
-            ],
-        ),
-        ("cn".to_string(), vec!["Subschema".to_string()]),
-    ];
-
-    let attribute_types = schema
-        .attribute_types_unique_sorted()
-        .into_iter()
-        .map(|attribute| attribute.to_schema_description())
-        .collect::<Vec<_>>();
-    if !attribute_types.is_empty() {
-        attributes.push(("attributeTypes".to_string(), attribute_types));
-    }
-
-    let object_classes = schema
-        .object_classes_unique_sorted()
-        .into_iter()
-        .map(|object_class| object_class.to_schema_description())
-        .collect::<Vec<_>>();
-    if !object_classes.is_empty() {
-        attributes.push(("objectClasses".to_string(), object_classes));
-    }
-
-    attributes
-}
-
-fn active_runtime_supported_extensions(
-    connection_is_secure: bool,
-    starttls_available: bool,
-) -> Vec<String> {
-    let mut supported = Vec::new();
-    if starttls_available && !connection_is_secure {
-        supported.push(START_TLS_OID.to_string());
-    }
-    supported.push(CANCEL_OID.to_string());
-    supported.push(PASSWORD_MODIFY_OID.to_string());
-    supported.push(WHO_AM_I_OID.to_string());
-    supported
-}
-
-fn active_runtime_supported_sasl_mechanisms() -> Vec<String> {
-    vec!["PLAIN".to_string()]
-}
-
 async fn send_virtual_search_entry(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -3128,7 +3084,10 @@ async fn send_virtual_search_entry(
     types_only: bool,
 ) -> Result<(), ServerError> {
     let synthetic_entry = DirectoryEntry::new(dn, HashMap::new());
-    let selected_attributes = select_virtual_attributes(available_attributes, requested_attributes);
+    let selected_attributes = crate::search_protocol::select_virtual_attributes(
+        available_attributes,
+        requested_attributes,
+    );
     send_search_entry_with_controls(
         socket,
         message_id,
@@ -3138,34 +3097,6 @@ async fn send_virtual_search_entry(
         &[],
     )
     .await
-}
-
-fn select_virtual_attributes(
-    available_attributes: &[(String, Vec<String>)],
-    requested_attributes: &[String],
-) -> Vec<(String, Vec<String>)> {
-    if requested_attributes
-        .iter()
-        .any(|attribute| attribute.eq_ignore_ascii_case("1.1"))
-    {
-        return Vec::new();
-    }
-
-    let include_all = requested_attributes.is_empty()
-        || requested_attributes
-            .iter()
-            .any(|attribute| attribute == "*" || attribute == "+");
-
-    available_attributes
-        .iter()
-        .filter(|(name, _)| {
-            include_all
-                || requested_attributes
-                    .iter()
-                    .any(|attribute| attribute.eq_ignore_ascii_case(name))
-        })
-        .cloned()
-        .collect()
 }
 
 fn map_backend_error(err: &BackendError) -> ResultCode {
@@ -3184,7 +3115,7 @@ fn diagnostic_for_error(err: &BackendError) -> &'static str {
     }
 }
 
-fn compute_new_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {
+pub(crate) fn compute_new_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {
     if let Some(superior) = new_superior {
         format!("{},{}", new_rdn, superior)
     } else if let Some((_, rest)) = dn.split_once(',') {
@@ -3243,6 +3174,7 @@ pub async fn handle_search_request_with_controls(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 async fn handle_search_request_with_context(
     socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
@@ -3274,7 +3206,8 @@ async fn handle_search_request_with_context(
     .await
 }
 
-async fn handle_search_request_with_context_and_registry(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_search_request_with_context_and_registry(
     socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
@@ -3536,8 +3469,8 @@ async fn handle_search_request_with_context_and_registry(
 
     if !manage_dsa_it && request.scope == ldap_parser::ldap::SearchScope::BaseObject {
         if let Some(base_entry) = base_object_entry.as_ref() {
-            if entry_is_referral(&base_entry) {
-                match referral_urls_for_entry(&base_entry) {
+            if entry_is_referral(base_entry) {
+                match referral_urls_for_entry(base_entry) {
                     Ok(referrals) => {
                         increment_control_counter(
                             request_context,
@@ -4228,6 +4161,11 @@ async fn collect_base_object_search_result_set(
     })
 }
 
+#[allow(clippy::manual_is_multiple_of)]
+fn search_progress_checkpoint(returned: usize) -> bool {
+    returned % 100 == 0
+}
+
 async fn emit_search_entries(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -4270,7 +4208,7 @@ async fn emit_search_entries(
             .await?;
             returned += 1;
 
-            if returned % 100 == 0 || returned == entries.len() {
+            if search_progress_checkpoint(returned) || returned == entries.len() {
                 trace_search(format_args!(
                     "emit_search_entries progress returned={returned}/{}",
                     entries.len()
@@ -4312,7 +4250,7 @@ async fn emit_search_entries(
         }
 
         let progress_returned = returned + pending_entries;
-        if progress_returned % 100 == 0 || progress_returned == entries.len() {
+        if search_progress_checkpoint(progress_returned) || progress_returned == entries.len() {
             trace_search(format_args!(
                 "emit_search_entries progress returned={progress_returned}/{}",
                 entries.len()
@@ -4350,18 +4288,8 @@ async fn emit_search_references(
     Ok(())
 }
 
-fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
-    match filter {
-        Filter::And(filters) => filters.iter().find_map(extract_search_hint),
-        Filter::EqualityMatch(ava) => Some(SearchCandidateHint::Equality {
-            attribute: ava.attribute_desc.0.as_ref().to_string(),
-            value: bytes_to_string(ava.assertion_value),
-        }),
-        Filter::Present(attribute) => Some(SearchCandidateHint::Present {
-            attribute: attribute.0.as_ref().to_string(),
-        }),
-        _ => None,
-    }
+pub(crate) fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
+    crate::ldap_filter_eval::extract_search_candidate_hint(filter)
 }
 
 fn trace_search(message: std::fmt::Arguments<'_>) {
@@ -4411,7 +4339,7 @@ fn alias_target_dn(entry: &DirectoryEntry) -> Option<&str> {
         .map(String::as_str)
 }
 
-fn entry_is_referral(entry: &DirectoryEntry) -> bool {
+pub(crate) fn entry_is_referral(entry: &DirectoryEntry) -> bool {
     entry
         .attributes
         .get("objectclass")
@@ -4427,7 +4355,7 @@ fn entry_is_referral(entry: &DirectoryEntry) -> bool {
             .is_some_and(|values| !values.is_empty())
 }
 
-fn referral_urls_for_entry(entry: &DirectoryEntry) -> Result<Vec<String>, String> {
+pub(crate) fn referral_urls_for_entry(entry: &DirectoryEntry) -> Result<Vec<String>, String> {
     let urls = entry
         .attributes
         .get("ref")
@@ -4497,7 +4425,7 @@ async fn resolve_alias_chain(
     Ok(target_entry)
 }
 
-async fn resolve_search_base_dn(
+pub(crate) async fn resolve_search_base_dn(
     backend: &dyn DirectoryBackend,
     base_dn: &str,
     deref_aliases: ldap_parser::ldap::DerefAliases,
@@ -4526,7 +4454,7 @@ async fn resolve_search_base_dn(
         .map(|resolved| resolved.dn)
 }
 
-async fn resolve_search_candidate_entry(
+pub(crate) async fn resolve_search_candidate_entry(
     backend: &dyn DirectoryBackend,
     entry: &DirectoryEntry,
     deref_aliases: ldap_parser::ldap::DerefAliases,
@@ -4779,7 +4707,7 @@ async fn emit_sync_refresh_entries(
     Ok((returned, false))
 }
 
-async fn reject_sync_request(
+pub(crate) async fn reject_sync_request(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
     base_dn: &str,
@@ -4811,7 +4739,8 @@ async fn reject_sync_request(
     }
 }
 
-async fn handle_sync_search_request(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_sync_search_request(
     socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
@@ -4930,8 +4859,8 @@ async fn handle_sync_search_request(
             operation_registry.finish(message_id, FinishedOperationState::Completed);
             return Ok(());
         }
-    } else {
-        for change in changelog.get_since_csn(cookie_csn.as_ref().expect("validated cookie")) {
+    } else if let Some(cookie_csn) = cookie_csn.as_ref() {
+        for change in changelog.get_since_csn(cookie_csn) {
             if provider_lifecycle
                 .as_ref()
                 .is_some_and(|lifecycle| lifecycle.is_draining())
@@ -5358,7 +5287,7 @@ impl<'a, S: AsyncWrite + Unpin> ProviderOwnedReplicationSession<'a, S> {
     }
 }
 
-async fn log_compare_audit(
+pub(crate) async fn log_compare_audit(
     request_context: &RequestContext,
     session: &ConnectionSession,
     dn: &str,
@@ -5394,7 +5323,7 @@ async fn log_compare_audit(
     .await;
 }
 
-async fn log_modify_audit_event(
+pub(crate) async fn log_modify_audit_event(
     request_context: &RequestContext,
     session: &ConnectionSession,
     dn: &str,
@@ -5437,7 +5366,102 @@ async fn log_modify_audit_event(
     .await;
 }
 
-async fn log_password_modify_audit_event(
+pub(crate) async fn log_add_audit_event(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    success: bool,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_modifications {
+        return;
+    }
+    let Some(logger) = security.audit_logger.as_ref() else {
+        return;
+    };
+
+    logger
+        .log_add(
+            dn,
+            &audit_actor(session),
+            &client_ip_for_audit(request_context),
+            success,
+        )
+        .await;
+}
+
+pub(crate) async fn log_delete_audit_event(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    success: bool,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_modifications {
+        return;
+    }
+    let Some(logger) = security.audit_logger.as_ref() else {
+        return;
+    };
+
+    logger
+        .log_delete(
+            dn,
+            &audit_actor(session),
+            &client_ip_for_audit(request_context),
+            success,
+        )
+        .await;
+}
+
+pub(crate) async fn log_moddn_audit_event(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    new_dn: &str,
+    success: bool,
+    error_message: Option<&str>,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_modifications {
+        return;
+    }
+
+    if success {
+        if let Some(logger) = security.audit_logger.as_ref() {
+            logger
+                .log_modifydn(
+                    dn,
+                    new_dn,
+                    &audit_actor(session),
+                    &client_ip_for_audit(request_context),
+                )
+                .await;
+        }
+        return;
+    }
+
+    log_generic_audit_event(
+        request_context,
+        session,
+        AuditLevel::Error,
+        AuditEventType::DataModification,
+        "modifydn",
+        false,
+        Some(dn),
+        error_message,
+        vec![("new_dn".to_string(), new_dn.to_string())],
+    )
+    .await;
+}
+
+pub(crate) async fn log_password_modify_audit_event(
     request_context: &RequestContext,
     session: &ConnectionSession,
     target_dn: Option<&str>,
@@ -5498,7 +5522,7 @@ pub async fn handle_modify_request(
     .await
 }
 
-async fn handle_modify_request_with_context(
+pub(crate) async fn handle_modify_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
@@ -5603,7 +5627,8 @@ pub async fn handle_add_request(
     .await
 }
 
-async fn handle_add_request_with_context(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_add_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     schema: &LdapSchema,
@@ -5665,20 +5690,7 @@ async fn handle_add_request_with_context(
         .await
     {
         Ok(()) => {
-            if let Some(security) = request_context.security.as_ref() {
-                if security.audit_config.log_modifications {
-                    if let Some(logger) = security.audit_logger.as_ref() {
-                        logger
-                            .log_add(
-                                &dn,
-                                &audit_actor(session),
-                                &client_ip_for_audit(request_context),
-                                true,
-                            )
-                            .await;
-                    }
-                }
-            }
+            log_add_audit_event(request_context, session, &dn, true).await;
             send_result(
                 socket,
                 message_id,
@@ -5691,20 +5703,7 @@ async fn handle_add_request_with_context(
         }
         Err(err) => {
             error!("Add operation failed for {}: {}", dn, err);
-            if let Some(security) = request_context.security.as_ref() {
-                if security.audit_config.log_modifications {
-                    if let Some(logger) = security.audit_logger.as_ref() {
-                        logger
-                            .log_add(
-                                &dn,
-                                &audit_actor(session),
-                                &client_ip_for_audit(request_context),
-                                false,
-                            )
-                            .await;
-                    }
-                }
-            }
+            log_add_audit_event(request_context, session, &dn, false).await;
             send_result(
                 socket,
                 message_id,
@@ -5740,7 +5739,7 @@ pub async fn handle_delete_request(
     .await
 }
 
-async fn handle_delete_request_with_context(
+pub(crate) async fn handle_delete_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
@@ -5770,20 +5769,7 @@ async fn handle_delete_request_with_context(
 
     match backend.delete_entry(&dn).await {
         Ok(()) => {
-            if let Some(security) = request_context.security.as_ref() {
-                if security.audit_config.log_modifications {
-                    if let Some(logger) = security.audit_logger.as_ref() {
-                        logger
-                            .log_delete(
-                                &dn,
-                                &audit_actor(session),
-                                &client_ip_for_audit(request_context),
-                                true,
-                            )
-                            .await;
-                    }
-                }
-            }
+            log_delete_audit_event(request_context, session, &dn, true).await;
             send_result(
                 socket,
                 message_id,
@@ -5796,20 +5782,7 @@ async fn handle_delete_request_with_context(
         }
         Err(err) => {
             error!("Delete operation failed for {}: {}", dn, err);
-            if let Some(security) = request_context.security.as_ref() {
-                if security.audit_config.log_modifications {
-                    if let Some(logger) = security.audit_logger.as_ref() {
-                        logger
-                            .log_delete(
-                                &dn,
-                                &audit_actor(session),
-                                &client_ip_for_audit(request_context),
-                                false,
-                            )
-                            .await;
-                    }
-                }
-            }
+            log_delete_audit_event(request_context, session, &dn, false).await;
             send_result(
                 socket,
                 message_id,
@@ -5845,7 +5818,7 @@ pub async fn handle_moddn_request(
     .await
 }
 
-async fn handle_moddn_request_with_context(
+pub(crate) async fn handle_moddn_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
@@ -5892,20 +5865,7 @@ async fn handle_moddn_request_with_context(
         .await
     {
         Ok(()) => {
-            if let Some(security) = request_context.security.as_ref() {
-                if security.audit_config.log_modifications {
-                    if let Some(logger) = security.audit_logger.as_ref() {
-                        logger
-                            .log_modifydn(
-                                &dn,
-                                &new_dn,
-                                &audit_actor(session),
-                                &client_ip_for_audit(request_context),
-                            )
-                            .await;
-                    }
-                }
-            }
+            log_moddn_audit_event(request_context, session, &dn, &new_dn, true, None).await;
             send_result(
                 socket,
                 message_id,
@@ -5918,16 +5878,13 @@ async fn handle_moddn_request_with_context(
         }
         Err(err) => {
             error!("ModifyDN operation failed for {}: {}", dn, err);
-            log_generic_audit_event(
+            log_moddn_audit_event(
                 request_context,
                 session,
-                AuditLevel::Error,
-                AuditEventType::DataModification,
-                "modifydn",
+                &dn,
+                &new_dn,
                 false,
-                Some(&dn),
                 Some(diagnostic_for_error(&err)),
-                vec![("new_dn".to_string(), new_dn)],
             )
             .await;
             send_result(
@@ -5965,7 +5922,7 @@ pub async fn handle_compare_request(
     .await
 }
 
-async fn handle_compare_request_with_context(
+pub(crate) async fn handle_compare_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
     message_id: u32,
@@ -6121,6 +6078,7 @@ pub async fn handle_extended_request(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 async fn handle_extended_request_with_session(
     socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
@@ -6146,6 +6104,7 @@ async fn handle_extended_request_with_session(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_extended_request_with_session_and_registry(
     socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
@@ -6855,7 +6814,7 @@ fn convert_modifications(changes: Vec<Change<'_>>) -> Vec<Modification> {
         .collect()
 }
 
-fn build_entry_from_add_request(
+pub(crate) fn build_entry_from_add_request(
     dn: &str,
     attributes: Vec<ldap_parser::filter::Attribute<'_>>,
 ) -> (DirectoryEntry, Vec<u8>) {

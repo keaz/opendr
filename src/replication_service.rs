@@ -685,7 +685,15 @@ impl ReplicationProviderLifecycle {
             drained_notifier: Notify::new(),
         }
     }
+}
 
+impl Default for ReplicationProviderLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplicationProviderLifecycle {
     pub fn begin_shutdown(&self) {
         if !self.draining.swap(true, Ordering::SeqCst) {
             self.shutdown_notifier.notify_waiters();

@@ -43,6 +43,7 @@
 //! ```rust,no_run
 //! use opendr::search_fsm::*;
 //! use opendr::fsm::{StateMachine, SearchState, SearchEvent};
+//! use std::sync::Arc;
 //!
 //! # struct MockSearchBackend;
 //! # #[async_trait::async_trait]
@@ -50,7 +51,7 @@
 //! #     async fn find_candidates(&self, _base_dn: &str, _scope: i32, _filter: &str) -> Result<Vec<String>, String> {
 //! #         Ok(vec!["cn=user1,dc=example,dc=org".to_string()])
 //! #     }
-//! #     async fn get_entry(&self, _dn: &str, _attributes: &[String]) -> Result<Option<SearchEntry>, String> {
+//! #     async fn get_entry(&self, _dn: &str, _attributes: &[String]) -> Result<Option<Arc<SearchEntry>>, String> {
 //! #         Ok(None)
 //! #     }
 //! # }
@@ -58,7 +59,7 @@
 //! # struct MockFilterMatcher;
 //! # #[async_trait::async_trait]
 //! # impl FilterMatcher for MockFilterMatcher {
-//! #     async fn matches_filter(&self, _entry: &SearchEntry, _filter: &str) -> Result<bool, String> {
+//! #     async fn matches_filter(&mut self, _entry: &SearchEntry, _filter: &str) -> Result<bool, String> {
 //! #         Ok(true)
 //! #     }
 //! # }
@@ -66,7 +67,7 @@
 //! # struct MockEntryFormatter;
 //! # #[async_trait::async_trait]
 //! # impl EntryFormatter for MockEntryFormatter {
-//! #     async fn format_entry(&self, _entry: &SearchEntry, _attributes: &[String]) -> Result<Vec<u8>, String> {
+//! #     async fn format_entry(&mut self, _entry: &SearchEntry, _attributes: &[String]) -> Result<Vec<u8>, String> {
 //! #         Ok(vec![])
 //! #     }
 //! # }
@@ -97,6 +98,7 @@ use crate::fsm::{
 };
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -233,14 +235,14 @@ pub trait SearchBackend: Send + Sync {
     /// * `attributes` - List of attributes to include (empty = all attributes)
     ///
     /// # Returns
-    /// * `Ok(Some(SearchEntry))` - Entry if found
+    /// * `Ok(Some(Arc<SearchEntry>))` - Entry if found
     /// * `Ok(None)` - Entry not found
     /// * `Err(String)` - Error message if operation fails
     async fn get_entry(
         &self,
         dn: &str,
         attributes: &[String],
-    ) -> Result<Option<SearchEntry>, String>;
+    ) -> Result<Option<Arc<SearchEntry>>, String>;
 
     /// Check if an entry exists
     ///
@@ -287,7 +289,7 @@ pub trait FilterMatcher: Send + Sync {
     /// * `Ok(true)` - Entry matches filter
     /// * `Ok(false)` - Entry does not match filter
     /// * `Err(String)` - Error message if evaluation fails
-    async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String>;
+    async fn matches_filter(&mut self, entry: &SearchEntry, filter: &str) -> Result<bool, String>;
 
     /// Validate filter syntax
     ///
@@ -297,7 +299,7 @@ pub trait FilterMatcher: Send + Sync {
     /// # Returns
     /// * `Ok(())` - Filter is valid
     /// * `Err(String)` - Error message if filter is invalid
-    async fn validate_filter(&self, _filter: &str) -> Result<(), String> {
+    async fn validate_filter(&mut self, _filter: &str) -> Result<(), String> {
         // Default implementation accepts all filters
         Ok(())
     }
@@ -331,7 +333,7 @@ pub trait EntryFormatter: Send + Sync {
     /// * `Ok(Vec<u8>)` - Encoded entry data
     /// * `Err(String)` - Error message if formatting fails
     async fn format_entry(
-        &self,
+        &mut self,
         entry: &SearchEntry,
         requested_attributes: &[String],
     ) -> Result<Vec<u8>, String>;
@@ -430,8 +432,6 @@ pub struct SearchFsmConfig {
     pub max_candidates: usize,
     /// Batch size for candidate processing
     pub candidate_batch_size: usize,
-    /// Enable search result caching
-    pub enable_caching: bool,
 }
 
 impl Default for SearchFsmConfig {
@@ -443,7 +443,6 @@ impl Default for SearchFsmConfig {
             max_time_limit: 300, // 5 minutes
             max_candidates: 50000,
             candidate_batch_size: 100,
-            enable_caching: false,
         }
     }
 }
@@ -453,6 +452,10 @@ impl Default for SearchFsmConfig {
 pub struct SearchSession {
     /// Search parameters
     pub params: SearchParams,
+    /// Shared filter string for candidate iteration.
+    pub filter: Arc<str>,
+    /// Shared requested attributes for candidate iteration.
+    pub attributes: Arc<[String]>,
     /// Start time of the search
     pub start_time: Instant,
     /// Candidate entry DNs to process
@@ -480,8 +483,12 @@ impl SearchSession {
     /// # Returns
     /// * New SearchSession instance
     pub fn new(params: SearchParams) -> Self {
+        let filter = Arc::<str>::from(params.filter.as_str());
+        let attributes = Arc::<[String]>::from(params.attributes.clone().into_boxed_slice());
         Self {
             params,
+            filter,
+            attributes,
             start_time: Instant::now(),
             candidates: Vec::new(),
             candidate_index: 0,
@@ -727,8 +734,8 @@ impl SearchFsmImpl {
 
                 (
                     candidate_dn,
-                    session.params.filter.clone(),
-                    session.params.attributes.clone(),
+                    session.filter.clone(),
+                    session.attributes.clone(),
                     session.candidates_found,
                     session.entries_sent,
                 )
@@ -739,7 +746,11 @@ impl SearchFsmImpl {
                 entries_sent,
             };
 
-            let entry = match self.backend.get_entry(&candidate_dn, &attributes).await {
+            let entry = match self
+                .backend
+                .get_entry(&candidate_dn, attributes.as_ref())
+                .await
+            {
                 Ok(entry) => entry,
                 Err(message) => {
                     return Err(self.fail_search(SearchFsmError::BackendError { message }));
@@ -753,7 +764,11 @@ impl SearchFsmImpl {
                 continue;
             };
 
-            let matches = match self.filter_matcher.matches_filter(&entry, &filter).await {
+            let matches = match self
+                .filter_matcher
+                .matches_filter(entry.as_ref(), filter.as_ref())
+                .await
+            {
                 Ok(matches) => matches,
                 Err(message) => {
                     return Err(self.fail_search(SearchFsmError::FilterError { message }));
@@ -779,7 +794,10 @@ impl SearchFsmImpl {
                 return Err(SearchFsmError::SizeLimitExceeded);
             }
 
-            let formatted_entry = match self.entry_formatter.format_entry(&entry, &attributes).await
+            let formatted_entry = match self
+                .entry_formatter
+                .format_entry(entry.as_ref(), attributes.as_ref())
+                .await
             {
                 Ok(formatted_entry) => formatted_entry,
                 Err(message) => {
@@ -1387,7 +1405,7 @@ mod tests {
             &self,
             dn: &str,
             _attributes: &[String],
-        ) -> Result<Option<SearchEntry>, String> {
+        ) -> Result<Option<Arc<SearchEntry>>, String> {
             self.call_log
                 .lock()
                 .unwrap()
@@ -1397,7 +1415,7 @@ mod tests {
                 return Err("Mock backend failure".to_string());
             }
 
-            Ok(self.entries.get(dn).cloned())
+            Ok(self.entries.get(dn).cloned().map(Arc::new))
         }
     }
 
@@ -1445,7 +1463,11 @@ mod tests {
 
     #[async_trait]
     impl FilterMatcher for MockFilterMatcher {
-        async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String> {
+        async fn matches_filter(
+            &mut self,
+            entry: &SearchEntry,
+            filter: &str,
+        ) -> Result<bool, String> {
             self.call_log
                 .lock()
                 .unwrap()
@@ -1491,7 +1513,7 @@ mod tests {
     #[async_trait]
     impl EntryFormatter for MockEntryFormatter {
         async fn format_entry(
-            &self,
+            &mut self,
             entry: &SearchEntry,
             attributes: &[String],
         ) -> Result<Vec<u8>, String> {
@@ -1598,7 +1620,6 @@ mod tests {
             max_time_limit: 600,
             max_candidates: 10000,
             candidate_batch_size: 50,
-            enable_caching: true,
         };
 
         let fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);
@@ -1607,7 +1628,7 @@ mod tests {
         assert_eq!(fsm.config.default_size_limit, 50);
         assert_eq!(fsm.config.default_time_limit, 60);
         assert_eq!(fsm.config.max_size_limit, 5000);
-        assert!(fsm.config.enable_caching);
+        assert_eq!(fsm.config.candidate_batch_size, 50);
     }
 
     #[tokio::test]

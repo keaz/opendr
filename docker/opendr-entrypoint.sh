@@ -12,6 +12,7 @@ mkdir -p "${CONFIG_DIR}" "${CERT_DIR}" "${DATA_DIR}"
 : "${OPENDR_BIND_ADDRESS:=0.0.0.0}"
 : "${OPENDR_LDAP_PORT:=1389}"
 : "${OPENDR_LDAPS_PORT:=1636}"
+: "${OPENDR_RUNTIME:=legacy}"
 : "${OPENDR_BASE_DN:=dc=example,dc=com}"
 : "${OPENDR_ROOT_USER_DN:=cn=admin}"
 : "${OPENDR_ROOT_PASSWORD:=PerfRootSecret123!}"
@@ -35,7 +36,7 @@ ROOT_PASSWORD_HASH=$(/usr/local/bin/opendr-setup hash-password "${OPENDR_ROOT_PA
 
 cat > "${CONFIG_DIR}/server.toml" <<EOF
 [server]
-runtime = "legacy"
+runtime = "${OPENDR_RUNTIME}"
 bind_address = "${OPENDR_BIND_ADDRESS}"
 ldap_port = ${OPENDR_LDAP_PORT}
 ldaps_port = ${OPENDR_LDAPS_PORT}

@@ -562,7 +562,7 @@ fn default_hostname() -> String {
     "localhost".to_string()
 }
 fn default_server_runtime() -> String {
-    "legacy".to_string()
+    "fsm".to_string()
 }
 fn default_replica_id() -> u16 {
     1
@@ -1475,10 +1475,7 @@ impl ServerConfig {
                 }
                 Ok(())
             }
-            "fsm" => Err(ConfigError::ValidationError(
-                "server.runtime = \"fsm\" is not supported by the shipped opendr binary yet; use \"legacy\""
-                    .to_string(),
-            )),
+            "fsm" => Ok(()),
             other => Err(ConfigError::ValidationError(format!(
                 "server.runtime must be one of: legacy, fsm (got {})",
                 other
@@ -1547,7 +1544,7 @@ mod tests {
         assert_eq!(config.server.ldap_port, 1389);
         assert_eq!(config.server.ldaps_port, 1636);
         assert_eq!(config.server.bind_address, "127.0.0.1");
-        assert_eq!(config.server.runtime, "legacy");
+        assert_eq!(config.server.runtime, "fsm");
         assert_eq!(config.server.replica_id, 1);
         assert!(config.rate_limit.enabled);
         assert!(config.monitoring.enabled);
@@ -1752,14 +1749,10 @@ root_password_env = "OPENDR_TEST_ROOT_PASSWORD"
     }
 
     #[test]
-    fn test_shipped_binary_rejects_fsm_runtime() {
+    fn test_shipped_binary_accepts_fsm_runtime() {
         let mut config = ServerConfig::default();
         config.server.runtime = "fsm".to_string();
-        let error = config
-            .validate_for_shipped_binary()
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not supported by the shipped opendr binary"));
+        assert!(config.validate_for_shipped_binary().is_ok());
     }
 
     #[test]
