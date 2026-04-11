@@ -5,6 +5,7 @@ pub mod backend;
 pub mod backend_adapters;
 pub mod backend_changelog_wrapper;
 pub mod backend_lmdb;
+pub mod backup;
 // Internal storage/runtime FSM; not part of the public crate API.
 #[allow(dead_code)]
 mod backend_txn_fsm;
