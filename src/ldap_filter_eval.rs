@@ -102,14 +102,6 @@ pub(crate) fn matches_filter_string(entry: &DirectoryEntry, filter: &str) -> Res
     Ok(compiled.matches(entry))
 }
 
-pub(crate) fn matches_search_entry_filter_string(
-    entry: &SearchEntry,
-    filter: &str,
-) -> Result<bool, String> {
-    let compiled = compile_filter(filter)?;
-    Ok(compiled.matches_search_entry(entry))
-}
-
 pub(crate) fn prepare_change(
     change: &ChangelogEntry,
     require_entry_snapshot: bool,
@@ -345,7 +337,7 @@ impl CompiledLdapFilter {
         self.matches_attributes(&entry.dn, &entry.attributes)
     }
 
-    fn matches_search_entry(&self, entry: &SearchEntry) -> bool {
+    pub(crate) fn matches_search_entry(&self, entry: &SearchEntry) -> bool {
         self.matches_attributes(&entry.dn, &entry.attributes)
     }
 

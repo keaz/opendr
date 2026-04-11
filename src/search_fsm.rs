@@ -43,6 +43,7 @@
 //! ```rust,no_run
 //! use opendr::search_fsm::*;
 //! use opendr::fsm::{StateMachine, SearchState, SearchEvent};
+//! use std::sync::Arc;
 //!
 //! # struct MockSearchBackend;
 //! # #[async_trait::async_trait]
@@ -50,7 +51,7 @@
 //! #     async fn find_candidates(&self, _base_dn: &str, _scope: i32, _filter: &str) -> Result<Vec<String>, String> {
 //! #         Ok(vec!["cn=user1,dc=example,dc=org".to_string()])
 //! #     }
-//! #     async fn get_entry(&self, _dn: &str, _attributes: &[String]) -> Result<Option<SearchEntry>, String> {
+//! #     async fn get_entry(&self, _dn: &str, _attributes: &[String]) -> Result<Option<Arc<SearchEntry>>, String> {
 //! #         Ok(None)
 //! #     }
 //! # }
@@ -58,7 +59,7 @@
 //! # struct MockFilterMatcher;
 //! # #[async_trait::async_trait]
 //! # impl FilterMatcher for MockFilterMatcher {
-//! #     async fn matches_filter(&self, _entry: &SearchEntry, _filter: &str) -> Result<bool, String> {
+//! #     async fn matches_filter(&mut self, _entry: &SearchEntry, _filter: &str) -> Result<bool, String> {
 //! #         Ok(true)
 //! #     }
 //! # }
@@ -66,7 +67,7 @@
 //! # struct MockEntryFormatter;
 //! # #[async_trait::async_trait]
 //! # impl EntryFormatter for MockEntryFormatter {
-//! #     async fn format_entry(&self, _entry: &SearchEntry, _attributes: &[String]) -> Result<Vec<u8>, String> {
+//! #     async fn format_entry(&mut self, _entry: &SearchEntry, _attributes: &[String]) -> Result<Vec<u8>, String> {
 //! #         Ok(vec![])
 //! #     }
 //! # }
@@ -234,14 +235,14 @@ pub trait SearchBackend: Send + Sync {
     /// * `attributes` - List of attributes to include (empty = all attributes)
     ///
     /// # Returns
-    /// * `Ok(Some(SearchEntry))` - Entry if found
+    /// * `Ok(Some(Arc<SearchEntry>))` - Entry if found
     /// * `Ok(None)` - Entry not found
     /// * `Err(String)` - Error message if operation fails
     async fn get_entry(
         &self,
         dn: &str,
         attributes: &[String],
-    ) -> Result<Option<SearchEntry>, String>;
+    ) -> Result<Option<Arc<SearchEntry>>, String>;
 
     /// Check if an entry exists
     ///
@@ -288,7 +289,7 @@ pub trait FilterMatcher: Send + Sync {
     /// * `Ok(true)` - Entry matches filter
     /// * `Ok(false)` - Entry does not match filter
     /// * `Err(String)` - Error message if evaluation fails
-    async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String>;
+    async fn matches_filter(&mut self, entry: &SearchEntry, filter: &str) -> Result<bool, String>;
 
     /// Validate filter syntax
     ///
@@ -298,7 +299,7 @@ pub trait FilterMatcher: Send + Sync {
     /// # Returns
     /// * `Ok(())` - Filter is valid
     /// * `Err(String)` - Error message if filter is invalid
-    async fn validate_filter(&self, _filter: &str) -> Result<(), String> {
+    async fn validate_filter(&mut self, _filter: &str) -> Result<(), String> {
         // Default implementation accepts all filters
         Ok(())
     }
@@ -332,7 +333,7 @@ pub trait EntryFormatter: Send + Sync {
     /// * `Ok(Vec<u8>)` - Encoded entry data
     /// * `Err(String)` - Error message if formatting fails
     async fn format_entry(
-        &self,
+        &mut self,
         entry: &SearchEntry,
         requested_attributes: &[String],
     ) -> Result<Vec<u8>, String>;
@@ -765,7 +766,7 @@ impl SearchFsmImpl {
 
             let matches = match self
                 .filter_matcher
-                .matches_filter(&entry, filter.as_ref())
+                .matches_filter(entry.as_ref(), filter.as_ref())
                 .await
             {
                 Ok(matches) => matches,
@@ -795,7 +796,7 @@ impl SearchFsmImpl {
 
             let formatted_entry = match self
                 .entry_formatter
-                .format_entry(&entry, attributes.as_ref())
+                .format_entry(entry.as_ref(), attributes.as_ref())
                 .await
             {
                 Ok(formatted_entry) => formatted_entry,
@@ -1404,7 +1405,7 @@ mod tests {
             &self,
             dn: &str,
             _attributes: &[String],
-        ) -> Result<Option<SearchEntry>, String> {
+        ) -> Result<Option<Arc<SearchEntry>>, String> {
             self.call_log
                 .lock()
                 .unwrap()
@@ -1414,7 +1415,7 @@ mod tests {
                 return Err("Mock backend failure".to_string());
             }
 
-            Ok(self.entries.get(dn).cloned())
+            Ok(self.entries.get(dn).cloned().map(Arc::new))
         }
     }
 
@@ -1462,7 +1463,11 @@ mod tests {
 
     #[async_trait]
     impl FilterMatcher for MockFilterMatcher {
-        async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String> {
+        async fn matches_filter(
+            &mut self,
+            entry: &SearchEntry,
+            filter: &str,
+        ) -> Result<bool, String> {
             self.call_log
                 .lock()
                 .unwrap()
@@ -1508,7 +1513,7 @@ mod tests {
     #[async_trait]
     impl EntryFormatter for MockEntryFormatter {
         async fn format_entry(
-            &self,
+            &mut self,
             entry: &SearchEntry,
             attributes: &[String],
         ) -> Result<Vec<u8>, String> {

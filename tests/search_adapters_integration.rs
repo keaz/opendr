@@ -69,7 +69,7 @@ async fn production_search_backend_returns_full_entry_and_stats() {
 
 #[tokio::test]
 async fn production_filter_matcher_uses_real_filter_evaluation() {
-    let matcher = ProductionFilterMatcher::new();
+    let mut matcher = ProductionFilterMatcher::new();
     let entry = test_search_entry();
 
     matcher
@@ -89,7 +89,7 @@ async fn production_filter_matcher_uses_real_filter_evaluation() {
 
 #[tokio::test]
 async fn production_entry_formatter_projects_and_encodes_entries() {
-    let formatter = ProductionEntryFormatter::with_message_id(41);
+    let mut formatter = ProductionEntryFormatter::with_message_id(41);
     let entry = test_search_entry();
 
     let encoded = formatter

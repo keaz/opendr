@@ -1008,7 +1008,7 @@ fn legacy_session_from_fsm(fsm_set: &ConnectionFsmSet) -> ConnectionSession {
 
 struct PreloadedSearchBackend {
     candidates: Vec<String>,
-    entries: HashMap<String, SearchEntry>,
+    entries: HashMap<String, Arc<SearchEntry>>,
 }
 
 impl PreloadedSearchBackend {
@@ -1023,7 +1023,10 @@ impl PreloadedSearchBackend {
             }
 
             candidates.push(entry.dn.clone());
-            indexed_entries.insert(normalized_dn, directory_entry_to_search_entry(&entry));
+            indexed_entries.insert(
+                normalized_dn,
+                Arc::new(directory_entry_to_search_entry(&entry)),
+            );
         }
 
         Self {
@@ -1048,7 +1051,7 @@ impl SearchBackend for PreloadedSearchBackend {
         &self,
         dn: &str,
         _requested_attributes: &[String],
-    ) -> Result<Option<SearchEntry>, String> {
+    ) -> Result<Option<Arc<SearchEntry>>, String> {
         Ok(self.entries.get(&normalize_search_dn(dn)).cloned())
     }
 
@@ -2367,7 +2370,7 @@ async fn emit_native_search_entries(
     types_only: bool,
     search_deadline: Option<Instant>,
 ) -> Result<(usize, bool), String> {
-    let formatter = ProductionEntryFormatter::with_request(message_id, types_only);
+    let mut formatter = ProductionEntryFormatter::with_request(message_id, types_only);
     let mut pending_bytes = Vec::new();
     let mut returned = 0usize;
 

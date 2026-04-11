@@ -43,7 +43,7 @@ impl SearchBackend for SearchBackendAdapter {
         &self,
         dn: &str,
         attributes: &[String],
-    ) -> Result<Option<SearchEntry>, String> {
+    ) -> Result<Option<Arc<SearchEntry>>, String> {
         let entry = self
             .backend
             .get_entry(dn)
@@ -56,7 +56,7 @@ impl SearchBackend for SearchBackendAdapter {
                 filter_operational_attributes(&entry.operational_attributes, attributes);
             let combined_attrs = merge_attributes(user_attrs, operational);
 
-            SearchEntry {
+            Arc::new(SearchEntry {
                 dn: entry.dn.clone(),
                 attributes: combined_attrs,
                 object_classes: entry
@@ -64,7 +64,7 @@ impl SearchBackend for SearchBackendAdapter {
                     .get("objectclass")
                     .cloned()
                     .unwrap_or_default(),
-            }
+            })
         }))
     }
 

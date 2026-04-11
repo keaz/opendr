@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::backend::{DirectoryBackend, DirectoryEntry, OperationalAttributes};
 use crate::fsm::SearchResultCode;
+use crate::ldap_filter_eval::CompiledLdapFilter;
 use crate::metrics::{FsmType, MetricsCollector, OperationType};
 use crate::operational_attrs::parse_attribute_request;
 use crate::parser::encode_search_entry_parts_with_controls;
@@ -46,14 +47,14 @@ impl SearchBackend for ProductionSearchBackendAdapter {
         &self,
         dn: &str,
         _requested_attributes: &[String],
-    ) -> Result<Option<SearchEntry>, String> {
+    ) -> Result<Option<Arc<SearchEntry>>, String> {
         let entry = self
             .backend
             .get_entry(dn)
             .await
             .map_err(|e| format!("backend get_entry failed: {e}"))?;
 
-        Ok(entry.map(|entry| directory_entry_to_search_entry(&entry)))
+        Ok(entry.map(|entry| Arc::new(directory_entry_to_search_entry(&entry))))
     }
 
     async fn entry_exists(&self, dn: &str) -> Result<bool, String> {
@@ -77,22 +78,47 @@ impl SearchBackend for ProductionSearchBackendAdapter {
 
 /// Production filter matcher backed by the LDAP filter evaluator.
 #[derive(Debug, Default)]
-pub struct ProductionFilterMatcher;
+pub struct ProductionFilterMatcher {
+    compiled_filter: Option<(String, CompiledLdapFilter)>,
+}
 
 impl ProductionFilterMatcher {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    fn with_compiled_filter<T>(
+        &mut self,
+        filter: &str,
+        operation: impl FnOnce(&CompiledLdapFilter) -> T,
+    ) -> Result<T, String> {
+        let cache_hit = self
+            .compiled_filter
+            .as_ref()
+            .map(|(cached_filter, _)| cached_filter == filter)
+            .unwrap_or(false);
+
+        if !cache_hit {
+            let compiled = crate::ldap_filter_eval::compile_filter(filter)?;
+            self.compiled_filter = Some((filter.to_string(), compiled));
+        }
+
+        let (_, compiled) = self
+            .compiled_filter
+            .as_ref()
+            .expect("compiled filter populated before use");
+        Ok(operation(compiled))
     }
 }
 
 #[async_trait]
 impl FilterMatcher for ProductionFilterMatcher {
-    async fn matches_filter(&self, entry: &SearchEntry, filter: &str) -> Result<bool, String> {
-        crate::ldap_filter_eval::matches_search_entry_filter_string(entry, filter)
+    async fn matches_filter(&mut self, entry: &SearchEntry, filter: &str) -> Result<bool, String> {
+        self.with_compiled_filter(filter, |compiled| compiled.matches_search_entry(entry))
     }
 
-    async fn validate_filter(&self, filter: &str) -> Result<(), String> {
-        crate::ldap_filter_eval::compile_filter(filter).map(|_| ())
+    async fn validate_filter(&mut self, filter: &str) -> Result<(), String> {
+        self.with_compiled_filter(filter, |_| ())
     }
 
     fn extract_indexed_attributes(&self, _filter: &str) -> Vec<String> {
@@ -105,6 +131,7 @@ impl FilterMatcher for ProductionFilterMatcher {
 pub struct ProductionEntryFormatter {
     message_id: u32,
     types_only: bool,
+    projection: Option<AttributeProjection>,
 }
 
 impl ProductionEntryFormatter {
@@ -112,6 +139,7 @@ impl ProductionEntryFormatter {
         Self {
             message_id: 0,
             types_only: false,
+            projection: None,
         }
     }
 
@@ -119,6 +147,7 @@ impl ProductionEntryFormatter {
         Self {
             message_id,
             types_only: false,
+            projection: None,
         }
     }
 
@@ -126,6 +155,7 @@ impl ProductionEntryFormatter {
         Self {
             message_id,
             types_only,
+            projection: None,
         }
     }
 }
@@ -133,11 +163,26 @@ impl ProductionEntryFormatter {
 #[async_trait]
 impl EntryFormatter for ProductionEntryFormatter {
     async fn format_entry(
-        &self,
+        &mut self,
         entry: &SearchEntry,
         requested_attributes: &[String],
     ) -> Result<Vec<u8>, String> {
-        let selected_attributes = project_search_entry_attributes(entry, requested_attributes);
+        let projection = if self
+            .projection
+            .as_ref()
+            .map(|projection| projection.matches(requested_attributes))
+            .unwrap_or(false)
+        {
+            self.projection
+                .as_ref()
+                .expect("projection checked before use")
+        } else {
+            self.projection = Some(AttributeProjection::new(requested_attributes));
+            self.projection
+                .as_ref()
+                .expect("projection populated before use")
+        };
+        let selected_attributes = project_search_entry_attributes(entry, projection);
 
         encode_search_entry_parts_with_controls(
             self.message_id,
@@ -147,6 +192,42 @@ impl EntryFormatter for ProductionEntryFormatter {
             &[],
         )
         .map_err(|e| format!("failed to encode search entry: {e:?}"))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AttributeProjection {
+    requested_attributes: Vec<String>,
+    requested_lower: Vec<String>,
+    include_user: bool,
+    include_all_user: bool,
+    include_all_operational: bool,
+    specific_operational: Vec<String>,
+}
+
+impl AttributeProjection {
+    fn new(requested_attributes: &[String]) -> Self {
+        let (include_user, include_all_operational, specific_operational) =
+            parse_attribute_request(requested_attributes);
+        let requested_lower = requested_attributes
+            .iter()
+            .map(|attribute| attribute.to_lowercase())
+            .collect::<Vec<_>>();
+        let include_all_user = requested_attributes.is_empty()
+            || requested_lower.iter().any(|attribute| attribute == "*");
+
+        Self {
+            requested_attributes: requested_attributes.to_vec(),
+            requested_lower,
+            include_user,
+            include_all_user,
+            include_all_operational,
+            specific_operational,
+        }
+    }
+
+    fn matches(&self, requested_attributes: &[String]) -> bool {
+        self.requested_attributes == requested_attributes
     }
 }
 
@@ -264,15 +345,8 @@ fn directory_entry_to_search_entry(entry: &DirectoryEntry) -> SearchEntry {
 
 fn project_search_entry_attributes(
     entry: &SearchEntry,
-    requested_attributes: &[String],
+    projection: &AttributeProjection,
 ) -> Vec<(String, Vec<String>)> {
-    let (include_user, include_all_operational, specific_operational) =
-        parse_attribute_request(requested_attributes);
-    let requested_lower: Vec<String> = requested_attributes
-        .iter()
-        .map(|attribute| attribute.to_lowercase())
-        .collect();
-
     entry
         .attributes
         .iter()
@@ -281,13 +355,11 @@ fn project_search_entry_attributes(
             let is_operational = OperationalAttributes::is_operational(&key);
 
             if is_operational {
-                include_all_operational || specific_operational.contains(&key)
-            } else if requested_attributes.is_empty()
-                || requested_lower.iter().any(|attr| attr == "*")
-            {
-                include_user
+                projection.include_all_operational || projection.specific_operational.contains(&key)
+            } else if projection.include_all_user {
+                projection.include_user
             } else {
-                include_user && requested_lower.contains(&key)
+                projection.include_user && projection.requested_lower.contains(&key)
             }
         })
         .map(|(name, values)| (name.clone(), values.clone()))
