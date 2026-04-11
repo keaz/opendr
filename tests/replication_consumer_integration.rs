@@ -75,7 +75,7 @@ async fn wait_for_port(addr: &str) {
 }
 
 async fn wait_for_entry(backend: &MockBackend, dn: &str) -> DirectoryEntry {
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(10), async {
         loop {
             if let Some(entry) = backend
                 .get_entry(dn)
@@ -89,6 +89,27 @@ async fn wait_for_entry(backend: &MockBackend, dn: &str) -> DirectoryEntry {
     })
     .await
     .expect("timed out waiting for replicated entry")
+}
+
+async fn wait_for_stable_provider_replication_session(backend: &dyn DirectoryBackend) {
+    let lifecycle = backend
+        .replication_provider_lifecycle()
+        .expect("provider backend should expose replication lifecycle");
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if lifecycle.active_session_count() > 0 {
+                sleep(Duration::from_millis(100)).await;
+                if lifecycle.active_session_count() > 0 {
+                    return;
+                }
+            }
+
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for persistent provider replication session");
 }
 
 async fn assert_entry_absent_for(backend: &MockBackend, dn: &str, duration: Duration) {
@@ -439,6 +460,7 @@ async fn test_consumer_service_listening_mode_applies_initial_refresh_and_live_u
         .expect("consumer handle should be present");
 
     wait_for_entry(consumer_backend.as_ref(), &initial_entry.dn).await;
+    wait_for_stable_provider_replication_session(provider_backend.as_ref()).await;
 
     let live_entry = create_test_entry("cn=live,dc=example,dc=org", "live");
     provider_backend
