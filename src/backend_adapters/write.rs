@@ -471,6 +471,10 @@ impl WriteBackend for WriteBackendAdapter {
             .map_err(|e| format!("Backend entry_exists error: {}", e))?;
         Ok(entry.is_some())
     }
+
+    fn validates_modify_target_existence_on_write(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

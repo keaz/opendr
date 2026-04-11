@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ldap_parser::filter::{Filter, Substring};
@@ -1007,7 +1007,7 @@ fn legacy_session_from_fsm(fsm_set: &ConnectionFsmSet) -> ConnectionSession {
 }
 
 struct PreloadedSearchBackend {
-    candidates: Vec<String>,
+    candidates: Mutex<Option<Vec<String>>>,
     entries: HashMap<String, Arc<SearchEntry>>,
 }
 
@@ -1030,7 +1030,7 @@ impl PreloadedSearchBackend {
         }
 
         Self {
-            candidates,
+            candidates: Mutex::new(Some(candidates)),
             entries: indexed_entries,
         }
     }
@@ -1044,7 +1044,12 @@ impl SearchBackend for PreloadedSearchBackend {
         _scope: i32,
         _filter: &str,
     ) -> Result<Vec<String>, String> {
-        Ok(self.candidates.clone())
+        Ok(self
+            .candidates
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .unwrap_or_default())
     }
 
     async fn get_entry(

@@ -399,6 +399,12 @@ pub trait WriteBackend: Send + Sync {
     /// * `Err(String)` - Error message if check fails
     async fn entry_exists(&self, dn: &str) -> Result<bool, String>;
 
+    /// Return true when modify writes already validate target existence and
+    /// return backend errors that can be mapped to LDAP result codes.
+    fn validates_modify_target_existence_on_write(&self) -> bool {
+        false
+    }
+
     /// Get transaction statistics
     ///
     /// # Arguments
@@ -1100,13 +1106,15 @@ impl WriteFsmImpl {
                     .map_err(|message| WriteFsmError::BackendError { message })
             }
             PreparedWriteOperation::Modify { dn, modifications } => {
-                let exists = self
-                    .backend
-                    .entry_exists(&dn)
-                    .await
-                    .map_err(|message| WriteFsmError::BackendError { message })?;
-                if !exists {
-                    return Err(WriteFsmError::NoSuchObject { dn });
+                if !self.backend.validates_modify_target_existence_on_write() {
+                    let exists = self
+                        .backend
+                        .entry_exists(&dn)
+                        .await
+                        .map_err(|message| WriteFsmError::BackendError { message })?;
+                    if !exists {
+                        return Err(WriteFsmError::NoSuchObject { dn });
+                    }
                 }
 
                 self.backend

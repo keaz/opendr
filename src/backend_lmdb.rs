@@ -463,7 +463,22 @@ impl LmdbBackend {
     ) -> Result<(), BackendError> {
         let _lock = self.write_lock.write().await;
 
-        let mut entry = self.get_entry_internal(dn)?.ok_or(BackendError::NotFound)?;
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+
+        let normalized_dn = Self::normalize_dn(dn);
+        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
+            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        };
+        let entry_bytes = txn
+            .get(self.entries_db, &actual_dn.as_bytes())
+            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
+        let mut entry: StoredEntry = bincode::deserialize(entry_bytes)
+            .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
         let old_attributes = entry.attributes.clone();
 
         for modification in modifications {
@@ -505,11 +520,6 @@ impl LmdbBackend {
         entry
             .operational_attributes
             .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
-
-        let mut txn = self
-            .env
-            .begin_rw_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
         let entry_bytes = bincode::serialize(&entry)
             .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
@@ -560,7 +570,7 @@ impl LmdbBackend {
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
-        self.entry_cache.invalidate(&Self::normalize_dn(&entry.dn));
+        self.entry_cache.invalidate(&normalized_dn);
         Ok(())
     }
 
@@ -799,8 +809,6 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
         let mut results = Vec::new();
-        let base_components = Self::dn_components(base_dn);
-
         // Use cursor for efficient iteration
         let mut cursor = txn
             .open_ro_cursor(self.entries_db)
@@ -809,7 +817,7 @@ impl LmdbBackend {
         for (key, value) in cursor.iter() {
             let dn = String::from_utf8_lossy(key).to_string();
 
-            if Self::entry_in_scope(&dn, &base_components, scope) {
+            if Self::entry_in_scope(&dn, base_dn, scope) {
                 let entry: StoredEntry = bincode::deserialize(value).map_err(|e| {
                     BackendError::Storage(format!("Failed to deserialize entry: {}", e))
                 })?;
@@ -837,7 +845,6 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
         let mut results = Vec::with_capacity(limit);
-        let base_components = Self::dn_components(base_dn);
         let mut matched = 0usize;
 
         let mut cursor = txn
@@ -846,7 +853,7 @@ impl LmdbBackend {
 
         for (key, value) in cursor.iter() {
             let dn = String::from_utf8_lossy(key).to_string();
-            if !Self::entry_in_scope(&dn, &base_components, scope) {
+            if !Self::entry_in_scope(&dn, base_dn, scope) {
                 continue;
             }
 
@@ -879,7 +886,6 @@ impl LmdbBackend {
             .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
-        let base_components = Self::dn_components(base_dn);
         let mut count = 0usize;
         let mut cursor = txn
             .open_ro_cursor(self.entries_db)
@@ -887,7 +893,7 @@ impl LmdbBackend {
 
         for (key, _) in cursor.iter() {
             let dn = String::from_utf8_lossy(key).to_string();
-            if Self::entry_in_scope(&dn, &base_components, scope) {
+            if Self::entry_in_scope(&dn, base_dn, scope) {
                 count += 1;
             }
         }
@@ -896,47 +902,29 @@ impl LmdbBackend {
     }
 
     /// Check if DN is in search scope
-    fn entry_in_scope(dn: &str, base_components: &[String], scope: SearchScope) -> bool {
-        let components = Self::dn_components(dn);
+    fn entry_in_scope(dn: &str, base_dn: &str, scope: SearchScope) -> bool {
+        let mut dn_components = dn.split(',').rev().map(str::trim).filter(|c| !c.is_empty());
+
+        for base_component in base_dn
+            .split(',')
+            .rev()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            let Some(dn_component) = dn_components.next() else {
+                return false;
+            };
+            if !dn_component.eq_ignore_ascii_case(base_component) {
+                return false;
+            }
+        }
 
         match scope {
-            SearchScope(0) => {
-                // Base: exact match
-                components
-                    .iter()
-                    .map(|c| c.to_lowercase())
-                    .eq(base_components.iter().map(|c| c.to_lowercase()))
-            }
-            SearchScope(1) => {
-                // One level: immediate children
-                if components.len() != base_components.len() + 1 {
-                    return false;
-                }
-                components[1..]
-                    .iter()
-                    .map(|c| c.to_lowercase())
-                    .eq(base_components.iter().map(|c| c.to_lowercase()))
-            }
-            SearchScope(2) => {
-                // Subtree: all descendants
-                if components.len() < base_components.len() {
-                    return false;
-                }
-                components[components.len() - base_components.len()..]
-                    .iter()
-                    .map(|c| c.to_lowercase())
-                    .eq(base_components.iter().map(|c| c.to_lowercase()))
-            }
+            SearchScope(0) => dn_components.next().is_none(),
+            SearchScope(1) => dn_components.next().is_some() && dn_components.next().is_none(),
+            SearchScope(2) => true,
             _ => false,
         }
-    }
-
-    /// Split DN into components
-    fn dn_components(dn: &str) -> Vec<String> {
-        dn.split(',')
-            .map(|c| c.trim().to_string())
-            .filter(|c| !c.is_empty())
-            .collect()
     }
 
     /// Create SSHA512 password hash
@@ -1224,7 +1212,6 @@ impl LmdbBackend {
             .env
             .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
-        let base_components = Self::dn_components(base_dn);
         let mut results = Vec::new();
 
         for dn in dns {
@@ -1236,7 +1223,7 @@ impl LmdbBackend {
             let entry: StoredEntry = bincode::deserialize(entry_bytes).map_err(|e| {
                 BackendError::Storage(format!("Failed to deserialize entry: {}", e))
             })?;
-            if Self::entry_in_scope(&entry.dn, &base_components, scope) {
+            if Self::entry_in_scope(&entry.dn, base_dn, scope) {
                 results.push(entry.to_directory_entry());
             }
         }
@@ -2012,7 +1999,7 @@ mod tests {
         assert_eq!(updated.attributes["cn"], vec!["after".to_string()]);
 
         let stats = backend.entry_cache_stats();
-        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 2);
         assert_eq!(stats.len, 1);
     }
