@@ -8,6 +8,12 @@ mod compare;
 mod search;
 mod write;
 
-pub use compare::CompareBackendAdapter;
+pub use compare::{
+    AllowAllCompareAccessControl, CompareBackendAdapter, ProductionAttributeComparator,
+    ProductionCompareMetrics,
+};
 pub use search::SearchBackendAdapter;
-pub use write::WriteBackendAdapter;
+pub use write::{
+    AllowAllWriteAciChecker, PassthroughSchemaValidator, ProductionWriteMetrics,
+    WriteBackendAdapter,
+};

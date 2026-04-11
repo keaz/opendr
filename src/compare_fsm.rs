@@ -680,7 +680,7 @@ impl CompareFsmImpl {
             return Err(self.invalid_transition(CompareState::Evaluating));
         }
 
-        let (entry, dn, attribute, value) = {
+        let (entry, attribute, value) = {
             let session = self
                 .session
                 .as_ref()
@@ -690,17 +690,10 @@ impl CompareFsmImpl {
                     .entry
                     .clone()
                     .ok_or(CompareFsmError::NoActiveCompare)?,
-                session.params.dn.clone(),
                 session.params.attribute.clone(),
                 session.params.value.clone(),
             )
         };
-
-        if !entry.has_attribute(&attribute) {
-            self.state = CompareState::Completed { result: false };
-            self.record_compare_error_metric("NoSuchAttribute");
-            return Err(CompareFsmError::NoSuchAttribute { dn, attribute });
-        }
 
         let comparison_start = Instant::now();
         let result = match self
@@ -1603,7 +1596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_entry_read_missing_attribute_returns_no_such_attribute() {
+    async fn test_entry_read_missing_attribute_returns_compare_false() {
         let backend = Box::new(MockCompareBackend::new());
         let comparator = Box::new(MockAttributeComparator::new());
         let access_control = Box::new(MockCompareAccessControl::new());
@@ -1622,14 +1615,11 @@ mod tests {
 
         let result = fsm.handle_event(CompareEvent::EntryRead).await;
 
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            CompareFsmError::NoSuchAttribute { .. }
-        ));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
         assert_eq!(
             fsm.current_state(),
-            &CompareState::Completed { result: false }
+            &CompareState::Emitting { result: false }
         );
         assert_eq!(fsm.result(), Some(false));
     }

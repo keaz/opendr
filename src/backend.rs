@@ -220,6 +220,15 @@ pub trait DirectoryBackend: Send + Sync {
 
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError>;
 
+    async fn delete_entry_with_actor(
+        &self,
+        dn: &str,
+        actor_dn: Option<String>,
+    ) -> Result<(), BackendError> {
+        let _ = actor_dn;
+        self.delete_entry(dn).await
+    }
+
     async fn modify_entry(
         &self,
         dn: &str,

@@ -1,6 +1,6 @@
 # OpenDR LDAP Server
 
-A high-performance, production-ready LDAP v3 server implementation in Rust. The shipped `opendr` binary supports both the `legacy` and `fsm` runtimes; `legacy` remains the default rollout path in `config/server.toml`.
+A high-performance, production-ready LDAP v3 server implementation in Rust. The shipped `opendr` binary supports both the `fsm` and `legacy` runtimes; `fsm` is the default rollout path in `config/server.toml`.
 
 ## Features
 

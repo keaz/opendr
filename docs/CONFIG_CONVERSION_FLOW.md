@@ -2,7 +2,7 @@
 
 This document explains how `ServerConfig.to_fsm_server_config()` works and how configuration flows through the system.
 
-> Note: this flow documents the experimental FSM runtime configuration path. The shipped `opendr` binary currently validates and runs the legacy runtime instead.
+> Note: this flow documents the default FSM runtime configuration path. The shipped `opendr` binary also keeps the legacy runtime available with `server.runtime = "legacy"`.
 
 ## Overview
 

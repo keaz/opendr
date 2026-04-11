@@ -16,7 +16,7 @@ ROOT_PASSWORD="PerfRootSecret123!"
 OPENDR_IMAGE="opendr:docker-perf"
 OPENDJ_IMAGE="openidentityplatform/opendj:5.0.4"
 PRODUCTS="opendr,opendj"
-OPENDR_RUNTIME="legacy"
+OPENDR_RUNTIME="fsm"
 
 CURRENT_CONTAINER=""
 CURRENT_OUTPUT_DIR=""
@@ -38,7 +38,7 @@ Options:
   --base-dn DN             Benchmark base DN (default: dc=example,dc=com)
   --root-password VALUE    Root password used for both products
   --opendr-image TAG       Local OpenDR image tag (default: opendr:docker-perf)
-  --opendr-runtime VALUE   OpenDR server runtime: legacy or fsm (default: legacy)
+  --opendr-runtime VALUE   OpenDR server runtime: legacy or fsm (default: fsm)
   --opendj-image TAG       OpenDJ image tag (default: openidentityplatform/opendj:5.0.4)
   --help                   Show this help text
 EOF

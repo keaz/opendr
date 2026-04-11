@@ -1,9 +1,9 @@
 use opendr::config::ServerConfig;
 
 #[test]
-fn test_default_runtime_is_legacy() {
+fn test_default_runtime_is_fsm() {
     let config = ServerConfig::default();
-    assert_eq!(config.server.runtime, "legacy");
+    assert_eq!(config.server.runtime, "fsm");
     assert!(config.validate().is_ok());
     assert!(config.validate_for_shipped_binary().is_ok());
 }

@@ -17,7 +17,7 @@ PROFILE="release"
 NAME_PREFIX="perfbench"
 LDAP_PORT=""
 OUTPUT_DIR=""
-SERVER_RUNTIME="legacy"
+SERVER_RUNTIME="fsm"
 
 SERVER_PID=""
 SAMPLER_PID=""
@@ -38,7 +38,7 @@ Options:
   --name-prefix VALUE       Prefix for benchmark DNs (default: perfbench)
   --port PORT               LDAP port for the temporary single instance
   --profile VALUE           Cargo profile to build/use: release or debug (default: release)
-  --runtime VALUE           Server runtime to benchmark: legacy or fsm (default: legacy)
+  --runtime VALUE           Server runtime to benchmark: legacy or fsm (default: fsm)
   --help                    Show this help text
 EOF
 }

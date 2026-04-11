@@ -105,11 +105,31 @@ impl FilterMatcher for ProductionFilterMatcher {
 
 /// Production entry formatter backed by the LDAP encoder.
 #[derive(Debug, Default)]
-pub struct ProductionEntryFormatter;
+pub struct ProductionEntryFormatter {
+    message_id: u32,
+    types_only: bool,
+}
 
 impl ProductionEntryFormatter {
     pub fn new() -> Self {
-        Self
+        Self {
+            message_id: 0,
+            types_only: false,
+        }
+    }
+
+    pub fn with_message_id(message_id: u32) -> Self {
+        Self {
+            message_id,
+            types_only: false,
+        }
+    }
+
+    pub fn with_request(message_id: u32, types_only: bool) -> Self {
+        Self {
+            message_id,
+            types_only,
+        }
     }
 }
 
@@ -123,8 +143,13 @@ impl EntryFormatter for ProductionEntryFormatter {
         let directory_entry = search_entry_to_directory_entry(entry);
         let selected_attributes = project_search_entry_attributes(entry, requested_attributes);
 
-        encode_search_entry(0, &directory_entry, &selected_attributes, false)
-            .map_err(|e| format!("failed to encode search entry: {e:?}"))
+        encode_search_entry(
+            self.message_id,
+            &directory_entry,
+            &selected_attributes,
+            self.types_only,
+        )
+        .map_err(|e| format!("failed to encode search entry: {e:?}"))
     }
 }
 
@@ -192,9 +217,30 @@ pub fn build_production_search_fsm(
     backend: Arc<dyn DirectoryBackend>,
     metrics: Option<Arc<MetricsCollector>>,
 ) -> SearchFsmImpl {
+    build_production_search_fsm_with_message_id(backend, metrics, 0)
+}
+
+/// Build a production-ready `SearchFsmImpl` for a specific LDAP request message id.
+pub fn build_production_search_fsm_with_message_id(
+    backend: Arc<dyn DirectoryBackend>,
+    metrics: Option<Arc<MetricsCollector>>,
+    message_id: u32,
+) -> SearchFsmImpl {
+    build_production_search_fsm_with_request(backend, metrics, message_id, false)
+}
+
+/// Build a production-ready `SearchFsmImpl` for a specific LDAP request.
+pub fn build_production_search_fsm_with_request(
+    backend: Arc<dyn DirectoryBackend>,
+    metrics: Option<Arc<MetricsCollector>>,
+    message_id: u32,
+    types_only: bool,
+) -> SearchFsmImpl {
     let backend = Box::new(ProductionSearchBackendAdapter::new(backend));
     let filter_matcher = Box::new(ProductionFilterMatcher::new());
-    let entry_formatter = Box::new(ProductionEntryFormatter::new());
+    let entry_formatter = Box::new(ProductionEntryFormatter::with_request(
+        message_id, types_only,
+    ));
 
     let mut fsm = SearchFsmImpl::new(backend, filter_matcher, entry_formatter);
     if let Some(metrics) = metrics {

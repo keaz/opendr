@@ -562,7 +562,7 @@ fn default_hostname() -> String {
     "localhost".to_string()
 }
 fn default_server_runtime() -> String {
-    "legacy".to_string()
+    "fsm".to_string()
 }
 fn default_replica_id() -> u16 {
     1
@@ -1544,7 +1544,7 @@ mod tests {
         assert_eq!(config.server.ldap_port, 1389);
         assert_eq!(config.server.ldaps_port, 1636);
         assert_eq!(config.server.bind_address, "127.0.0.1");
-        assert_eq!(config.server.runtime, "legacy");
+        assert_eq!(config.server.runtime, "fsm");
         assert_eq!(config.server.replica_id, 1);
         assert!(config.rate_limit.enabled);
         assert!(config.monitoring.enabled);

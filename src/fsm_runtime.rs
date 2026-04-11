@@ -140,6 +140,7 @@ impl AuthenticationFsm {
 }
 
 /// Represents a single LDAP operation FSM
+#[allow(clippy::large_enum_variant)]
 pub enum OperationFsm {
     /// Search operation
     Search(SearchFsmImpl),

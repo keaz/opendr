@@ -3,13 +3,15 @@
 //! This module provides an LDAP server implementation using the FSM
 //! (Finite State Machine) architecture. Unlike the traditional `server.rs`
 //! listener, this module manages FSM instances for connection lifecycle,
-//! BER decoding, authentication state, and operation dispatch while reusing
-//! the proven legacy handlers for protocol-heavy LDAP operations.
+//! BER decoding, authentication state, operation dispatch, LDAP controls,
+//! and operation execution.
 
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ldap_parser::filter::{Filter, Substring};
 use ldap_parser::ldap::{LdapMessage, ProtocolOp};
 use ldap_parser::parse_ldap_messages;
 use log::{debug, error, info, warn};
@@ -19,37 +21,67 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
+use crate::aci::Permission;
 use crate::audit::{AuditEventType, AuditLevel};
 use crate::backend::DirectoryBackend;
+use crate::backend_adapters::{
+    AllowAllCompareAccessControl, AllowAllWriteAciChecker, CompareBackendAdapter,
+    PassthroughSchemaValidator, ProductionAttributeComparator, ProductionCompareMetrics,
+    ProductionWriteMetrics, WriteBackendAdapter,
+};
+use crate::compare_fsm::{CompareFsmConfig, CompareFsmError, CompareFsmImpl};
 use crate::connection_fsm::{ConnectionTransport, TlsHandler};
 use crate::connection_pool::{ConnectionPool, ResourceLimits};
 use crate::extended_ops::{
     encode_password_modify_response_value, oids, parse_cancel_request_value,
     parse_password_modify_request_value,
 };
-use crate::fsm::{BerDecoderEvent, ConnectionEvent, ConnectionFsm, StateMachine};
-use crate::fsm_request::{
-    active_fsm_control_registry, FsmRequestContext, FsmRequestRejection, FsmResponseKind,
+use crate::fsm::{
+    BerDecoderEvent, CompareEvent, CompareFsm, ConnectionEvent, ConnectionFsm, SearchEvent,
+    StateMachine, WriteEvent, WriteOperation,
 };
+use crate::fsm_request::{FsmRequestContext, FsmRequestRejection, FsmResponseKind};
 use crate::fsm_runtime::{AuthenticationFsm, ConnectionFsmSet};
-use crate::ldap_controls::RequestControls;
+use crate::ldap_controls::LdapControl;
 use crate::metrics::{
     FsmType, MetricsCollector, OperationType as MetricsOperationType, ResourceEventType,
 };
-use crate::parser::{encode_custom_extended_response, encode_extended_response, ResponseOp};
+use crate::parser::{
+    encode_custom_extended_response, encode_extended_response,
+    encode_result_response_with_referrals, encode_search_reference_with_controls, ResponseOp,
+};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::schema::LdapSchema;
+use crate::schema_adapter::LdapSchemaValidator;
+use crate::search_adapters::{
+    ProductionEntryFormatter, ProductionFilterMatcher, ProductionSearchMetrics,
+};
+use crate::search_controls::{
+    decode_paged_results_control, decode_server_side_sort_request_control,
+    encode_paged_results_control, encode_server_side_sort_response_control, PagedResultsControl,
+    ServerSideSortResultCode, SortKey, PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID,
+    SERVER_SIDE_SORT_RESPONSE_OID,
+};
+use crate::search_fsm::{
+    EntryFormatter, SearchBackend, SearchEntry, SearchFsmConfig, SearchFsmError, SearchFsmImpl,
+};
 use crate::server::{
-    handle_add_request_with_context, handle_compare_request_with_context,
-    handle_delete_request_with_context, handle_moddn_request_with_context,
-    handle_modify_request_with_context, handle_search_request_with_context_and_registry,
-    log_anonymous_bind, log_generic_audit_event, log_password_modify_audit_event,
-    log_simple_bind_failure, log_simple_bind_success, CancelRequestOutcome,
+    authorize_operation, build_entry_from_add_request, compute_new_dn,
+    entry_is_referral as directory_entry_is_referral, handle_sync_search_request,
+    increment_control_counter, log_add_audit_event, log_anonymous_bind, log_compare_audit,
+    log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
+    log_password_modify_audit_event, log_simple_bind_failure, log_simple_bind_success,
+    parse_sync_request_control, referral_urls_for_entry, reject_sync_request,
+    resolve_search_base_dn, resolve_search_candidate_entry, CancelRequestOutcome,
     ConnectionOperationRegistry, ConnectionSession, LegacySecurityConfig, LegacyServerConfig,
-    RequestContext, ServerError,
+    PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError, SyncRequestError,
 };
 use crate::shutdown::ShutdownCoordinator;
+use crate::sync_controls::SYNC_REQUEST_OID;
 use crate::tls::RustlsTlsHandler;
+use crate::write_fsm::{WriteFsmConfig, WriteFsmError, WriteFsmImpl};
+
+const MANAGE_DSA_IT_OID: &str = "2.16.840.1.113730.3.4.2";
 
 /// Configuration for the FSM-based server.
 #[derive(Debug, Clone)]
@@ -520,6 +552,7 @@ async fn handle_connection(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection_with_transport(
     transport: ConnectionTransport,
     backend: Arc<dyn DirectoryBackend>,
@@ -666,6 +699,7 @@ async fn decode_ready_messages(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_ldap_message(
     fsm_set: &mut ConnectionFsmSet,
     message: LdapMessage<'_>,
@@ -685,8 +719,6 @@ async fn process_ldap_message(
             return Ok(());
         }
     };
-    let request_controls = extract_request_controls(&message)?;
-
     debug!(
         "Processing LDAP message ID {} type {:?}",
         request.message_id, message.protocol_op
@@ -735,31 +767,16 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
-            let session = legacy_session_from_fsm(fsm_set);
-            let connection_is_secure = fsm_set.connection().is_secure();
-            let backend = fsm_set.backend().clone();
-            let result = {
-                let stream = fsm_set
-                    .connection_mut()
-                    .stream_mut()
-                    .ok_or("No active stream")?;
-                handle_search_request_with_context_and_registry(
-                    stream,
-                    backend.as_ref(),
-                    schema,
-                    &runtime_context.legacy_runtime_config,
-                    request.message_id as u32,
-                    search_req,
-                    &session,
-                    legacy_operation_registry,
-                    request_context,
-                    &request_controls,
-                    connection_is_secure,
-                    runtime_context.tls_handler.is_some(),
-                )
-                .await
-                .map_err(|err| err.to_string())
-            };
+            let result = handle_search_request_with_fsm_runtime(
+                fsm_set,
+                &request,
+                search_req,
+                schema,
+                request_context,
+                runtime_context,
+                legacy_operation_registry,
+            )
+            .await;
             pool.end_operation(conn_id).await;
             result?;
         }
@@ -784,25 +801,14 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
-            let session = legacy_session_from_fsm(fsm_set);
-            let backend = fsm_set.backend().clone();
-            let result = {
-                let stream = fsm_set
-                    .connection_mut()
-                    .stream_mut()
-                    .ok_or("No active stream")?;
-                handle_modify_request_with_context(
-                    stream,
-                    backend.as_ref(),
-                    request.message_id as u32,
-                    modify_req,
-                    &session,
-                    request_context,
-                    &request_controls,
-                )
-                .await
-                .map_err(|err| err.to_string())
-            };
+            let result = handle_modify_request_with_fsm_runtime(
+                fsm_set,
+                &request,
+                modify_req,
+                request_context,
+                runtime_context,
+            )
+            .await;
             pool.end_operation(conn_id).await;
             result?;
         }
@@ -827,26 +833,15 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
-            let session = legacy_session_from_fsm(fsm_set);
-            let backend = fsm_set.backend().clone();
-            let result = {
-                let stream = fsm_set
-                    .connection_mut()
-                    .stream_mut()
-                    .ok_or("No active stream")?;
-                handle_add_request_with_context(
-                    stream,
-                    backend.as_ref(),
-                    schema,
-                    request.message_id as u32,
-                    add_req,
-                    &session,
-                    request_context,
-                    &request_controls,
-                )
-                .await
-                .map_err(|err| err.to_string())
-            };
+            let result = handle_add_request_with_fsm_runtime(
+                fsm_set,
+                &request,
+                add_req,
+                schema,
+                request_context,
+                runtime_context,
+            )
+            .await;
             pool.end_operation(conn_id).await;
             result?;
         }
@@ -871,25 +866,14 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
-            let session = legacy_session_from_fsm(fsm_set);
-            let backend = fsm_set.backend().clone();
-            let result = {
-                let stream = fsm_set
-                    .connection_mut()
-                    .stream_mut()
-                    .ok_or("No active stream")?;
-                handle_delete_request_with_context(
-                    stream,
-                    backend.as_ref(),
-                    request.message_id as u32,
-                    delete_req,
-                    &session,
-                    request_context,
-                    &request_controls,
-                )
-                .await
-                .map_err(|err| err.to_string())
-            };
+            let result = handle_delete_request_with_fsm_runtime(
+                fsm_set,
+                &request,
+                delete_req,
+                request_context,
+                runtime_context,
+            )
+            .await;
             pool.end_operation(conn_id).await;
             result?;
         }
@@ -914,25 +898,14 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
-            let session = legacy_session_from_fsm(fsm_set);
-            let backend = fsm_set.backend().clone();
-            let result = {
-                let stream = fsm_set
-                    .connection_mut()
-                    .stream_mut()
-                    .ok_or("No active stream")?;
-                handle_moddn_request_with_context(
-                    stream,
-                    backend.as_ref(),
-                    request.message_id as u32,
-                    rename_req,
-                    &session,
-                    request_context,
-                    &request_controls,
-                )
-                .await
-                .map_err(|err| err.to_string())
-            };
+            let result = handle_moddn_request_with_fsm_runtime(
+                fsm_set,
+                &request,
+                rename_req,
+                request_context,
+                runtime_context,
+            )
+            .await;
             pool.end_operation(conn_id).await;
             result?;
         }
@@ -944,31 +917,20 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
-            let session = legacy_session_from_fsm(fsm_set);
-            let backend = fsm_set.backend().clone();
-            let result = {
-                let stream = fsm_set
-                    .connection_mut()
-                    .stream_mut()
-                    .ok_or("No active stream")?;
-                handle_compare_request_with_context(
-                    stream,
-                    backend.as_ref(),
-                    request.message_id as u32,
-                    compare_req,
-                    &session,
-                    request_context,
-                    &request_controls,
-                )
-                .await
-                .map_err(|err| err.to_string())
-            };
+            let result = handle_compare_request_with_fsm_runtime(
+                fsm_set,
+                &request,
+                compare_req,
+                request_context,
+                runtime_context,
+            )
+            .await;
             pool.end_operation(conn_id).await;
             result?;
         }
         ProtocolOp::AbandonRequest(abandoned_id) => {
             info!("Abandon request for message ID {}", abandoned_id.0);
-            let _ = legacy_operation_registry.request_abandon(abandoned_id.0 as u32);
+            let _ = legacy_operation_registry.request_abandon(abandoned_id.0);
         }
         ProtocolOp::ExtendedRequest(extended_req) => {
             if !pool.start_operation(conn_id).await {
@@ -1009,11 +971,2655 @@ fn legacy_session_from_fsm(fsm_set: &ConnectionFsmSet) -> ConnectionSession {
     session
 }
 
-fn extract_request_controls(message: &LdapMessage<'_>) -> Result<RequestControls, String> {
-    active_fsm_control_registry()
-        .validate_request_controls(message.controls.as_deref())
-        .map(|validated| validated.into_accepted())
-        .map_err(|err| err.to_string())
+struct PreloadedSearchBackend {
+    candidates: Vec<String>,
+    entries: HashMap<String, SearchEntry>,
+}
+
+impl PreloadedSearchBackend {
+    fn new(entries: Vec<crate::backend::DirectoryEntry>) -> Self {
+        let mut candidates = Vec::with_capacity(entries.len());
+        let mut indexed_entries = HashMap::with_capacity(entries.len());
+
+        for entry in entries {
+            let normalized_dn = normalize_search_dn(&entry.dn);
+            if indexed_entries.contains_key(&normalized_dn) {
+                continue;
+            }
+
+            candidates.push(entry.dn.clone());
+            indexed_entries.insert(normalized_dn, directory_entry_to_search_entry(&entry));
+        }
+
+        Self {
+            candidates,
+            entries: indexed_entries,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SearchBackend for PreloadedSearchBackend {
+    async fn find_candidates(
+        &self,
+        _base_dn: &str,
+        _scope: i32,
+        _filter: &str,
+    ) -> Result<Vec<String>, String> {
+        Ok(self.candidates.clone())
+    }
+
+    async fn get_entry(
+        &self,
+        dn: &str,
+        _requested_attributes: &[String],
+    ) -> Result<Option<SearchEntry>, String> {
+        Ok(self.entries.get(&normalize_search_dn(dn)).cloned())
+    }
+
+    async fn entry_exists(&self, dn: &str) -> Result<bool, String> {
+        Ok(self.entries.contains_key(&normalize_search_dn(dn)))
+    }
+
+    async fn get_search_stats(&self, _base_dn: &str) -> Result<(usize, usize), String> {
+        Ok((self.entries.len(), 1))
+    }
+}
+
+async fn handle_search_request_with_fsm_runtime(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    search_req: ldap_parser::ldap::SearchRequest<'_>,
+    schema: &LdapSchema,
+    request_context: &RequestContext,
+    runtime_context: &FsmServerRuntimeContext,
+    legacy_operation_registry: &mut ConnectionOperationRegistry,
+) -> Result<(), String> {
+    if try_handle_virtual_search_request_with_fsm_runtime(
+        fsm_set,
+        request,
+        &search_req,
+        schema,
+        request_context,
+        runtime_context,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let manage_dsa_it = match parse_native_manage_dsa_it_request(&request.request_controls) {
+        Ok(manage_dsa_it) => manage_dsa_it,
+        Err(diagnostic) => {
+            send_request_result_response_with_referrals(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                search_req.base_object.0.as_ref().trim(),
+                &diagnostic,
+                &[],
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let requested_sort = match parse_native_server_side_sort_request(&request.request_controls) {
+        Ok(requested_sort) => requested_sort,
+        Err(error) => {
+            let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+            let session = legacy_session_from_fsm(fsm_set);
+            reject_native_server_side_sort_request(
+                fsm_set,
+                request,
+                request_context,
+                &session,
+                &base_dn,
+                error,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if requested_sort.is_some() {
+        increment_control_counter(request_context, "ldap_sort_requests_total", 1);
+    }
+    let paged_results = match parse_native_paged_results_request(&request.request_controls) {
+        Ok(paged_results) => paged_results,
+        Err(error) => {
+            let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+            let session = legacy_session_from_fsm(fsm_set);
+            reject_native_paged_search_request(
+                fsm_set,
+                request,
+                request_context,
+                &session,
+                &base_dn,
+                error,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if paged_results.is_some() {
+        increment_control_counter(request_context, "ldap_paged_search_requests_total", 1);
+    }
+    let requested_sync = match parse_sync_request_control(&request.request_controls) {
+        Ok(sync) => sync,
+        Err(error) => {
+            let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+            let stream = fsm_set
+                .connection_mut()
+                .stream_mut()
+                .ok_or("No active stream")?;
+            reject_sync_request(stream, request.message_id as u32, &base_dn, &error)
+                .await
+                .map_err(|err| err.to_string())?;
+            return Ok(());
+        }
+    };
+    if requested_sync.is_some() {
+        increment_control_counter(request_context, "ldap_sync_requests_total", 1);
+    }
+    if requested_sync.is_some() && paged_results.is_some() {
+        let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+        let err = SyncRequestError::Unsupported(
+            "sync request control cannot be combined with paged results".to_string(),
+        );
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        reject_sync_request(stream, request.message_id as u32, &base_dn, &err)
+            .await
+            .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+    if requested_sync.is_some() && requested_sort.is_some() {
+        let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+        let err = SyncRequestError::Unsupported(
+            "sync request control cannot be combined with server-side sort".to_string(),
+        );
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        reject_sync_request(stream, request.message_id as u32, &base_dn, &err)
+            .await
+            .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+    if let Some(control) = paged_results.as_ref() {
+        if control.size == 0 && control.cookie.is_empty() {
+            let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+            let session = legacy_session_from_fsm(fsm_set);
+            reject_native_paged_search_request(
+                fsm_set,
+                request,
+                request_context,
+                &session,
+                &base_dn,
+                NativePagedSearchError::ProtocolError(
+                    "paged results page size must be greater than zero on the initial request"
+                        .to_string(),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    let session = legacy_session_from_fsm(fsm_set);
+    let backend = fsm_set.backend().clone();
+    let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+    let attribute_selection: Vec<String> = search_req
+        .attributes
+        .iter()
+        .map(|attribute| attribute.0.as_ref().trim().to_owned())
+        .collect();
+
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_operation(
+            stream,
+            Some(backend.as_ref()),
+            request.message_id as u32,
+            ResponseOp::SearchDone,
+            &session,
+            request_context,
+            Permission::Search,
+            "search",
+            &base_dn,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    let effective_base_dn =
+        match resolve_search_base_dn(backend.as_ref(), &base_dn, search_req.deref_aliases).await {
+            Ok(dn) => dn,
+            Err((result_code, diagnostic)) => {
+                increment_control_counter(
+                    request_context,
+                    "ldap_search_alias_dereference_failures_total",
+                    1,
+                );
+                log_generic_audit_event(
+                    request_context,
+                    &session,
+                    AuditLevel::Warning,
+                    AuditEventType::Authorization,
+                    "search_alias_deref",
+                    false,
+                    Some(base_dn.as_str()),
+                    Some(diagnostic.as_str()),
+                    Vec::new(),
+                )
+                .await;
+                send_request_result_response_with_referrals(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    result_code,
+                    &base_dn,
+                    &diagnostic,
+                    &[],
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+    if let Some(sync_request) = requested_sync.as_ref() {
+        if !manage_dsa_it && search_req.scope == ldap_parser::ldap::SearchScope::BaseObject {
+            match backend.get_entry(&effective_base_dn).await {
+                Ok(Some(base_entry)) if directory_entry_is_referral(&base_entry) => {
+                    match referral_urls_for_entry(&base_entry) {
+                        Ok(referrals) => {
+                            increment_control_counter(
+                                request_context,
+                                "ldap_referral_results_total",
+                                1,
+                            );
+                            log_generic_audit_event(
+                                request_context,
+                                &session,
+                                AuditLevel::Info,
+                                AuditEventType::Authorization,
+                                "search_referral",
+                                true,
+                                Some(effective_base_dn.as_str()),
+                                Some("base search resolved to referral"),
+                                vec![("referral_count".to_string(), referrals.len().to_string())],
+                            )
+                            .await;
+                            send_request_result_response_with_referrals(
+                                fsm_set,
+                                request.message_id as u32,
+                                request.response_kind,
+                                ResultCode::Referral,
+                                &effective_base_dn,
+                                "search base is a referral",
+                                &referrals,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Err(diagnostic) => {
+                            increment_control_counter(
+                                request_context,
+                                "ldap_referral_processing_failures_total",
+                                1,
+                            );
+                            send_request_result_response(
+                                fsm_set,
+                                request.message_id as u32,
+                                request.response_kind,
+                                ResultCode::OperationsError,
+                                &diagnostic,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    send_request_result_response(
+                        fsm_set,
+                        request.message_id as u32,
+                        request.response_kind,
+                        map_backend_error_code(&err),
+                        backend_diagnostic(&err),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let search_deadline = if search_req.time_limit == 0 {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_secs(search_req.time_limit as u64))
+        };
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        handle_sync_search_request(
+            stream,
+            backend.as_ref(),
+            request.message_id as u32,
+            &search_req,
+            &effective_base_dn,
+            &attribute_selection,
+            sync_request,
+            manage_dsa_it,
+            &session,
+            legacy_operation_registry,
+            request_context,
+            search_deadline,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+
+    let search_signature = paged_results.as_ref().map(|_| {
+        SearchRequestSignature::from_request(
+            &base_dn,
+            &search_req,
+            &attribute_selection,
+            requested_sort.as_ref().map(|sort| sort.keys.as_slice()),
+        )
+    });
+    if let Some(control) = paged_results
+        .as_ref()
+        .filter(|control| !control.cookie.is_empty())
+    {
+        handle_native_paged_search_continuation(
+            fsm_set,
+            request,
+            request_context,
+            legacy_operation_registry,
+            control,
+            search_signature.as_ref().expect("paged search signature"),
+            &base_dn,
+            &attribute_selection,
+            search_req.types_only,
+            search_req.time_limit,
+            requested_sort.as_ref(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let search_started_at = Instant::now();
+    let mut preloaded_entries = match backend
+        .search_entries(&effective_base_dn, search_req.scope)
+        .await
+    {
+        Ok(entries) => entries,
+        Err(err) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                map_backend_error_code(&err),
+                backend_diagnostic(&err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    match resolve_plain_search_alias_candidates(
+        backend.as_ref(),
+        preloaded_entries,
+        search_req.deref_aliases,
+    )
+    .await
+    {
+        Ok(entries) => preloaded_entries = entries,
+        Err(error) => {
+            increment_control_counter(
+                request_context,
+                "ldap_search_alias_dereference_failures_total",
+                1,
+            );
+            log_generic_audit_event(
+                request_context,
+                &session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "search_alias_deref",
+                false,
+                Some(error.target_dn.as_str()),
+                Some(error.diagnostic.as_str()),
+                Vec::new(),
+            )
+            .await;
+            send_request_result_response_with_referrals(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                error.result_code,
+                &base_dn,
+                &error.diagnostic,
+                &[],
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    let mut search_references = Vec::new();
+    if !manage_dsa_it {
+        match prepare_plain_search_referrals(preloaded_entries, search_req.scope) {
+            Ok(PlainSearchReferralDisposition::BaseReferral { dn, referrals }) => {
+                increment_control_counter(request_context, "ldap_referral_results_total", 1);
+                log_generic_audit_event(
+                    request_context,
+                    &session,
+                    AuditLevel::Info,
+                    AuditEventType::Authorization,
+                    "search_referral",
+                    true,
+                    Some(dn.as_str()),
+                    Some("base search resolved to referral"),
+                    vec![("referral_count".to_string(), referrals.len().to_string())],
+                )
+                .await;
+                send_request_result_response_with_referrals(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    ResultCode::Referral,
+                    &dn,
+                    "search base is a referral",
+                    &referrals,
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(PlainSearchReferralDisposition::SearchEntries {
+                entries,
+                references,
+            }) => {
+                preloaded_entries = entries;
+                search_references = references;
+            }
+            Err(error) => {
+                increment_control_counter(
+                    request_context,
+                    "ldap_referral_processing_failures_total",
+                    1,
+                );
+                log_generic_audit_event(
+                    request_context,
+                    &session,
+                    AuditLevel::Warning,
+                    AuditEventType::Authorization,
+                    "search_referral",
+                    false,
+                    Some(error.target_dn.as_str()),
+                    Some(error.diagnostic.as_str()),
+                    Vec::new(),
+                )
+                .await;
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    ResultCode::OperationsError,
+                    &error.diagnostic,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+    if let Some(requested_sort) = requested_sort.as_ref() {
+        sort_native_search_entries(&mut preloaded_entries, requested_sort);
+    }
+
+    let effective_time_limit = match remaining_time_limit(search_started_at, search_req.time_limit)
+    {
+        Some(time_limit) => time_limit,
+        None => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::TimeLimitExceeded,
+                "time limit exceeded",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let filter = render_search_filter_string(&search_req.filter);
+    if let Some(control) = paged_results.as_ref() {
+        handle_native_paged_search_initial(
+            fsm_set,
+            request,
+            request_context,
+            legacy_operation_registry,
+            control,
+            search_signature.expect("paged search signature"),
+            &base_dn,
+            &attribute_selection,
+            search_req.types_only,
+            requested_sort.as_ref(),
+            preloaded_entries,
+            search_references,
+            &filter,
+            effective_time_limit,
+            search_req.size_limit,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut search_fsm = build_preloaded_search_fsm(
+        preloaded_entries,
+        runtime_context.metrics.clone(),
+        request.message_id as u32,
+        search_req.types_only,
+    );
+
+    let mut next_entry = match search_fsm
+        .handle_event(SearchEvent::StartSearch {
+            base_dn: effective_base_dn,
+            scope: search_req.scope.0 as i32,
+            filter,
+            attributes: attribute_selection,
+            size_limit: search_req.size_limit,
+            time_limit: effective_time_limit,
+        })
+        .await
+    {
+        Ok(next_entry) => next_entry,
+        Err(error) => {
+            let (result_code, diagnostic) = search_fsm_error_response(&error);
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                result_code,
+                &diagnostic,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    loop {
+        let Some(encoded_entry) = next_entry else {
+            emit_plain_search_references(fsm_set, request, request_context, &search_references)
+                .await?;
+            let response_controls =
+                native_search_done_controls(requested_sort.as_ref(), ResultCode::Success)?;
+            send_request_result_response_with_controls(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::Success,
+                "",
+                "",
+                &response_controls,
+            )
+            .await?;
+            return Ok(());
+        };
+
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        stream
+            .write_all(&encoded_entry)
+            .await
+            .map_err(|err| format!("Write error: {err}"))?;
+
+        next_entry = match search_fsm.handle_event(SearchEvent::EntryEmitted).await {
+            Ok(next_entry) => next_entry,
+            Err(error) => {
+                if matches!(
+                    error,
+                    SearchFsmError::SizeLimitExceeded | SearchFsmError::TimeLimitExceeded
+                ) {
+                    emit_plain_search_references(
+                        fsm_set,
+                        request,
+                        request_context,
+                        &search_references,
+                    )
+                    .await?;
+                }
+                let (result_code, diagnostic) = search_fsm_error_response(&error);
+                let response_controls =
+                    native_search_error_controls(requested_sort.as_ref(), &error)?;
+                send_request_result_response_with_controls(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    result_code,
+                    "",
+                    &diagnostic,
+                    &response_controls,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    }
+}
+
+enum PlainSearchReferralDisposition {
+    SearchEntries {
+        entries: Vec<crate::backend::DirectoryEntry>,
+        references: Vec<Vec<String>>,
+    },
+    BaseReferral {
+        dn: String,
+        referrals: Vec<String>,
+    },
+}
+
+struct PlainSearchReferralError {
+    target_dn: String,
+    diagnostic: String,
+}
+
+struct PlainSearchAliasError {
+    target_dn: String,
+    result_code: ResultCode,
+    diagnostic: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeServerSideSort {
+    keys: Vec<SortKey>,
+    critical: bool,
+}
+
+#[derive(Debug)]
+enum NativeServerSideSortError {
+    ProtocolError(String),
+    Unsupported {
+        result: ServerSideSortResultCode,
+        attribute_type: Option<String>,
+        diagnostic: String,
+        critical: bool,
+    },
+}
+
+#[derive(Debug)]
+enum NativePagedSearchError {
+    ProtocolError(String),
+    InvalidCookie(String),
+}
+
+impl NativePagedSearchError {
+    fn result_code(&self) -> ResultCode {
+        match self {
+            Self::ProtocolError(_) => ResultCode::ProtocolError,
+            Self::InvalidCookie(_) => ResultCode::UnwillingToPerform,
+        }
+    }
+
+    fn diagnostic(&self) -> &str {
+        match self {
+            Self::ProtocolError(message) | Self::InvalidCookie(message) => message.as_str(),
+        }
+    }
+}
+
+fn parse_native_paged_results_request(
+    request_controls: &crate::ldap_controls::RequestControls,
+) -> Result<Option<PagedResultsControl>, NativePagedSearchError> {
+    let control = request_controls
+        .singleton(PAGED_RESULTS_OID)
+        .map_err(|err| NativePagedSearchError::ProtocolError(err.to_string()))?;
+    let Some(control) = control else {
+        return Ok(None);
+    };
+
+    decode_paged_results_control(control.value())
+        .map(Some)
+        .map_err(|err| {
+            NativePagedSearchError::ProtocolError(format!("malformed paged results control: {err}"))
+        })
+}
+
+fn native_paged_results_response_control(
+    total_size: usize,
+    cookie: &[u8],
+) -> Result<LdapControl, String> {
+    let value = encode_paged_results_control(u32::try_from(total_size).unwrap_or(u32::MAX), cookie)
+        .map_err(|err| err.to_string())?;
+    Ok(LdapControl::new(PAGED_RESULTS_OID, false, Some(value)))
+}
+
+async fn reject_native_paged_search_request(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    base_dn: &str,
+    error: NativePagedSearchError,
+) -> Result<(), String> {
+    if matches!(error, NativePagedSearchError::InvalidCookie(_)) {
+        increment_control_counter(request_context, "ldap_paged_search_invalid_cookie_total", 1);
+    }
+
+    let error_kind = match &error {
+        NativePagedSearchError::ProtocolError(_) => "protocol_error",
+        NativePagedSearchError::InvalidCookie(_) => "invalid_cookie",
+    };
+    log_generic_audit_event(
+        request_context,
+        session,
+        AuditLevel::Warning,
+        AuditEventType::Authorization,
+        "paged_search",
+        false,
+        Some(base_dn),
+        Some(error.diagnostic()),
+        vec![("error_kind".to_string(), error_kind.to_string())],
+    )
+    .await;
+
+    send_request_result_response_with_controls(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        error.result_code(),
+        base_dn,
+        error.diagnostic(),
+        &[],
+    )
+    .await
+}
+
+fn parse_native_manage_dsa_it_request(
+    request_controls: &crate::ldap_controls::RequestControls,
+) -> Result<bool, String> {
+    let control = request_controls
+        .singleton(MANAGE_DSA_IT_OID)
+        .map_err(|err| err.to_string())?;
+    let Some(control) = control else {
+        return Ok(false);
+    };
+
+    if control.value().is_some() {
+        return Err("ManageDsaIT control must not include a controlValue".to_string());
+    }
+
+    Ok(true)
+}
+
+fn parse_native_server_side_sort_request(
+    request_controls: &crate::ldap_controls::RequestControls,
+) -> Result<Option<NativeServerSideSort>, NativeServerSideSortError> {
+    let control = request_controls
+        .singleton(SERVER_SIDE_SORT_REQUEST_OID)
+        .map_err(|err| NativeServerSideSortError::ProtocolError(err.to_string()))?;
+    let Some(control) = control else {
+        return Ok(None);
+    };
+
+    let decoded = decode_server_side_sort_request_control(control.value()).map_err(|err| {
+        NativeServerSideSortError::ProtocolError(format!(
+            "malformed server-side sort control: {err}"
+        ))
+    })?;
+    let requested_sort = NativeServerSideSort {
+        keys: decoded.keys,
+        critical: control.criticality(),
+    };
+    validate_native_server_side_sort_request(&requested_sort)?;
+
+    Ok(Some(requested_sort))
+}
+
+fn validate_native_server_side_sort_request(
+    requested_sort: &NativeServerSideSort,
+) -> Result<(), NativeServerSideSortError> {
+    let mut seen_attributes = std::collections::HashSet::new();
+    for key in &requested_sort.keys {
+        let normalized_attribute = key.attribute_type.to_ascii_lowercase();
+        if !seen_attributes.insert(normalized_attribute) {
+            return Err(NativeServerSideSortError::Unsupported {
+                result: ServerSideSortResultCode::UnwillingToPerform,
+                attribute_type: Some(key.attribute_type.clone()),
+                diagnostic: format!(
+                    "server-side sort attribute {} appears more than once",
+                    key.attribute_type
+                ),
+                critical: requested_sort.critical,
+            });
+        }
+
+        if key.ordering_rule.is_some() {
+            return Err(NativeServerSideSortError::Unsupported {
+                result: ServerSideSortResultCode::InappropriateMatching,
+                attribute_type: Some(key.attribute_type.clone()),
+                diagnostic: format!(
+                    "explicit ordering rule is not supported for {}",
+                    key.attribute_type
+                ),
+                critical: requested_sort.critical,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn reject_native_server_side_sort_request(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    base_dn: &str,
+    error: NativeServerSideSortError,
+) -> Result<(), String> {
+    match error {
+        NativeServerSideSortError::ProtocolError(diagnostic) => {
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "server_side_sort",
+                false,
+                Some(base_dn),
+                Some(diagnostic.as_str()),
+                vec![("error_kind".to_string(), "protocol_error".to_string())],
+            )
+            .await;
+            send_request_result_response_with_referrals(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                base_dn,
+                &diagnostic,
+                &[],
+            )
+            .await
+        }
+        NativeServerSideSortError::Unsupported {
+            result,
+            attribute_type,
+            diagnostic,
+            critical,
+        } => {
+            increment_control_counter(request_context, "ldap_sort_failures_total", 1);
+            if result == ServerSideSortResultCode::InappropriateMatching {
+                increment_control_counter(
+                    request_context,
+                    "ldap_sort_unsupported_ordering_rule_total",
+                    1,
+                );
+            }
+            log_generic_audit_event(
+                request_context,
+                session,
+                AuditLevel::Warning,
+                AuditEventType::Authorization,
+                "server_side_sort",
+                false,
+                Some(base_dn),
+                Some(diagnostic.as_str()),
+                vec![("error_kind".to_string(), "sort_failure".to_string())],
+            )
+            .await;
+
+            let sort_response =
+                native_server_side_sort_response_control(result, attribute_type.as_deref())?;
+            let result_code = if critical {
+                ResultCode::UnavailableCriticalExtension
+            } else {
+                ResultCode::Success
+            };
+            send_request_result_response_with_controls(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                result_code,
+                base_dn,
+                &diagnostic,
+                &[sort_response],
+            )
+            .await
+        }
+    }
+}
+
+fn native_server_side_sort_response_control(
+    result: ServerSideSortResultCode,
+    attribute_type: Option<&str>,
+) -> Result<LdapControl, String> {
+    let value = encode_server_side_sort_response_control(result, attribute_type)
+        .map_err(|err| err.to_string())?;
+    Ok(LdapControl::new(
+        SERVER_SIDE_SORT_RESPONSE_OID,
+        false,
+        Some(value),
+    ))
+}
+
+fn sort_native_search_entries(
+    entries: &mut [crate::backend::DirectoryEntry],
+    requested_sort: &NativeServerSideSort,
+) {
+    entries.sort_by(|left, right| {
+        for key in &requested_sort.keys {
+            let left_value = native_sort_value_for_key(left, key);
+            let right_value = native_sort_value_for_key(right, key);
+            let ordering = match (&left_value, &right_value) {
+                (Some(left_value), Some(right_value)) => left_value.cmp(right_value),
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+
+            let ordering = if key.reverse_order {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+
+        normalize_search_dn(&left.dn).cmp(&normalize_search_dn(&right.dn))
+    });
+}
+
+fn native_sort_value_for_key(
+    entry: &crate::backend::DirectoryEntry,
+    key: &SortKey,
+) -> Option<String> {
+    let attribute_name = key.attribute_type.to_ascii_lowercase();
+    entry
+        .attributes
+        .get(&attribute_name)
+        .and_then(|values| values.iter().map(|value| value.to_ascii_lowercase()).min())
+}
+
+fn native_search_done_controls(
+    requested_sort: Option<&NativeServerSideSort>,
+    result_code: ResultCode,
+) -> Result<Vec<LdapControl>, String> {
+    let Some(_requested_sort) = requested_sort else {
+        return Ok(Vec::new());
+    };
+
+    let sort_result = if result_code == ResultCode::TimeLimitExceeded {
+        ServerSideSortResultCode::TimeLimitExceeded
+    } else {
+        ServerSideSortResultCode::Success
+    };
+    Ok(vec![native_server_side_sort_response_control(
+        sort_result,
+        None,
+    )?])
+}
+
+fn native_search_error_controls(
+    requested_sort: Option<&NativeServerSideSort>,
+    error: &SearchFsmError,
+) -> Result<Vec<LdapControl>, String> {
+    match error {
+        SearchFsmError::SizeLimitExceeded => {
+            native_search_done_controls(requested_sort, ResultCode::SizeLimitExceeded)
+        }
+        SearchFsmError::TimeLimitExceeded => {
+            native_search_done_controls(requested_sort, ResultCode::TimeLimitExceeded)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_native_paged_search_continuation(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    operation_registry: &mut ConnectionOperationRegistry,
+    control: &PagedResultsControl,
+    search_signature: &SearchRequestSignature,
+    base_dn: &str,
+    attribute_selection: &[String],
+    types_only: bool,
+    requested_time_limit: u32,
+    requested_sort: Option<&NativeServerSideSort>,
+) -> Result<(), String> {
+    let Some(cursor) = operation_registry.paged_search(control.cookie.as_slice()) else {
+        let session = legacy_session_from_fsm(fsm_set);
+        reject_native_paged_search_request(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            base_dn,
+            NativePagedSearchError::InvalidCookie(
+                "paged results cookie is not valid for this search sequence".to_string(),
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    if &cursor.signature != search_signature {
+        let session = legacy_session_from_fsm(fsm_set);
+        reject_native_paged_search_request(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            base_dn,
+            NativePagedSearchError::InvalidCookie(
+                "paged results cookie does not match the active search sequence".to_string(),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if control.size == 0 {
+        operation_registry.remove_paged_search(control.cookie.as_slice());
+        increment_control_counter(request_context, "ldap_paged_search_abandoned_total", 1);
+        let response_control = native_paged_results_response_control(0, &[])?;
+        send_request_result_response_with_controls(
+            fsm_set,
+            request.message_id as u32,
+            request.response_kind,
+            ResultCode::Success,
+            base_dn,
+            "",
+            &[response_control],
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let total_size = operation_registry
+        .paged_search(control.cookie.as_slice())
+        .map(|cursor| cursor.total_size() as usize)
+        .unwrap_or_default();
+    let (page_entries, result_code, diagnostic, complete) = operation_registry
+        .paged_search_mut(control.cookie.as_slice())
+        .expect("paged search cursor must exist after validation")
+        .next_page(control.size as usize);
+    if complete {
+        operation_registry.remove_paged_search(control.cookie.as_slice());
+    }
+
+    let search_deadline = search_deadline_from_limit(requested_time_limit);
+    let (returned, time_limit_hit) = emit_native_search_entries(
+        fsm_set,
+        request.message_id as u32,
+        &page_entries,
+        attribute_selection,
+        types_only,
+        search_deadline,
+    )
+    .await?;
+    let _ = returned;
+    increment_control_counter(request_context, "ldap_paged_search_pages_total", 1);
+
+    let response_cookie = if complete || time_limit_hit {
+        if time_limit_hit {
+            operation_registry.remove_paged_search(control.cookie.as_slice());
+        }
+        Vec::new()
+    } else {
+        control.cookie.clone()
+    };
+    let response_control = native_paged_results_response_control(total_size, &response_cookie)?;
+    let (result_code, diagnostic) = if time_limit_hit {
+        (ResultCode::TimeLimitExceeded, "time limit exceeded")
+    } else {
+        (result_code, diagnostic)
+    };
+    let mut response_controls = vec![response_control];
+    response_controls.extend(native_search_done_controls(requested_sort, result_code)?);
+    send_request_result_response_with_controls(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        result_code,
+        base_dn,
+        diagnostic,
+        &response_controls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_native_paged_search_initial(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    operation_registry: &mut ConnectionOperationRegistry,
+    control: &PagedResultsControl,
+    search_signature: SearchRequestSignature,
+    base_dn: &str,
+    attribute_selection: &[String],
+    types_only: bool,
+    requested_sort: Option<&NativeServerSideSort>,
+    entries: Vec<crate::backend::DirectoryEntry>,
+    references: Vec<Vec<String>>,
+    filter: &str,
+    effective_time_limit: u32,
+    size_limit: u32,
+) -> Result<(), String> {
+    let search_deadline = search_deadline_from_limit(effective_time_limit);
+    let NativePagedSearchCollection {
+        mut entries,
+        size_limit_hit,
+        time_limit_hit,
+    } = match collect_native_paged_search_entries(entries, filter, size_limit, search_deadline) {
+        Ok(collection) => collection,
+        Err(diagnostic) => {
+            send_request_result_response_with_controls(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::Unavailable,
+                base_dn,
+                &diagnostic,
+                &[],
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let page_size = control.size as usize;
+    let total_size = entries.len();
+    let (page_entries, response_cookie, result_code, diagnostic) = if time_limit_hit {
+        (
+            entries.into_iter().take(page_size).collect::<Vec<_>>(),
+            Vec::new(),
+            ResultCode::TimeLimitExceeded,
+            "time limit exceeded",
+        )
+    } else if entries.len() > page_size {
+        let remaining_entries = entries.split_off(page_size);
+        let cursor = PagedSearchCursor::new(
+            search_signature,
+            total_size,
+            remaining_entries,
+            if size_limit_hit {
+                ResultCode::SizeLimitExceeded
+            } else {
+                ResultCode::Success
+            },
+            if size_limit_hit {
+                "size limit exceeded"
+            } else {
+                ""
+            },
+        );
+        let cookie = operation_registry.remember_paged_search(cursor);
+        increment_control_counter(request_context, "ldap_paged_search_sequences_total", 1);
+        (entries, cookie, ResultCode::Success, "")
+    } else if size_limit_hit {
+        (
+            entries,
+            Vec::new(),
+            ResultCode::SizeLimitExceeded,
+            "size limit exceeded",
+        )
+    } else {
+        (entries, Vec::new(), ResultCode::Success, "")
+    };
+
+    let (returned, emit_time_limit_hit) = emit_native_search_entries(
+        fsm_set,
+        request.message_id as u32,
+        &page_entries,
+        attribute_selection,
+        types_only,
+        search_deadline,
+    )
+    .await?;
+    let _ = returned;
+    emit_plain_search_references(fsm_set, request, request_context, &references).await?;
+    increment_control_counter(request_context, "ldap_paged_search_pages_total", 1);
+
+    let final_cookie = if emit_time_limit_hit {
+        if !response_cookie.is_empty() {
+            operation_registry.remove_paged_search(response_cookie.as_slice());
+        }
+        Vec::new()
+    } else {
+        response_cookie
+    };
+    let response_control = native_paged_results_response_control(total_size, &final_cookie)?;
+    let (result_code, diagnostic) = if emit_time_limit_hit {
+        (ResultCode::TimeLimitExceeded, "time limit exceeded")
+    } else {
+        (result_code, diagnostic)
+    };
+    let mut response_controls = vec![response_control];
+    response_controls.extend(native_search_done_controls(requested_sort, result_code)?);
+    send_request_result_response_with_controls(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        result_code,
+        base_dn,
+        diagnostic,
+        &response_controls,
+    )
+    .await
+}
+
+struct NativePagedSearchCollection {
+    entries: Vec<crate::backend::DirectoryEntry>,
+    size_limit_hit: bool,
+    time_limit_hit: bool,
+}
+
+fn collect_native_paged_search_entries(
+    entries: Vec<crate::backend::DirectoryEntry>,
+    filter: &str,
+    size_limit: u32,
+    search_deadline: Option<Instant>,
+) -> Result<NativePagedSearchCollection, String> {
+    let mut collected = Vec::new();
+    let mut returned_dns = HashSet::new();
+    let mut size_limit_hit = false;
+    let mut time_limit_hit = false;
+
+    for entry in entries {
+        if search_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            time_limit_hit = true;
+            break;
+        }
+
+        if !crate::ldap_filter_eval::matches_filter_string(&entry, filter)? {
+            continue;
+        }
+
+        if !returned_dns.insert(normalize_search_dn(&entry.dn)) {
+            continue;
+        }
+
+        if size_limit != 0 && collected.len() >= size_limit as usize {
+            size_limit_hit = true;
+            break;
+        }
+
+        collected.push(entry);
+    }
+
+    if !time_limit_hit && search_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        time_limit_hit = true;
+    }
+
+    Ok(NativePagedSearchCollection {
+        entries: collected,
+        size_limit_hit,
+        time_limit_hit,
+    })
+}
+
+fn search_deadline_from_limit(time_limit: u32) -> Option<Instant> {
+    (time_limit != 0).then(|| Instant::now() + Duration::from_secs(time_limit as u64))
+}
+
+async fn emit_native_search_entries(
+    fsm_set: &mut ConnectionFsmSet,
+    message_id: u32,
+    entries: &[crate::backend::DirectoryEntry],
+    attribute_selection: &[String],
+    types_only: bool,
+    search_deadline: Option<Instant>,
+) -> Result<(usize, bool), String> {
+    let formatter = ProductionEntryFormatter::with_request(message_id, types_only);
+    let mut pending_bytes = Vec::new();
+    let mut returned = 0usize;
+
+    for entry in entries {
+        if search_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+
+        let search_entry = directory_entry_to_search_entry(entry);
+        let encoded = formatter
+            .format_entry(&search_entry, attribute_selection)
+            .await?;
+        pending_bytes.extend_from_slice(&encoded);
+        returned += 1;
+
+        if search_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let stream = fsm_set
+                .connection_mut()
+                .stream_mut()
+                .ok_or("No active stream")?;
+            if !pending_bytes.is_empty() {
+                stream
+                    .write_all(&pending_bytes)
+                    .await
+                    .map_err(|err| format!("Write error: {err}"))?;
+            }
+            return Ok((returned, true));
+        }
+    }
+
+    if !pending_bytes.is_empty() {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        stream
+            .write_all(&pending_bytes)
+            .await
+            .map_err(|err| format!("Write error: {err}"))?;
+    }
+
+    Ok((
+        returned,
+        search_deadline.is_some_and(|deadline| Instant::now() >= deadline),
+    ))
+}
+
+async fn resolve_plain_search_alias_candidates(
+    backend: &dyn DirectoryBackend,
+    entries: Vec<crate::backend::DirectoryEntry>,
+    deref_aliases: ldap_parser::ldap::DerefAliases,
+) -> Result<Vec<crate::backend::DirectoryEntry>, PlainSearchAliasError> {
+    if !matches!(deref_aliases.0, 1 | 3) {
+        return Ok(entries);
+    }
+
+    let mut resolved_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let target_dn = entry.dn.clone();
+        let resolved = resolve_search_candidate_entry(backend, &entry, deref_aliases)
+            .await
+            .map_err(|(result_code, diagnostic)| PlainSearchAliasError {
+                target_dn,
+                result_code,
+                diagnostic,
+            })?;
+        resolved_entries.push(resolved);
+    }
+
+    Ok(resolved_entries)
+}
+
+fn prepare_plain_search_referrals(
+    entries: Vec<crate::backend::DirectoryEntry>,
+    scope: ldap_parser::ldap::SearchScope,
+) -> Result<PlainSearchReferralDisposition, PlainSearchReferralError> {
+    if scope == ldap_parser::ldap::SearchScope::BaseObject {
+        if let Some(entry) = entries
+            .first()
+            .filter(|entry| directory_entry_is_referral(entry))
+        {
+            let referrals =
+                referral_urls_for_entry(entry).map_err(|diagnostic| PlainSearchReferralError {
+                    target_dn: entry.dn.clone(),
+                    diagnostic,
+                })?;
+            return Ok(PlainSearchReferralDisposition::BaseReferral {
+                dn: entry.dn.clone(),
+                referrals,
+            });
+        }
+
+        return Ok(PlainSearchReferralDisposition::SearchEntries {
+            entries,
+            references: Vec::new(),
+        });
+    }
+
+    let mut searchable_entries = Vec::with_capacity(entries.len());
+    let mut references = Vec::new();
+    for entry in entries {
+        if directory_entry_is_referral(&entry) {
+            let referrals =
+                referral_urls_for_entry(&entry).map_err(|diagnostic| PlainSearchReferralError {
+                    target_dn: entry.dn.clone(),
+                    diagnostic,
+                })?;
+            references.push(referrals);
+        } else {
+            searchable_entries.push(entry);
+        }
+    }
+
+    Ok(PlainSearchReferralDisposition::SearchEntries {
+        entries: searchable_entries,
+        references,
+    })
+}
+
+async fn emit_plain_search_references(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    references: &[Vec<String>],
+) -> Result<(), String> {
+    if references.is_empty() {
+        return Ok(());
+    }
+
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
+        .ok_or("No active stream")?;
+    for referrals in references {
+        let encoded =
+            encode_search_reference_with_controls(request.message_id as u32, referrals, &[])
+                .map_err(|err| format!("Encode error: {err:?}"))?;
+        stream
+            .write_all(&encoded)
+            .await
+            .map_err(|err| format!("Write error: {err}"))?;
+    }
+    increment_control_counter(
+        request_context,
+        "ldap_search_references_total",
+        references.len() as u64,
+    );
+    Ok(())
+}
+
+async fn try_handle_virtual_search_request_with_fsm_runtime(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    search_req: &ldap_parser::ldap::SearchRequest<'_>,
+    schema: &LdapSchema,
+    request_context: &RequestContext,
+    runtime_context: &FsmServerRuntimeContext,
+) -> Result<bool, String> {
+    if search_req.scope != ldap_parser::ldap::SearchScope::BaseObject {
+        return Ok(false);
+    }
+
+    let base_dn = search_req.base_object.0.as_ref().trim();
+    if !base_dn.is_empty()
+        && !base_dn.eq_ignore_ascii_case(&runtime_context.legacy_runtime_config.subschema_dn)
+    {
+        return Ok(false);
+    }
+
+    if !native_search_control_oids_supported(&request.request_controls) {
+        return Ok(false);
+    }
+
+    let session = legacy_session_from_fsm(fsm_set);
+    let manage_dsa_it = match parse_native_manage_dsa_it_request(&request.request_controls) {
+        Ok(manage_dsa_it) => manage_dsa_it,
+        Err(diagnostic) => {
+            send_request_result_response_with_referrals(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                base_dn,
+                &diagnostic,
+                &[],
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+    if manage_dsa_it {
+        increment_control_counter(request_context, "ldap_manage_dsa_it_requests_total", 1);
+    }
+
+    let requested_sort = match parse_native_server_side_sort_request(&request.request_controls) {
+        Ok(requested_sort) => requested_sort,
+        Err(error) => {
+            reject_native_server_side_sort_request(
+                fsm_set,
+                request,
+                request_context,
+                &session,
+                base_dn,
+                error,
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+    if requested_sort.is_some() {
+        increment_control_counter(request_context, "ldap_sort_requests_total", 1);
+    }
+
+    let paged_results = match parse_native_paged_results_request(&request.request_controls) {
+        Ok(paged_results) => paged_results,
+        Err(error) => {
+            reject_native_paged_search_request(
+                fsm_set,
+                request,
+                request_context,
+                &session,
+                base_dn,
+                error,
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+    if paged_results.is_some() {
+        increment_control_counter(request_context, "ldap_paged_search_requests_total", 1);
+    }
+
+    let requested_sync = match parse_sync_request_control(&request.request_controls) {
+        Ok(requested_sync) => requested_sync,
+        Err(error) => {
+            let stream = fsm_set
+                .connection_mut()
+                .stream_mut()
+                .ok_or("No active stream")?;
+            reject_sync_request(stream, request.message_id as u32, base_dn, &error)
+                .await
+                .map_err(|err| err.to_string())?;
+            return Ok(true);
+        }
+    };
+    if requested_sync.is_some() {
+        increment_control_counter(request_context, "ldap_sync_requests_total", 1);
+        let error = SyncRequestError::Unsupported(
+            "sync request control is not supported for virtual search bases".to_string(),
+        );
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        reject_sync_request(stream, request.message_id as u32, base_dn, &error)
+            .await
+            .map_err(|err| err.to_string())?;
+        return Ok(true);
+    }
+
+    if let Some(control) = paged_results.as_ref() {
+        if control.size == 0 && control.cookie.is_empty() {
+            reject_native_paged_search_request(
+                fsm_set,
+                request,
+                request_context,
+                &session,
+                base_dn,
+                NativePagedSearchError::ProtocolError(
+                    "paged results page size must be greater than zero on the initial request"
+                        .to_string(),
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        if !control.cookie.is_empty() {
+            reject_native_paged_search_request(
+                fsm_set,
+                request,
+                request_context,
+                &session,
+                base_dn,
+                NativePagedSearchError::InvalidCookie(
+                    "paged results cookie is not valid for this search sequence".to_string(),
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
+
+    let requested_attributes: Vec<String> = search_req
+        .attributes
+        .iter()
+        .map(|attribute| attribute.0.as_ref().trim().to_owned())
+        .collect();
+
+    let available_attributes = if base_dn.is_empty() {
+        let supported_control_oids =
+            crate::fsm_request::active_fsm_control_registry().supported_control_oids();
+        match crate::search_protocol::build_root_dse_attributes(
+            fsm_set.backend().as_ref(),
+            &runtime_context.legacy_runtime_config.naming_contexts,
+            &runtime_context.legacy_runtime_config.subschema_dn,
+            request.is_secure,
+            runtime_context.tls_handler.is_some(),
+            &supported_control_oids,
+            &crate::search_protocol::supported_sasl_mechanisms(),
+        )
+        .await
+        {
+            Ok(attributes) => attributes,
+            Err(err) => {
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+    } else if base_dn.eq_ignore_ascii_case(&runtime_context.legacy_runtime_config.subschema_dn) {
+        crate::search_protocol::build_subschema_attributes(schema)
+    } else {
+        return Ok(false);
+    };
+
+    let selected_attributes = crate::search_protocol::select_virtual_attributes(
+        &available_attributes,
+        &requested_attributes,
+    );
+    let synthetic_entry = crate::backend::DirectoryEntry::new(base_dn, HashMap::new());
+    let encoded = crate::parser::encode_search_entry(
+        request.message_id as u32,
+        &synthetic_entry,
+        &selected_attributes,
+        search_req.types_only,
+    )
+    .map_err(|err| format!("failed to encode virtual search entry: {err:?}"))?;
+
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
+        .ok_or("No active stream")?;
+    stream
+        .write_all(&encoded)
+        .await
+        .map_err(|err| format!("Write error: {err}"))?;
+    let mut response_controls =
+        native_search_done_controls(requested_sort.as_ref(), ResultCode::Success)?;
+    if paged_results.is_some() {
+        response_controls.push(native_paged_results_response_control(1, &[])?);
+        increment_control_counter(request_context, "ldap_paged_search_pages_total", 1);
+    }
+    send_request_result_response_with_controls(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        ResultCode::Success,
+        "",
+        "",
+        &response_controls,
+    )
+    .await?;
+    Ok(true)
+}
+
+fn native_search_control_oids_supported(
+    request_controls: &crate::ldap_controls::RequestControls,
+) -> bool {
+    request_controls.iter().all(|control| {
+        control.oid().eq_ignore_ascii_case(MANAGE_DSA_IT_OID)
+            || control.oid().eq_ignore_ascii_case(PAGED_RESULTS_OID)
+            || control
+                .oid()
+                .eq_ignore_ascii_case(SERVER_SIDE_SORT_REQUEST_OID)
+            || control.oid().eq_ignore_ascii_case(SYNC_REQUEST_OID)
+    })
+}
+
+fn build_preloaded_search_fsm(
+    entries: Vec<crate::backend::DirectoryEntry>,
+    metrics: Option<Arc<MetricsCollector>>,
+    message_id: u32,
+    types_only: bool,
+) -> SearchFsmImpl {
+    let candidate_count = entries.len().max(1);
+    let config = SearchFsmConfig {
+        default_size_limit: u32::MAX,
+        default_time_limit: 0,
+        max_size_limit: u32::MAX,
+        max_time_limit: u32::MAX,
+        max_candidates: candidate_count,
+        candidate_batch_size: 100,
+        enable_caching: false,
+    };
+
+    let backend = Box::new(PreloadedSearchBackend::new(entries));
+    let filter_matcher = Box::new(ProductionFilterMatcher::new());
+    let entry_formatter = Box::new(ProductionEntryFormatter::with_request(
+        message_id, types_only,
+    ));
+    let mut fsm = SearchFsmImpl::with_config(backend, filter_matcher, entry_formatter, config);
+
+    if let Some(metrics) = metrics {
+        fsm = fsm.with_metrics(Box::new(ProductionSearchMetrics::new(metrics)));
+    }
+
+    fsm
+}
+
+fn search_fsm_error_response(error: &SearchFsmError) -> (ResultCode, String) {
+    match error {
+        SearchFsmError::InvalidParameters { message } => {
+            (ResultCode::ProtocolError, message.clone())
+        }
+        SearchFsmError::TimeLimitExceeded => (
+            ResultCode::TimeLimitExceeded,
+            "time limit exceeded".to_string(),
+        ),
+        SearchFsmError::SizeLimitExceeded => (
+            ResultCode::SizeLimitExceeded,
+            "size limit exceeded".to_string(),
+        ),
+        SearchFsmError::BackendError { message }
+        | SearchFsmError::FilterError { message }
+        | SearchFsmError::FormattingError { message }
+        | SearchFsmError::Generic { message } => (ResultCode::Unavailable, message.clone()),
+        SearchFsmError::Abandoned
+        | SearchFsmError::InvalidStateTransition { .. }
+        | SearchFsmError::NoActiveSearch => (ResultCode::OperationsError, error.to_string()),
+    }
+}
+
+fn directory_entry_to_search_entry(entry: &crate::backend::DirectoryEntry) -> SearchEntry {
+    let mut combined_attrs = entry.attributes.clone();
+    combined_attrs.extend(entry.operational_attributes.to_attributes());
+
+    SearchEntry {
+        dn: entry.dn.clone(),
+        attributes: combined_attrs,
+        object_classes: entry
+            .attributes
+            .get("objectclass")
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+fn normalize_search_dn(dn: &str) -> String {
+    dn.trim().to_ascii_lowercase()
+}
+
+fn remaining_time_limit(started_at: Instant, requested_time_limit: u32) -> Option<u32> {
+    if requested_time_limit == 0 {
+        return Some(0);
+    }
+
+    let elapsed = started_at.elapsed().as_secs();
+    if elapsed >= requested_time_limit as u64 {
+        None
+    } else {
+        Some(requested_time_limit - elapsed as u32)
+    }
+}
+
+fn render_search_filter_string(filter: &Filter<'_>) -> String {
+    match filter {
+        Filter::And(filters) => format!(
+            "(&{})",
+            filters
+                .iter()
+                .map(render_search_filter_string)
+                .collect::<String>()
+        ),
+        Filter::Or(filters) => format!(
+            "(|{})",
+            filters
+                .iter()
+                .map(render_search_filter_string)
+                .collect::<String>()
+        ),
+        Filter::Not(filter) => format!("(!{})", render_search_filter_string(filter)),
+        Filter::EqualityMatch(ava) => format!(
+            "({}={})",
+            ava.attribute_desc.0.as_ref(),
+            escape_filter_value(ava.assertion_value)
+        ),
+        Filter::Substrings(substring) => format!(
+            "({}={})",
+            substring.filter_type.0.as_ref(),
+            render_substring_filter(&substring.substrings)
+        ),
+        Filter::GreaterOrEqual(ava) => format!(
+            "({}>={})",
+            ava.attribute_desc.0.as_ref(),
+            escape_filter_value(ava.assertion_value)
+        ),
+        Filter::LessOrEqual(ava) => format!(
+            "({}<={})",
+            ava.attribute_desc.0.as_ref(),
+            escape_filter_value(ava.assertion_value)
+        ),
+        Filter::Present(attribute) => format!("({}=*)", attribute.0.as_ref()),
+        Filter::ApproxMatch(ava) => format!(
+            "({}~={})",
+            ava.attribute_desc.0.as_ref(),
+            escape_filter_value(ava.assertion_value)
+        ),
+        Filter::ExtensibleMatch(assertion) => {
+            let mut head = String::new();
+            if let Some(rule_type) = assertion.rule_type.as_ref() {
+                head.push_str(rule_type.0.as_ref());
+            }
+            if assertion.dn_attributes.unwrap_or(false) {
+                head.push_str(":dn");
+            }
+            if let Some(matching_rule) = assertion.matching_rule.as_ref() {
+                head.push(':');
+                head.push_str(matching_rule.0.as_ref());
+            }
+            format!(
+                "({}:={})",
+                head,
+                escape_filter_value(assertion.assertion_value.0.as_ref())
+            )
+        }
+    }
+}
+
+fn render_substring_filter(substrings: &[Substring<'_>]) -> String {
+    if substrings.is_empty() {
+        return "*".to_string();
+    }
+
+    let mut rendered = String::new();
+    if !matches!(substrings.first(), Some(Substring::Initial(_))) {
+        rendered.push('*');
+    }
+
+    for substring in substrings {
+        match substring {
+            Substring::Initial(value) => {
+                rendered.push_str(&escape_filter_value(value.0.as_ref()));
+            }
+            Substring::Any(value) => {
+                if !rendered.ends_with('*') {
+                    rendered.push('*');
+                }
+                rendered.push_str(&escape_filter_value(value.0.as_ref()));
+                rendered.push('*');
+            }
+            Substring::Final(value) => {
+                if !rendered.ends_with('*') {
+                    rendered.push('*');
+                }
+                rendered.push_str(&escape_filter_value(value.0.as_ref()));
+            }
+        }
+    }
+
+    rendered
+}
+
+fn escape_filter_value(value: &[u8]) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value {
+        match byte {
+            b'*' | b'(' | b')' | b'\\' | 0 => {
+                escaped.push_str(&format!("\\{:02x}", byte));
+            }
+            0x20..=0x7e => escaped.push(*byte as char),
+            _ => escaped.push_str(&format!("\\{:02x}", byte)),
+        }
+    }
+    escaped
+}
+
+async fn handle_delete_request_with_fsm_runtime(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    delete_req: ldap_parser::ldap::LdapDN<'_>,
+    request_context: &RequestContext,
+    runtime_context: &FsmServerRuntimeContext,
+) -> Result<(), String> {
+    let session = legacy_session_from_fsm(fsm_set);
+    let backend = fsm_set.backend().clone();
+    let dn = delete_req.0.as_ref().trim().to_owned();
+
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_operation(
+            stream,
+            Some(backend.as_ref()),
+            request.message_id as u32,
+            ResponseOp::Delete,
+            &session,
+            request_context,
+            Permission::Delete,
+            "delete",
+            &dn,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    let write_config = WriteFsmConfig {
+        strict_schema_validation: false,
+        enable_aci_checks: false,
+        enable_audit_logging: false,
+        ..WriteFsmConfig::default()
+    };
+
+    let mut write_fsm = WriteFsmImpl::with_config(
+        Box::new(
+            WriteBackendAdapter::new(backend).with_actor(session.bound_dn().map(str::to_string)),
+        ),
+        Box::new(PassthroughSchemaValidator),
+        Box::new(AllowAllWriteAciChecker),
+        write_config,
+    );
+
+    if let Some(bound_dn) = fsm_set.authenticated_dn() {
+        write_fsm = write_fsm.with_user_dn(bound_dn.to_string());
+    }
+    if let Some(metrics) = runtime_context.metrics.as_ref() {
+        write_fsm = write_fsm.with_metrics(Box::new(ProductionWriteMetrics::new(metrics.clone())));
+    }
+
+    if let Err(err) = write_fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Delete {
+            dn: dn.clone(),
+        }))
+        .await
+    {
+        return send_delete_write_fsm_error(fsm_set, request, request_context, &session, &dn, err)
+            .await;
+    }
+
+    if let Err(err) = write_fsm.handle_event(WriteEvent::ValidationComplete).await {
+        return send_delete_write_fsm_error(fsm_set, request, request_context, &session, &dn, err)
+            .await;
+    }
+
+    log_delete_audit_event(request_context, &session, &dn, true).await;
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        ResultCode::Success,
+        "",
+    )
+    .await
+}
+
+async fn handle_modify_request_with_fsm_runtime(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    modify_req: ldap_parser::ldap::ModifyRequest<'_>,
+    request_context: &RequestContext,
+    runtime_context: &FsmServerRuntimeContext,
+) -> Result<(), String> {
+    let session = legacy_session_from_fsm(fsm_set);
+    let backend = fsm_set.backend().clone();
+    let dn = modify_req.object.0.as_ref().trim().to_owned();
+    let modified_attributes: Vec<String> = modify_req
+        .changes
+        .iter()
+        .map(|change| change.modification.attr_type.0.to_ascii_lowercase())
+        .collect();
+    let encoded_changes = encode_modify_changes_for_write_fsm(&modify_req.changes);
+
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_operation(
+            stream,
+            Some(backend.as_ref()),
+            request.message_id as u32,
+            ResponseOp::Modify,
+            &session,
+            request_context,
+            Permission::Modify,
+            "modify",
+            &dn,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    let write_config = WriteFsmConfig {
+        strict_schema_validation: false,
+        enable_aci_checks: false,
+        enable_audit_logging: false,
+        ..WriteFsmConfig::default()
+    };
+
+    let mut write_fsm = WriteFsmImpl::with_config(
+        Box::new(
+            WriteBackendAdapter::new(backend).with_actor(session.bound_dn().map(str::to_string)),
+        ),
+        Box::new(PassthroughSchemaValidator),
+        Box::new(AllowAllWriteAciChecker),
+        write_config,
+    );
+
+    if let Some(bound_dn) = fsm_set.authenticated_dn() {
+        write_fsm = write_fsm.with_user_dn(bound_dn.to_string());
+    }
+    if let Some(metrics) = runtime_context.metrics.as_ref() {
+        write_fsm = write_fsm.with_metrics(Box::new(ProductionWriteMetrics::new(metrics.clone())));
+    }
+
+    if let Err(err) = write_fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Modify {
+            dn: dn.clone(),
+            changes: encoded_changes,
+        }))
+        .await
+    {
+        return send_modify_write_fsm_error(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            &dn,
+            &modified_attributes,
+            err,
+        )
+        .await;
+    }
+
+    if let Err(err) = write_fsm.handle_event(WriteEvent::ValidationComplete).await {
+        return send_modify_write_fsm_error(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            &dn,
+            &modified_attributes,
+            err,
+        )
+        .await;
+    }
+
+    log_modify_audit_event(
+        request_context,
+        &session,
+        &dn,
+        true,
+        &modified_attributes,
+        None,
+    )
+    .await;
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        ResultCode::Success,
+        "",
+    )
+    .await
+}
+
+async fn handle_add_request_with_fsm_runtime(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    add_req: ldap_parser::ldap::AddRequest<'_>,
+    schema: &LdapSchema,
+    request_context: &RequestContext,
+    runtime_context: &FsmServerRuntimeContext,
+) -> Result<(), String> {
+    let session = legacy_session_from_fsm(fsm_set);
+    let backend = fsm_set.backend().clone();
+    let dn = add_req.entry.0.as_ref().trim().to_owned();
+    let (entry, _) = build_entry_from_add_request(&dn, add_req.attributes);
+    let encoded_entry = encode_add_entry_for_write_fsm(&entry);
+
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_operation(
+            stream,
+            Some(backend.as_ref()),
+            request.message_id as u32,
+            ResponseOp::Add,
+            &session,
+            request_context,
+            Permission::Add,
+            "add",
+            &dn,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    let write_config = WriteFsmConfig {
+        enable_aci_checks: false,
+        enable_audit_logging: false,
+        ..WriteFsmConfig::default()
+    };
+
+    let mut write_fsm = WriteFsmImpl::with_config(
+        Box::new(
+            WriteBackendAdapter::new(backend).with_actor(session.bound_dn().map(str::to_string)),
+        ),
+        Box::new(LdapSchemaValidator::with_schema(schema.clone())),
+        Box::new(AllowAllWriteAciChecker),
+        write_config,
+    );
+
+    if let Some(bound_dn) = fsm_set.authenticated_dn() {
+        write_fsm = write_fsm.with_user_dn(bound_dn.to_string());
+    }
+    if let Some(metrics) = runtime_context.metrics.as_ref() {
+        write_fsm = write_fsm.with_metrics(Box::new(ProductionWriteMetrics::new(metrics.clone())));
+    }
+
+    if let Err(err) = write_fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::Add {
+            dn: dn.clone(),
+            entry: encoded_entry,
+        }))
+        .await
+    {
+        return send_add_write_fsm_error(fsm_set, request, request_context, &session, &dn, err)
+            .await;
+    }
+
+    if let Err(err) = write_fsm.handle_event(WriteEvent::ValidationComplete).await {
+        return send_add_write_fsm_error(fsm_set, request, request_context, &session, &dn, err)
+            .await;
+    }
+
+    log_add_audit_event(request_context, &session, &dn, true).await;
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        ResultCode::Success,
+        "",
+    )
+    .await
+}
+
+async fn handle_moddn_request_with_fsm_runtime(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    rename_req: ldap_parser::ldap::ModDnRequest<'_>,
+    request_context: &RequestContext,
+    runtime_context: &FsmServerRuntimeContext,
+) -> Result<(), String> {
+    let session = legacy_session_from_fsm(fsm_set);
+    let backend = fsm_set.backend().clone();
+    let dn = rename_req.entry.0.as_ref().trim().to_owned();
+    let new_rdn = rename_req.newrdn.0.as_ref().trim().to_owned();
+    let delete_old = rename_req.deleteoldrdn;
+    let new_superior = rename_req
+        .newsuperior
+        .map(|sup| sup.0.into_owned())
+        .filter(|sup| !sup.is_empty());
+    let new_dn = compute_new_dn(&dn, &new_rdn, new_superior.as_deref());
+
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_operation(
+            stream,
+            Some(backend.as_ref()),
+            request.message_id as u32,
+            ResponseOp::ModifyDn,
+            &session,
+            request_context,
+            Permission::Modify,
+            "modifydn",
+            &dn,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    let write_config = WriteFsmConfig {
+        strict_schema_validation: false,
+        enable_aci_checks: false,
+        enable_audit_logging: false,
+        ..WriteFsmConfig::default()
+    };
+
+    let mut write_fsm = WriteFsmImpl::with_config(
+        Box::new(
+            WriteBackendAdapter::new(backend).with_actor(session.bound_dn().map(str::to_string)),
+        ),
+        Box::new(PassthroughSchemaValidator),
+        Box::new(AllowAllWriteAciChecker),
+        write_config,
+    );
+
+    if let Some(bound_dn) = fsm_set.authenticated_dn() {
+        write_fsm = write_fsm.with_user_dn(bound_dn.to_string());
+    }
+    if let Some(metrics) = runtime_context.metrics.as_ref() {
+        write_fsm = write_fsm.with_metrics(Box::new(ProductionWriteMetrics::new(metrics.clone())));
+    }
+
+    if let Err(err) = write_fsm
+        .handle_event(WriteEvent::StartWrite(WriteOperation::ModifyDn {
+            dn: dn.clone(),
+            new_rdn: new_rdn.clone(),
+            delete_old,
+            new_superior: new_superior.clone(),
+        }))
+        .await
+    {
+        return send_moddn_write_fsm_error(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            &dn,
+            &new_dn,
+            err,
+        )
+        .await;
+    }
+
+    if let Err(err) = write_fsm.handle_event(WriteEvent::ValidationComplete).await {
+        return send_moddn_write_fsm_error(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            &dn,
+            &new_dn,
+            err,
+        )
+        .await;
+    }
+
+    log_moddn_audit_event(request_context, &session, &dn, &new_dn, true, None).await;
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        ResultCode::Success,
+        "",
+    )
+    .await
+}
+
+async fn handle_compare_request_with_fsm_runtime(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    compare_req: ldap_parser::ldap::CompareRequest<'_>,
+    request_context: &RequestContext,
+    runtime_context: &FsmServerRuntimeContext,
+) -> Result<(), String> {
+    let session = legacy_session_from_fsm(fsm_set);
+    let backend = fsm_set.backend().clone();
+    let dn = compare_req.entry.0.as_ref().trim().to_owned();
+    let attribute = compare_req.ava.attribute_desc.0.as_ref().trim().to_owned();
+    let assertion = compare_req.ava.assertion_value.to_vec();
+
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_operation(
+            stream,
+            Some(backend.as_ref()),
+            request.message_id as u32,
+            ResponseOp::Compare,
+            &session,
+            request_context,
+            Permission::Compare,
+            "compare",
+            &dn,
+            Some(&attribute),
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    let compare_config = CompareFsmConfig {
+        enable_access_control: false,
+        enable_metrics: runtime_context.metrics.is_some(),
+        ..CompareFsmConfig::default()
+    };
+
+    let mut compare_fsm = CompareFsmImpl::with_config(
+        Box::new(CompareBackendAdapter::new(backend)),
+        Box::new(ProductionAttributeComparator::new()),
+        Box::new(AllowAllCompareAccessControl),
+        compare_config,
+    );
+
+    if let Some(bound_dn) = fsm_set.authenticated_dn() {
+        compare_fsm = compare_fsm.with_user_dn(bound_dn.to_string());
+    }
+    if let Some(metrics) = runtime_context.metrics.as_ref() {
+        compare_fsm =
+            compare_fsm.with_metrics(Box::new(ProductionCompareMetrics::new(metrics.clone())));
+    }
+
+    if let Err(err) = compare_fsm
+        .handle_event(CompareEvent::StartCompare {
+            dn: dn.clone(),
+            attribute: attribute.clone(),
+            value: assertion,
+        })
+        .await
+    {
+        return send_compare_fsm_error(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            &dn,
+            &attribute,
+            err,
+        )
+        .await;
+    }
+
+    if let Err(err) = compare_fsm.handle_event(CompareEvent::EntryRead).await {
+        return send_compare_fsm_error(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            &dn,
+            &attribute,
+            err,
+        )
+        .await;
+    }
+
+    let result = compare_fsm
+        .result()
+        .ok_or_else(|| "compare FSM did not produce a result".to_string())?;
+
+    if let Err(err) = compare_fsm.handle_event(CompareEvent::ResultEmitted).await {
+        return send_compare_fsm_error(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            &dn,
+            &attribute,
+            err,
+        )
+        .await;
+    }
+
+    log_compare_audit(
+        request_context,
+        &session,
+        &dn,
+        &attribute,
+        true,
+        if result { "true" } else { "false" },
+        None,
+    )
+    .await;
+
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        if result {
+            ResultCode::CompareTrue
+        } else {
+            ResultCode::CompareFalse
+        },
+        "",
+    )
+    .await
+}
+
+fn compare_fsm_error_response(error: &CompareFsmError) -> (ResultCode, String) {
+    match error {
+        CompareFsmError::InvalidParameters { message } => {
+            (ResultCode::ProtocolError, message.clone())
+        }
+        CompareFsmError::NoSuchObject { .. } => {
+            (ResultCode::NoSuchObject, "no such object".to_string())
+        }
+        CompareFsmError::AccessDenied { message } => {
+            (ResultCode::InsufficientAccessRights, message.clone())
+        }
+        CompareFsmError::BackendError { message }
+        | CompareFsmError::ComparisonError { message }
+        | CompareFsmError::Generic { message } => (ResultCode::Unavailable, message.clone()),
+        CompareFsmError::InvalidStateTransition { .. } | CompareFsmError::NoActiveCompare => {
+            (ResultCode::OperationsError, error.to_string())
+        }
+        CompareFsmError::NoSuchAttribute { .. } => (ResultCode::CompareFalse, String::new()),
+    }
+}
+
+fn write_fsm_error_response(error: &WriteFsmError) -> (ResultCode, String) {
+    match error {
+        WriteFsmError::InvalidOperation { message } => (ResultCode::ProtocolError, message.clone()),
+        WriteFsmError::AccessDenied { message } => {
+            (ResultCode::InsufficientAccessRights, message.clone())
+        }
+        WriteFsmError::EntryAlreadyExists { .. } => (
+            ResultCode::EntryAlreadyExists,
+            "entry already exists".to_string(),
+        ),
+        WriteFsmError::NoSuchObject { .. } => {
+            (ResultCode::NoSuchObject, "no such object".to_string())
+        }
+        WriteFsmError::ConstraintViolation { message } => {
+            (ResultCode::ConstraintViolation, message.clone())
+        }
+        WriteFsmError::SchemaError { message } => {
+            (ResultCode::ObjectClassViolation, message.clone())
+        }
+        WriteFsmError::BackendError { message }
+        | WriteFsmError::TransactionError { message }
+        | WriteFsmError::Generic { message } => backend_write_fsm_error_response(message)
+            .unwrap_or_else(|| (ResultCode::Unavailable, message.clone())),
+        WriteFsmError::InvalidStateTransition { .. } | WriteFsmError::NoActiveOperation => {
+            (ResultCode::OperationsError, error.to_string())
+        }
+    }
+}
+
+fn backend_write_fsm_error_response(message: &str) -> Option<(ResultCode, String)> {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("entry already exists") {
+        return Some((
+            ResultCode::EntryAlreadyExists,
+            "entry already exists".to_string(),
+        ));
+    }
+    if normalized.contains("entry not found") || normalized.contains("no such object") {
+        return Some((ResultCode::NoSuchObject, "no such object".to_string()));
+    }
+    None
+}
+
+async fn send_compare_fsm_error(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    attribute: &str,
+    error: CompareFsmError,
+) -> Result<(), String> {
+    let (result_code, diagnostic) = compare_fsm_error_response(&error);
+
+    log_compare_audit(
+        request_context,
+        session,
+        dn,
+        attribute,
+        false,
+        "error",
+        if diagnostic.is_empty() {
+            None
+        } else {
+            Some(diagnostic.as_str())
+        },
+    )
+    .await;
+
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        result_code,
+        &diagnostic,
+    )
+    .await
+}
+
+async fn send_delete_write_fsm_error(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    error: WriteFsmError,
+) -> Result<(), String> {
+    let (result_code, diagnostic) = write_fsm_error_response(&error);
+
+    log_delete_audit_event(request_context, session, dn, false).await;
+
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        result_code,
+        &diagnostic,
+    )
+    .await
+}
+
+async fn send_add_write_fsm_error(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    error: WriteFsmError,
+) -> Result<(), String> {
+    let (result_code, diagnostic) = write_fsm_error_response(&error);
+
+    log_add_audit_event(request_context, session, dn, false).await;
+
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        result_code,
+        &diagnostic,
+    )
+    .await
+}
+
+async fn send_modify_write_fsm_error(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    modified_attributes: &[String],
+    error: WriteFsmError,
+) -> Result<(), String> {
+    let (result_code, diagnostic) = write_fsm_error_response(&error);
+
+    log_modify_audit_event(
+        request_context,
+        session,
+        dn,
+        false,
+        modified_attributes,
+        if diagnostic.is_empty() {
+            None
+        } else {
+            Some(diagnostic.as_str())
+        },
+    )
+    .await;
+
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        result_code,
+        &diagnostic,
+    )
+    .await
+}
+
+async fn send_moddn_write_fsm_error(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    dn: &str,
+    new_dn: &str,
+    error: WriteFsmError,
+) -> Result<(), String> {
+    let (result_code, diagnostic) = write_fsm_error_response(&error);
+
+    log_moddn_audit_event(
+        request_context,
+        session,
+        dn,
+        new_dn,
+        false,
+        if diagnostic.is_empty() {
+            None
+        } else {
+            Some(diagnostic.as_str())
+        },
+    )
+    .await;
+
+    send_request_result_response(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        result_code,
+        &diagnostic,
+    )
+    .await
 }
 
 fn map_backend_error_code(err: &crate::backend::BackendError) -> ResultCode {
@@ -1030,6 +3636,46 @@ fn backend_diagnostic(err: &crate::backend::BackendError) -> &'static str {
         crate::backend::BackendError::NotFound => "no such object",
         crate::backend::BackendError::Storage(_) => "backend failure",
     }
+}
+
+fn encode_modify_changes_for_write_fsm(changes: &[ldap_parser::ldap::Change<'_>]) -> Vec<u8> {
+    let mut encoded = String::new();
+
+    for change in changes {
+        let operation = match change.operation.0 {
+            0 => "add",
+            1 => "delete",
+            2 => "replace",
+            _ => "replace",
+        };
+        let attribute = change.modification.attr_type.0.to_ascii_lowercase();
+        encoded.push_str(&format!("{}: {}\n", operation, attribute));
+        for value in &change.modification.attr_vals {
+            encoded.push_str(&format!(
+                "{}: {}\n",
+                attribute,
+                String::from_utf8_lossy(value.0.as_ref())
+            ));
+        }
+    }
+
+    encoded.into_bytes()
+}
+
+fn encode_add_entry_for_write_fsm(entry: &crate::backend::DirectoryEntry) -> Vec<u8> {
+    let mut encoded = format!("dn: {}\n", entry.dn);
+    let mut attribute_names: Vec<_> = entry.attributes.keys().cloned().collect();
+    attribute_names.sort();
+
+    for attribute in attribute_names {
+        if let Some(values) = entry.attributes.get(&attribute) {
+            for value in values {
+                encoded.push_str(&format!("{}: {}\n", attribute, value));
+            }
+        }
+    }
+
+    encoded.into_bytes()
 }
 
 async fn send_extended_response_value(
@@ -1081,6 +3727,7 @@ async fn send_custom_extended_response_value(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_extended_request_with_fsm_runtime(
     fsm_set: &mut ConnectionFsmSet,
     message_id: u32,
@@ -1719,6 +4366,85 @@ async fn send_request_result_response(
     Ok(())
 }
 
+async fn send_request_result_response_with_controls(
+    fsm_set: &mut ConnectionFsmSet,
+    message_id: u32,
+    response_kind: FsmResponseKind,
+    result_code: ResultCode,
+    matched_dn: &str,
+    diagnostic: &str,
+    controls: &[LdapControl],
+) -> Result<(), String> {
+    use crate::parser::{encode_bind_response, encode_result_response_with_controls};
+
+    let response = match response_kind {
+        FsmResponseKind::Bind => {
+            encode_bind_response(message_id, result_code, matched_dn, diagnostic)
+                .map_err(|err| format!("Encode error: {err:?}"))?
+        }
+        FsmResponseKind::Result(op) => encode_result_response_with_controls(
+            message_id,
+            op,
+            result_code,
+            matched_dn,
+            diagnostic,
+            controls,
+        )
+        .map_err(|err| format!("Encode error: {err:?}"))?,
+        FsmResponseKind::None => return Ok(()),
+    };
+
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
+        .ok_or("No active stream")?;
+    stream
+        .write_all(&response)
+        .await
+        .map_err(|err| format!("Write error: {err}"))?;
+    Ok(())
+}
+
+async fn send_request_result_response_with_referrals(
+    fsm_set: &mut ConnectionFsmSet,
+    message_id: u32,
+    response_kind: FsmResponseKind,
+    result_code: ResultCode,
+    matched_dn: &str,
+    diagnostic: &str,
+    referrals: &[String],
+) -> Result<(), String> {
+    use crate::parser::encode_bind_response;
+
+    let response = match response_kind {
+        FsmResponseKind::Bind => {
+            encode_bind_response(message_id, result_code, matched_dn, diagnostic)
+                .map_err(|err| format!("Encode error: {err:?}"))?
+        }
+        FsmResponseKind::Result(op) => encode_result_response_with_referrals(
+            message_id,
+            op,
+            result_code,
+            matched_dn,
+            diagnostic,
+            referrals,
+            &[],
+        )
+        .map_err(|err| format!("Encode error: {err:?}"))?,
+        FsmResponseKind::None => return Ok(()),
+    };
+
+    let stream = fsm_set
+        .connection_mut()
+        .stream_mut()
+        .ok_or("No active stream")?;
+    stream
+        .write_all(&response)
+        .await
+        .map_err(|err| format!("Write error: {err}"))?;
+    Ok(())
+}
+
 async fn send_transport_unavailable(
     fsm_set: &mut ConnectionFsmSet,
     diagnostic: &str,
@@ -1825,16 +4551,31 @@ async fn audit_connection_closed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::MockBackend;
+    use crate::backend::{DirectoryEntry, MockBackend};
+    use crate::config::ServerConfig;
     use crate::extended_ops::oids;
+    use crate::replication_service::ReplicationService;
+    use crate::sync_controls::{
+        decode_sync_done_control, decode_sync_state_control, encode_sync_request_control,
+        SyncRefreshMode, SyncRequestControl, SyncStateControl, SyncStateType, SYNC_DONE_OID,
+        SYNC_STATE_OID,
+    };
     use ldap_parser::ldap::{ProtocolOp, ResultCode as ParserResultCode};
     use ldap_parser::parse_ldap_messages;
     use rasn::der;
     use rasn_ldap::{
-        Attribute, AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
-        Filter as RasnFilter, LdapMessage as RasnLdapMessage, ProtocolOp as RasnProtocolOp,
-        SearchRequest as RasnSearchRequest, SearchRequestDerefAliases, SearchRequestScope,
+        Attribute, AttributeDescription as RasnAttributeDescription,
+        AttributeValue as RasnAttributeValue,
+        AttributeValueAssertion as RasnAttributeValueAssertion,
+        AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
+        ChangeOperation as RasnChangeOperation, CompareRequest as RasnCompareRequest,
+        Control as RasnControl, Filter as RasnFilter, LdapMessage as RasnLdapMessage,
+        ModifyDnRequest as RasnModifyDnRequest, ModifyRequest as RasnModifyRequest,
+        ModifyRequestChanges as RasnModifyRequestChanges, PartialAttribute as RasnPartialAttribute,
+        ProtocolOp as RasnProtocolOp, SearchRequest as RasnSearchRequest,
+        SearchRequestDerefAliases, SearchRequestScope,
     };
+    use std::collections::HashMap;
     use tokio::time::timeout;
 
     async fn connected_stream_pair() -> (TcpStream, TcpStream) {
@@ -1862,43 +4603,291 @@ mod tests {
     }
 
     fn encode_root_dse_search_request(message_id: u32) -> Vec<u8> {
-        let search_request = RasnSearchRequest::new(
-            b"".to_vec().into(),
+        encode_search_request(
+            message_id,
+            "",
             SearchRequestScope::BaseObject,
+            RasnFilter::Present(b"objectClass".to_vec().into()),
+            &["supportedLDAPVersion"],
+            false,
+        )
+    }
+
+    fn encode_search_request(
+        message_id: u32,
+        base_dn: &str,
+        scope: SearchRequestScope,
+        filter: RasnFilter,
+        attributes: &[&str],
+        types_only: bool,
+    ) -> Vec<u8> {
+        let search_request = RasnSearchRequest::new(
+            base_dn.as_bytes().to_vec().into(),
+            scope,
             SearchRequestDerefAliases::NeverDerefAliases,
             0,
             0,
-            false,
-            RasnFilter::Present(b"objectClass".to_vec().into()),
-            vec![b"supportedLDAPVersion".to_vec().into()],
+            types_only,
+            filter,
+            attributes
+                .iter()
+                .map(|attribute| attribute.as_bytes().to_vec().into())
+                .collect(),
         );
         let message =
             RasnLdapMessage::new(message_id, RasnProtocolOp::SearchRequest(search_request));
         der::encode(&message).unwrap()
     }
 
-    fn encode_add_request(message_id: u32) -> Vec<u8> {
-        let attributes = vec![
-            Attribute::new(
-                b"objectClass".to_vec().into(),
-                vec![b"person".to_vec().into()].into_iter().collect(),
-            ),
-            Attribute::new(
-                b"cn".to_vec().into(),
-                vec![b"alice".to_vec().into()].into_iter().collect(),
-            ),
-            Attribute::new(
-                b"sn".to_vec().into(),
-                vec![b"User".to_vec().into()].into_iter().collect(),
-            ),
-        ]
-        .into_iter()
-        .collect();
+    fn encode_search_request_with_deref_aliases(
+        message_id: u32,
+        base_dn: &str,
+        scope: SearchRequestScope,
+        deref_aliases: SearchRequestDerefAliases,
+        filter: RasnFilter,
+        attributes: &[&str],
+    ) -> Vec<u8> {
+        let search_request = RasnSearchRequest::new(
+            base_dn.as_bytes().to_vec().into(),
+            scope,
+            deref_aliases,
+            0,
+            0,
+            false,
+            filter,
+            attributes
+                .iter()
+                .map(|attribute| attribute.as_bytes().to_vec().into())
+                .collect(),
+        );
+        let message =
+            RasnLdapMessage::new(message_id, RasnProtocolOp::SearchRequest(search_request));
+        der::encode(&message).unwrap()
+    }
+
+    fn encode_search_request_with_controls(
+        message_id: u32,
+        base_dn: &str,
+        scope: SearchRequestScope,
+        filter: RasnFilter,
+        attributes: &[&str],
+        types_only: bool,
+        controls: Vec<RasnControl>,
+    ) -> Vec<u8> {
+        let search_request = RasnSearchRequest::new(
+            base_dn.as_bytes().to_vec().into(),
+            scope,
+            SearchRequestDerefAliases::NeverDerefAliases,
+            0,
+            0,
+            types_only,
+            filter,
+            attributes
+                .iter()
+                .map(|attribute| attribute.as_bytes().to_vec().into())
+                .collect(),
+        );
+        let mut message =
+            RasnLdapMessage::new(message_id, RasnProtocolOp::SearchRequest(search_request));
+        message.controls = Some(controls.into_iter().collect());
+        der::encode(&message).unwrap()
+    }
+
+    fn manage_dsa_it_control() -> RasnControl {
+        RasnControl::new(MANAGE_DSA_IT_OID.as_bytes().to_vec().into(), true, None)
+    }
+
+    fn server_side_sort_control(attribute: &str, reverse_order: bool) -> RasnControl {
+        let value = crate::search_controls::encode_server_side_sort_request_control(&[SortKey {
+            attribute_type: attribute.to_string(),
+            ordering_rule: None,
+            reverse_order,
+        }])
+        .unwrap();
+        RasnControl::new(
+            SERVER_SIDE_SORT_REQUEST_OID.as_bytes().to_vec().into(),
+            true,
+            Some(value.into()),
+        )
+    }
+
+    fn paged_results_control(size: u32, cookie: &[u8]) -> RasnControl {
+        let value = crate::search_controls::encode_paged_results_control(size, cookie).unwrap();
+        RasnControl::new(
+            PAGED_RESULTS_OID.as_bytes().to_vec().into(),
+            false,
+            Some(value.into()),
+        )
+    }
+
+    fn sync_request_control(mode: SyncRefreshMode, cookie: Option<&[u8]>) -> RasnControl {
+        let value = encode_sync_request_control(&SyncRequestControl {
+            mode,
+            cookie: cookie.map(|cookie| cookie.to_vec()),
+            reload_hint: false,
+        })
+        .unwrap();
+        RasnControl::new(
+            SYNC_REQUEST_OID.as_bytes().to_vec().into(),
+            true,
+            Some(value.into()),
+        )
+    }
+
+    fn search_result_dns(messages: &[ldap_parser::ldap::LdapMessage<'_>]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match &message.protocol_op {
+                ProtocolOp::SearchResultEntry(entry) => {
+                    Some(entry.object_name.0.as_ref().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn response_sort_result(
+        messages: &[ldap_parser::ldap::LdapMessage<'_>],
+    ) -> crate::search_controls::ServerSideSortResponseControl {
+        let done = messages.last().expect("search done message");
+        let controls = done.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == SERVER_SIDE_SORT_RESPONSE_OID)
+            .expect("sort response control");
+        crate::search_controls::decode_server_side_sort_response_control(
+            control.control_value.as_deref(),
+        )
+        .unwrap()
+    }
+
+    fn response_paged_results(
+        messages: &[ldap_parser::ldap::LdapMessage<'_>],
+    ) -> crate::search_controls::PagedResultsControl {
+        let done = messages.last().expect("search done message");
+        let controls = done.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == PAGED_RESULTS_OID)
+            .expect("paged results response control");
+        crate::search_controls::decode_paged_results_control(control.control_value.as_deref())
+            .unwrap()
+    }
+
+    fn response_sync_state(message: &ldap_parser::ldap::LdapMessage<'_>) -> SyncStateControl {
+        let controls = message.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == SYNC_STATE_OID)
+            .expect("sync state response control");
+        decode_sync_state_control(control.control_value.as_deref()).unwrap()
+    }
+
+    fn response_sync_done(message: &ldap_parser::ldap::LdapMessage<'_>) {
+        let controls = message.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == SYNC_DONE_OID)
+            .expect("sync done response control");
+        decode_sync_done_control(control.control_value.as_deref()).unwrap();
+    }
+
+    fn encode_add_request_with_attributes(
+        message_id: u32,
+        dn: &str,
+        attributes: &[(&str, &[&str])],
+    ) -> Vec<u8> {
+        let attributes = attributes
+            .iter()
+            .map(|(name, values)| {
+                Attribute::new(
+                    name.as_bytes().to_vec().into(),
+                    values
+                        .iter()
+                        .map(|value| value.as_bytes().to_vec().into())
+                        .collect(),
+                )
+            })
+            .collect();
         let request = rasn_ldap::AddRequest {
-            entry: b"cn=alice,dc=example,dc=org".to_vec().into(),
+            entry: dn.as_bytes().to_vec().into(),
             attributes,
         };
         let message = RasnLdapMessage::new(message_id, RasnProtocolOp::AddRequest(request));
+        der::encode(&message).unwrap()
+    }
+
+    fn encode_add_request(message_id: u32) -> Vec<u8> {
+        encode_add_request_with_attributes(
+            message_id,
+            "cn=alice,dc=example,dc=org",
+            &[
+                ("objectClass", &["person"]),
+                ("cn", &["alice"]),
+                ("sn", &["User"]),
+            ],
+        )
+    }
+
+    fn encode_delete_request(message_id: u32, dn: &str) -> Vec<u8> {
+        let message = RasnLdapMessage::new(
+            message_id,
+            RasnProtocolOp::DelRequest(rasn_ldap::DelRequest(dn.as_bytes().to_vec().into())),
+        );
+        der::encode(&message).unwrap()
+    }
+
+    fn encode_modify_request(
+        message_id: u32,
+        dn: &str,
+        operation: RasnChangeOperation,
+        attribute: &str,
+        values: &[&str],
+    ) -> Vec<u8> {
+        let change = RasnModifyRequestChanges {
+            operation,
+            modification: RasnPartialAttribute::new(
+                RasnAttributeDescription::from(attribute.as_bytes().to_vec()),
+                values
+                    .iter()
+                    .map(|value| RasnAttributeValue::from(value.as_bytes().to_vec()))
+                    .collect(),
+            ),
+        };
+        let request = RasnModifyRequest {
+            object: dn.as_bytes().to_vec().into(),
+            changes: vec![change],
+        };
+        let message = RasnLdapMessage::new(message_id, RasnProtocolOp::ModifyRequest(request));
+        der::encode(&message).unwrap()
+    }
+
+    fn encode_modifydn_request(
+        message_id: u32,
+        dn: &str,
+        new_rdn: &str,
+        delete_old_rdn: bool,
+        new_superior: Option<&str>,
+    ) -> Vec<u8> {
+        let request = RasnModifyDnRequest {
+            entry: dn.as_bytes().to_vec().into(),
+            new_rdn: new_rdn.as_bytes().to_vec().into(),
+            delete_old_rdn,
+            new_superior: new_superior.map(|dn| dn.as_bytes().to_vec().into()),
+        };
+        let message = RasnLdapMessage::new(message_id, RasnProtocolOp::ModDnRequest(request));
+        der::encode(&message).unwrap()
+    }
+
+    fn encode_compare_request(message_id: u32, dn: &str, attribute: &str, value: &str) -> Vec<u8> {
+        let request = RasnCompareRequest {
+            entry: dn.as_bytes().to_vec().into(),
+            ava: RasnAttributeValueAssertion::new(
+                attribute.as_bytes().to_vec().into(),
+                value.as_bytes().to_vec().into(),
+            ),
+        };
+        let message = RasnLdapMessage::new(message_id, RasnProtocolOp::CompareRequest(request));
         der::encode(&message).unwrap()
     }
 
@@ -1932,7 +4921,7 @@ mod tests {
     }
 
     async fn spawn_test_connection(
-        backend: Arc<MockBackend>,
+        backend: Arc<dyn DirectoryBackend>,
     ) -> (tokio::task::JoinHandle<()>, TcpStream) {
         let config = FsmServerConfig {
             cleanup_interval: Duration::from_millis(50),
@@ -2106,6 +5095,993 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_connection_processes_root_dse_sort_control_natively() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                111,
+                "",
+                SearchRequestScope::BaseObject,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["supportedLDAPVersion"],
+                false,
+                vec![server_side_sort_control("supportedLDAPVersion", false)],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[0].protocol_op,
+            ProtocolOp::SearchResultEntry(_)
+        ));
+        let sort_result = response_sort_result(&messages);
+        assert_eq!(sort_result.result, ServerSideSortResultCode::Success);
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_root_dse_paged_search_natively() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                112,
+                "",
+                SearchRequestScope::BaseObject,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["supportedLDAPVersion"],
+                false,
+                vec![paged_results_control(1, &[])],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[0].protocol_op,
+            ProtocolOp::SearchResultEntry(_)
+        ));
+        let paged_result = response_paged_results(&messages);
+        assert_eq!(paged_result.size, 1);
+        assert!(paged_result.cookie.is_empty());
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_subschema_search_request() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                12,
+                "cn=Subschema",
+                SearchRequestScope::BaseObject,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn", "objectClass"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "cn=Subschema");
+                assert!(entry
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.attr_type.0.as_ref() == "cn"));
+                assert!(entry
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.attr_type.0.as_ref() == "objectClass"));
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        match &messages[1].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_plain_search_request() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["alice".to_string()]),
+                        ("mail".to_string(), vec!["alice@example.org".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=bob,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["bob".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                12,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::EqualityMatch(RasnAttributeValueAssertion::new(
+                    b"cn".to_vec().into(),
+                    b"alice".to_vec().into(),
+                )),
+                &["cn"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "cn=alice,dc=example,dc=org");
+                assert_eq!(entry.attributes.len(), 1);
+                assert_eq!(entry.attributes[0].attr_type.0.as_ref(), "cn");
+                assert_eq!(entry.attributes[0].attr_vals.len(), 1);
+                assert_eq!(entry.attributes[0].attr_vals[0].0.as_ref(), b"alice");
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        match &messages[1].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_extensible_match_search_natively() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["Alice".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                13,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::ExtensibleMatch(rasn_ldap::MatchingRuleAssertion::new(
+                    Some(b"caseIgnoreMatch".to_vec().into()),
+                    Some(b"cn".to_vec().into()),
+                    b"alice".to_vec().into(),
+                    false,
+                )),
+                &["cn"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=alice,dc=example,dc=org".to_string()]
+        );
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_types_only_search_request() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["alice".to_string()]),
+                        ("mail".to_string(), vec!["alice@example.org".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                13,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::EqualityMatch(RasnAttributeValueAssertion::new(
+                    b"cn".to_vec().into(),
+                    b"alice".to_vec().into(),
+                )),
+                &["cn", "mail"],
+                true,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "cn=alice,dc=example,dc=org");
+                assert_eq!(entry.attributes.len(), 2);
+                assert!(entry
+                    .attributes
+                    .iter()
+                    .all(|attr| attr.attr_vals.is_empty()));
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        match &messages[1].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_server_side_sort_search_natively() {
+        let backend = Arc::new(MockBackend::default());
+        for (dn, cn) in [
+            ("cn=bob,dc=example,dc=org", "bob"),
+            ("cn=alice,dc=example,dc=org", "alice"),
+            ("cn=charlie,dc=example,dc=org", "charlie"),
+        ] {
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        dn,
+                        HashMap::from([
+                            ("objectClass".to_string(), vec!["person".to_string()]),
+                            ("cn".to_string(), vec![cn.to_string()]),
+                        ]),
+                    ),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                14,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+                false,
+                vec![server_side_sort_control("cn", false)],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 4).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec![
+                "cn=alice,dc=example,dc=org".to_string(),
+                "cn=bob,dc=example,dc=org".to_string(),
+                "cn=charlie,dc=example,dc=org".to_string(),
+            ]
+        );
+        let sort_result = response_sort_result(&messages);
+        assert_eq!(sort_result.result, ServerSideSortResultCode::Success);
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_paged_search_natively() {
+        let backend = Arc::new(MockBackend::default());
+        for cn in ["alice", "bob", "charlie"] {
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        format!("cn={cn},dc=example,dc=org"),
+                        HashMap::from([
+                            ("objectClass".to_string(), vec!["person".to_string()]),
+                            ("cn".to_string(), vec![cn.to_string()]),
+                        ]),
+                    ),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                20,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+                false,
+                vec![paged_results_control(2, &[])],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 3).await;
+        let (_, first_page) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(search_result_dns(&first_page).len(), 2);
+        let first_page_control = response_paged_results(&first_page);
+        assert_eq!(first_page_control.size, 3);
+        assert!(!first_page_control.cookie.is_empty());
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                21,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+                false,
+                vec![paged_results_control(2, &first_page_control.cookie)],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, second_page) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(search_result_dns(&second_page).len(), 1);
+        let second_page_control = response_paged_results(&second_page);
+        assert_eq!(second_page_control.size, 3);
+        assert!(second_page_control.cookie.is_empty());
+        assert!(matches!(
+            second_page.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_sorted_paged_search_natively() {
+        let backend = Arc::new(MockBackend::default());
+        for cn in ["charlie", "alice", "bob"] {
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        format!("cn={cn},dc=example,dc=org"),
+                        HashMap::from([
+                            ("objectClass".to_string(), vec!["person".to_string()]),
+                            ("cn".to_string(), vec![cn.to_string()]),
+                        ]),
+                    ),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                22,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+                false,
+                vec![
+                    paged_results_control(2, &[]),
+                    server_side_sort_control("cn", false),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 3).await;
+        let (_, first_page) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(
+            search_result_dns(&first_page),
+            vec![
+                "cn=alice,dc=example,dc=org".to_string(),
+                "cn=bob,dc=example,dc=org".to_string(),
+            ]
+        );
+        assert_eq!(
+            response_sort_result(&first_page).result,
+            ServerSideSortResultCode::Success
+        );
+        let first_page_control = response_paged_results(&first_page);
+        assert!(!first_page_control.cookie.is_empty());
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                23,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+                false,
+                vec![
+                    paged_results_control(2, &first_page_control.cookie),
+                    server_side_sort_control("cn", false),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, second_page) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(
+            search_result_dns(&second_page),
+            vec!["cn=charlie,dc=example,dc=org".to_string()]
+        );
+        assert!(response_paged_results(&second_page).cookie.is_empty());
+        assert_eq!(
+            response_sort_result(&second_page).result,
+            ServerSideSortResultCode::Success
+        );
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_sync_refresh_only_search_natively() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=sync-user,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["sync-user".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(provider_backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                24,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+                false,
+                vec![sync_request_control(SyncRefreshMode::RefreshOnly, None)],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=sync-user,dc=example,dc=org".to_string()]
+        );
+        assert_eq!(
+            response_sync_state(&messages[0]).state,
+            SyncStateType::Present
+        );
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+        response_sync_done(messages.last().expect("sync done message"));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_manage_dsa_it_search_as_entry() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=referral,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["referral".to_string()]),
+                        (
+                            "ref".to_string(),
+                            vec!["ldap://remote.example.org/dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                14,
+                "cn=referral,dc=example,dc=org",
+                SearchRequestScope::BaseObject,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["objectClass", "ref"],
+                false,
+                vec![manage_dsa_it_control()],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(
+                    entry.object_name.0.as_ref(),
+                    "cn=referral,dc=example,dc=org"
+                );
+                assert!(entry
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.attr_type.0.as_ref() == "ref"));
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        match &messages[1].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_base_search_referral_natively() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=referral,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["referral".to_string()]),
+                        (
+                            "ref".to_string(),
+                            vec!["ldap://remote.example.org/dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                15,
+                "cn=referral,dc=example,dc=org",
+                SearchRequestScope::BaseObject,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["objectClass"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let decoded: RasnLdapMessage = der::decode(&response).unwrap();
+        match decoded.protocol_op {
+            RasnProtocolOp::SearchResDone(done) => {
+                assert_eq!(done.0.result_code, ResultCode::Referral);
+                let referrals = done.0.referral.expect("referral URLs");
+                let urls: Vec<String> = referrals
+                    .iter()
+                    .map(|value| String::from_utf8(value.to_vec()).expect("valid UTF-8 URL"))
+                    .collect();
+                assert_eq!(
+                    urls,
+                    vec!["ldap://remote.example.org/dc=example,dc=org".to_string()]
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_subtree_search_referral_reference_natively() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["alice".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=referral,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["referral".to_string()]),
+                        (
+                            "ref".to_string(),
+                            vec!["ldap://remote.example.org/dc=example,dc=org??sub".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                16,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 3).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 3);
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_))));
+        let reference = messages
+            .iter()
+            .find_map(|message| match &message.protocol_op {
+                ProtocolOp::SearchResultReference(refs) => Some(
+                    refs.iter()
+                        .map(|url| url.0.as_ref().to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .expect("search result reference");
+        assert_eq!(
+            reference,
+            vec!["ldap://remote.example.org/dc=example,dc=org??sub".to_string()]
+        );
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_search_dereferences_alias_base_natively() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=target,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["Target User".to_string()]),
+                        ("sn".to_string(), vec!["Target".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=alias,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectclass".to_string(), vec!["alias".to_string()]),
+                        ("cn".to_string(), vec!["Alias Entry".to_string()]),
+                        (
+                            "aliasedobjectname".to_string(),
+                            vec!["cn=target,dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_deref_aliases(
+                17,
+                "cn=alias,dc=example,dc=org",
+                SearchRequestScope::BaseObject,
+                SearchRequestDerefAliases::DerefFindingBaseObj,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "cn=target,dc=example,dc=org");
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_search_dereferences_alias_candidates_natively() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=target,ou=people,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["Target User".to_string()]),
+                        ("sn".to_string(), vec!["Target".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=external,ou=aliases,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectclass".to_string(), vec!["alias".to_string()]),
+                        ("cn".to_string(), vec!["External Alias".to_string()]),
+                        (
+                            "aliasedobjectname".to_string(),
+                            vec!["cn=target,ou=people,dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_deref_aliases(
+                18,
+                "ou=aliases,dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                SearchRequestDerefAliases::DerefAlways,
+                RasnFilter::EqualityMatch(RasnAttributeValueAssertion::new(
+                    b"sn".to_vec().into(),
+                    b"Target".to_vec().into(),
+                )),
+                &["cn"],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(
+                    entry.object_name.0.as_ref(),
+                    "cn=target,ou=people,dc=example,dc=org"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_search_deref_alias_loop_returns_loop_detect() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=loop-a,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectclass".to_string(), vec!["alias".to_string()]),
+                        ("cn".to_string(), vec!["Loop A".to_string()]),
+                        (
+                            "aliasedobjectname".to_string(),
+                            vec!["cn=loop-b,dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=loop-b,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectclass".to_string(), vec!["alias".to_string()]),
+                        ("cn".to_string(), vec!["Loop B".to_string()]),
+                        (
+                            "aliasedobjectname".to_string(),
+                            vec!["cn=loop-a,dc=example,dc=org".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_deref_aliases(
+                19,
+                "cn=loop-a,dc=example,dc=org",
+                SearchRequestScope::BaseObject,
+                SearchRequestDerefAliases::DerefAlways,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn"],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::LoopDetect);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn handle_connection_rejects_unauthenticated_add_request() {
         let backend = Arc::new(MockBackend::default());
         let (server_task, mut client_stream) = spawn_test_connection(backend).await;
@@ -2126,6 +6102,154 @@ mod tests {
                     result.result_code,
                     ParserResultCode::InsufficientAccessRights
                 );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_add_request_and_preserves_password() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend.clone()).await;
+
+        client_stream
+            .write_all(&encode_bind_request(13))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_add_request_with_attributes(
+                14,
+                "cn=add-me,dc=example,dc=org",
+                &[
+                    ("objectClass", &["person"]),
+                    ("cn", &["add-me"]),
+                    ("sn", &["User"]),
+                    ("userPassword", &["new-secret"]),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 14);
+        match &messages[0].protocol_op {
+            ProtocolOp::AddResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        assert!(backend
+            .get_entry("cn=add-me,dc=example,dc=org")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(backend
+            .authenticate("cn=add-me,dc=example,dc=org", b"new-secret")
+            .await
+            .unwrap());
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_add_duplicate_returns_entry_already_exists() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=duplicate,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["duplicate".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_bind_request(15))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_add_request_with_attributes(
+                16,
+                "cn=duplicate,dc=example,dc=org",
+                &[
+                    ("objectClass", &["person"]),
+                    ("cn", &["duplicate"]),
+                    ("sn", &["User"]),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 16);
+        match &messages[0].protocol_op {
+            ProtocolOp::AddResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::EntryAlreadyExists);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_add_invalid_entry_returns_object_class_violation() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_bind_request(17))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_add_request_with_attributes(
+                18,
+                "cn=invalid,dc=example,dc=org",
+                &[("objectClass", &["person"]), ("cn", &["invalid"])],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 18);
+        match &messages[0].protocol_op {
+            ProtocolOp::AddResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::ObjectClassViolation);
             }
             other => panic!("unexpected response: {:?}", other),
         }
@@ -2166,6 +6290,477 @@ mod tests {
             }
             other => panic!("unexpected response: {:?}", other),
         }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_compare_request() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=target,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["target".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_compare_request(
+                31,
+                "cn=target,dc=example,dc=org",
+                "cn",
+                "target",
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 31);
+        match &messages[0].protocol_op {
+            ProtocolOp::CompareResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::CompareTrue);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_compare_missing_attribute_returns_false() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=target,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["target".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_compare_request(
+                32,
+                "cn=target,dc=example,dc=org",
+                "telephoneNumber",
+                "+1-555-0100",
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 32);
+        match &messages[0].protocol_op {
+            ProtocolOp::CompareResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::CompareFalse);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_delete_request() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=delete-me,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["delete-me".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend.clone()).await;
+
+        client_stream
+            .write_all(&encode_bind_request(41))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_delete_request(42, "cn=delete-me,dc=example,dc=org"))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 42);
+        match &messages[0].protocol_op {
+            ProtocolOp::DelResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        assert!(backend
+            .get_entry("cn=delete-me,dc=example,dc=org")
+            .await
+            .unwrap()
+            .is_none());
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_delete_missing_entry_returns_no_such_object() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_bind_request(51))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_delete_request(52, "cn=missing,dc=example,dc=org"))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 52);
+        match &messages[0].protocol_op {
+            ProtocolOp::DelResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::NoSuchObject);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_modify_request() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=modify-me,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["modify-me".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        (
+                            "telephoneNumber".to_string(),
+                            vec!["+1-555-0100".to_string()],
+                        ),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend.clone()).await;
+
+        client_stream
+            .write_all(&encode_bind_request(43))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_modify_request(
+                44,
+                "cn=modify-me,dc=example,dc=org",
+                RasnChangeOperation::Replace,
+                "telephoneNumber",
+                &["+1-555-0199"],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 44);
+        match &messages[0].protocol_op {
+            ProtocolOp::ModifyResponse(result) => {
+                assert_eq!(result.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let stored = backend
+            .get_entry("cn=modify-me,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.attributes.get("telephonenumber"),
+            Some(&vec!["+1-555-0199".to_string()])
+        );
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_modify_missing_entry_returns_no_such_object() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_bind_request(53))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_modify_request(
+                54,
+                "cn=missing,dc=example,dc=org",
+                RasnChangeOperation::Replace,
+                "telephoneNumber",
+                &["+1-555-0199"],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 54);
+        match &messages[0].protocol_op {
+            ProtocolOp::ModifyResponse(result) => {
+                assert_eq!(result.result.result_code, ParserResultCode::NoSuchObject);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_processes_modifydn_request() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=rename-me,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["rename-me".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend.clone()).await;
+
+        client_stream
+            .write_all(&encode_bind_request(61))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_modifydn_request(
+                62,
+                "cn=rename-me,dc=example,dc=org",
+                "cn=renamed-user",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 62);
+        match &messages[0].protocol_op {
+            ProtocolOp::ModDnResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        assert!(backend
+            .get_entry("cn=rename-me,dc=example,dc=org")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(backend
+            .get_entry("cn=renamed-user,dc=example,dc=org")
+            .await
+            .unwrap()
+            .is_some());
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_modifydn_missing_entry_returns_no_such_object() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_bind_request(71))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_modifydn_request(
+                72,
+                "cn=missing,dc=example,dc=org",
+                "cn=renamed-missing",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 72);
+        match &messages[0].protocol_op {
+            ProtocolOp::ModDnResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::NoSuchObject);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_modifydn_conflict_returns_entry_already_exists() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=rename-source,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["rename-source".to_string()]),
+                        ("sn".to_string(), vec!["Source".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=rename-target,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["rename-target".to_string()]),
+                        ("sn".to_string(), vec!["Target".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend.clone()).await;
+
+        client_stream
+            .write_all(&encode_bind_request(81))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert_eq!(bind_messages.len(), 1);
+
+        client_stream
+            .write_all(&encode_modifydn_request(
+                82,
+                "cn=rename-source,dc=example,dc=org",
+                "cn=rename-target",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id.0, 82);
+        match &messages[0].protocol_op {
+            ProtocolOp::ModDnResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::EntryAlreadyExists);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        assert!(backend
+            .get_entry("cn=rename-source,dc=example,dc=org")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(backend
+            .get_entry("cn=rename-target,dc=example,dc=org")
+            .await
+            .unwrap()
+            .is_some());
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();

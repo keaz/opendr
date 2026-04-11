@@ -4,8 +4,9 @@ use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend, Operational
 use opendr::fsm::{SearchEvent, StateMachine};
 use opendr::metrics::{MetricsCollector, OperationType};
 use opendr::search_adapters::{
-    build_production_search_fsm, ProductionEntryFormatter, ProductionFilterMatcher,
-    ProductionSearchBackendAdapter, ProductionSearchMetrics,
+    build_production_search_fsm, build_production_search_fsm_with_message_id,
+    ProductionEntryFormatter, ProductionFilterMatcher, ProductionSearchBackendAdapter,
+    ProductionSearchMetrics,
 };
 use opendr::search_fsm::{
     EntryFormatter, FilterMatcher, SearchBackend, SearchEntry, SearchMetrics,
@@ -88,7 +89,7 @@ async fn production_filter_matcher_uses_real_filter_evaluation() {
 
 #[tokio::test]
 async fn production_entry_formatter_projects_and_encodes_entries() {
-    let formatter = ProductionEntryFormatter::new();
+    let formatter = ProductionEntryFormatter::with_message_id(41);
     let entry = test_search_entry();
 
     let encoded = formatter
@@ -98,6 +99,7 @@ async fn production_entry_formatter_projects_and_encodes_entries() {
 
     let (_, messages) = parse_ldap_messages(&encoded).unwrap();
     assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].message_id.0, 41);
 
     match &messages[0].protocol_op {
         ProtocolOp::SearchResultEntry(response) => {
@@ -195,4 +197,29 @@ async fn production_search_fsm_executes_real_searches() {
     let stats = metrics.get_operation_stats(OperationType::Search).unwrap();
     assert_eq!(stats.count, 1);
     assert_eq!(stats.success, 1);
+}
+
+#[tokio::test]
+async fn production_search_fsm_builder_uses_request_message_id() {
+    let backend = Arc::new(MockBackend::new());
+    let entry = test_directory_entry("cn=alice,dc=example,dc=org");
+    backend.add_entry(entry, Vec::new()).await.unwrap();
+
+    let mut fsm = build_production_search_fsm_with_message_id(backend, None, 73);
+    let result = fsm
+        .handle_event(SearchEvent::StartSearch {
+            base_dn: "dc=example,dc=org".to_string(),
+            scope: 2,
+            filter: "(cn=Alice)".to_string(),
+            attributes: vec!["cn".to_string()],
+            size_limit: 10,
+            time_limit: 30,
+        })
+        .await
+        .unwrap()
+        .expect("expected first search entry");
+
+    let (_, messages) = parse_ldap_messages(&result).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].message_id.0, 73);
 }

@@ -49,6 +49,12 @@ pub(crate) enum CompiledLdapFilter {
         attribute: String,
         value: String,
     },
+    Extensible {
+        attribute: Option<String>,
+        matching_rule: Option<String>,
+        value: String,
+        dn_attributes: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,9 +215,18 @@ impl CompiledLdapFilter {
                 attribute: ava.attribute_desc.0.to_ascii_lowercase(),
                 value: bytes_to_string(ava.assertion_value),
             }),
-            Filter::ExtensibleMatch(_) => {
-                Err("extensibleMatch filters are not supported".to_string())
-            }
+            Filter::ExtensibleMatch(assertion) => Ok(Self::Extensible {
+                attribute: assertion
+                    .rule_type
+                    .as_ref()
+                    .map(|attribute| attribute.0.to_ascii_lowercase()),
+                matching_rule: assertion
+                    .matching_rule
+                    .as_ref()
+                    .map(|rule| rule.0.to_ascii_lowercase()),
+                value: bytes_to_string(assertion.assertion_value.0.as_ref()),
+                dn_attributes: assertion.dn_attributes.unwrap_or(false),
+            }),
         }
     }
 
@@ -284,8 +299,7 @@ impl CompiledLdapFilter {
             Tag::Sequence(sequence)
                 if sequence.class == TagClass::Context && sequence.id == EXTENSIBLE_MATCH =>
             {
-                let _ = sequence;
-                Err("extensibleMatch filters are not supported".to_string())
+                parse_extensible_match_sequence(sequence)
             }
             other => Err(format!("unsupported LDAP filter tag: {:?}", other)),
         }
@@ -316,6 +330,18 @@ impl CompiledLdapFilter {
                         .any(|candidate| candidate.eq_ignore_ascii_case(value))
                 })
                 .unwrap_or(false),
+            Self::Extensible {
+                attribute,
+                matching_rule,
+                value,
+                dn_attributes,
+            } => matches_extensible(
+                entry,
+                attribute.as_deref(),
+                matching_rule.as_deref(),
+                value,
+                *dn_attributes,
+            ),
         }
     }
 }
@@ -394,6 +420,44 @@ fn parse_substring_part(tag: &Tag) -> Result<SubstringPart, String> {
     }
 }
 
+fn parse_extensible_match_sequence(
+    sequence: &lber::structures::Sequence,
+) -> Result<CompiledLdapFilter, String> {
+    let mut matching_rule = None;
+    let mut attribute = None;
+    let mut value = None;
+    let mut dn_attributes = false;
+
+    for tag in &sequence.inner {
+        match tag {
+            Tag::OctetString(octet) if octet.class == TagClass::Context && octet.id == 1 => {
+                matching_rule = Some(octet_string_value(octet).to_ascii_lowercase());
+            }
+            Tag::OctetString(octet) if octet.class == TagClass::Context && octet.id == 2 => {
+                attribute = Some(octet_string_value(octet).to_ascii_lowercase());
+            }
+            Tag::OctetString(octet) if octet.class == TagClass::Context && octet.id == 3 => {
+                value = Some(octet_string_value(octet));
+            }
+            Tag::Boolean(boolean) if boolean.class == TagClass::Context && boolean.id == 4 => {
+                dn_attributes = boolean.inner;
+            }
+            _ => return Err("unsupported extensibleMatch assertion component".to_string()),
+        }
+    }
+
+    if attribute.is_none() && matching_rule.is_none() {
+        return Err("extensibleMatch requires an attribute or matching rule".to_string());
+    }
+
+    Ok(CompiledLdapFilter::Extensible {
+        attribute,
+        matching_rule,
+        value: value.ok_or_else(|| "extensibleMatch requires an assertion value".to_string())?,
+        dn_attributes,
+    })
+}
+
 fn convert_search_substring(substring: &Substring<'_>) -> SubstringPart {
     match substring {
         Substring::Initial(segment) => SubstringPart::Initial(bytes_to_string(segment.0.as_ref())),
@@ -432,6 +496,89 @@ fn matches_substrings(values: &[String], parts: &[SubstringPart]) -> bool {
     }
 
     values.iter().any(|value| substring_matches(value, parts))
+}
+
+fn matches_extensible(
+    entry: &DirectoryEntry,
+    attribute: Option<&str>,
+    matching_rule: Option<&str>,
+    assertion: &str,
+    dn_attributes: bool,
+) -> bool {
+    if let Some(attribute) = attribute {
+        if attribute_values(entry, attribute)
+            .map(|values| {
+                values
+                    .iter()
+                    .any(|value| extensible_value_matches(value, assertion, matching_rule))
+            })
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        return dn_attributes
+            && dn_attribute_values(&entry.dn, Some(attribute))
+                .iter()
+                .any(|value| extensible_value_matches(value, assertion, matching_rule));
+    }
+
+    if entry.attributes.values().any(|values| {
+        values
+            .iter()
+            .any(|value| extensible_value_matches(value, assertion, matching_rule))
+    }) {
+        return true;
+    }
+
+    dn_attributes
+        && dn_attribute_values(&entry.dn, None)
+            .iter()
+            .any(|value| extensible_value_matches(value, assertion, matching_rule))
+}
+
+fn extensible_value_matches(candidate: &str, assertion: &str, matching_rule: Option<&str>) -> bool {
+    match matching_rule {
+        None | Some("caseexactmatch") | Some("2.5.13.5") => candidate == assertion,
+        Some("caseignorematch") | Some("2.5.13.2") => {
+            candidate.to_lowercase() == assertion.to_lowercase()
+        }
+        Some("distinguishednamematch") | Some("2.5.13.1") => {
+            normalize_dn_value(candidate) == normalize_dn_value(assertion)
+        }
+        Some("integermatch") | Some("2.5.13.14") => {
+            let candidate = candidate.trim().parse::<i64>();
+            let assertion = assertion.trim().parse::<i64>();
+            matches!((candidate, assertion), (Ok(candidate), Ok(assertion)) if candidate == assertion)
+        }
+        Some("booleanmatch")
+        | Some("2.5.13.13")
+        | Some("objectidentifiermatch")
+        | Some("2.5.13.0") => candidate.eq_ignore_ascii_case(assertion),
+        Some(_) => false,
+    }
+}
+
+fn dn_attribute_values(dn: &str, attribute: Option<&str>) -> Vec<String> {
+    dn.split(',')
+        .flat_map(|rdn| rdn.split('+'))
+        .filter_map(|ava| {
+            let (name, value) = ava.split_once('=')?;
+            match attribute {
+                Some(attribute) if !name.trim().eq_ignore_ascii_case(attribute) => None,
+                _ => Some(value.trim().to_string()),
+            }
+        })
+        .collect()
+}
+
+fn normalize_dn_value(value: &str) -> String {
+    value
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(",")
+        .to_ascii_lowercase()
 }
 
 fn substring_matches(value: &str, parts: &[SubstringPart]) -> bool {
@@ -507,9 +654,23 @@ mod tests {
     }
 
     #[test]
-    fn compile_filter_rejects_invalid_and_unsupported_filters() {
+    fn compile_filter_rejects_invalid_filters() {
         assert!(compile_filter("(objectClass=person").is_err());
-        assert!(compile_filter("(cn:caseExactMatch:=Alice)").is_err());
+        assert!(compile_filter("(:=Alice)").is_err());
+    }
+
+    #[test]
+    fn compile_filter_parses_extensible_match_filters() {
+        let exact = compile_filter("(cn:=Alice)").unwrap();
+        let ignore_case = compile_filter("(cn:caseIgnoreMatch:=ALICE)").unwrap();
+        let dn_attribute = compile_filter("(cn:dn:caseIgnoreMatch:=alice)").unwrap();
+        let unsupported_rule = compile_filter("(cn:unknownRule:=Alice)").unwrap();
+        let entry = test_entry("cn=alice,dc=example,dc=com", "person", "Alice");
+
+        assert!(exact.matches(&entry));
+        assert!(ignore_case.matches(&entry));
+        assert!(dn_attribute.matches(&entry));
+        assert!(!unsupported_rule.matches(&entry));
     }
 
     #[test]

@@ -459,13 +459,10 @@ impl ExtendedOpParser for StandardExtendedOpParser {
     }
 
     fn validate_operation(&self, operation: &ParsedOperation) -> Result<(), String> {
-        match &operation.operation_type {
-            ExtendedOperationType::Cancel => {
-                if !operation.parameters.contains_key("value") {
-                    return Err("Cancel requires value parameter (message ID)".to_string());
-                }
-            }
-            _ => {}
+        if operation.operation_type == ExtendedOperationType::Cancel
+            && !operation.parameters.contains_key("value")
+        {
+            return Err("Cancel requires value parameter (message ID)".to_string());
         }
         Ok(())
     }
