@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -90,7 +90,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_config(path: &PathBuf) -> Result<ServerConfig, opendr::config::ConfigError> {
+fn load_config(path: &Path) -> Result<ServerConfig, opendr::config::ConfigError> {
     ServerConfig::from_file(&path.to_string_lossy())
 }
 

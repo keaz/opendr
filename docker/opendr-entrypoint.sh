@@ -18,7 +18,13 @@ mkdir -p "${CONFIG_DIR}" "${CERT_DIR}" "${DATA_DIR}"
 : "${OPENDR_ROOT_PASSWORD:=PerfRootSecret123!}"
 : "${OPENDR_ORGANIZATION_NAME:=OpenDR Docker}"
 : "${OPENDR_LMDB_MAX_SIZE:=1073741824}"
-: "${OPENDR_LMDB_MAX_READERS:=126}"
+: "${OPENDR_LMDB_MAX_READERS:=256}"
+: "${OPENDR_MAX_CONNECTIONS:=512}"
+: "${OPENDR_MAX_CONNECTIONS_PER_IP:=256}"
+: "${OPENDR_MAX_OPERATIONS_PER_CONNECTION:=200}"
+: "${OPENDR_MAX_MEMORY_PER_CONNECTION:=10485760}"
+: "${OPENDR_MAX_TOTAL_MEMORY:=2147483648}"
+: "${OPENDR_CONNECTION_IDLE_TIMEOUT_SECS:=600}"
 
 if [[ ! -f "${CERT_DIR}/server.crt" || ! -f "${CERT_DIR}/server.key" ]]; then
   openssl req \
@@ -50,6 +56,14 @@ backend_type = "lmdb"
 data_directory = "./data"
 lmdb_max_size = ${OPENDR_LMDB_MAX_SIZE}
 lmdb_max_readers = ${OPENDR_LMDB_MAX_READERS}
+
+[resources]
+max_connections = ${OPENDR_MAX_CONNECTIONS}
+max_connections_per_ip = ${OPENDR_MAX_CONNECTIONS_PER_IP}
+max_operations_per_connection = ${OPENDR_MAX_OPERATIONS_PER_CONNECTION}
+max_memory_per_connection = ${OPENDR_MAX_MEMORY_PER_CONNECTION}
+max_total_memory = ${OPENDR_MAX_TOTAL_MEMORY}
+connection_idle_timeout_secs = ${OPENDR_CONNECTION_IDLE_TIMEOUT_SECS}
 
 [tls]
 enabled = true

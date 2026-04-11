@@ -105,7 +105,7 @@ If tests fail:
 **Purpose**: End-to-end performance run for a single OpenDR instance backed by LMDB.
 
 **What it measures**:
-1. LDAP operation latency and throughput for bind, search, compare, modify, password modify, add, modifyDN, and delete
+1. LDAP operation latency, throughput, success counts, failure counts, and failure rate for bind, search, compare, modify, password modify, add, modifyDN, and delete
 2. Server CPU usage sampled during the benchmark run
 3. Server memory usage (RSS) sampled during the benchmark run
 4. LMDB database size on disk before and after the run
@@ -144,7 +144,7 @@ If tests fail:
 2. Pulls `openidentityplatform/opendj:5.0.4`
 3. Runs both servers with `--cpus=2` and `--memory=4g`
 4. Executes the same StartTLS-enabled benchmark client against each load profile
-5. Captures latency, throughput, CPU, memory, database size, and record-count artifacts per run
+5. Captures latency, throughput, failure rate, CPU, memory, database size, record-count, and concurrent bind artifacts per run
 6. Produces a matrix-wide markdown and CSV comparison summary
 
 **Usage**:
@@ -161,17 +161,37 @@ If tests fail:
 ./scripts/perf_docker_matrix.sh \
   --products opendr \
   --benchmark-timeout 120
+
+# Targeted auth-concurrency comparison for high-login workloads
+./scripts/perf_docker_matrix.sh \
+  --profile-set concurrency \
+  --concurrent-bind-clients 1,4,8,16,32,64,128 \
+  --concurrent-bind-iterations 100 \
+  --concurrent-bind-valid-percent 90 \
+  --concurrent-bind-wrong-password-percent 5 \
+  --concurrent-bind-hot-user-percent 80 \
+  --concurrent-bind-hot-user-count 100 \
+  --concurrent-bind-operation-timeout-ms 5000
 ```
 
 **Profiles**:
 - `smoke`: very small validation run
 - `standard`: light, moderate, heavy
 - `full`: light, moderate, heavy, stress
+- `concurrency`: single `auth-concurrency` profile for focused concurrent bind comparison
 
 **Key options**:
 - `--cpu`: container CPU limit, default `2`
 - `--memory`: container memory limit, default `4g`
 - `--benchmark-timeout`: per-profile timeout budget in seconds, default `180`
+- `--concurrent-bind-clients`: comma-separated concurrent bind client levels, default disabled except `--profile-set concurrency`
+- `--concurrent-bind-iterations`: bind operations per concurrent client level, default `20`
+- `--concurrent-bind-warmup-iterations`: warmup binds per concurrent client before timed measurement, default `1`
+- `--concurrent-bind-operation-timeout-ms`: timeout for each concurrent probe connect or bind operation, default `5000`
+- `--concurrent-bind-valid-percent`: percent of auth-concurrency attempts using valid credentials, default `100`
+- `--concurrent-bind-wrong-password-percent`: percent of auth-concurrency attempts using wrong passwords; the remainder is unknown DN, default `0`
+- `--concurrent-bind-hot-user-percent`: percent of auth-concurrency attempts targeting the hot-user set, default `80`
+- `--concurrent-bind-hot-user-count`: number of hot users used by the auth-concurrency distribution, default `1`
 - `--products`: comma-separated subset of `opendr,opendj`
 
 **Artifacts**:

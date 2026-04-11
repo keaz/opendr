@@ -286,6 +286,39 @@ struct ResourceMetrics {
     idle_connection_evictions: AtomicU64,
 }
 
+#[derive(Debug, Default)]
+struct AuthCacheMetrics {
+    capacity: AtomicU64,
+    entries: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl AuthCacheMetrics {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record_snapshot(&self, capacity: u64, entries: u64, hits: u64, misses: u64, evictions: u64) {
+        self.capacity.store(capacity, Ordering::Relaxed);
+        self.entries.store(entries, Ordering::Relaxed);
+        self.hits.store(hits, Ordering::Relaxed);
+        self.misses.store(misses, Ordering::Relaxed);
+        self.evictions.store(evictions, Ordering::Relaxed);
+    }
+
+    fn get_stats(&self) -> AuthCacheStats {
+        AuthCacheStats {
+            capacity: self.capacity.load(Ordering::Relaxed),
+            entries: self.entries.load(Ordering::Relaxed),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl ResourceMetrics {
     fn new() -> Self {
         Self::default()
@@ -336,6 +369,15 @@ pub struct ResourceStats {
     pub rate_limit_blocks: u64,
     pub rate_limit_allows: u64,
     pub idle_connection_evictions: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthCacheStats {
+    pub capacity: u64,
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
 }
 
 impl ConnectionMetrics {
@@ -462,6 +504,8 @@ pub struct MetricsCollector {
     connections: ConnectionMetrics,
     /// Resource metrics
     resources: ResourceMetrics,
+    /// Authentication credential cache metrics
+    auth_cache: AuthCacheMetrics,
     /// FSM state distribution
     fsm_states: FsmStateTracker,
     /// Custom counters
@@ -483,6 +527,7 @@ impl MetricsCollector {
             operations,
             connections: ConnectionMetrics::new(),
             resources: ResourceMetrics::new(),
+            auth_cache: AuthCacheMetrics::new(),
             fsm_states: FsmStateTracker::new(),
             custom_counters: RwLock::new(HashMap::new()),
             custom_gauges: RwLock::new(HashMap::new()),
@@ -554,6 +599,22 @@ impl MetricsCollector {
     /// Get resource event statistics.
     pub fn get_resource_stats(&self) -> ResourceStats {
         self.resources.get_stats()
+    }
+
+    pub fn record_auth_cache_stats(
+        &self,
+        capacity: u64,
+        entries: u64,
+        hits: u64,
+        misses: u64,
+        evictions: u64,
+    ) {
+        self.auth_cache
+            .record_snapshot(capacity, entries, hits, misses, evictions);
+    }
+
+    pub fn get_auth_cache_stats(&self) -> AuthCacheStats {
+        self.auth_cache.get_stats()
     }
 
     /// Record FSM state
@@ -694,6 +755,56 @@ impl MetricsCollector {
         output.push_str(&format!(
             "ldap_resource_idle_connection_evictions_total {}\n",
             resource_stats.idle_connection_evictions
+        ));
+        output.push('\n');
+
+        // Authentication credential cache metrics
+        let auth_cache_stats = self.get_auth_cache_stats();
+        output.push_str(
+            "# HELP ldap_auth_cache_capacity Configured authentication credential cache capacity\n",
+        );
+        output.push_str("# TYPE ldap_auth_cache_capacity gauge\n");
+        output.push_str(&format!(
+            "ldap_auth_cache_capacity {}\n",
+            auth_cache_stats.capacity
+        ));
+        output.push('\n');
+
+        output.push_str(
+            "# HELP ldap_auth_cache_entries Current authentication credential cache entries\n",
+        );
+        output.push_str("# TYPE ldap_auth_cache_entries gauge\n");
+        output.push_str(&format!(
+            "ldap_auth_cache_entries {}\n",
+            auth_cache_stats.entries
+        ));
+        output.push('\n');
+
+        output.push_str("# HELP ldap_auth_cache_hits_total Authentication credential cache hits\n");
+        output.push_str("# TYPE ldap_auth_cache_hits_total counter\n");
+        output.push_str(&format!(
+            "ldap_auth_cache_hits_total {}\n",
+            auth_cache_stats.hits
+        ));
+        output.push('\n');
+
+        output.push_str(
+            "# HELP ldap_auth_cache_misses_total Authentication credential cache misses\n",
+        );
+        output.push_str("# TYPE ldap_auth_cache_misses_total counter\n");
+        output.push_str(&format!(
+            "ldap_auth_cache_misses_total {}\n",
+            auth_cache_stats.misses
+        ));
+        output.push('\n');
+
+        output.push_str(
+            "# HELP ldap_auth_cache_evictions_total Authentication credential cache evictions\n",
+        );
+        output.push_str("# TYPE ldap_auth_cache_evictions_total counter\n");
+        output.push_str(&format!(
+            "ldap_auth_cache_evictions_total {}\n",
+            auth_cache_stats.evictions
         ));
         output.push('\n');
 
@@ -914,6 +1025,7 @@ impl Default for MetricsCollector {
             operations,
             connections: ConnectionMetrics::new(),
             resources: ResourceMetrics::new(),
+            auth_cache: AuthCacheMetrics::new(),
             fsm_states: FsmStateTracker::new(),
             custom_counters: RwLock::new(HashMap::new()),
             custom_gauges: RwLock::new(HashMap::new()),
@@ -1079,6 +1191,32 @@ mod tests {
         assert!(output.contains("ldap_resource_rate_limit_blocks_total 1"));
         assert!(output.contains("ldap_resource_rate_limit_allows_total 1"));
         assert!(output.contains("ldap_resource_idle_connection_evictions_total 1"));
+    }
+
+    #[test]
+    fn test_auth_cache_metrics_and_export() {
+        let metrics = MetricsCollector::new();
+
+        metrics.record_auth_cache_stats(1000, 42, 7, 3, 2);
+
+        let stats = metrics.get_auth_cache_stats();
+        assert_eq!(
+            stats,
+            AuthCacheStats {
+                capacity: 1000,
+                entries: 42,
+                hits: 7,
+                misses: 3,
+                evictions: 2,
+            }
+        );
+
+        let output = metrics.export_prometheus();
+        assert!(output.contains("ldap_auth_cache_capacity 1000"));
+        assert!(output.contains("ldap_auth_cache_entries 42"));
+        assert!(output.contains("ldap_auth_cache_hits_total 7"));
+        assert!(output.contains("ldap_auth_cache_misses_total 3"));
+        assert!(output.contains("ldap_auth_cache_evictions_total 2"));
     }
 
     #[test]

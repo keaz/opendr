@@ -23,7 +23,7 @@
 //! - Indexed attribute lookups
 //! - DN normalization for fast case-insensitive searches
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,9 +41,13 @@ use crate::backend::{
     SearchCandidateHint,
 };
 use crate::csn::CsnGenerator;
+use crate::metrics::MetricsCollector;
 
 const LMDB_SET_RANGE_OP: u32 = 17;
 const DEFAULT_ENTRY_CACHE_CAPACITY: usize = 1000;
+const PRESENCE_INDEX_VALUE_SENTINEL: &str = "\0present";
+const PRESENCE_INDEX_VERSION: &[u8] = b"1";
+const PRESENCE_INDEX_MIGRATION_BATCH_SIZE: usize = 4096;
 
 /// Serialized entry structure for LMDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +408,8 @@ pub struct LmdbBackend {
     entry_cache: Arc<EntryCache>,
     /// Bounded cache for hot bind password hashes. Cleartext passwords and auth decisions are never cached.
     auth_cache: Arc<AuthCredentialCache>,
+    /// Optional production metrics collector for auth-cache snapshots.
+    metrics: Option<Arc<MetricsCollector>>,
     /// Database directory path
     _db_path: PathBuf,
     /// Configured maximum reader slots
@@ -520,6 +526,8 @@ impl LmdbBackend {
             attr_indexes.insert(attr.to_lowercase(), db);
         }
 
+        Self::ensure_presence_index_markers(&env, entries_db, metadata_db, &attr_indexes)?;
+
         // Initialize CSN generator with replica ID
         let csn_generator = Arc::new(CsnGenerator::new(replica_id));
 
@@ -534,6 +542,7 @@ impl LmdbBackend {
             write_lock: Arc::new(RwLock::new(())),
             entry_cache: Arc::new(EntryCache::new(entry_cache_capacity)),
             auth_cache: Arc::new(AuthCredentialCache::new(entry_cache_capacity)),
+            metrics: None,
             _db_path: db_path,
             max_readers,
             csn_generator,
@@ -622,6 +631,7 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
         self.auth_cache.invalidate(&normalized_dn);
+        self.record_auth_cache_metrics();
         Ok(())
     }
 
@@ -755,6 +765,7 @@ impl LmdbBackend {
             } else {
                 self.auth_cache.invalidate(&normalized_dn);
             }
+            self.record_auth_cache_metrics();
         }
         Ok(())
     }
@@ -902,6 +913,7 @@ impl LmdbBackend {
         } else {
             self.auth_cache.invalidate(&normalized_new_dn);
         }
+        self.record_auth_cache_metrics();
         Ok(())
     }
 
@@ -951,6 +963,7 @@ impl LmdbBackend {
         } else {
             self.auth_cache.invalidate(&normalized_dn);
         }
+        self.record_auth_cache_metrics();
         Ok(())
     }
 
@@ -1233,6 +1246,176 @@ impl LmdbBackend {
         format!("{}:", value)
     }
 
+    fn presence_index_key(dn: &str) -> String {
+        Self::equality_index_key(PRESENCE_INDEX_VALUE_SENTINEL, dn)
+    }
+
+    fn presence_index_prefix() -> String {
+        Self::equality_index_prefix(PRESENCE_INDEX_VALUE_SENTINEL)
+    }
+
+    fn presence_index_metadata_key(attribute: &str) -> String {
+        format!("presence_index_v1:{}", attribute)
+    }
+
+    fn ensure_presence_index_markers(
+        env: &Arc<Environment>,
+        entries_db: Database,
+        metadata_db: Database,
+        attr_indexes: &HashMap<String, Database>,
+    ) -> Result<(), BackendError> {
+        let pending_indexes = {
+            let txn = env.begin_ro_txn().map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to begin presence index version read txn: {}",
+                    e
+                ))
+            })?;
+            let mut pending = Vec::new();
+            for (attr, index_db) in attr_indexes {
+                let metadata_key = Self::presence_index_metadata_key(attr);
+                match txn.get(metadata_db, &metadata_key.as_bytes()) {
+                    Ok(value) if value == PRESENCE_INDEX_VERSION => {}
+                    Ok(_) | Err(lmdb::Error::NotFound) => {
+                        pending.push((attr.clone(), *index_db));
+                    }
+                    Err(e) => {
+                        return Err(BackendError::Storage(format!(
+                            "Failed to read presence index metadata for {}: {}",
+                            attr, e
+                        )))
+                    }
+                }
+            }
+            pending
+        };
+
+        if pending_indexes.is_empty() {
+            return Ok(());
+        }
+
+        let pending_by_attr = pending_indexes.iter().cloned().collect::<HashMap<_, _>>();
+        let mut last_key = None;
+
+        loop {
+            let mut markers = Vec::with_capacity(PRESENCE_INDEX_MIGRATION_BATCH_SIZE);
+            let mut batch_full = false;
+
+            {
+                let txn = env.begin_ro_txn().map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Failed to begin presence index migration read txn: {}",
+                        e
+                    ))
+                })?;
+                let mut cursor = txn.open_ro_cursor(entries_db).map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Failed to open entries cursor for presence index migration: {}",
+                        e
+                    ))
+                })?;
+
+                if let Some(last_key) = last_key.as_deref() {
+                    match cursor.get(Some(last_key), None, LMDB_SET_RANGE_OP) {
+                        Ok(_) => {}
+                        Err(lmdb::Error::NotFound) => break,
+                        Err(e) => {
+                            return Err(BackendError::Storage(format!(
+                                "Failed to seek entries cursor for presence index migration: {}",
+                                e
+                            )))
+                        }
+                    }
+                }
+
+                for (entry_key, entry_bytes) in cursor.iter() {
+                    last_key = Some(entry_key.to_vec());
+                    let entry: StoredEntry = bincode::deserialize(entry_bytes).map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to deserialize entry during presence index migration: {}",
+                            e
+                        ))
+                    })?;
+
+                    for (attr_name, values) in &entry.attributes {
+                        if values.is_empty() {
+                            continue;
+                        }
+                        let attr_lower = attr_name.to_lowercase();
+                        if let Some(index_db) = pending_by_attr.get(&attr_lower) {
+                            markers.push((*index_db, Self::presence_index_key(&entry.dn)));
+                        }
+                    }
+
+                    if markers.len() >= PRESENCE_INDEX_MIGRATION_BATCH_SIZE {
+                        batch_full = true;
+                        break;
+                    }
+                }
+            }
+
+            if markers.is_empty() {
+                break;
+            }
+
+            let mut txn = env.begin_rw_txn().map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to begin presence index migration write txn: {}",
+                    e
+                ))
+            })?;
+            for (index_db, marker_key) in markers {
+                txn.put(index_db, &marker_key.as_bytes(), &[], WriteFlags::empty())
+                    .map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to write migrated presence index marker: {}",
+                            e
+                        ))
+                    })?;
+            }
+            txn.commit().map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to commit presence index migration batch: {}",
+                    e
+                ))
+            })?;
+
+            if !batch_full {
+                break;
+            }
+        }
+
+        let mut txn = env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin presence index metadata write txn: {}",
+                e
+            ))
+        })?;
+        for (attr, _) in pending_indexes {
+            let metadata_key = Self::presence_index_metadata_key(&attr);
+            txn.put(
+                metadata_db,
+                &metadata_key.as_bytes(),
+                &PRESENCE_INDEX_VERSION,
+                WriteFlags::empty(),
+            )
+            .map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to mark presence index migration complete for {}: {}",
+                    attr, e
+                ))
+            })?;
+        }
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to commit presence index metadata update: {}",
+                e
+            ))
+        })?;
+
+        Ok(())
+    }
+
     fn collect_index_dns_by_prefix(
         cursor: &mut lmdb::RoCursor<'_>,
         prefix: &[u8],
@@ -1297,6 +1480,22 @@ impl LmdbBackend {
 
             // Check if this attribute is indexed
             if let Some(index_db) = indexes.get(&attr_lower) {
+                if !values.is_empty() {
+                    let presence_key = Self::presence_index_key(dn);
+                    txn.put(
+                        *index_db,
+                        &presence_key.as_bytes(),
+                        &[],
+                        WriteFlags::empty(),
+                    )
+                    .map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to update presence index for {}: {}",
+                            attr_name, e
+                        ))
+                    })?;
+                }
+
                 for value in values {
                     let value_lower = value.to_lowercase();
                     let index_key = Self::equality_index_key(&value_lower, dn);
@@ -1333,6 +1532,18 @@ impl LmdbBackend {
 
             // Check if this attribute is indexed
             if let Some(index_db) = indexes.get(&attr_lower) {
+                if !values.is_empty() {
+                    let presence_key = Self::presence_index_key(dn);
+                    txn.del(*index_db, &presence_key.as_bytes(), None)
+                        .or_else(|e| match e {
+                            lmdb::Error::NotFound => Ok(()),
+                            _ => Err(BackendError::Storage(format!(
+                                "Failed to remove presence index for {}: {}",
+                                attr_name, e
+                            ))),
+                        })?;
+                }
+
                 for value in values {
                     let value_lower = value.to_lowercase();
                     let index_key = Self::equality_index_key(&value_lower, dn);
@@ -1407,16 +1618,8 @@ impl LmdbBackend {
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
-        let mut results = HashSet::new();
-
-        for (key, _) in cursor.iter() {
-            let key = String::from_utf8_lossy(key);
-            if let Some((_, dn)) = key.split_once(':') {
-                results.insert(dn.to_string());
-            }
-        }
-
-        Ok(results.into_iter().collect())
+        let search_prefix = Self::presence_index_prefix();
+        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes())
     }
 
     fn load_entries_by_dns(
@@ -1472,6 +1675,24 @@ impl LmdbBackend {
     pub fn auth_cache_stats(&self) -> AuthCredentialCacheStats {
         self.auth_cache.stats()
     }
+
+    pub fn set_metrics(&mut self, metrics: Option<Arc<MetricsCollector>>) {
+        self.metrics = metrics;
+        self.record_auth_cache_metrics();
+    }
+
+    fn record_auth_cache_metrics(&self) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            let stats = self.auth_cache.stats();
+            metrics.record_auth_cache_stats(
+                stats.capacity as u64,
+                stats.len as u64,
+                stats.hits,
+                stats.misses,
+                stats.evictions,
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -1480,7 +1701,9 @@ impl DirectoryBackend for LmdbBackend {
         let normalized_dn = Self::normalize_dn(dn);
 
         if let Some(record) = self.auth_cache.get(&normalized_dn) {
-            return Ok(Self::verify_ssha512_record(password, &record));
+            let result = Self::verify_ssha512_record(password, &record);
+            self.record_auth_cache_metrics();
+            return Ok(result);
         }
 
         let txn = self
@@ -1495,6 +1718,7 @@ impl DirectoryBackend for LmdbBackend {
             Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
             Err(lmdb::Error::NotFound) => {
                 log::debug!("DN not found in index: {}", normalized_dn);
+                self.record_auth_cache_metrics();
                 return Ok(false);
             }
             Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
@@ -1506,14 +1730,18 @@ impl DirectoryBackend for LmdbBackend {
                 let stored_password_str = String::from_utf8_lossy(stored_password_bytes);
                 let Some(record) = Self::decode_ssha512_hash(&stored_password_str) else {
                     log::debug!("Unsupported password hash format for DN: {}", actual_dn);
+                    self.record_auth_cache_metrics();
                     return Ok(false);
                 };
                 let record = Arc::new(record);
                 self.auth_cache.insert(&normalized_dn, Arc::clone(&record));
-                Ok(Self::verify_ssha512_record(password, &record))
+                let result = Self::verify_ssha512_record(password, &record);
+                self.record_auth_cache_metrics();
+                Ok(result)
             }
             Err(lmdb::Error::NotFound) => {
                 log::debug!("Password not found for DN: {}", actual_dn);
+                self.record_auth_cache_metrics();
                 Ok(false)
             }
             Err(e) => Err(BackendError::Storage(format!(
@@ -1594,6 +1822,7 @@ impl DirectoryBackend for LmdbBackend {
 
         self.entry_cache.invalidate(&normalized_dn);
         self.auth_cache.invalidate(&normalized_dn);
+        self.record_auth_cache_metrics();
         Ok(())
     }
 
@@ -2244,6 +2473,18 @@ mod tests {
                 "uid=bob,dc=example,dc=org".to_string(),
             ]
         );
+
+        let indexes = backend.attr_indexes.try_read().unwrap();
+        let index_db = *indexes.get("mail").unwrap();
+        drop(indexes);
+        let txn = backend.env.begin_ro_txn().unwrap();
+        let mut cursor = txn.open_ro_cursor(index_db).unwrap();
+        let presence_prefix = LmdbBackend::presence_index_prefix();
+        let mut marker_results =
+            LmdbBackend::collect_index_dns_by_prefix(&mut cursor, presence_prefix.as_bytes())
+                .unwrap();
+        marker_results.sort();
+        assert_eq!(marker_results, results);
     }
 
     #[tokio::test]

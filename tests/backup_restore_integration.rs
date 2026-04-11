@@ -126,7 +126,7 @@ async fn incremental_backup_restores_changelog_entries_after_full_backup() {
     let restore_dir = root.path().join("restore-data");
     restore_backup_chain(
         &full_dir,
-        &[incremental_dir.clone()],
+        std::slice::from_ref(&incremental_dir),
         &restore_dir,
         false,
         false,
