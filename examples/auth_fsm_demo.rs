@@ -140,7 +140,7 @@ async fn demo_successful_authentication() -> Result<(), AuthError> {
 
     // Step 1: Start authentication
     println!("\n1️⃣ Starting bind request...");
-    let _result = auth_fsm
+    let result = auth_fsm
         .handle_event(AuthEvent::BindRequest {
             dn: "cn=alice,ou=people,dc=example,dc=org".to_string(),
             password: b"alice_password".to_vec(),
@@ -153,14 +153,8 @@ async fn demo_successful_authentication() -> Result<(), AuthError> {
     );
     assert!(matches!(
         auth_fsm.current_state(),
-        AuthState::Authenticating { .. }
+        AuthState::SimpleBound { .. }
     ));
-
-    // Step 2: Simulate successful authentication (in real usage, this would be triggered by backend)
-    println!("\n2️⃣ Processing authentication success...");
-    let result = auth_fsm
-        .handle_event(AuthEvent::AuthenticationSuccess)
-        .await?;
 
     println!("📊 Final state: {:?}", auth_fsm.current_state());
     println!("🔒 Authenticated: {}", auth_fsm.is_authenticated());
@@ -318,21 +312,15 @@ async fn demo_full_lifecycle() -> Result<(), AuthError> {
             password: b"alice_password".to_vec(),
         })
         .await?;
-    let _ = auth_fsm
-        .handle_event(AuthEvent::AuthenticationSuccess)
-        .await?;
     println!("   Authenticated as: {:?}", auth_fsm.authenticated_dn());
 
     // 3. Re-bind as different user
     println!("3️⃣ Re-binding as Admin...");
-    let _ = auth_fsm
+    let user_info = auth_fsm
         .handle_event(AuthEvent::BindRequest {
             dn: "cn=admin,dc=example,dc=org".to_string(),
             password: b"admin_secret".to_vec(),
         })
-        .await?;
-    let user_info = auth_fsm
-        .handle_event(AuthEvent::AuthenticationSuccess)
         .await?;
     println!("   Authenticated as: {:?}", auth_fsm.authenticated_dn());
 

@@ -70,6 +70,15 @@ pub struct EntryCacheStats {
     pub evictions: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthCredentialCacheStats {
+    pub capacity: usize,
+    pub len: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
 #[derive(Default)]
 struct EntryCacheState {
     entries: HashMap<String, StoredEntry>,
@@ -186,6 +195,163 @@ impl EntryCache {
     }
 }
 
+#[derive(Debug)]
+struct AuthCredentialRecord {
+    hash: [u8; 64],
+    salt: Vec<u8>,
+}
+
+#[derive(Default)]
+struct AuthCredentialCacheShard {
+    capacity: usize,
+    records: HashMap<String, Arc<AuthCredentialRecord>>,
+    lru: VecDeque<String>,
+}
+
+struct AuthCredentialCache {
+    capacity: usize,
+    shards: Vec<Mutex<AuthCredentialCacheShard>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl AuthCredentialCache {
+    const MAX_SHARDS: usize = 64;
+
+    fn new(capacity: usize) -> Self {
+        let shard_count = if capacity == 0 {
+            1
+        } else {
+            capacity.min(Self::MAX_SHARDS)
+        };
+        let base_capacity = capacity / shard_count;
+        let extra_capacity = capacity % shard_count;
+        let mut shards = Vec::with_capacity(shard_count);
+
+        for index in 0..shard_count {
+            shards.push(Mutex::new(AuthCredentialCacheShard {
+                capacity: base_capacity + usize::from(index < extra_capacity),
+                ..AuthCredentialCacheShard::default()
+            }));
+        }
+
+        Self {
+            capacity,
+            shards,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    fn get(&self, normalized_dn: &str) -> Option<Arc<AuthCredentialRecord>> {
+        if self.capacity == 0 {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let mut shard = self.lock_shard(normalized_dn);
+        let record = shard.records.get(normalized_dn).cloned();
+        match record {
+            Some(record) => {
+                Self::touch_key(&mut shard.lru, normalized_dn);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(record)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn insert(&self, normalized_dn: &str, record: Arc<AuthCredentialRecord>) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        let mut shard = self.lock_shard(normalized_dn);
+        if shard.capacity == 0 {
+            return;
+        }
+
+        if !shard.records.contains_key(normalized_dn) && shard.records.len() == shard.capacity {
+            while let Some(oldest_key) = shard.lru.pop_front() {
+                if oldest_key == normalized_dn {
+                    continue;
+                }
+                if shard.records.remove(&oldest_key).is_some() {
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+
+        shard.records.insert(normalized_dn.to_string(), record);
+        Self::touch_key(&mut shard.lru, normalized_dn);
+    }
+
+    fn invalidate(&self, normalized_dn: &str) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        let mut shard = self.lock_shard(normalized_dn);
+        if shard.records.remove(normalized_dn).is_some() {
+            Self::remove_key(&mut shard.lru, normalized_dn);
+        }
+    }
+
+    fn stats(&self) -> AuthCredentialCacheStats {
+        let mut len = 0;
+        for shard in &self.shards {
+            len += shard
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .records
+                .len();
+        }
+
+        AuthCredentialCacheStats {
+            capacity: self.capacity,
+            len,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    fn lock_shard(
+        &self,
+        normalized_dn: &str,
+    ) -> std::sync::MutexGuard<'_, AuthCredentialCacheShard> {
+        self.shards[self.shard_index(normalized_dn)]
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn shard_index(&self, normalized_dn: &str) -> usize {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in normalized_dn.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (hash as usize) % self.shards.len()
+    }
+
+    fn touch_key(lru: &mut VecDeque<String>, normalized_dn: &str) {
+        Self::remove_key(lru, normalized_dn);
+        lru.push_back(normalized_dn.to_string());
+    }
+
+    fn remove_key(lru: &mut VecDeque<String>, normalized_dn: &str) {
+        if let Some(position) = lru.iter().position(|existing| existing == normalized_dn) {
+            lru.remove(position);
+        }
+    }
+}
+
 impl StoredEntry {
     fn to_directory_entry(&self) -> DirectoryEntry {
         let mut entry = DirectoryEntry::new(self.dn.clone(), self.attributes.clone());
@@ -236,6 +402,8 @@ pub struct LmdbBackend {
     write_lock: Arc<RwLock<()>>,
     /// Bounded cache for hot exact-DN reads.
     entry_cache: Arc<EntryCache>,
+    /// Bounded cache for hot bind password hashes. Cleartext passwords and auth decisions are never cached.
+    auth_cache: Arc<AuthCredentialCache>,
     /// Database directory path
     _db_path: PathBuf,
     /// Configured maximum reader slots
@@ -365,6 +533,7 @@ impl LmdbBackend {
             index_config,
             write_lock: Arc::new(RwLock::new(())),
             entry_cache: Arc::new(EntryCache::new(entry_cache_capacity)),
+            auth_cache: Arc::new(AuthCredentialCache::new(entry_cache_capacity)),
             _db_path: db_path,
             max_readers,
             csn_generator,
@@ -452,6 +621,7 @@ impl LmdbBackend {
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
+        self.auth_cache.invalidate(&normalized_dn);
         Ok(())
     }
 
@@ -480,9 +650,13 @@ impl LmdbBackend {
         let mut entry: StoredEntry = bincode::deserialize(entry_bytes)
             .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
         let old_attributes = entry.attributes.clone();
+        let mut password_touched = false;
 
         for modification in modifications {
             let attribute = modification.attribute.to_lowercase();
+            if attribute == "userpassword" {
+                password_touched = true;
+            }
             match modification.operation {
                 ModifyOperation::Add => {
                     let existing = entry.attributes.entry(attribute).or_default();
@@ -532,27 +706,31 @@ impl LmdbBackend {
         )
         .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
 
-        if let Some(password_value) = entry
-            .attributes
-            .get("userpassword")
-            .and_then(|values| values.first())
-        {
-            let password_hash = Self::password_hash_from_value(password_value);
-            txn.put(
-                self.passwords_db,
-                &entry.dn.as_bytes(),
-                &password_hash.as_bytes(),
-                WriteFlags::empty(),
-            )
-            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
-        } else {
-            txn.del(self.passwords_db, &entry.dn.as_bytes(), None)
-                .or_else(|e| match e {
-                    lmdb::Error::NotFound => Ok(()),
-                    _ => Err(BackendError::Storage(
-                        "Failed to delete password".to_string(),
-                    )),
-                })?;
+        let mut updated_auth_record = None;
+        if password_touched {
+            if let Some(password_value) = entry
+                .attributes
+                .get("userpassword")
+                .and_then(|values| values.first())
+            {
+                let password_hash = Self::password_hash_from_value(password_value);
+                updated_auth_record = Self::decode_ssha512_hash(&password_hash).map(Arc::new);
+                txn.put(
+                    self.passwords_db,
+                    &entry.dn.as_bytes(),
+                    &password_hash.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+            } else {
+                txn.del(self.passwords_db, &entry.dn.as_bytes(), None)
+                    .or_else(|e| match e {
+                        lmdb::Error::NotFound => Ok(()),
+                        _ => Err(BackendError::Storage(
+                            "Failed to delete password".to_string(),
+                        )),
+                    })?;
+            }
         }
 
         self.remove_attribute_indexes(&mut txn, &entry.dn, &old_attributes)?;
@@ -571,6 +749,13 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
         self.entry_cache.invalidate(&normalized_dn);
+        if password_touched {
+            if let Some(record) = updated_auth_record {
+                self.auth_cache.insert(&normalized_dn, record);
+            } else {
+                self.auth_cache.invalidate(&normalized_dn);
+            }
+        }
         Ok(())
     }
 
@@ -683,7 +868,11 @@ impl LmdbBackend {
             WriteFlags::empty(),
         )
         .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
-        if let Some(password_hash) = password_hash {
+        let updated_auth_record = password_hash
+            .as_deref()
+            .and_then(Self::decode_ssha512_hash)
+            .map(Arc::new);
+        if let Some(password_hash) = password_hash.as_deref() {
             txn.put(
                 self.passwords_db,
                 &new_dn.as_bytes(),
@@ -707,6 +896,12 @@ impl LmdbBackend {
 
         self.entry_cache.invalidate(&normalized_dn);
         self.entry_cache.invalidate(&normalized_new_dn);
+        self.auth_cache.invalidate(&normalized_dn);
+        if let Some(record) = updated_auth_record {
+            self.auth_cache.insert(&normalized_new_dn, record);
+        } else {
+            self.auth_cache.invalidate(&normalized_new_dn);
+        }
         Ok(())
     }
 
@@ -751,6 +946,11 @@ impl LmdbBackend {
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
+        if let Some(record) = Self::decode_ssha512_hash(hashed_password).map(Arc::new) {
+            self.auth_cache.insert(&normalized_dn, record);
+        } else {
+            self.auth_cache.invalidate(&normalized_dn);
+        }
         Ok(())
     }
 
@@ -953,9 +1153,7 @@ impl LmdbBackend {
         )
     }
 
-    /// Verify SSHA512 password hash
-    /// Format: {SSHA512}base64(SHA512(password + salt) + salt)
-    fn verify_ssha512(password: &[u8], stored_hash: &str) -> bool {
+    fn decode_ssha512_hash(stored_hash: &str) -> Option<AuthCredentialRecord> {
         // Remove {SSHA512} prefix if present
         let hash_b64 = if let Some(stripped) = stored_hash.strip_prefix("{SSHA512}") {
             stripped
@@ -964,26 +1162,45 @@ impl LmdbBackend {
         };
 
         // Decode base64
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(hash_b64) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(hash_b64)
+            .ok()?;
 
         // SSHA512: first 64 bytes are SHA512 hash, remaining bytes are salt
         if decoded.len() < 64 {
-            return false;
+            return None;
         }
 
         let (stored_hash, salt) = decoded.split_at(64);
+        let mut hash = [0; 64];
+        hash.copy_from_slice(stored_hash);
 
+        Some(AuthCredentialRecord {
+            hash,
+            salt: salt.to_vec(),
+        })
+    }
+
+    fn verify_ssha512_record(password: &[u8], record: &AuthCredentialRecord) -> bool {
         // Hash the provided password with the stored salt
         let mut hasher = Sha512::new();
         hasher.update(password);
-        hasher.update(salt);
+        hasher.update(&record.salt);
         let computed_hash = hasher.finalize();
 
-        // Constant-time comparison
-        computed_hash.as_slice() == stored_hash
+        Self::constant_time_eq(&computed_hash, &record.hash)
+    }
+
+    fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+
+        let mut diff = 0;
+        for (left_byte, right_byte) in left.iter().zip(right) {
+            diff |= left_byte ^ right_byte;
+        }
+        diff == 0
     }
 
     fn password_hash_from_bytes(password: &[u8]) -> Option<String> {
@@ -1251,46 +1468,52 @@ impl LmdbBackend {
     pub fn entry_cache_stats(&self) -> EntryCacheStats {
         self.entry_cache.stats()
     }
+
+    pub fn auth_cache_stats(&self) -> AuthCredentialCacheStats {
+        self.auth_cache.stats()
+    }
 }
 
 #[async_trait]
 impl DirectoryBackend for LmdbBackend {
     async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError> {
+        let normalized_dn = Self::normalize_dn(dn);
+
+        if let Some(record) = self.auth_cache.get(&normalized_dn) {
+            return Ok(Self::verify_ssha512_record(password, &record));
+        }
+
         let txn = self
             .env
             .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
-        let normalized_dn = Self::normalize_dn(dn);
-        log::debug!(
-            "Authentication attempt - DN: {}, Normalized: {}",
-            dn,
-            normalized_dn
-        );
+        log::debug!("Authentication cache miss - DN: {dn}, Normalized: {normalized_dn}");
 
         // Get actual DN from index
         let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
             Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
             Err(lmdb::Error::NotFound) => {
-                log::warn!("DN not found in index: {}", normalized_dn);
+                log::debug!("DN not found in index: {}", normalized_dn);
                 return Ok(false);
             }
             Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
         };
-        log::debug!("Found actual DN: {}", actual_dn);
 
         // Get password hash
         match txn.get(self.passwords_db, &actual_dn.as_bytes()) {
             Ok(stored_password_bytes) => {
                 let stored_password_str = String::from_utf8_lossy(stored_password_bytes);
-                log::debug!("Found password hash for DN: {}", actual_dn);
-                // Verify SSHA512 hash
-                let result = Self::verify_ssha512(password, &stored_password_str);
-                log::debug!("Password verification result: {}", result);
-                Ok(result)
+                let Some(record) = Self::decode_ssha512_hash(&stored_password_str) else {
+                    log::debug!("Unsupported password hash format for DN: {}", actual_dn);
+                    return Ok(false);
+                };
+                let record = Arc::new(record);
+                self.auth_cache.insert(&normalized_dn, Arc::clone(&record));
+                Ok(Self::verify_ssha512_record(password, &record))
             }
             Err(lmdb::Error::NotFound) => {
-                log::warn!("Password not found for DN: {}", actual_dn);
+                log::debug!("Password not found for DN: {}", actual_dn);
                 Ok(false)
             }
             Err(e) => Err(BackendError::Storage(format!(
@@ -1370,6 +1593,7 @@ impl DirectoryBackend for LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
         self.entry_cache.invalidate(&normalized_dn);
+        self.auth_cache.invalidate(&normalized_dn);
         Ok(())
     }
 
@@ -1614,6 +1838,246 @@ mod tests {
             .unwrap());
         assert!(!backend
             .authenticate("cn=test,dc=example,dc=org", b"wrong")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_auth_cache_records_hits_on_repeated_binds() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+        let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
+        backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
+
+        assert_eq!(backend.auth_cache_stats().len, 0);
+        assert!(backend
+            .authenticate("cn=cached,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+        let after_first_bind = backend.auth_cache_stats();
+        assert_eq!(after_first_bind.hits, 0);
+        assert_eq!(after_first_bind.misses, 1);
+        assert_eq!(after_first_bind.len, 1);
+
+        assert!(backend
+            .authenticate("CN=CACHED,DC=EXAMPLE,DC=ORG", b"secret")
+            .await
+            .unwrap());
+        let after_second_bind = backend.auth_cache_stats();
+        assert_eq!(after_second_bind.hits, 1);
+        assert_eq!(after_second_bind.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn test_auth_cache_invalidates_after_password_modify() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+        let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
+        backend
+            .add_entry(entry, b"old-secret".to_vec())
+            .await
+            .unwrap();
+
+        assert!(backend
+            .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+            .await
+            .unwrap());
+        backend
+            .modify_entry(
+                "cn=cached,dc=example,dc=org",
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "userPassword".to_string(),
+                    values: vec!["new-secret".to_string()],
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert!(!backend
+            .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+            .await
+            .unwrap());
+        assert!(backend
+            .authenticate("cn=cached,dc=example,dc=org", b"new-secret")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_non_password_modify_preserves_auth_cache_and_credentials() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+        let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
+        backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
+
+        assert!(backend
+            .authenticate("cn=cached,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+        backend
+            .modify_entry(
+                "cn=cached,dc=example,dc=org",
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "description".to_string(),
+                    values: vec!["non-password update".to_string()],
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert!(backend
+            .authenticate("cn=cached,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+        let stats = backend.auth_cache_stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.len, 1);
+    }
+
+    #[tokio::test]
+    async fn test_auth_cache_invalidates_after_delete() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+        let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
+        backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
+        assert!(backend
+            .authenticate("cn=cached,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+
+        backend
+            .delete_entry("cn=cached,dc=example,dc=org")
+            .await
+            .unwrap();
+
+        assert_eq!(backend.auth_cache_stats().len, 0);
+        assert!(!backend
+            .authenticate("cn=cached,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_auth_cache_invalidates_after_rename() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["old".to_string()]);
+        let entry = DirectoryEntry::new("cn=old,dc=example,dc=org", attributes);
+        backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
+        assert!(backend
+            .authenticate("cn=old,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+
+        backend
+            .rename_entry("cn=old,dc=example,dc=org", "cn=new", true, None)
+            .await
+            .unwrap();
+
+        assert!(!backend
+            .authenticate("cn=old,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+        assert!(backend
+            .authenticate("cn=new,dc=example,dc=org", b"secret")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_auth_cache_invalidates_after_prehashed_password_update() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+        let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
+        backend
+            .add_entry(entry, b"old-secret".to_vec())
+            .await
+            .unwrap();
+        assert!(backend
+            .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+            .await
+            .unwrap());
+
+        let new_hash = LmdbBackend::create_ssha512(b"new-secret");
+        backend
+            .set_prehashed_password("cn=cached,dc=example,dc=org", &new_hash)
+            .await
+            .unwrap();
+
+        assert!(!backend
+            .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+            .await
+            .unwrap());
+        assert!(backend
+            .authenticate("cn=cached,dc=example,dc=org", b"new-secret")
             .await
             .unwrap());
     }
