@@ -1433,6 +1433,7 @@ dependencies = [
  "ldap-parser",
  "ldap3",
  "lmdb",
+ "lmdb-sys",
  "log",
  "log4rs",
  "md-5",
