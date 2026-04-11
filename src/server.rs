@@ -4161,6 +4161,11 @@ async fn collect_base_object_search_result_set(
     })
 }
 
+#[allow(clippy::manual_is_multiple_of)]
+fn search_progress_checkpoint(returned: usize) -> bool {
+    returned % 100 == 0
+}
+
 async fn emit_search_entries(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -4203,7 +4208,7 @@ async fn emit_search_entries(
             .await?;
             returned += 1;
 
-            if returned.is_multiple_of(100) || returned == entries.len() {
+            if search_progress_checkpoint(returned) || returned == entries.len() {
                 trace_search(format_args!(
                     "emit_search_entries progress returned={returned}/{}",
                     entries.len()
@@ -4245,7 +4250,7 @@ async fn emit_search_entries(
         }
 
         let progress_returned = returned + pending_entries;
-        if progress_returned.is_multiple_of(100) || progress_returned == entries.len() {
+        if search_progress_checkpoint(progress_returned) || progress_returned == entries.len() {
             trace_search(format_args!(
                 "emit_search_entries progress returned={progress_returned}/{}",
                 entries.len()
