@@ -2,12 +2,14 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ldap3::exop::{PasswordModify, WhoAmI, WhoAmIResp};
+use ldap3::result::LdapError;
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Mod, Scope, SearchEntry};
 use serde::Serialize;
+use tokio::sync::{mpsc, watch};
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -51,6 +53,30 @@ struct Args {
 
     #[arg(long, default_value_t = 10)]
     warmup_iterations: usize,
+
+    #[arg(long, default_value = "")]
+    concurrent_bind_clients: String,
+
+    #[arg(long, default_value_t = 20)]
+    concurrent_bind_iterations: usize,
+
+    #[arg(long, default_value_t = 1)]
+    concurrent_bind_warmup_iterations: usize,
+
+    #[arg(long, default_value_t = 5000)]
+    concurrent_bind_operation_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 100)]
+    concurrent_bind_valid_percent: u8,
+
+    #[arg(long, default_value_t = 0)]
+    concurrent_bind_wrong_password_percent: u8,
+
+    #[arg(long, default_value_t = 80)]
+    concurrent_bind_hot_user_percent: u8,
+
+    #[arg(long, default_value_t = 1)]
+    concurrent_bind_hot_user_count: usize,
 
     #[arg(long, default_value = "perfbench")]
     name_prefix: String,
@@ -100,8 +126,13 @@ struct FixtureSummary {
 struct BenchmarkStats {
     operation: String,
     iterations: usize,
+    concurrency: usize,
+    successes: usize,
+    failures: usize,
+    failure_rate_percent: f64,
     elapsed_ms: f64,
     throughput_ops_per_sec: f64,
+    success_throughput_ops_per_sec: f64,
     min_ms: f64,
     mean_ms: f64,
     p50_ms: f64,
@@ -132,6 +163,31 @@ async fn run(args: Args) -> AppResult<()> {
         args.write_iterations > 0,
         "--write-iterations must be greater than zero",
     )?;
+    let concurrent_bind_clients = parse_concurrent_bind_clients(&args.concurrent_bind_clients)?;
+    if !concurrent_bind_clients.is_empty() {
+        ensure(
+            args.concurrent_bind_iterations > 0,
+            "--concurrent-bind-iterations must be greater than zero when --concurrent-bind-clients is set",
+        )?;
+        ensure(
+            args.concurrent_bind_operation_timeout_ms > 0,
+            "--concurrent-bind-operation-timeout-ms must be greater than zero when --concurrent-bind-clients is set",
+        )?;
+        ensure(
+            args.concurrent_bind_hot_user_count > 0,
+            "--concurrent-bind-hot-user-count must be greater than zero when --concurrent-bind-clients is set",
+        )?;
+        ensure(
+            u16::from(args.concurrent_bind_valid_percent)
+                + u16::from(args.concurrent_bind_wrong_password_percent)
+                <= 100,
+            "--concurrent-bind-valid-percent plus --concurrent-bind-wrong-password-percent must be <= 100",
+        )?;
+        ensure(
+            args.concurrent_bind_hot_user_percent <= 100,
+            "--concurrent-bind-hot-user-percent must be <= 100",
+        )?;
+    }
 
     let total_start = Instant::now();
     progress("connect.setup");
@@ -170,6 +226,18 @@ async fn run(args: Args) -> AppResult<()> {
     let records_after_setup = count_entries(&mut admin_setup, &args.base_dn).await?;
     admin_setup.unbind().await?;
 
+    let mut benchmarks = Vec::new();
+
+    if !concurrent_bind_clients.is_empty() {
+        progress("benchmark.concurrent_bind_fixture_users");
+        for concurrency in &concurrent_bind_clients {
+            progress(&format!(
+                "benchmark.concurrent_bind_fixture_users.c{concurrency}"
+            ));
+            benchmarks.push(run_concurrent_bind_benchmark(&args, &dns, *concurrency).await?);
+        }
+    }
+
     progress("connect.benchmark_clients");
     let mut anonymous_client = connect(&args.url, args.starttls, args.insecure).await?;
     let mut admin_ops = connect(&args.url, args.starttls, args.insecure).await?;
@@ -183,8 +251,6 @@ async fn run(args: Args) -> AppResult<()> {
         &args.user_password,
     )
     .await?;
-
-    let mut benchmarks = Vec::new();
 
     progress("benchmark.root_dse");
     for _ in 0..args.warmup_iterations {
@@ -601,6 +667,270 @@ async fn simple_bind(ldap: &mut Ldap, bind_dn: &str, password: &str) -> AppResul
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindExpectation {
+    Valid,
+    WrongPassword,
+    UnknownDn,
+}
+
+#[derive(Debug)]
+struct ConcurrentBindWorkerResult {
+    latencies_ms: Vec<f64>,
+    successes: usize,
+    failures: usize,
+}
+
+async fn run_concurrent_bind_benchmark(
+    args: &Args,
+    dns: &ScenarioDns,
+    concurrency: usize,
+) -> AppResult<BenchmarkStats> {
+    ensure(
+        concurrency > 0,
+        "--concurrent-bind-clients values must be greater than zero",
+    )?;
+
+    let expected_attempts = concurrency * args.concurrent_bind_iterations;
+    let (ready_tx, mut ready_rx) = mpsc::channel(concurrency);
+    let (start_tx, start_rx) = watch::channel(false);
+    let mut handles = Vec::with_capacity(concurrency);
+
+    for client_index in 0..concurrency {
+        let ready_tx = ready_tx.clone();
+        let mut start_rx = start_rx.clone();
+        let url = args.url.clone();
+        let starttls = args.starttls;
+        let insecure = args.insecure;
+        let users_ou_dn = dns.users_ou_dn.clone();
+        let name_prefix = args.name_prefix.clone();
+        let password = args.user_password.clone();
+        let wrong_password = format!("{}-wrong", args.user_password);
+        let preloaded_users = args.preloaded_users;
+        let iterations = args.concurrent_bind_iterations;
+        let warmup_iterations = args.concurrent_bind_warmup_iterations;
+        let operation_timeout = Duration::from_millis(args.concurrent_bind_operation_timeout_ms);
+        let valid_percent = args.concurrent_bind_valid_percent;
+        let wrong_password_percent = args.concurrent_bind_wrong_password_percent;
+        let hot_user_percent = args.concurrent_bind_hot_user_percent;
+        let hot_user_count = args.concurrent_bind_hot_user_count;
+
+        handles.push(tokio::spawn(async move {
+            let mut ldap =
+                match connect_with_timeout(&url, starttls, insecure, operation_timeout).await {
+                    Ok(ldap) => ldap,
+                    Err(_) => {
+                        let _ = ready_tx.send(()).await;
+                        return ConcurrentBindWorkerResult {
+                            latencies_ms: Vec::new(),
+                            successes: 0,
+                            failures: iterations,
+                        };
+                    }
+                };
+
+            for warmup in 0..warmup_iterations {
+                let global_attempt = client_index * iterations + warmup;
+                let dn = fixture_bind_dn(
+                    global_attempt,
+                    preloaded_users,
+                    hot_user_count,
+                    hot_user_percent,
+                    &name_prefix,
+                    &users_ou_dn,
+                );
+                if simple_bind_with_timeout(&mut ldap, &dn, &password, operation_timeout)
+                    .await
+                    .is_err()
+                {
+                    let _ = ready_tx.send(()).await;
+                    let _ = ldap.unbind().await;
+                    return ConcurrentBindWorkerResult {
+                        latencies_ms: Vec::new(),
+                        successes: 0,
+                        failures: iterations,
+                    };
+                }
+            }
+
+            let _ = ready_tx.send(()).await;
+            while !*start_rx.borrow() {
+                if start_rx.changed().await.is_err() {
+                    let _ = ldap.unbind().await;
+                    return ConcurrentBindWorkerResult {
+                        latencies_ms: Vec::new(),
+                        successes: 0,
+                        failures: iterations,
+                    };
+                }
+            }
+
+            let mut latencies_ms = Vec::with_capacity(iterations);
+            let mut successes = 0;
+            let mut failures = 0;
+            for iteration in 0..iterations {
+                let global_attempt = client_index * iterations + iteration;
+                let expectation =
+                    bind_expectation(global_attempt, valid_percent, wrong_password_percent);
+                let dn = match expectation {
+                    BindExpectation::UnknownDn => {
+                        format!("uid={name_prefix}-missing-{global_attempt:06},{users_ou_dn}")
+                    }
+                    BindExpectation::Valid | BindExpectation::WrongPassword => fixture_bind_dn(
+                        global_attempt,
+                        preloaded_users,
+                        hot_user_count,
+                        hot_user_percent,
+                        &name_prefix,
+                        &users_ou_dn,
+                    ),
+                };
+                let bind_password = match expectation {
+                    BindExpectation::Valid => password.as_str(),
+                    BindExpectation::WrongPassword | BindExpectation::UnknownDn => {
+                        wrong_password.as_str()
+                    }
+                };
+
+                let started = Instant::now();
+                if bind_matches_expectation_with_timeout(
+                    &mut ldap,
+                    &dn,
+                    bind_password,
+                    expectation,
+                    operation_timeout,
+                )
+                .await
+                {
+                    successes += 1;
+                } else {
+                    failures += 1;
+                }
+                latencies_ms.push(elapsed_ms(started.elapsed().as_secs_f64()));
+            }
+
+            let _ = ldap.unbind().await;
+            ConcurrentBindWorkerResult {
+                latencies_ms,
+                successes,
+                failures,
+            }
+        }));
+    }
+
+    drop(ready_tx);
+    for _ in 0..concurrency {
+        if ready_rx.recv().await.is_none() {
+            break;
+        }
+    }
+
+    let total_started = Instant::now();
+    let _ = start_tx.send(true);
+
+    let mut latencies_ms = Vec::with_capacity(expected_attempts);
+    let mut successes = 0;
+    let mut failures = 0;
+    for handle in handles {
+        match handle.await {
+            Ok(result) => {
+                latencies_ms.extend(result.latencies_ms);
+                successes += result.successes;
+                failures += result.failures;
+            }
+            Err(_) => {
+                failures += args.concurrent_bind_iterations;
+            }
+        }
+    }
+
+    Ok(build_benchmark_stats_with_counts(
+        &format!("concurrent_bind_fixture_users_c{concurrency}"),
+        latencies_ms,
+        total_started,
+        expected_attempts,
+        successes,
+        failures,
+        concurrency,
+    ))
+}
+
+fn bind_expectation(
+    global_attempt: usize,
+    valid_percent: u8,
+    wrong_password_percent: u8,
+) -> BindExpectation {
+    let bucket = (global_attempt % 100) as u8;
+    if bucket < valid_percent {
+        BindExpectation::Valid
+    } else if bucket < valid_percent + wrong_password_percent {
+        BindExpectation::WrongPassword
+    } else {
+        BindExpectation::UnknownDn
+    }
+}
+
+fn fixture_bind_dn(
+    global_attempt: usize,
+    preloaded_users: usize,
+    hot_user_count: usize,
+    hot_user_percent: u8,
+    name_prefix: &str,
+    users_ou_dn: &str,
+) -> String {
+    let hot_user_count = hot_user_count.min(preloaded_users).max(1);
+    let use_hot_user = (global_attempt % 100) < usize::from(hot_user_percent);
+    let user_index = if use_hot_user {
+        global_attempt % hot_user_count
+    } else {
+        global_attempt % preloaded_users
+    };
+    format!("uid={name_prefix}-user-{user_index:06},{users_ou_dn}")
+}
+
+async fn connect_with_timeout(
+    url: &str,
+    starttls: bool,
+    insecure: bool,
+    timeout_duration: Duration,
+) -> AppResult<Ldap> {
+    match tokio::time::timeout(timeout_duration, connect(url, starttls, insecure)).await {
+        Ok(result) => result,
+        Err(_) => Err(other_error("concurrent bind connect timed out")),
+    }
+}
+
+async fn simple_bind_with_timeout(
+    ldap: &mut Ldap,
+    bind_dn: &str,
+    password: &str,
+    timeout_duration: Duration,
+) -> AppResult<()> {
+    match tokio::time::timeout(timeout_duration, simple_bind(ldap, bind_dn, password)).await {
+        Ok(result) => result,
+        Err(_) => Err(other_error("concurrent bind operation timed out")),
+    }
+}
+
+async fn bind_matches_expectation_with_timeout(
+    ldap: &mut Ldap,
+    bind_dn: &str,
+    password: &str,
+    expectation: BindExpectation,
+    timeout_duration: Duration,
+) -> bool {
+    match tokio::time::timeout(timeout_duration, ldap.simple_bind(bind_dn, password)).await {
+        Ok(Ok(result)) => match result.success() {
+            Ok(_) => expectation == BindExpectation::Valid,
+            Err(LdapError::LdapResult { result }) if result.rc == 49 => {
+                expectation != BindExpectation::Valid
+            }
+            Err(_) => false,
+        },
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
 async fn create_benchmark_tree(ldap: &mut Ldap, dns: &ScenarioDns) -> AppResult<()> {
     add_organizational_unit(ldap, &dns.benchmark_root_dn).await?;
     add_organizational_unit(ldap, &dns.users_ou_dn).await?;
@@ -775,20 +1105,61 @@ fn build_benchmark_stats(
     total_start: Instant,
 ) -> BenchmarkStats {
     let iterations = latencies_ms.len();
+    build_benchmark_stats_with_counts(
+        operation,
+        latencies_ms,
+        total_start,
+        iterations,
+        iterations,
+        0,
+        1,
+    )
+}
+
+fn build_benchmark_stats_with_counts(
+    operation: &str,
+    latencies_ms: Vec<f64>,
+    total_start: Instant,
+    attempts: usize,
+    successes: usize,
+    failures: usize,
+    concurrency: usize,
+) -> BenchmarkStats {
     let elapsed_ms_total = elapsed_ms(total_start.elapsed().as_secs_f64());
     let throughput_ops_per_sec = if elapsed_ms_total > 0.0 {
-        iterations as f64 / (elapsed_ms_total / 1000.0)
+        attempts as f64 / (elapsed_ms_total / 1000.0)
+    } else {
+        0.0
+    };
+    let success_throughput_ops_per_sec = if elapsed_ms_total > 0.0 {
+        successes as f64 / (elapsed_ms_total / 1000.0)
+    } else {
+        0.0
+    };
+    let failure_rate_percent = if attempts > 0 {
+        failures as f64 * 100.0 / attempts as f64
+    } else {
+        0.0
+    };
+    let latency_count = latencies_ms.len();
+    let mean_ms = if latency_count > 0 {
+        latencies_ms.iter().sum::<f64>() / latency_count as f64
     } else {
         0.0
     };
 
     BenchmarkStats {
         operation: operation.to_string(),
-        iterations,
+        iterations: attempts,
+        concurrency,
+        successes,
+        failures,
+        failure_rate_percent,
         elapsed_ms: elapsed_ms_total,
         throughput_ops_per_sec,
+        success_throughput_ops_per_sec,
         min_ms: percentile(&latencies_ms, 0.0),
-        mean_ms: latencies_ms.iter().sum::<f64>() / iterations as f64,
+        mean_ms,
         p50_ms: percentile(&latencies_ms, 0.50),
         p95_ms: percentile(&latencies_ms, 0.95),
         p99_ms: percentile(&latencies_ms, 0.99),
@@ -823,21 +1194,52 @@ fn print_human_summary(report: &BenchmarkReport) {
     println!();
     println!("## Benchmarks");
     println!();
-    println!("| Operation | Iterations | Mean ms | P50 ms | P95 ms | P99 ms | Max ms | Throughput ops/s |");
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|");
+    println!("| Operation | Concurrency | Attempts | Successes | Failures | Failure % | Mean ms | P50 ms | P95 ms | P99 ms | Max ms | Attempt ops/s | Success ops/s |");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for benchmark in &report.benchmarks {
         println!(
-            "| {} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.2} |",
+            "| {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.2} | {:.2} |",
             benchmark.operation,
+            benchmark.concurrency,
             benchmark.iterations,
+            benchmark.successes,
+            benchmark.failures,
+            benchmark.failure_rate_percent,
             benchmark.mean_ms,
             benchmark.p50_ms,
             benchmark.p95_ms,
             benchmark.p99_ms,
             benchmark.max_ms,
             benchmark.throughput_ops_per_sec,
+            benchmark.success_throughput_ops_per_sec,
         );
     }
+}
+
+fn parse_concurrent_bind_clients(raw: &str) -> AppResult<Vec<usize>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut values = Vec::new();
+    for value in raw.split(',') {
+        let value = value.trim();
+        ensure(!value.is_empty(), "empty --concurrent-bind-clients value")?;
+        let parsed = value.parse::<usize>().map_err(|err| {
+            other_error(format!(
+                "invalid --concurrent-bind-clients value {value:?}: {err}"
+            ))
+        })?;
+        ensure(
+            parsed > 0,
+            "--concurrent-bind-clients values must be greater than zero",
+        )?;
+        values.push(parsed);
+    }
+
+    values.sort_unstable();
+    values.dedup();
+    Ok(values)
 }
 
 fn percentile(samples: &[f64], quantile: f64) -> f64 {
@@ -895,4 +1297,59 @@ fn ensure(condition: bool, message: impl Into<String>) -> AppResult<()> {
 
 fn other_error(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
     Box::new(io::Error::other(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_concurrent_bind_clients_accepts_empty_list() {
+        let values = parse_concurrent_bind_clients("").unwrap();
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn parse_concurrent_bind_clients_sorts_and_deduplicates() {
+        let values = parse_concurrent_bind_clients("16, 4, 16, 1").unwrap();
+        assert_eq!(values, vec![1, 4, 16]);
+    }
+
+    #[test]
+    fn parse_concurrent_bind_clients_rejects_zero() {
+        assert!(parse_concurrent_bind_clients("1,0,4").is_err());
+    }
+
+    #[test]
+    fn bind_expectation_uses_unknown_dn_for_remaining_percent() {
+        assert_eq!(bind_expectation(0, 70, 20), BindExpectation::Valid);
+        assert_eq!(bind_expectation(75, 70, 20), BindExpectation::WrongPassword);
+        assert_eq!(bind_expectation(95, 70, 20), BindExpectation::UnknownDn);
+    }
+
+    #[test]
+    fn fixture_bind_dn_uses_configured_hot_set() {
+        let dn = fixture_bind_dn(5, 1000, 2, 100, "bench", "ou=users,dc=example,dc=com");
+        assert_eq!(dn, "uid=bench-user-000001,ou=users,dc=example,dc=com");
+    }
+
+    #[test]
+    fn benchmark_stats_record_failure_rate_and_success_throughput() {
+        let stats = build_benchmark_stats_with_counts(
+            "concurrent_bind_fixture_users_c4",
+            vec![1.0, 2.0, 3.0, 4.0],
+            Instant::now(),
+            5,
+            4,
+            1,
+            4,
+        );
+
+        assert_eq!(stats.iterations, 5);
+        assert_eq!(stats.concurrency, 4);
+        assert_eq!(stats.successes, 4);
+        assert_eq!(stats.failures, 1);
+        assert_eq!(stats.failure_rate_percent, 20.0);
+        assert!(stats.throughput_ops_per_sec >= stats.success_throughput_ops_per_sec);
+    }
 }

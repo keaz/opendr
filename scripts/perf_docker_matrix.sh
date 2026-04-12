@@ -11,6 +11,14 @@ SAMPLE_INTERVAL="0.25"
 CPU_LIMIT="2"
 MEMORY_LIMIT="4g"
 BENCHMARK_TIMEOUT_SECONDS="180"
+CONCURRENT_BIND_CLIENTS=""
+CONCURRENT_BIND_ITERATIONS="20"
+CONCURRENT_BIND_WARMUP_ITERATIONS="1"
+CONCURRENT_BIND_OPERATION_TIMEOUT_MS="5000"
+CONCURRENT_BIND_VALID_PERCENT="100"
+CONCURRENT_BIND_WRONG_PASSWORD_PERCENT="0"
+CONCURRENT_BIND_HOT_USER_PERCENT="80"
+CONCURRENT_BIND_HOT_USER_COUNT="1"
 BASE_DN="dc=example,dc=com"
 ROOT_PASSWORD="PerfRootSecret123!"
 OPENDR_IMAGE="opendr:docker-perf"
@@ -33,12 +41,28 @@ Usage: scripts/perf_docker_matrix.sh [options]
 
 Options:
   --output-dir PATH         Output directory for the matrix run
-  --profile-set VALUE      One of: smoke, standard, full (default: full)
+  --profile-set VALUE      One of: smoke, standard, full, concurrency (default: full)
   --products LIST          Comma-separated subset of: opendr,opendj
   --sample-interval SEC    Container stats sample interval (default: 0.25)
   --cpu VALUE              Docker CPU limit for each server container (default: 2)
   --memory VALUE           Docker memory limit for each server container (default: 4g)
   --benchmark-timeout SEC  Max seconds to allow each benchmark profile (default: 180)
+  --concurrent-bind-clients LIST
+                          Comma-separated concurrent bind client levels; empty disables (default: disabled)
+  --concurrent-bind-iterations N
+                          Bind operations per concurrent client level (default: 20)
+  --concurrent-bind-warmup-iterations N
+                          Warmup binds per concurrent client before timed bind probe (default: 1)
+  --concurrent-bind-operation-timeout-ms N
+                          Per-connect/per-bind timeout for concurrent bind probe (default: 5000)
+  --concurrent-bind-valid-percent N
+                          Percent of auth-concurrency attempts using valid credentials (default: 100)
+  --concurrent-bind-wrong-password-percent N
+                          Percent of auth-concurrency attempts using wrong passwords; remainder is unknown DN (default: 0)
+  --concurrent-bind-hot-user-percent N
+                          Percent of auth-concurrency attempts targeting the hot-user set (default: 80)
+  --concurrent-bind-hot-user-count N
+                          Number of hot users in the auth-concurrency distribution (default: 1)
   --base-dn DN             Benchmark base DN (default: dc=example,dc=com)
   --root-password VALUE    Root password used for both products
   --opendr-image TAG       Local OpenDR image tag (default: opendr:docker-perf)
@@ -80,6 +104,38 @@ while [[ $# -gt 0 ]]; do
       ;;
     --benchmark-timeout)
       BENCHMARK_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --concurrent-bind-clients)
+      CONCURRENT_BIND_CLIENTS="$2"
+      shift 2
+      ;;
+    --concurrent-bind-iterations)
+      CONCURRENT_BIND_ITERATIONS="$2"
+      shift 2
+      ;;
+    --concurrent-bind-warmup-iterations)
+      CONCURRENT_BIND_WARMUP_ITERATIONS="$2"
+      shift 2
+      ;;
+    --concurrent-bind-operation-timeout-ms)
+      CONCURRENT_BIND_OPERATION_TIMEOUT_MS="$2"
+      shift 2
+      ;;
+    --concurrent-bind-valid-percent)
+      CONCURRENT_BIND_VALID_PERCENT="$2"
+      shift 2
+      ;;
+    --concurrent-bind-wrong-password-percent)
+      CONCURRENT_BIND_WRONG_PASSWORD_PERCENT="$2"
+      shift 2
+      ;;
+    --concurrent-bind-hot-user-percent)
+      CONCURRENT_BIND_HOT_USER_PERCENT="$2"
+      shift 2
+      ;;
+    --concurrent-bind-hot-user-count)
+      CONCURRENT_BIND_HOT_USER_COUNT="$2"
       shift 2
       ;;
     --base-dn)
@@ -168,8 +224,16 @@ case "${PROFILE_SET}" in
       "stress:2500:3:3:1"
     )
     ;;
+  concurrency)
+    LOAD_PROFILES=(
+      "auth-concurrency:2500:3:3:1"
+    )
+    if [[ -z "${CONCURRENT_BIND_CLIENTS}" ]]; then
+      CONCURRENT_BIND_CLIENTS="1,4,8,16,32,64,128"
+    fi
+    ;;
   *)
-    echo "--profile-set must be one of: smoke, standard, full" >&2
+    echo "--profile-set must be one of: smoke, standard, full, concurrency" >&2
     exit 1
     ;;
 esac
@@ -461,6 +525,14 @@ write_run_metadata() {
   "read_iterations": ${read_iterations},
   "write_iterations": ${write_iterations},
   "warmup_iterations": ${warmup_iterations},
+  "concurrent_bind_clients": "${CONCURRENT_BIND_CLIENTS}",
+  "concurrent_bind_iterations": ${CONCURRENT_BIND_ITERATIONS},
+  "concurrent_bind_warmup_iterations": ${CONCURRENT_BIND_WARMUP_ITERATIONS},
+  "concurrent_bind_operation_timeout_ms": ${CONCURRENT_BIND_OPERATION_TIMEOUT_MS},
+  "concurrent_bind_valid_percent": ${CONCURRENT_BIND_VALID_PERCENT},
+  "concurrent_bind_wrong_password_percent": ${CONCURRENT_BIND_WRONG_PASSWORD_PERCENT},
+  "concurrent_bind_hot_user_percent": ${CONCURRENT_BIND_HOT_USER_PERCENT},
+  "concurrent_bind_hot_user_count": ${CONCURRENT_BIND_HOT_USER_COUNT},
   "cpu_limit": "${CPU_LIMIT}",
   "memory_limit": "${MEMORY_LIMIT}",
   "opendr_runtime": "${OPENDR_RUNTIME}",
@@ -742,6 +814,18 @@ run_profile() {
     --name-prefix "${product}-${profile_name}"
     --json-out "${run_dir}/ldap-benchmark-results.json"
   )
+  if [[ -n "${CONCURRENT_BIND_CLIENTS}" ]]; then
+    benchmark_cmd+=(
+      --concurrent-bind-clients "${CONCURRENT_BIND_CLIENTS}"
+      --concurrent-bind-iterations "${CONCURRENT_BIND_ITERATIONS}"
+      --concurrent-bind-warmup-iterations "${CONCURRENT_BIND_WARMUP_ITERATIONS}"
+      --concurrent-bind-operation-timeout-ms "${CONCURRENT_BIND_OPERATION_TIMEOUT_MS}"
+      --concurrent-bind-valid-percent "${CONCURRENT_BIND_VALID_PERCENT}"
+      --concurrent-bind-wrong-password-percent "${CONCURRENT_BIND_WRONG_PASSWORD_PERCENT}"
+      --concurrent-bind-hot-user-percent "${CONCURRENT_BIND_HOT_USER_PERCENT}"
+      --concurrent-bind-hot-user-count "${CONCURRENT_BIND_HOT_USER_COUNT}"
+    )
+  fi
 
   "${benchmark_cmd[@]}" > "${run_dir}/ldap-benchmark-summary.md" 2> "${run_dir}/benchmark.stderr.log" &
   benchmark_pid=$!
@@ -897,7 +981,43 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
         item = bench_map.get(operation)
         if item is None:
             return None
-        return item[field]
+        return item.get(field)
+
+    concurrent_bind_runs = [
+        item
+        for item in bench_map.values()
+        if item.get("operation", "").startswith("concurrent_bind_fixture_users_c")
+    ]
+    successful_concurrent_bind_runs = [
+        item
+        for item in concurrent_bind_runs
+        if item.get("failure_rate_percent", 100.0) == 0.0
+    ]
+    max_concurrent_bind_clients_tested = max(
+        (item.get("concurrency", 0) for item in concurrent_bind_runs),
+        default=None,
+    )
+    max_concurrent_bind_clients_zero_failure = max(
+        (item.get("concurrency", 0) for item in successful_concurrent_bind_runs),
+        default=None,
+    )
+    max_concurrent_bind_failure_rate_percent = None
+    if max_concurrent_bind_clients_tested is not None:
+        max_tested_runs = [
+            item
+            for item in concurrent_bind_runs
+            if item.get("concurrency") == max_concurrent_bind_clients_tested
+        ]
+        if max_tested_runs:
+            max_concurrent_bind_failure_rate_percent = max_tested_runs[0].get("failure_rate_percent")
+    peak_concurrent_bind_success_throughput = max(
+        (item.get("success_throughput_ops_per_sec", 0.0) for item in concurrent_bind_runs),
+        default=None,
+    )
+    peak_concurrent_bind_attempt_throughput = max(
+        (item.get("throughput_ops_per_sec", 0.0) for item in concurrent_bind_runs),
+        default=None,
+    )
 
     runs.append(
         {
@@ -910,6 +1030,14 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "read_iterations": metadata["read_iterations"],
             "write_iterations": metadata["write_iterations"],
             "warmup_iterations": metadata["warmup_iterations"],
+            "concurrent_bind_clients": metadata.get("concurrent_bind_clients", ""),
+            "concurrent_bind_iterations": metadata.get("concurrent_bind_iterations", 0),
+            "concurrent_bind_warmup_iterations": metadata.get("concurrent_bind_warmup_iterations", 0),
+            "concurrent_bind_operation_timeout_ms": metadata.get("concurrent_bind_operation_timeout_ms", 0),
+            "concurrent_bind_valid_percent": metadata.get("concurrent_bind_valid_percent", 100),
+            "concurrent_bind_wrong_password_percent": metadata.get("concurrent_bind_wrong_password_percent", 0),
+            "concurrent_bind_hot_user_percent": metadata.get("concurrent_bind_hot_user_percent", 0),
+            "concurrent_bind_hot_user_count": metadata.get("concurrent_bind_hot_user_count", 0),
             "cpu_limit": metadata["cpu_limit"],
             "memory_limit": metadata["memory_limit"],
             "benchmark_client": metadata.get("benchmark_client", "target/release/ldap_perf_client"),
@@ -931,11 +1059,22 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "bind_admin_mean_ms": bench_value("bind_admin", "mean_ms"),
             "search_subtree_mean_ms": bench_value("search_subtree_fixture_users", "mean_ms"),
             "search_subtree_throughput": bench_value("search_subtree_fixture_users", "throughput_ops_per_sec"),
+            "search_subtree_failure_rate_percent": bench_value("search_subtree_fixture_users", "failure_rate_percent"),
             "add_mean_ms": bench_value("add_entries", "mean_ms"),
+            "add_failure_rate_percent": bench_value("add_entries", "failure_rate_percent"),
             "modify_mean_ms": bench_value("modify_entries", "mean_ms"),
+            "modify_failure_rate_percent": bench_value("modify_entries", "failure_rate_percent"),
             "modifydn_mean_ms": bench_value("modifydn_entries", "mean_ms"),
+            "modifydn_failure_rate_percent": bench_value("modifydn_entries", "failure_rate_percent"),
             "delete_mean_ms": bench_value("delete_entries", "mean_ms"),
+            "delete_failure_rate_percent": bench_value("delete_entries", "failure_rate_percent"),
             "password_modify_mean_ms": bench_value("password_modify_fixture_user", "mean_ms"),
+            "password_modify_failure_rate_percent": bench_value("password_modify_fixture_user", "failure_rate_percent"),
+            "max_concurrent_bind_clients_tested": max_concurrent_bind_clients_tested,
+            "max_concurrent_bind_clients_zero_failure": max_concurrent_bind_clients_zero_failure,
+            "max_concurrent_bind_failure_rate_percent": max_concurrent_bind_failure_rate_percent,
+            "peak_concurrent_bind_success_throughput": peak_concurrent_bind_success_throughput,
+            "peak_concurrent_bind_attempt_throughput": peak_concurrent_bind_attempt_throughput,
         }
     )
 
@@ -968,7 +1107,7 @@ summary_md = root / "comparison-summary.md"
 summary_csv = root / "comparison-summary.csv"
 
 csv_lines = [
-    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,search_subtree_mean_ms,search_subtree_throughput,add_mean_ms,modify_mean_ms,modifydn_mean_ms,delete_mean_ms,password_modify_mean_ms"
+    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput"
 ]
 for run in runs:
     csv_lines.append(
@@ -982,6 +1121,12 @@ for run in runs:
                 str(run["preloaded_users"]),
                 str(run["read_iterations"]),
                 str(run["write_iterations"]),
+                str(run["concurrent_bind_clients"]).replace(",", ";"),
+                str(run["concurrent_bind_iterations"]),
+                str(run["concurrent_bind_valid_percent"]),
+                str(run["concurrent_bind_wrong_password_percent"]),
+                str(run["concurrent_bind_hot_user_percent"]),
+                str(run["concurrent_bind_hot_user_count"]),
                 fmt_int(run["records_before_setup"]),
                 fmt_int(run["records_after_setup"]),
                 fmt_int(run["records_after_benchmark"]),
@@ -998,11 +1143,22 @@ for run in runs:
                 csv_value(run["bind_admin_mean_ms"]),
                 csv_value(run["search_subtree_mean_ms"]),
                 csv_value(run["search_subtree_throughput"]),
+                csv_value(run["search_subtree_failure_rate_percent"]),
                 csv_value(run["add_mean_ms"]),
+                csv_value(run["add_failure_rate_percent"]),
                 csv_value(run["modify_mean_ms"]),
+                csv_value(run["modify_failure_rate_percent"]),
                 csv_value(run["modifydn_mean_ms"]),
+                csv_value(run["modifydn_failure_rate_percent"]),
                 csv_value(run["delete_mean_ms"]),
+                csv_value(run["delete_failure_rate_percent"]),
                 csv_value(run["password_modify_mean_ms"]),
+                csv_value(run["password_modify_failure_rate_percent"]),
+                fmt_int(run["max_concurrent_bind_clients_tested"]),
+                fmt_int(run["max_concurrent_bind_clients_zero_failure"]),
+                csv_value(run["max_concurrent_bind_failure_rate_percent"]),
+                csv_value(run["peak_concurrent_bind_success_throughput"]),
+                csv_value(run["peak_concurrent_bind_attempt_throughput"]),
             ]
         )
     )
@@ -1026,11 +1182,16 @@ if runs:
             f"- Benchmark client host: `{reference.get('benchmark_client_host', '127.0.0.1')}`",
             f"- Benchmark client network: `{reference.get('benchmark_client_network', 'host')}`",
             f"- Timeout budget per profile: `{reference['timeout_seconds']}` seconds",
+            f"- Concurrent bind clients: `{reference.get('concurrent_bind_clients', '') or 'disabled'}`",
+            f"- Concurrent bind iterations per client: `{reference.get('concurrent_bind_iterations', 0)}`",
+            f"- Concurrent bind auth mix: valid `{reference.get('concurrent_bind_valid_percent', 100)}%`, wrong password `{reference.get('concurrent_bind_wrong_password_percent', 0)}%`, unknown DN `{100 - int(reference.get('concurrent_bind_valid_percent', 100)) - int(reference.get('concurrent_bind_wrong_password_percent', 0))}%`",
+            f"- Concurrent bind hot-user mix: `{reference.get('concurrent_bind_hot_user_percent', 0)}%` across `{reference.get('concurrent_bind_hot_user_count', 0)}` users",
+            f"- Concurrent bind operation timeout: `{reference.get('concurrent_bind_operation_timeout_ms', 0)}` ms",
             "",
             "## Load Profiles",
             "",
-            "| Profile | Preloaded Users | Read Iterations | Write Iterations |",
-            "|---|---:|---:|---:|",
+            "| Profile | Preloaded Users | Read Iterations | Write Iterations | Concurrent Bind Clients | Concurrent Bind Iterations/Client |",
+            "|---|---:|---:|---:|---|---:|",
         ]
     )
     seen_profiles = set()
@@ -1039,7 +1200,7 @@ if runs:
             continue
         seen_profiles.add(run["profile"])
         lines.append(
-            f"| {run['profile']} | {run['preloaded_users']} | {run['read_iterations']} | {run['write_iterations']} |"
+            f"| {run['profile']} | {run['preloaded_users']} | {run['read_iterations']} | {run['write_iterations']} | {run.get('concurrent_bind_clients', '') or 'disabled'} | {run.get('concurrent_bind_iterations', 0)} |"
         )
 
     lines.extend(
@@ -1047,13 +1208,13 @@ if runs:
             "",
             "## Top-Line Comparison",
             "",
-            "| Product | Profile | Status | Total Runtime ms | Records After Setup | DB After | CPU Avg % | CPU Max % | Memory Avg | Memory Max | Subtree Search Mean ms | Subtree Search ops/s | Add Mean ms | Modify Mean ms | Delete Mean ms | Password Modify Mean ms |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Product | Profile | Status | Total Runtime ms | Records After Setup | DB After | CPU Avg % | CPU Max % | Memory Avg | Memory Max | Subtree Search Mean ms | Subtree Search ops/s | Add Mean ms | Modify Mean ms | Delete Mean ms | Password Modify Mean ms | Max Concurrent Bind Clients Tested | Max 0% Failure Concurrent Bind Clients | Max-Test Failure % | Peak Concurrent Bind Success ops/s |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for run in runs:
         lines.append(
-            f"| {run['product']} | {run['profile']} | {run['status']} | {fmt_number(run['total_elapsed_ms'])} | {fmt_int(run['records_after_setup'])} | {human_bytes(int(run['db_after_bytes']))} | {run['cpu_avg_percent']:.2f} | {run['cpu_max_percent']:.2f} | {human_bytes(int(run['memory_avg_bytes']))} | {human_bytes(int(run['memory_max_bytes']))} | {fmt_number(run['search_subtree_mean_ms'])} | {fmt_number(run['search_subtree_throughput'], 2)} | {fmt_number(run['add_mean_ms'])} | {fmt_number(run['modify_mean_ms'])} | {fmt_number(run['delete_mean_ms'])} | {fmt_number(run['password_modify_mean_ms'])} |"
+            f"| {run['product']} | {run['profile']} | {run['status']} | {fmt_number(run['total_elapsed_ms'])} | {fmt_int(run['records_after_setup'])} | {human_bytes(int(run['db_after_bytes']))} | {run['cpu_avg_percent']:.2f} | {run['cpu_max_percent']:.2f} | {human_bytes(int(run['memory_avg_bytes']))} | {human_bytes(int(run['memory_max_bytes']))} | {fmt_number(run['search_subtree_mean_ms'])} | {fmt_number(run['search_subtree_throughput'], 2)} | {fmt_number(run['add_mean_ms'])} | {fmt_number(run['modify_mean_ms'])} | {fmt_number(run['delete_mean_ms'])} | {fmt_number(run['password_modify_mean_ms'])} | {fmt_int(run['max_concurrent_bind_clients_tested'])} | {fmt_int(run['max_concurrent_bind_clients_zero_failure'])} | {fmt_number(run['max_concurrent_bind_failure_rate_percent'], 2)} | {fmt_number(run['peak_concurrent_bind_success_throughput'], 2)} |"
         )
 
     incomplete_runs = [run for run in runs if run["status"] != "success"]

@@ -3,6 +3,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use clap::Parser;
 use opendr::aci::AciEngine;
 use opendr::audit::{AuditConfig, AuditFormat, AuditLevel, AuditLogger};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
@@ -15,6 +16,17 @@ use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use opendr::tls::{RustlsTlsHandler, TlsConfig as RuntimeTlsConfig, TlsVersion};
+
+#[derive(Debug, Parser)]
+#[command(name = "opendr")]
+#[command(about = "OpenDR LDAP server")]
+struct Args {
+    #[arg(long, default_value = "config/server.toml")]
+    config: PathBuf,
+
+    #[arg(long, default_value = "config/log4rs.yml")]
+    log_config: PathBuf,
+}
 
 fn parse_audit_level(level: &str) -> Result<AuditLevel, Box<dyn Error>> {
     match level {
@@ -81,12 +93,17 @@ async fn build_legacy_security_config(
     })))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    log4rs::init_file("config/log4rs.yml", Default::default()).unwrap();
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    tokio::runtime::Runtime::new()?.block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<(), Box<dyn Error>> {
+    log4rs::init_file(&args.log_config, Default::default()).unwrap();
 
     // Load configuration from server.toml
-    let config = ServerConfig::from_file("config/server.toml")?;
+    let config_path = args.config.to_string_lossy();
+    let config = ServerConfig::from_file(&config_path)?;
 
     // Validate configuration
     config.validate()?;
@@ -149,6 +166,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     config.backend.lmdb_max_readers,
                     config.performance.cache_size,
                 )?;
+                backend.set_metrics(monitoring_metrics.clone());
 
                 // Initialize with base structure if needed
                 match backend.get_entry(&config.server.base_dn).await {
