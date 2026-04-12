@@ -7,7 +7,7 @@ use clap::Parser;
 use opendr::aci::AciEngine;
 use opendr::audit::{AuditConfig, AuditFormat, AuditLevel, AuditLogger};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
-use opendr::backend_lmdb::{IndexConfig, LmdbBackend};
+use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBackend};
 use opendr::config::ServerConfig;
 use opendr::fsm_server;
 use opendr::metrics::MetricsCollector;
@@ -147,12 +147,33 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
                 // Create LMDB backend with configured max size (convert to MB)
                 let max_size_mb = config.backend.lmdb_max_size / (1024 * 1024);
                 let replica_id = config.server.replica_id;
+                let mut attribute_indexes = Vec::new();
+                if config.performance.indexing_enabled {
+                    for index in &config.backend.indexes {
+                        let mut index_types = Vec::new();
+                        for index_type in &index.types {
+                            let Some(index_type) = IndexType::from_name(index_type) else {
+                                return Err(format!(
+                                    "unsupported index type for {}: {}",
+                                    index.attribute, index_type
+                                )
+                                .into());
+                            };
+                            index_types.push(index_type);
+                        }
+                        attribute_indexes.push(AttributeIndexConfig {
+                            attribute: index.attribute.clone(),
+                            index_types,
+                        });
+                    }
+                }
                 let index_config = IndexConfig {
                     indexed_attributes: if config.performance.indexing_enabled {
                         config.backend.indexed_attributes.clone()
                     } else {
                         Vec::new()
                     },
+                    attribute_indexes,
                 };
                 println!(
                     "LMDB entry cache capacity: {}",

@@ -14,6 +14,17 @@ backend_type = "lmdb"
 data_directory = "./data"
 lmdb_max_size = 10737418240  # 10GB
 lmdb_max_readers = 256
+# Legacy indexed_attributes entries get equality and presence indexes.
+# indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou"]
+#
+# Typed indexes can add OpenDJ-style index categories for custom attributes.
+# [[backend.indexes]]
+# attribute = "cn"
+# types = ["substring"]
+#
+# [[backend.indexes]]
+# attribute = "entryCSN"
+# types = ["ordering"]
 
 [resources]
 # Support at least 128 concurrent clients from the same Docker bridge / proxy IP

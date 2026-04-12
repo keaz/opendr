@@ -1,4 +1,4 @@
-use crate::backend::{DirectoryEntry, SearchCandidateHint};
+use crate::backend::{DirectoryEntry, SearchCandidateHint, SearchSubstringPart};
 use crate::replication::RenameChange;
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 use crate::search_fsm::SearchEntry;
@@ -22,6 +22,7 @@ const EXTENSIBLE_MATCH: u64 = 9;
 const SUBSTRING_INITIAL: u64 = 0;
 const SUBSTRING_ANY: u64 = 1;
 const SUBSTRING_FINAL: u64 = 2;
+const SUBSTRING_INDEX_MIN_CHARS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompiledLdapFilter {
@@ -198,6 +199,30 @@ impl CompiledLdapFilter {
             }),
             Self::Present { attribute } => Some(SearchCandidateHint::Present {
                 attribute: attribute.clone(),
+            }),
+            Self::Substrings { attribute, parts }
+                if parts.iter().any(|part| {
+                    substring_part_value(part).chars().count() >= SUBSTRING_INDEX_MIN_CHARS
+                }) =>
+            {
+                Some(SearchCandidateHint::Substring {
+                    attribute: attribute.clone(),
+                    parts: parts.iter().map(SearchSubstringPart::from).collect(),
+                })
+            }
+            Self::GreaterOrEqual { attribute, value } => {
+                Some(SearchCandidateHint::GreaterOrEqual {
+                    attribute: attribute.clone(),
+                    value: value.clone(),
+                })
+            }
+            Self::LessOrEqual { attribute, value } => Some(SearchCandidateHint::LessOrEqual {
+                attribute: attribute.clone(),
+                value: value.clone(),
+            }),
+            Self::ApproxMatch { attribute, value } => Some(SearchCandidateHint::Equality {
+                attribute: attribute.clone(),
+                value: value.clone(),
             }),
             _ => None,
         }
@@ -387,6 +412,16 @@ impl CompiledLdapFilter {
     }
 }
 
+impl From<&SubstringPart> for SearchSubstringPart {
+    fn from(part: &SubstringPart) -> Self {
+        match part {
+            SubstringPart::Initial(value) => Self::Initial(value.clone()),
+            SubstringPart::Any(value) => Self::Any(value.clone()),
+            SubstringPart::Final(value) => Self::Final(value.clone()),
+        }
+    }
+}
+
 fn change_type_label(change_type: &ChangeType) -> &'static str {
     match change_type {
         ChangeType::Add => "add",
@@ -504,6 +539,14 @@ fn convert_search_substring(substring: &Substring<'_>) -> SubstringPart {
         Substring::Initial(segment) => SubstringPart::Initial(bytes_to_string(segment.0.as_ref())),
         Substring::Any(segment) => SubstringPart::Any(bytes_to_string(segment.0.as_ref())),
         Substring::Final(segment) => SubstringPart::Final(bytes_to_string(segment.0.as_ref())),
+    }
+}
+
+fn substring_part_value(part: &SubstringPart) -> &str {
+    match part {
+        SubstringPart::Initial(value) | SubstringPart::Any(value) | SubstringPart::Final(value) => {
+            value
+        }
     }
 }
 
@@ -716,6 +759,39 @@ mod tests {
         assert!(ignore_case.matches(&entry));
         assert!(dn_attribute.matches(&entry));
         assert!(!unsupported_rule.matches(&entry));
+    }
+
+    #[test]
+    fn compile_filter_extracts_substring_and_ordering_hints() {
+        assert_eq!(
+            extract_search_candidate_hint_from_str("(cn=Ali*)"),
+            Some(SearchCandidateHint::Substring {
+                attribute: "cn".to_string(),
+                parts: vec![SearchSubstringPart::Initial("Ali".to_string())],
+            })
+        );
+        assert_eq!(
+            extract_search_candidate_hint_from_str("(entryCSN>=020)"),
+            Some(SearchCandidateHint::GreaterOrEqual {
+                attribute: "entrycsn".to_string(),
+                value: "020".to_string(),
+            })
+        );
+        assert_eq!(
+            extract_search_candidate_hint_from_str("(entryCSN<=020)"),
+            Some(SearchCandidateHint::LessOrEqual {
+                attribute: "entrycsn".to_string(),
+                value: "020".to_string(),
+            })
+        );
+        assert_eq!(
+            extract_search_candidate_hint_from_str("(cn~=Alice)"),
+            Some(SearchCandidateHint::Equality {
+                attribute: "cn".to_string(),
+                value: "Alice".to_string(),
+            })
+        );
+        assert_eq!(extract_search_candidate_hint_from_str("(cn=Al*)"), None);
     }
 
     #[test]

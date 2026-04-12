@@ -364,8 +364,32 @@ pub enum ModifyOperation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchCandidateHint {
-    Equality { attribute: String, value: String },
-    Present { attribute: String },
+    Equality {
+        attribute: String,
+        value: String,
+    },
+    Present {
+        attribute: String,
+    },
+    Substring {
+        attribute: String,
+        parts: Vec<SearchSubstringPart>,
+    },
+    GreaterOrEqual {
+        attribute: String,
+        value: String,
+    },
+    LessOrEqual {
+        attribute: String,
+        value: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchSubstringPart {
+    Initial(String),
+    Any(String),
+    Final(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

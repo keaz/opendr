@@ -23,7 +23,7 @@
 //! - Indexed attribute lookups
 //! - DN normalization for fast case-insensitive searches
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,7 @@ use tokio::sync::RwLock;
 
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
-    SearchCandidateHint,
+    SearchCandidateHint, SearchSubstringPart,
 };
 use crate::csn::CsnGenerator;
 use crate::metrics::MetricsCollector;
@@ -46,8 +46,11 @@ use crate::metrics::MetricsCollector;
 const LMDB_SET_RANGE_OP: u32 = 17;
 const DEFAULT_ENTRY_CACHE_CAPACITY: usize = 1000;
 const PRESENCE_INDEX_VALUE_SENTINEL: &str = "\0present";
-const PRESENCE_INDEX_VERSION: &[u8] = b"1";
-const PRESENCE_INDEX_MIGRATION_BATCH_SIZE: usize = 4096;
+const SUBSTRING_INDEX_KEY_PREFIX: &str = "\0sub\0";
+const ORDERING_INDEX_KEY_PREFIX: &str = "\0ord\0";
+const SUBSTRING_INDEX_TOKEN_LEN: usize = 3;
+const ATTRIBUTE_INDEX_VERSION: &[u8] = b"1";
+const ATTRIBUTE_INDEX_CONFIG_METADATA_KEY: &str = "attribute_indexes_v1:configured";
 
 /// Serialized entry structure for LMDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,8 +370,45 @@ impl StoredEntry {
 /// Configuration for indexed attributes
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
-    /// Attributes that should be indexed
+    /// Legacy attributes that should get equality and presence indexes.
     pub indexed_attributes: Vec<String>,
+    /// Typed attribute indexes. These are merged with `indexed_attributes`.
+    pub attribute_indexes: Vec<AttributeIndexConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeIndexConfig {
+    pub attribute: String,
+    pub index_types: Vec<IndexType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IndexType {
+    Equality,
+    Presence,
+    Substring,
+    Ordering,
+}
+
+impl IndexType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "equality" | "eq" => Some(Self::Equality),
+            "presence" | "pres" => Some(Self::Presence),
+            "substring" | "sub" => Some(Self::Substring),
+            "ordering" | "ord" => Some(Self::Ordering),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Equality => "equality",
+            Self::Presence => "presence",
+            Self::Substring => "substring",
+            Self::Ordering => "ordering",
+        }
+    }
 }
 
 impl Default for IndexConfig {
@@ -382,7 +422,57 @@ impl Default for IndexConfig {
                 "objectclass".to_string(),
                 "ou".to_string(),
             ],
+            attribute_indexes: Vec::new(),
         }
+    }
+}
+
+impl IndexConfig {
+    pub fn disabled() -> Self {
+        Self {
+            indexed_attributes: Vec::new(),
+            attribute_indexes: Vec::new(),
+        }
+    }
+
+    fn effective_index_types(&self) -> BTreeMap<String, BTreeSet<IndexType>> {
+        let mut indexes = BTreeMap::new();
+
+        for attribute in &self.indexed_attributes {
+            let attribute = attribute.to_lowercase();
+            if attribute.is_empty() {
+                continue;
+            }
+            let index_types = indexes.entry(attribute).or_insert_with(BTreeSet::new);
+            index_types.insert(IndexType::Equality);
+            index_types.insert(IndexType::Presence);
+        }
+
+        for configured in &self.attribute_indexes {
+            let attribute = configured.attribute.to_lowercase();
+            if attribute.is_empty() {
+                continue;
+            }
+            let index_types = indexes.entry(attribute).or_insert_with(BTreeSet::new);
+            for index_type in &configured.index_types {
+                index_types.insert(*index_type);
+            }
+        }
+
+        indexes.retain(|_, index_types| !index_types.is_empty());
+        indexes
+    }
+
+    fn index_types_for(&self, attribute: &str) -> Option<BTreeSet<IndexType>> {
+        self.effective_index_types()
+            .get(&attribute.to_lowercase())
+            .cloned()
+    }
+
+    fn has_index_type(&self, attribute: &str, index_type: IndexType) -> bool {
+        self.effective_index_types()
+            .get(&attribute.to_lowercase())
+            .is_some_and(|index_types| index_types.contains(&index_type))
     }
 }
 
@@ -514,19 +604,27 @@ impl LmdbBackend {
             .create_db(Some("metadata"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create metadata db: {}", e)))?;
 
+        let effective_index_types = index_config.effective_index_types();
+
         // Create attribute index databases.
         let mut attr_indexes = HashMap::new();
-        for attr in &index_config.indexed_attributes {
-            let db_name = format!("idx_{}", attr.to_lowercase());
+        for attr in effective_index_types.keys() {
+            let db_name = format!("idx_{}", attr);
             let db = env
                 .create_db(Some(&db_name), lmdb::DatabaseFlags::empty())
                 .map_err(|e| {
                     BackendError::Storage(format!("Failed to create index for {}: {}", attr, e))
                 })?;
-            attr_indexes.insert(attr.to_lowercase(), db);
+            attr_indexes.insert(attr.clone(), db);
         }
 
-        Self::ensure_presence_index_markers(&env, entries_db, metadata_db, &attr_indexes)?;
+        Self::ensure_attribute_indexes_backfilled(
+            &env,
+            entries_db,
+            metadata_db,
+            &attr_indexes,
+            &effective_index_types,
+        )?;
 
         // Initialize CSN generator with replica ID
         let csn_generator = Arc::new(CsnGenerator::new(replica_id));
@@ -1254,163 +1352,299 @@ impl LmdbBackend {
         Self::equality_index_prefix(PRESENCE_INDEX_VALUE_SENTINEL)
     }
 
-    fn presence_index_metadata_key(attribute: &str) -> String {
-        format!("presence_index_v1:{}", attribute)
+    fn substring_index_key(token: &str, dn: &str) -> String {
+        format!("{SUBSTRING_INDEX_KEY_PREFIX}{token}\0{dn}")
     }
 
-    fn ensure_presence_index_markers(
+    fn substring_index_prefix(token: &str) -> String {
+        format!("{SUBSTRING_INDEX_KEY_PREFIX}{token}\0")
+    }
+
+    fn ordering_index_key(value: &str, dn: &str) -> String {
+        format!("{ORDERING_INDEX_KEY_PREFIX}{value}\0{dn}")
+    }
+
+    fn ordering_index_prefix() -> &'static str {
+        ORDERING_INDEX_KEY_PREFIX
+    }
+
+    fn ordering_index_key_parts(key: &[u8]) -> Result<Option<(&str, &str)>, BackendError> {
+        let key = std::str::from_utf8(key)
+            .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
+        Ok(key
+            .strip_prefix(ORDERING_INDEX_KEY_PREFIX)
+            .and_then(|suffix| suffix.split_once('\0')))
+    }
+
+    fn attribute_index_keys(
+        index_db: Database,
+        dn: &str,
+        values: &[String],
+        index_types: &BTreeSet<IndexType>,
+    ) -> Vec<(Database, String)> {
+        let mut index_keys = Vec::new();
+
+        if index_types.contains(&IndexType::Presence) && !values.is_empty() {
+            index_keys.push((index_db, Self::presence_index_key(dn)));
+        }
+
+        for value in values {
+            let value_lower = value.to_lowercase();
+
+            if index_types.contains(&IndexType::Equality) {
+                index_keys.push((index_db, Self::equality_index_key(&value_lower, dn)));
+            }
+
+            if index_types.contains(&IndexType::Substring) {
+                for token in Self::substring_index_tokens(&value_lower) {
+                    index_keys.push((index_db, Self::substring_index_key(&token, dn)));
+                }
+            }
+
+            if index_types.contains(&IndexType::Ordering) {
+                index_keys.push((index_db, Self::ordering_index_key(&value_lower, dn)));
+            }
+        }
+
+        index_keys
+    }
+
+    fn substring_index_tokens(value: &str) -> BTreeSet<String> {
+        let chars = value.chars().collect::<Vec<_>>();
+        if chars.len() < SUBSTRING_INDEX_TOKEN_LEN {
+            return BTreeSet::new();
+        }
+
+        chars
+            .windows(SUBSTRING_INDEX_TOKEN_LEN)
+            .map(|window| window.iter().collect::<String>())
+            .collect()
+    }
+
+    fn substring_query_token(parts: &[SearchSubstringPart]) -> Option<String> {
+        let best_segment = parts
+            .iter()
+            .map(|part| match part {
+                SearchSubstringPart::Initial(value)
+                | SearchSubstringPart::Any(value)
+                | SearchSubstringPart::Final(value) => value,
+            })
+            .filter(|value| value.chars().count() >= SUBSTRING_INDEX_TOKEN_LEN)
+            .max_by_key(|value| value.chars().count())?;
+
+        Some(
+            best_segment
+                .to_lowercase()
+                .chars()
+                .take(SUBSTRING_INDEX_TOKEN_LEN)
+                .collect(),
+        )
+    }
+
+    fn attribute_index_metadata_key(attribute: &str) -> String {
+        format!("attribute_index_v1:{}", attribute)
+    }
+
+    fn attribute_index_config_value(index_types: &BTreeMap<String, BTreeSet<IndexType>>) -> String {
+        index_types
+            .iter()
+            .map(|(attribute, types)| {
+                let labels = types
+                    .iter()
+                    .map(|index_type| index_type.label())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{attribute}:{labels}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn ensure_attribute_indexes_backfilled(
         env: &Arc<Environment>,
         entries_db: Database,
         metadata_db: Database,
         attr_indexes: &HashMap<String, Database>,
+        index_types: &BTreeMap<String, BTreeSet<IndexType>>,
     ) -> Result<(), BackendError> {
+        let configured_attributes = Self::attribute_index_config_value(index_types);
         let pending_indexes = {
             let txn = env.begin_ro_txn().map_err(|e| {
                 BackendError::Storage(format!(
-                    "Failed to begin presence index version read txn: {}",
+                    "Failed to begin attribute index metadata read txn: {}",
                     e
                 ))
             })?;
-            let mut pending = Vec::new();
-            for (attr, index_db) in attr_indexes {
-                let metadata_key = Self::presence_index_metadata_key(attr);
-                match txn.get(metadata_db, &metadata_key.as_bytes()) {
-                    Ok(value) if value == PRESENCE_INDEX_VERSION => {}
-                    Ok(_) | Err(lmdb::Error::NotFound) => {
-                        pending.push((attr.clone(), *index_db));
-                    }
+            let config_changed =
+                match txn.get(metadata_db, &ATTRIBUTE_INDEX_CONFIG_METADATA_KEY.as_bytes()) {
+                    Ok(value) => value != configured_attributes.as_bytes(),
+                    Err(lmdb::Error::NotFound) => true,
                     Err(e) => {
                         return Err(BackendError::Storage(format!(
-                            "Failed to read presence index metadata for {}: {}",
-                            attr, e
+                            "Failed to read attribute index config metadata: {}",
+                            e
                         )))
                     }
-                }
-            }
-            pending
-        };
+                };
 
-        if pending_indexes.is_empty() {
-            return Ok(());
-        }
-
-        let pending_by_attr = pending_indexes.iter().cloned().collect::<HashMap<_, _>>();
-        let mut last_key = None;
-
-        loop {
-            let mut markers = Vec::with_capacity(PRESENCE_INDEX_MIGRATION_BATCH_SIZE);
-            let mut batch_full = false;
-
-            {
-                let txn = env.begin_ro_txn().map_err(|e| {
-                    BackendError::Storage(format!(
-                        "Failed to begin presence index migration read txn: {}",
-                        e
-                    ))
-                })?;
-                let mut cursor = txn.open_ro_cursor(entries_db).map_err(|e| {
-                    BackendError::Storage(format!(
-                        "Failed to open entries cursor for presence index migration: {}",
-                        e
-                    ))
-                })?;
-
-                if let Some(last_key) = last_key.as_deref() {
-                    match cursor.get(Some(last_key), None, LMDB_SET_RANGE_OP) {
-                        Ok(_) => {}
-                        Err(lmdb::Error::NotFound) => break,
+            if config_changed {
+                attr_indexes
+                    .iter()
+                    .filter_map(|(attr, index_db)| {
+                        index_types
+                            .get(attr)
+                            .map(|types| (attr.clone(), *index_db, types.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let mut pending = Vec::new();
+                for (attr, index_db) in attr_indexes {
+                    let metadata_key = Self::attribute_index_metadata_key(attr);
+                    match txn.get(metadata_db, &metadata_key.as_bytes()) {
+                        Ok(value) if value == ATTRIBUTE_INDEX_VERSION => {}
+                        Ok(_) | Err(lmdb::Error::NotFound) => {
+                            if let Some(types) = index_types.get(attr) {
+                                pending.push((attr.clone(), *index_db, types.clone()));
+                            }
+                        }
                         Err(e) => {
                             return Err(BackendError::Storage(format!(
-                                "Failed to seek entries cursor for presence index migration: {}",
-                                e
+                                "Failed to read attribute index metadata for {}: {}",
+                                attr, e
                             )))
                         }
                     }
                 }
-
-                for (entry_key, entry_bytes) in cursor.iter() {
-                    last_key = Some(entry_key.to_vec());
-                    let entry: StoredEntry = bincode::deserialize(entry_bytes).map_err(|e| {
-                        BackendError::Storage(format!(
-                            "Failed to deserialize entry during presence index migration: {}",
-                            e
-                        ))
-                    })?;
-
-                    for (attr_name, values) in &entry.attributes {
-                        if values.is_empty() {
-                            continue;
-                        }
-                        let attr_lower = attr_name.to_lowercase();
-                        if let Some(index_db) = pending_by_attr.get(&attr_lower) {
-                            markers.push((*index_db, Self::presence_index_key(&entry.dn)));
-                        }
-                    }
-
-                    if markers.len() >= PRESENCE_INDEX_MIGRATION_BATCH_SIZE {
-                        batch_full = true;
-                        break;
-                    }
-                }
+                pending
             }
+        };
 
-            if markers.is_empty() {
-                break;
-            }
-
+        if pending_indexes.is_empty() {
             let mut txn = env.begin_rw_txn().map_err(|e| {
                 BackendError::Storage(format!(
-                    "Failed to begin presence index migration write txn: {}",
+                    "Failed to begin attribute index config metadata write txn: {}",
                     e
                 ))
             })?;
-            for (index_db, marker_key) in markers {
-                txn.put(index_db, &marker_key.as_bytes(), &[], WriteFlags::empty())
-                    .map_err(|e| {
-                        BackendError::Storage(format!(
-                            "Failed to write migrated presence index marker: {}",
-                            e
-                        ))
-                    })?;
-            }
-            txn.commit().map_err(|e| {
-                BackendError::Storage(format!(
-                    "Failed to commit presence index migration batch: {}",
-                    e
-                ))
-            })?;
-
-            if !batch_full {
-                break;
-            }
-        }
-
-        let mut txn = env.begin_rw_txn().map_err(|e| {
-            BackendError::Storage(format!(
-                "Failed to begin presence index metadata write txn: {}",
-                e
-            ))
-        })?;
-        for (attr, _) in pending_indexes {
-            let metadata_key = Self::presence_index_metadata_key(&attr);
             txn.put(
                 metadata_db,
-                &metadata_key.as_bytes(),
-                &PRESENCE_INDEX_VERSION,
+                &ATTRIBUTE_INDEX_CONFIG_METADATA_KEY.as_bytes(),
+                &configured_attributes.as_bytes(),
                 WriteFlags::empty(),
             )
             .map_err(|e| {
                 BackendError::Storage(format!(
-                    "Failed to mark presence index migration complete for {}: {}",
+                    "Failed to mark attribute index config metadata: {}",
+                    e
+                ))
+            })?;
+            txn.commit().map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to commit attribute index config metadata: {}",
+                    e
+                ))
+            })?;
+            return Ok(());
+        }
+
+        let pending_by_attr = pending_indexes
+            .iter()
+            .map(|(attr, index_db, types)| (attr.clone(), (*index_db, types.clone())))
+            .collect::<HashMap<_, _>>();
+        let index_entries = {
+            let txn = env.begin_ro_txn().map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to begin attribute index backfill read txn: {}",
+                    e
+                ))
+            })?;
+            let mut cursor = txn.open_ro_cursor(entries_db).map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to open entries cursor for attribute index backfill: {}",
+                    e
+                ))
+            })?;
+
+            let mut index_entries = Vec::new();
+            for (_, entry_bytes) in cursor.iter() {
+                let entry: StoredEntry = bincode::deserialize(entry_bytes).map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Failed to deserialize entry during attribute index backfill: {}",
+                        e
+                    ))
+                })?;
+
+                for (attr_name, values) in &entry.attributes {
+                    if values.is_empty() {
+                        continue;
+                    }
+
+                    let attr_lower = attr_name.to_lowercase();
+                    if let Some((index_db, types)) = pending_by_attr.get(&attr_lower) {
+                        index_entries.extend(Self::attribute_index_keys(
+                            *index_db, &entry.dn, values, types,
+                        ));
+                    }
+                }
+            }
+
+            index_entries
+        };
+
+        let mut txn = env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin attribute index backfill write txn: {}",
+                e
+            ))
+        })?;
+
+        for (_, index_db, _) in &pending_indexes {
+            txn.clear_db(*index_db).map_err(|e| {
+                BackendError::Storage(format!("Failed to clear attribute index: {}", e))
+            })?;
+        }
+
+        for (index_db, index_key) in index_entries {
+            txn.put(index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
+                .map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Failed to write backfilled attribute index key: {}",
+                        e
+                    ))
+                })?;
+        }
+
+        for (attr, _, _) in pending_indexes {
+            let metadata_key = Self::attribute_index_metadata_key(&attr);
+            txn.put(
+                metadata_db,
+                &metadata_key.as_bytes(),
+                &ATTRIBUTE_INDEX_VERSION,
+                WriteFlags::empty(),
+            )
+            .map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to mark attribute index backfill complete for {}: {}",
                     attr, e
                 ))
             })?;
         }
-        txn.commit().map_err(|e| {
+
+        txn.put(
+            metadata_db,
+            &ATTRIBUTE_INDEX_CONFIG_METADATA_KEY.as_bytes(),
+            &configured_attributes.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| {
             BackendError::Storage(format!(
-                "Failed to commit presence index metadata update: {}",
+                "Failed to mark attribute index config metadata: {}",
                 e
             ))
+        })?;
+
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!("Failed to commit attribute index backfill: {}", e))
         })?;
 
         Ok(())
@@ -1463,7 +1697,8 @@ impl LmdbBackend {
     /// Update attribute indexes for an entry
     ///
     /// This method updates the attribute indexes when an entry is added or modified.
-    /// For each indexed attribute, it creates an index entry mapping `value:dn` -> ``.
+    /// For each indexed attribute, it creates the configured equality, presence,
+    /// substring, and ordering keys.
     fn update_attribute_indexes(
         &self,
         txn: &mut lmdb::RwTransaction,
@@ -1480,32 +1715,18 @@ impl LmdbBackend {
 
             // Check if this attribute is indexed
             if let Some(index_db) = indexes.get(&attr_lower) {
-                if !values.is_empty() {
-                    let presence_key = Self::presence_index_key(dn);
-                    txn.put(
-                        *index_db,
-                        &presence_key.as_bytes(),
-                        &[],
-                        WriteFlags::empty(),
-                    )
-                    .map_err(|e| {
-                        BackendError::Storage(format!(
-                            "Failed to update presence index for {}: {}",
-                            attr_name, e
-                        ))
-                    })?;
-                }
-
-                for value in values {
-                    let value_lower = value.to_lowercase();
-                    let index_key = Self::equality_index_key(&value_lower, dn);
-                    txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
-                        .map_err(|e| {
-                            BackendError::Storage(format!(
-                                "Failed to update index for {}:{}: {}",
-                                attr_name, value, e
-                            ))
-                        })?;
+                if let Some(index_types) = self.index_config.index_types_for(&attr_lower) {
+                    for (_, index_key) in
+                        Self::attribute_index_keys(*index_db, dn, values, &index_types)
+                    {
+                        txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
+                            .map_err(|e| {
+                                BackendError::Storage(format!(
+                                    "Failed to update index for {}: {}",
+                                    attr_name, e
+                                ))
+                            })?;
+                    }
                 }
             }
         }
@@ -1532,29 +1753,19 @@ impl LmdbBackend {
 
             // Check if this attribute is indexed
             if let Some(index_db) = indexes.get(&attr_lower) {
-                if !values.is_empty() {
-                    let presence_key = Self::presence_index_key(dn);
-                    txn.del(*index_db, &presence_key.as_bytes(), None)
-                        .or_else(|e| match e {
-                            lmdb::Error::NotFound => Ok(()),
-                            _ => Err(BackendError::Storage(format!(
-                                "Failed to remove presence index for {}: {}",
-                                attr_name, e
-                            ))),
-                        })?;
-                }
-
-                for value in values {
-                    let value_lower = value.to_lowercase();
-                    let index_key = Self::equality_index_key(&value_lower, dn);
-                    txn.del(*index_db, &index_key.as_bytes(), None)
-                        .or_else(|e| match e {
-                            lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
-                            _ => Err(BackendError::Storage(format!(
-                                "Failed to remove index for {}:{}: {}",
-                                attr_name, value, e
-                            ))),
-                        })?;
+                if let Some(index_types) = self.index_config.index_types_for(&attr_lower) {
+                    for (_, index_key) in
+                        Self::attribute_index_keys(*index_db, dn, values, &index_types)
+                    {
+                        txn.del(*index_db, &index_key.as_bytes(), None)
+                            .or_else(|e| match e {
+                                lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
+                                _ => Err(BackendError::Storage(format!(
+                                    "Failed to remove index for {}: {}",
+                                    attr_name, e
+                                ))),
+                            })?;
+                    }
                 }
             }
         }
@@ -1573,6 +1784,10 @@ impl LmdbBackend {
     ) -> Result<Vec<String>, BackendError> {
         let attr_lower = attribute.to_lowercase();
         let value_lower = value.to_lowercase();
+
+        if !self.has_index_type(&attr_lower, IndexType::Equality) {
+            return Ok(Vec::new());
+        }
 
         let indexes = self
             .attr_indexes
@@ -1602,6 +1817,11 @@ impl LmdbBackend {
 
     fn search_present_by_index(&self, attribute: &str) -> Result<Vec<String>, BackendError> {
         let attr_lower = attribute.to_lowercase();
+
+        if !self.has_index_type(&attr_lower, IndexType::Presence) {
+            return Ok(Vec::new());
+        }
+
         let indexes = self
             .attr_indexes
             .try_read()
@@ -1620,6 +1840,135 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
         let search_prefix = Self::presence_index_prefix();
         Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes())
+    }
+
+    fn search_substring_by_index(
+        &self,
+        attribute: &str,
+        parts: &[SearchSubstringPart],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let attr_lower = attribute.to_lowercase();
+
+        if !self.has_index_type(&attr_lower, IndexType::Substring) {
+            return Ok(None);
+        }
+
+        let Some(token) = Self::substring_query_token(parts) else {
+            return Ok(None);
+        };
+
+        let indexes = self
+            .attr_indexes
+            .try_read()
+            .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
+        let index_db = match indexes.get(&attr_lower) {
+            Some(db) => *db,
+            None => return Ok(None),
+        };
+
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let mut cursor = txn
+            .open_ro_cursor(index_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+        let search_prefix = Self::substring_index_prefix(&token);
+        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes()).map(Some)
+    }
+
+    fn search_ordering_by_index(
+        &self,
+        attribute: &str,
+        value: &str,
+        greater_or_equal: bool,
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let attr_lower = attribute.to_lowercase();
+
+        if !self.has_index_type(&attr_lower, IndexType::Ordering) {
+            return Ok(None);
+        }
+
+        let indexes = self
+            .attr_indexes
+            .try_read()
+            .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
+        let index_db = match indexes.get(&attr_lower) {
+            Some(db) => *db,
+            None => return Ok(None),
+        };
+
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let mut cursor = txn
+            .open_ro_cursor(index_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+
+        let value_lower = value.to_lowercase();
+        let seek_key = if greater_or_equal {
+            Self::ordering_index_key(&value_lower, "")
+        } else {
+            Self::ordering_index_prefix().to_string()
+        };
+        let first_key = match cursor.get(Some(seek_key.as_bytes()), None, LMDB_SET_RANGE_OP) {
+            Ok((Some(key), _)) => key,
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(Some(Vec::new())),
+            Err(e) => {
+                return Err(BackendError::Storage(format!(
+                    "Failed to seek ordering index cursor: {}",
+                    e
+                )))
+            }
+        };
+
+        if !first_key.starts_with(Self::ordering_index_prefix().as_bytes()) {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut results = Vec::new();
+        if Self::push_ordering_candidate(first_key, &value_lower, greater_or_equal, &mut results)? {
+            for (key, _value) in cursor.iter() {
+                if !key.starts_with(Self::ordering_index_prefix().as_bytes()) {
+                    break;
+                }
+                if !Self::push_ordering_candidate(
+                    key,
+                    &value_lower,
+                    greater_or_equal,
+                    &mut results,
+                )? {
+                    break;
+                }
+            }
+        }
+
+        Ok(Some(results))
+    }
+
+    fn push_ordering_candidate(
+        key: &[u8],
+        target_value: &str,
+        greater_or_equal: bool,
+        results: &mut Vec<String>,
+    ) -> Result<bool, BackendError> {
+        let Some((value, dn)) = Self::ordering_index_key_parts(key)? else {
+            return Ok(false);
+        };
+
+        let in_range = if greater_or_equal {
+            value >= target_value
+        } else {
+            value <= target_value
+        };
+
+        if in_range {
+            results.push(dn.to_string());
+            Ok(true)
+        } else {
+            Ok(greater_or_equal)
+        }
     }
 
     fn load_entries_by_dns(
@@ -1653,11 +2002,18 @@ impl LmdbBackend {
 
     /// Check if an attribute is indexed
     pub fn is_indexed(&self, attribute: &str) -> bool {
-        let attr_lower = attribute.to_lowercase();
         self.index_config
-            .indexed_attributes
-            .iter()
-            .any(|a| a.to_lowercase() == attr_lower)
+            .effective_index_types()
+            .contains_key(&attribute.to_lowercase())
+    }
+
+    /// Check if an attribute has a specific index type configured.
+    pub fn has_attribute_index(&self, attribute: &str, index_type: IndexType) -> bool {
+        self.has_index_type(attribute, index_type)
+    }
+
+    fn has_index_type(&self, attribute: &str, index_type: IndexType) -> bool {
+        self.index_config.has_index_type(attribute, index_type)
     }
 
     pub fn configured_max_readers(&self) -> u32 {
@@ -1929,16 +2285,36 @@ impl DirectoryBackend for LmdbBackend {
 
         let candidates = match hint {
             SearchCandidateHint::Equality { attribute, value } => {
-                if !self.is_indexed(&attribute) {
+                if !self.has_index_type(&attribute, IndexType::Equality) {
                     return self.search_entries(base_dn, scope).await;
                 }
                 self.search_by_index(&attribute, &value)?
             }
             SearchCandidateHint::Present { attribute } => {
-                if !self.is_indexed(&attribute) {
+                if !self.has_index_type(&attribute, IndexType::Presence) {
                     return self.search_entries(base_dn, scope).await;
                 }
                 self.search_present_by_index(&attribute)?
+            }
+            SearchCandidateHint::Substring { attribute, parts } => {
+                let Some(candidates) = self.search_substring_by_index(&attribute, &parts)? else {
+                    return self.search_entries(base_dn, scope).await;
+                };
+                candidates
+            }
+            SearchCandidateHint::GreaterOrEqual { attribute, value } => {
+                let Some(candidates) = self.search_ordering_by_index(&attribute, &value, true)?
+                else {
+                    return self.search_entries(base_dn, scope).await;
+                };
+                candidates
+            }
+            SearchCandidateHint::LessOrEqual { attribute, value } => {
+                let Some(candidates) = self.search_ordering_by_index(&attribute, &value, false)?
+                else {
+                    return self.search_entries(base_dn, scope).await;
+                };
+                candidates
             }
         };
 
@@ -2569,6 +2945,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = IndexConfig {
             indexed_attributes: vec!["custom".to_string(), "special".to_string()],
+            attribute_indexes: Vec::new(),
         };
         let backend = LmdbBackend::new_with_config(dir.path(), 100, 1, config).unwrap();
 
@@ -2587,10 +2964,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_custom_index_backfilled_for_existing_entries_on_reopen() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new_with_config(
+                &db_path,
+                100,
+                1,
+                IndexConfig {
+                    indexed_attributes: Vec::new(),
+                    attribute_indexes: Vec::new(),
+                },
+            )
+            .unwrap();
+
+            let mut attributes = HashMap::new();
+            attributes.insert("employeeNumber".to_string(), vec!["12345".to_string()]);
+            attributes.insert("cn".to_string(), vec!["Alice".to_string()]);
+            let entry = DirectoryEntry::new("uid=alice,dc=example,dc=org", attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+
+            let results = backend.search_by_index("employeeNumber", "12345").unwrap();
+            assert!(results.is_empty());
+        }
+
+        let backend = LmdbBackend::new_with_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: vec!["employeeNumber".to_string()],
+                attribute_indexes: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let results = backend.search_by_index("employeeNumber", "12345").unwrap();
+        assert_eq!(results, vec!["uid=alice,dc=example,dc=org".to_string()]);
+
+        let present_results = backend.search_present_by_index("employeeNumber").unwrap();
+        assert_eq!(
+            present_results,
+            vec!["uid=alice,dc=example,dc=org".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_custom_index_backfill_handles_attribute_without_existing_values() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new_with_config(
+                &db_path,
+                100,
+                1,
+                IndexConfig {
+                    indexed_attributes: Vec::new(),
+                    attribute_indexes: Vec::new(),
+                },
+            )
+            .unwrap();
+
+            let mut attributes = HashMap::new();
+            attributes.insert("cn".to_string(), vec!["Alice".to_string()]);
+            let entry = DirectoryEntry::new("uid=alice,dc=example,dc=org", attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+        }
+
+        let backend = LmdbBackend::new_with_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: vec!["employeeNumber".to_string()],
+                attribute_indexes: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(backend.is_indexed("employeeNumber"));
+        assert!(backend
+            .search_by_index("employeeNumber", "12345")
+            .unwrap()
+            .is_empty());
+        assert!(backend
+            .search_present_by_index("employeeNumber")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reenabled_index_rebuilds_after_disabled_changes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new_with_config(
+                &db_path,
+                100,
+                1,
+                IndexConfig {
+                    indexed_attributes: vec!["custom".to_string()],
+                    attribute_indexes: Vec::new(),
+                },
+            )
+            .unwrap();
+
+            let mut attributes = HashMap::new();
+            attributes.insert("custom".to_string(), vec!["old".to_string()]);
+            let entry = DirectoryEntry::new("uid=test,dc=example,dc=org", attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+            assert_eq!(backend.search_by_index("custom", "old").unwrap().len(), 1);
+        }
+
+        {
+            let backend = LmdbBackend::new_with_config(
+                &db_path,
+                100,
+                1,
+                IndexConfig {
+                    indexed_attributes: Vec::new(),
+                    attribute_indexes: Vec::new(),
+                },
+            )
+            .unwrap();
+
+            backend
+                .modify_entry(
+                    "uid=test,dc=example,dc=org",
+                    vec![Modification {
+                        operation: ModifyOperation::Replace,
+                        attribute: "custom".to_string(),
+                        values: vec!["new".to_string()],
+                    }],
+                )
+                .await
+                .unwrap();
+
+            assert!(backend.search_by_index("custom", "new").unwrap().is_empty());
+        }
+
+        let backend = LmdbBackend::new_with_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: vec!["custom".to_string()],
+                attribute_indexes: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(backend.search_by_index("custom", "old").unwrap().is_empty());
+        assert_eq!(
+            backend.search_by_index("custom", "new").unwrap(),
+            vec!["uid=test,dc=example,dc=org".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn test_runtime_config_applies_indexes_and_max_readers() {
         let dir = tempdir().unwrap();
         let config = IndexConfig {
             indexed_attributes: vec!["departmentnumber".to_string()],
+            attribute_indexes: Vec::new(),
         };
         let backend = LmdbBackend::new_with_runtime_config(dir.path(), 100, 1, config, 64).unwrap();
 
@@ -2609,6 +3149,264 @@ mod tests {
 
         let results = backend.search_by_index("departmentNumber", "42").unwrap();
         assert_eq!(results, vec!["uid=test,dc=example,dc=org".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_typed_substring_index_hint_uses_index_candidates() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "description".to_string(),
+                    index_types: vec![IndexType::Substring],
+                }],
+            },
+        )
+        .unwrap();
+
+        let mut alice_attributes = HashMap::new();
+        alice_attributes.insert("description".to_string(), vec!["alpha marker".to_string()]);
+        let alice = DirectoryEntry::new("uid=alice,dc=example,dc=org", alice_attributes);
+        backend.add_entry(alice, vec![]).await.unwrap();
+
+        let mut bob_attributes = HashMap::new();
+        bob_attributes.insert("description".to_string(), vec!["omega".to_string()]);
+        let bob = DirectoryEntry::new("uid=bob,dc=example,dc=org", bob_attributes);
+        backend.add_entry(bob, vec![]).await.unwrap();
+
+        let mut multi_value_attributes = HashMap::new();
+        multi_value_attributes.insert(
+            "description".to_string(),
+            vec!["plain".to_string(), "zebra finish".to_string()],
+        );
+        let multi_value =
+            DirectoryEntry::new("uid=multi,dc=example,dc=org", multi_value_attributes);
+        backend.add_entry(multi_value, vec![]).await.unwrap();
+
+        assert!(backend
+            .search_by_index("description", "alpha marker")
+            .unwrap()
+            .is_empty());
+
+        let results = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Substring {
+                    attribute: "description".to_string(),
+                    parts: vec![SearchSubstringPart::Any("pha".to_string())],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].dn, "uid=alice,dc=example,dc=org");
+
+        let initial_results = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Substring {
+                    attribute: "description".to_string(),
+                    parts: vec![SearchSubstringPart::Initial("ALP".to_string())],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(initial_results.len(), 1);
+        assert_eq!(initial_results[0].dn, "uid=alice,dc=example,dc=org");
+
+        let final_results = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Substring {
+                    attribute: "description".to_string(),
+                    parts: vec![SearchSubstringPart::Final("KER".to_string())],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(final_results.len(), 1);
+        assert_eq!(final_results[0].dn, "uid=alice,dc=example,dc=org");
+
+        let multi_value_results = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Substring {
+                    attribute: "description".to_string(),
+                    parts: vec![SearchSubstringPart::Any("BRA".to_string())],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(multi_value_results.len(), 1);
+        assert_eq!(multi_value_results[0].dn, "uid=multi,dc=example,dc=org");
+    }
+
+    #[tokio::test]
+    async fn test_typed_ordering_index_backfilled_for_existing_entries() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new_with_config(
+                &db_path,
+                100,
+                1,
+                IndexConfig {
+                    indexed_attributes: Vec::new(),
+                    attribute_indexes: Vec::new(),
+                },
+            )
+            .unwrap();
+
+            for (uid, serial) in [("low", "010"), ("mid", "020"), ("high", "030")] {
+                let mut attributes = HashMap::new();
+                attributes.insert("serialNumber".to_string(), vec![serial.to_string()]);
+                let entry = DirectoryEntry::new(format!("uid={uid},dc=example,dc=org"), attributes);
+                backend.add_entry(entry, vec![]).await.unwrap();
+            }
+        }
+
+        let backend = LmdbBackend::new_with_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "serialNumber".to_string(),
+                    index_types: vec![IndexType::Ordering],
+                }],
+            },
+        )
+        .unwrap();
+
+        let greater_or_equal = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::GreaterOrEqual {
+                    attribute: "serialNumber".to_string(),
+                    value: "020".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.dn)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            greater_or_equal,
+            vec![
+                "uid=mid,dc=example,dc=org".to_string(),
+                "uid=high,dc=example,dc=org".to_string()
+            ]
+        );
+
+        let less_or_equal = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::LessOrEqual {
+                    attribute: "serialNumber".to_string(),
+                    value: "020".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.dn)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            less_or_equal,
+            vec![
+                "uid=low,dc=example,dc=org".to_string(),
+                "uid=mid,dc=example,dc=org".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typed_ordering_index_handles_multivalue_scope_and_case() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "code".to_string(),
+                    index_types: vec![IndexType::Ordering],
+                }],
+            },
+        )
+        .unwrap();
+
+        let mut alpha_attributes = HashMap::new();
+        alpha_attributes.insert("code".to_string(), vec!["Alpha".to_string()]);
+        let alpha = DirectoryEntry::new("uid=alpha,ou=people,dc=example,dc=org", alpha_attributes);
+        backend.add_entry(alpha, vec![]).await.unwrap();
+
+        let mut multi_value_attributes = HashMap::new();
+        multi_value_attributes.insert(
+            "code".to_string(),
+            vec!["Lima".to_string(), "Zulu".to_string()],
+        );
+        let multi_value = DirectoryEntry::new(
+            "uid=multi,ou=people,dc=example,dc=org",
+            multi_value_attributes,
+        );
+        backend.add_entry(multi_value, vec![]).await.unwrap();
+
+        let mut out_of_scope_attributes = HashMap::new();
+        out_of_scope_attributes.insert("code".to_string(), vec!["Zulu".to_string()]);
+        let out_of_scope = DirectoryEntry::new(
+            "uid=outside,ou=ops,dc=example,dc=org",
+            out_of_scope_attributes,
+        );
+        backend.add_entry(out_of_scope, vec![]).await.unwrap();
+
+        let scoped_ge = backend
+            .search_entries_with_hint(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::GreaterOrEqual {
+                    attribute: "code".to_string(),
+                    value: "YANKEE".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(scoped_ge.len(), 1);
+        assert_eq!(scoped_ge[0].dn, "uid=multi,ou=people,dc=example,dc=org");
+
+        let less_or_equal = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::LessOrEqual {
+                    attribute: "code".to_string(),
+                    value: "BRAVO".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(less_or_equal.len(), 1);
+        assert_eq!(less_or_equal[0].dn, "uid=alpha,ou=people,dc=example,dc=org");
     }
 
     #[tokio::test]

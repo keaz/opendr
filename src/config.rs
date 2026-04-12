@@ -195,6 +195,21 @@ pub struct BackendSettings {
     /// Indexed attributes
     #[serde(default = "default_indexed_attributes")]
     pub indexed_attributes: Vec<String>,
+
+    /// Typed attribute indexes.
+    #[serde(default)]
+    pub indexes: Vec<AttributeIndexSettings>,
+}
+
+/// Typed backend index settings for one attribute.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttributeIndexSettings {
+    /// Attribute to index.
+    pub attribute: String,
+
+    /// Index types to maintain, e.g. "equality", "presence", "substring", "ordering".
+    #[serde(default)]
+    pub types: Vec<String>,
 }
 
 /// TLS settings
@@ -779,6 +794,13 @@ fn default_cache_size() -> usize {
     1000
 }
 
+fn is_valid_backend_index_type(index_type: &str) -> bool {
+    matches!(
+        index_type.to_ascii_lowercase().as_str(),
+        "equality" | "eq" | "presence" | "pres" | "substring" | "sub" | "ordering" | "ord"
+    )
+}
+
 // Default implementations
 impl Default for ServerSettings {
     fn default() -> Self {
@@ -812,6 +834,7 @@ impl Default for BackendSettings {
             lmdb_max_readers: default_lmdb_max_readers(),
             import_sample_data: false,
             indexed_attributes: default_indexed_attributes(),
+            indexes: Vec::new(),
         }
     }
 }
@@ -1293,6 +1316,34 @@ impl ServerConfig {
                 "Invalid backend type: {}",
                 self.backend.backend_type
             )));
+        }
+        for attribute in &self.backend.indexed_attributes {
+            if attribute.trim().is_empty() {
+                return Err(ConfigError::ValidationError(
+                    "backend.indexed_attributes cannot contain empty attribute names".to_string(),
+                ));
+            }
+        }
+        for index in &self.backend.indexes {
+            if index.attribute.trim().is_empty() {
+                return Err(ConfigError::ValidationError(
+                    "backend.indexes attribute cannot be empty".to_string(),
+                ));
+            }
+            if index.types.is_empty() {
+                return Err(ConfigError::ValidationError(format!(
+                    "backend.indexes for {} must configure at least one index type",
+                    index.attribute
+                )));
+            }
+            for index_type in &index.types {
+                if !is_valid_backend_index_type(index_type) {
+                    return Err(ConfigError::ValidationError(format!(
+                        "unsupported backend index type for {}: {}",
+                        index.attribute, index_type
+                    )));
+                }
+            }
         }
 
         // Validate TLS settings

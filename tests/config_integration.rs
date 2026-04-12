@@ -676,6 +676,62 @@ indexed_attributes = ["cn", "uid", "mail", "sn", "givenName", "objectClass", "ou
 }
 
 #[test]
+fn test_typed_backend_indexes_config() {
+    let toml = r#"
+[backend]
+indexed_attributes = []
+
+[[backend.indexes]]
+attribute = "cn"
+types = ["equality", "presence", "substring"]
+
+[[backend.indexes]]
+attribute = "entryCSN"
+types = ["ordering"]
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    config.validate().unwrap();
+
+    assert_eq!(config.backend.indexes.len(), 2);
+    assert_eq!(config.backend.indexes[0].attribute, "cn");
+    assert_eq!(
+        config.backend.indexes[0].types,
+        vec![
+            "equality".to_string(),
+            "presence".to_string(),
+            "substring".to_string()
+        ]
+    );
+    assert_eq!(config.backend.indexes[1].attribute, "entryCSN");
+    assert_eq!(
+        config.backend.indexes[1].types,
+        vec!["ordering".to_string()]
+    );
+}
+
+#[test]
+fn test_invalid_backend_index_type_validation() {
+    let toml = r#"
+[backend]
+indexed_attributes = []
+
+[[backend.indexes]]
+attribute = "cn"
+types = ["bogus"]
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    let result = config.validate();
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported backend index type for cn: bogus"));
+}
+
+#[test]
 fn test_max_connections_validation() {
     let toml = r#"
 [resources]
