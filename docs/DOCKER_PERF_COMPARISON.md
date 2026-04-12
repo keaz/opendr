@@ -15,6 +15,8 @@ This document captures the validated Dockerized LDAP benchmark results for OpenD
 - The latest concurrent-bind OpenDR tuned capacity run is `target/perf/docker-matrix-concurrent-bind-fsm-opendr-config-128-20260411/`.
 - The concurrent-bind OpenDJ comparison run is `target/perf/docker-matrix-concurrent-bind-fsm-opendj-isolated-20260411/`.
 - The latest index-type comparison run is `target/perf/docker-matrix-index-types-final-20260412/`.
+- The latest SASL PLAIN full-profile comparison run is `target/perf/docker-matrix-sasl-plain-full-20260412/`.
+- The latest SASL PLAIN concurrent-bind comparison run is `target/perf/docker-matrix-sasl-plain-concurrency-20260412/`.
 - There is not yet a validated 10M-user benchmark artifact. The 10M+ section below uses the largest measured Docker profile plus the concurrent-bind capacity run as bounded proxies and calls out the required production-scale benchmark work.
 
 ## Reproduction
@@ -93,6 +95,39 @@ Index-type comparison run:
   --output-dir target/perf/docker-matrix-index-types-final-20260412
 ```
 
+SASL PLAIN full-profile comparison run:
+
+```bash
+./scripts/perf_docker_matrix.sh \
+  --profile-set full \
+  --products opendr,opendj \
+  --opendr-runtime fsm \
+  --benchmark-timeout 240 \
+  --sasl-plain-benchmark \
+  --sasl-plain-authcid-format rdn-value \
+  --skip-sasl-plain-admin-benchmark \
+  --perf-client-image opendr:docker-perf-client \
+  --output-dir target/perf/docker-matrix-sasl-plain-full-20260412
+```
+
+SASL PLAIN concurrent-bind comparison run:
+
+```bash
+./scripts/perf_docker_matrix.sh \
+  --profile-set sasl \
+  --products opendr,opendj \
+  --opendr-runtime fsm \
+  --benchmark-timeout 240 \
+  --concurrent-bind-clients 1,4,8,16,32,64,128 \
+  --concurrent-bind-iterations 20 \
+  --concurrent-bind-warmup-iterations 1 \
+  --concurrent-bind-operation-timeout-ms 5000 \
+  --sasl-plain-authcid-format rdn-value \
+  --skip-sasl-plain-admin-benchmark \
+  --perf-client-image opendr:docker-perf-client \
+  --output-dir target/perf/docker-matrix-sasl-plain-concurrency-20260412
+```
+
 ## What Changed
 
 Legacy runtime remediation:
@@ -111,6 +146,7 @@ FSM runtime performance remediation:
 - Added a bounded LMDB auth credential cache that stores decoded SSHA512 hash+salt records only, with invalidation/update coverage for password modify, delete, rename, and prehashed password updates.
 - Fixed non-password modify operations so they no longer rewrite/delete password credentials.
 - Added an `index` Docker profile that exercises equality, presence, substring, and ordering-style search filters, plus concurrent mixed index-search probes. The OpenDR run uses LMDB equality/presence defaults plus typed `description` substring and `sn` ordering indexes. The OpenDJ run uses matching `uid` equality, `mail` presence, `description` substring, and `sn` ordering backend index settings.
+- Added SASL PLAIN perf probes to the Docker benchmark client. The full profile captures serial fixture-user SASL bind latency, and the `sasl` profile captures concurrent SASL bind throughput/failure rate using the same generated fixture users. OpenDJ rejected the directory-manager/admin SASL PLAIN probe with `InvalidCredentials`, so the OpenDR-vs-OpenDJ comparison uses fixture-user binds with `--sasl-plain-authcid-format rdn-value` and `--skip-sasl-plain-admin-benchmark`.
 
 ## Load Profiles
 
@@ -122,6 +158,7 @@ FSM runtime performance remediation:
 | stress | 2500 | 3 | 3 | 1 |
 | auth-concurrency | 2500 | 3 | 3 | 1 |
 | index | 1000 | 30 | 10 | 2 |
+| sasl-auth | 2500 | 3 | 3 | 1 |
 
 These profiles are not 10M-user scale. They are bounded Docker regression profiles intended to catch relative latency, storage, and resource regressions quickly under a repeatable 2 CPU / 4 GiB container envelope.
 
@@ -136,6 +173,8 @@ The `index` profile adds search probes for:
 - ordering upper bound: `(sn<=BenchmarkUser000500)`
 
 It also runs a concurrent mixed index-search probe over those filters at 1, 4, 8, 16, and 32 clients.
+
+The `sasl-auth` profile reuses the generated fixture-user tree and runs concurrent SASL PLAIN fixture-user binds at the configured client levels. For OpenDJ compatibility, the benchmark sends the LDAP bind name as the full fixture-user DN and sends the SASL PLAIN `authcid` as the fixture user's RDN value, for example `opendj-sasl-auth-user-000000`.
 
 ## Legacy Runtime Results
 
@@ -180,6 +219,47 @@ These are the latest OpenDR FSM-runtime results after the FSM search performance
 | ModifyDN mean ms | 0.470 vs 0.842 | 0.525 vs 0.978 | 0.602 vs 1.242 | 0.594 vs 1.768 | FSM faster |
 | Delete mean ms | 0.406 vs 1.156 | 0.430 vs 1.519 | 0.460 vs 2.895 | 0.514 vs 3.204 | FSM faster |
 | Password modify mean ms | 0.359 vs 0.610 | 0.461 vs 0.760 | 0.503 vs 0.754 | 0.769 vs 0.929 | FSM faster |
+
+## SASL PLAIN Results
+
+These results are from `target/perf/docker-matrix-sasl-plain-full-20260412/` and `target/perf/docker-matrix-sasl-plain-concurrency-20260412/`. Both runs use the Dockerized perf client, 2 CPU, 4 GiB memory, StartTLS, OpenDR FSM, and OpenDJ `openidentityplatform/opendj:5.0.4`.
+
+OpenDJ accepts SASL PLAIN for generated fixture users when the SASL `authcid` is the UID/RDN value. It rejected the directory-manager/admin SASL PLAIN probe with `InvalidCredentials`, so the comparison below intentionally skips the admin SASL probe and compares fixture-user binds only. OpenDR also passes this fixture-user mode because the bind request name remains the full DN.
+
+Serial fixture-user SASL PLAIN bind latency from the full profile:
+
+| Product / runtime | Light mean ms | Moderate mean ms | Heavy mean ms | Stress mean ms |
+|---|---:|---:|---:|---:|
+| OpenDR FSM | 0.059 | 0.059 | 0.063 | 0.062 |
+| OpenDJ | 0.383 | 0.425 | 0.331 | 0.474 |
+
+SASL PLAIN concurrent-bind summary from the `sasl-auth` profile:
+
+| Product / runtime | Max tested clients | Max 0% failure clients | Failure rate at max tested | Peak success ops/s | Clients at peak | Fixture-user mean ms | CPU avg / max | Memory avg / max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| OpenDR FSM | 128 | 128 | 0.00% | 99,330.02 | 8 | 0.064 | 7.47% / 40.93% | 12.36 MiB / 19.38 MiB |
+| OpenDJ | 128 | 128 | 0.00% | 16,091.05 | 8 | 0.245 | 56.60% / 197.80% | 984.68 MiB / 1.03 GiB |
+
+Per-level concurrent SASL PLAIN fixture-user bind results:
+
+| Product / runtime | Concurrent clients | Successes / attempts | Failure % | Success ops/s | Mean ms | P95 ms | P99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| OpenDR FSM | 1 | 20 / 20 | 0.00 | 17,462.80 | 0.053 | 0.065 | 0.070 |
+| OpenDR FSM | 4 | 80 / 80 | 0.00 | 73,928.61 | 0.040 | 0.078 | 0.108 |
+| OpenDR FSM | 8 | 160 / 160 | 0.00 | 99,330.02 | 0.073 | 0.118 | 0.147 |
+| OpenDR FSM | 16 | 320 / 320 | 0.00 | 97,475.54 | 0.152 | 0.191 | 0.232 |
+| OpenDR FSM | 32 | 640 / 640 | 0.00 | 94,727.68 | 0.315 | 0.376 | 0.499 |
+| OpenDR FSM | 64 | 1,280 / 1,280 | 0.00 | 95,486.76 | 0.608 | 0.939 | 1.106 |
+| OpenDR FSM | 128 | 2,560 / 2,560 | 0.00 | 92,930.11 | 1.263 | 1.406 | 2.676 |
+| OpenDJ | 1 | 20 / 20 | 0.00 | 3,441.03 | 0.286 | 0.467 | 0.506 |
+| OpenDJ | 4 | 80 / 80 | 0.00 | 10,697.57 | 0.359 | 0.474 | 0.538 |
+| OpenDJ | 8 | 160 / 160 | 0.00 | 16,091.05 | 0.452 | 0.713 | 0.914 |
+| OpenDJ | 16 | 320 / 320 | 0.00 | 3,494.51 | 4.469 | 2.266 | 77.086 |
+| OpenDJ | 32 | 640 / 640 | 0.00 | 3,390.23 | 8.716 | 77.279 | 82.469 |
+| OpenDJ | 64 | 1,280 / 1,280 | 0.00 | 4,200.83 | 14.931 | 83.189 | 88.462 |
+| OpenDJ | 128 | 2,560 / 2,560 | 0.00 | 4,277.56 | 26.395 | 92.482 | 100.713 |
+
+OpenDR FSM is faster than OpenDJ on every measured serial SASL PLAIN fixture-user bind row in the full profile, and reaches about 6.17x the peak concurrent SASL PLAIN successful-bind throughput in the bounded `sasl-auth` profile.
 
 ## Index Type Results
 
@@ -321,6 +401,7 @@ These deltas compare OpenDR legacy runtime in `target/perf/docker-matrix-issue55
 - The old OpenDR rows in this document are legacy-runtime results, not FSM-runtime results.
 - The latest OpenDR FSM runtime is faster than the fresh OpenDJ run on total runtime, Root DSE search, bind, subtree search, add, modifyDN, delete, password modify, memory footprint, and disk footprint.
 - The only OpenDJ-relative regression in the latest FSM run is `modify` at larger profiles: `heavy` is `0.472 ms` for FSM vs `0.365 ms` for OpenDJ, and `stress` is `0.473 ms` for FSM vs `0.420 ms` for OpenDJ.
+- SASL PLAIN fixture-user binds are now covered in the Docker perf harness. In the full-profile run, OpenDR FSM measured `0.059-0.063 ms` mean SASL fixture-user bind latency versus OpenDJ's `0.331-0.474 ms`. In the SASL concurrency run, both products sustained the max tested 128 clients at 0% SASL bind failures, with OpenDR peaking at `99,330.02` successful SASL binds/sec versus OpenDJ's `16,091.05`.
 - In the index profile, OpenDR FSM is faster than OpenDJ on all measured indexed read probes and reaches higher mixed concurrent index-search throughput, with 0% failures through the max tested 32 concurrent clients. OpenDJ remains faster on `add`, `modify`, and `delete` in that same index-profile write sample.
 - The remaining FSM search optimization target is no longer OpenDJ parity. It is OpenDR legacy-runtime parity: the latest FSM subtree search is still slower than the current OpenDR legacy baseline in the server-network harness.
 - The dominant earlier legacy-runtime bottleneck was not LMDB lookup cost. It was response-path latency on small LDAP search replies. Enabling `TCP_NODELAY` removed that bottleneck immediately.
@@ -359,3 +440,9 @@ These deltas compare OpenDR legacy runtime in `target/perf/docker-matrix-issue55
 - OpenDR FSM concurrent bind report: `target/perf/docker-matrix-concurrent-bind-fsm-opendj-isolated-20260411/opendr/auth-concurrency/report.md`
 - OpenDJ concurrent bind report: `target/perf/docker-matrix-concurrent-bind-fsm-opendj-isolated-20260411/opendj/auth-concurrency/report.md`
 - 10M+ benchmark tracking issue: `https://github.com/keaz/opendr/issues/74`
+- SASL PLAIN full-profile summary: `target/perf/docker-matrix-sasl-plain-full-20260412/comparison-summary.md`
+- SASL PLAIN full-profile CSV: `target/perf/docker-matrix-sasl-plain-full-20260412/comparison-summary.csv`
+- SASL PLAIN concurrency summary: `target/perf/docker-matrix-sasl-plain-concurrency-20260412/comparison-summary.md`
+- SASL PLAIN concurrency CSV: `target/perf/docker-matrix-sasl-plain-concurrency-20260412/comparison-summary.csv`
+- OpenDR FSM SASL concurrency report: `target/perf/docker-matrix-sasl-plain-concurrency-20260412/opendr/sasl-auth/report.md`
+- OpenDJ SASL concurrency report: `target/perf/docker-matrix-sasl-plain-concurrency-20260412/opendj/sasl-auth/report.md`

@@ -2,14 +2,35 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ldap3::exop::{PasswordModify, WhoAmI, WhoAmIResp};
 use ldap3::result::LdapError;
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Mod, Scope, SearchEntry};
+use ldap_parser::ldap::{ProtocolOp as ParserProtocolOp, ResultCode as ParserResultCode};
+use ldap_parser::parse_ldap_messages;
+use rasn::der;
+use rasn_ldap::{
+    AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
+    ExtendedRequest as RasnExtendedRequest, LdapMessage as RasnLdapMessage,
+    ProtocolOp as RasnProtocolOp, SaslCredentials as RasnSaslCredentials,
+};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
+use url::Url;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -56,6 +77,15 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     index_benchmark: bool,
+
+    #[arg(long, default_value_t = false)]
+    sasl_plain_benchmark: bool,
+
+    #[arg(long, default_value = "dn")]
+    sasl_plain_authcid_format: String,
+
+    #[arg(long, default_value_t = false)]
+    skip_sasl_plain_admin_benchmark: bool,
 
     #[arg(long, default_value = "")]
     concurrent_index_search_clients: String,
@@ -191,6 +221,14 @@ async fn run(args: Args) -> AppResult<()> {
     let concurrent_index_search_clients =
         parse_concurrent_index_search_clients(&args.concurrent_index_search_clients)?;
     let run_index_benchmarks = args.index_benchmark || !concurrent_index_search_clients.is_empty();
+    let sasl_plain_authcid_format =
+        parse_sasl_plain_authcid_format(&args.sasl_plain_authcid_format)?;
+    if args.sasl_plain_benchmark {
+        ensure(
+            args.starttls || args.url.starts_with("ldaps://"),
+            "--sasl-plain-benchmark requires --starttls or an ldaps:// URL",
+        )?;
+    }
     if !concurrent_bind_clients.is_empty() {
         ensure(
             args.concurrent_bind_iterations > 0,
@@ -277,6 +315,23 @@ async fn run(args: Args) -> AppResult<()> {
             ));
             benchmarks.push(run_concurrent_bind_benchmark(&args, &dns, *concurrency).await?);
         }
+        if args.sasl_plain_benchmark {
+            progress("benchmark.concurrent_sasl_plain_bind_fixture_users");
+            for concurrency in &concurrent_bind_clients {
+                progress(&format!(
+                    "benchmark.concurrent_sasl_plain_bind_fixture_users.c{concurrency}"
+                ));
+                benchmarks.push(
+                    run_concurrent_sasl_plain_bind_benchmark(
+                        &args,
+                        &dns,
+                        *concurrency,
+                        sasl_plain_authcid_format,
+                    )
+                    .await?,
+                );
+            }
+        }
     }
 
     progress("connect.benchmark_clients");
@@ -353,6 +408,58 @@ async fn run(args: Args) -> AppResult<()> {
         user_bind_latencies,
         user_bind_started,
     ));
+
+    if args.sasl_plain_benchmark {
+        if !args.skip_sasl_plain_admin_benchmark {
+            progress("benchmark.sasl_plain_bind_admin");
+            let admin_authcid = sasl_plain_authcid(&args.bind_dn, sasl_plain_authcid_format)?;
+            let mut admin_sasl_bind_client =
+                RawLdapClient::connect(&args.url, args.starttls, args.insecure).await?;
+            for _ in 0..args.warmup_iterations {
+                admin_sasl_bind_client
+                    .sasl_plain_bind(&args.bind_dn, &admin_authcid, &args.password)
+                    .await?;
+            }
+            let mut admin_sasl_bind_latencies = Vec::with_capacity(args.read_iterations);
+            let admin_sasl_bind_started = Instant::now();
+            for _ in 0..args.read_iterations {
+                let started = Instant::now();
+                admin_sasl_bind_client
+                    .sasl_plain_bind(&args.bind_dn, &admin_authcid, &args.password)
+                    .await?;
+                admin_sasl_bind_latencies.push(elapsed_ms(started.elapsed().as_secs_f64()));
+            }
+            benchmarks.push(build_benchmark_stats(
+                "sasl_plain_bind_admin",
+                admin_sasl_bind_latencies,
+                admin_sasl_bind_started,
+            ));
+        }
+
+        progress("benchmark.sasl_plain_bind_fixture_user");
+        let user_authcid = sasl_plain_authcid(&dns.control_user_dn, sasl_plain_authcid_format)?;
+        let mut user_sasl_bind_client =
+            RawLdapClient::connect(&args.url, args.starttls, args.insecure).await?;
+        for _ in 0..args.warmup_iterations {
+            user_sasl_bind_client
+                .sasl_plain_bind(&dns.control_user_dn, &user_authcid, &args.user_password)
+                .await?;
+        }
+        let mut user_sasl_bind_latencies = Vec::with_capacity(args.read_iterations);
+        let user_sasl_bind_started = Instant::now();
+        for _ in 0..args.read_iterations {
+            let started = Instant::now();
+            user_sasl_bind_client
+                .sasl_plain_bind(&dns.control_user_dn, &user_authcid, &args.user_password)
+                .await?;
+            user_sasl_bind_latencies.push(elapsed_ms(started.elapsed().as_secs_f64()));
+        }
+        benchmarks.push(build_benchmark_stats(
+            "sasl_plain_bind_fixture_user",
+            user_sasl_bind_latencies,
+            user_sasl_bind_started,
+        ));
+    }
 
     progress("benchmark.whoami_admin");
     for _ in 0..args.warmup_iterations {
@@ -719,11 +826,381 @@ async fn simple_bind(ldap: &mut Ldap, bind_dn: &str, password: &str) -> AppResul
     Ok(())
 }
 
+#[derive(Debug)]
+struct RawLdapClient {
+    stream: RawLdapStream,
+    next_message_id: u32,
+}
+
+impl RawLdapClient {
+    async fn connect(url: &str, starttls: bool, insecure: bool) -> AppResult<Self> {
+        let target = LdapTarget::parse(url)?;
+        let tcp_stream = TcpStream::connect((target.host.as_str(), target.port)).await?;
+        let mut stream = RawLdapStream::Plain(tcp_stream);
+        let mut next_message_id = 1_u32;
+
+        if target.ldaps {
+            let tls_stream = tls_connect(
+                stream
+                    .into_plain()
+                    .ok_or_else(|| other_error("ldaps connection started in TLS state"))?,
+                &target.host,
+                insecure,
+            )
+            .await?;
+            stream = RawLdapStream::Tls(Box::new(tls_stream));
+        } else if starttls {
+            let message = encode_starttls_request(next_message_id)?;
+            next_message_id += 1;
+            let response = send_ldap_message(&mut stream, &message).await?;
+            ensure(
+                extended_response_code(&response)? == ParserResultCode::Success,
+                "StartTLS request failed",
+            )?;
+            let tls_stream = tls_connect(
+                stream
+                    .into_plain()
+                    .ok_or_else(|| other_error("StartTLS upgrade requires a plain stream"))?,
+                &target.host,
+                insecure,
+            )
+            .await?;
+            stream = RawLdapStream::Tls(Box::new(tls_stream));
+        }
+
+        Ok(Self {
+            stream,
+            next_message_id,
+        })
+    }
+
+    async fn sasl_plain_bind(
+        &mut self,
+        bind_dn: &str,
+        authcid: &str,
+        password: &str,
+    ) -> AppResult<()> {
+        let message_id = self.next_message_id();
+        let message = encode_sasl_plain_bind_request(message_id, bind_dn, authcid, password)?;
+        let response = send_ldap_message(&mut self.stream, &message).await?;
+        let result_code = bind_response_code(&response)?;
+        ensure(
+            result_code == ParserResultCode::Success,
+            format!("SASL PLAIN bind failed for {bind_dn}: {result_code:?}"),
+        )?;
+        Ok(())
+    }
+
+    async fn sasl_plain_bind_matches_expectation(
+        &mut self,
+        bind_dn: &str,
+        authcid: &str,
+        password: &str,
+        expectation: BindExpectation,
+    ) -> bool {
+        let message_id = self.next_message_id();
+        let Ok(message) = encode_sasl_plain_bind_request(message_id, bind_dn, authcid, password)
+        else {
+            return false;
+        };
+        let Ok(response) = send_ldap_message(&mut self.stream, &message).await else {
+            return false;
+        };
+        let Ok(result_code) = bind_response_code(&response) else {
+            return false;
+        };
+
+        match result_code {
+            ParserResultCode::Success => expectation == BindExpectation::Valid,
+            ParserResultCode::InvalidCredentials => expectation != BindExpectation::Valid,
+            _ => false,
+        }
+    }
+
+    fn next_message_id(&mut self) -> u32 {
+        let message_id = self.next_message_id;
+        self.next_message_id = if self.next_message_id == i32::MAX as u32 {
+            1
+        } else {
+            self.next_message_id + 1
+        };
+        message_id
+    }
+}
+
+#[derive(Debug)]
+struct LdapTarget {
+    host: String,
+    port: u16,
+    ldaps: bool,
+}
+
+impl LdapTarget {
+    fn parse(raw_url: &str) -> AppResult<Self> {
+        let url = Url::parse(raw_url)?;
+        let ldaps = match url.scheme() {
+            "ldap" => false,
+            "ldaps" => true,
+            scheme => {
+                return Err(other_error(format!(
+                    "unsupported LDAP URL scheme for SASL benchmark: {scheme}"
+                )))
+            }
+        };
+        let host = url
+            .host_str()
+            .ok_or_else(|| other_error(format!("LDAP URL missing host: {raw_url}")))?
+            .to_string();
+        let port = url.port().unwrap_or(if ldaps { 636 } else { 389 });
+        Ok(Self { host, port, ldaps })
+    }
+}
+
+#[derive(Debug)]
+enum RawLdapStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl RawLdapStream {
+    fn into_plain(self) -> Option<TcpStream> {
+        match self {
+            RawLdapStream::Plain(stream) => Some(stream),
+            RawLdapStream::Tls(_) => None,
+        }
+    }
+}
+
+impl AsyncRead for RawLdapStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            RawLdapStream::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            RawLdapStream::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for RawLdapStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            RawLdapStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            RawLdapStream::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            RawLdapStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            RawLdapStream::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            RawLdapStream::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            RawLdapStream::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
+
+async fn tls_connect(
+    stream: TcpStream,
+    host: &str,
+    insecure: bool,
+) -> AppResult<TlsStream<TcpStream>> {
+    let config = if insecure {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth()
+    } else {
+        ClientConfig::builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth()
+    };
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = raw_tls_server_name(host, insecure)?;
+    Ok(connector.connect(server_name, stream).await?)
+}
+
+fn raw_tls_server_name(host: &str, insecure: bool) -> AppResult<ServerName<'static>> {
+    let name = if insecure && host.parse::<std::net::IpAddr>().is_ok() {
+        "localhost"
+    } else {
+        host
+    };
+    ServerName::try_from(name.to_string())
+        .map_err(|err| other_error(format!("invalid TLS server name {name:?}: {err}")))
+}
+
+fn encode_starttls_request(message_id: u32) -> AppResult<Vec<u8>> {
+    let request = RasnExtendedRequest {
+        request_name: STARTTLS_OID.as_bytes().to_vec().into(),
+        request_value: None,
+    };
+    let message = RasnLdapMessage::new(message_id, RasnProtocolOp::ExtendedReq(request));
+    der::encode(&message)
+        .map_err(|err| other_error(format!("failed to encode StartTLS request: {err:?}")))
+}
+
+fn encode_sasl_plain_bind_request(
+    message_id: u32,
+    bind_dn: &str,
+    authcid: &str,
+    password: &str,
+) -> AppResult<Vec<u8>> {
+    let mut credentials = Vec::with_capacity(authcid.len() + password.len() + 2);
+    credentials.push(0);
+    credentials.extend_from_slice(authcid.as_bytes());
+    credentials.push(0);
+    credentials.extend_from_slice(password.as_bytes());
+
+    let bind_request = RasnBindRequest::new(
+        3,
+        bind_dn.as_bytes().to_vec().into(),
+        RasnAuthChoice::Sasl(RasnSaslCredentials::new(
+            b"PLAIN".to_vec().into(),
+            Some(credentials.into()),
+        )),
+    );
+    let message = RasnLdapMessage::new(message_id, RasnProtocolOp::BindRequest(bind_request));
+    der::encode(&message)
+        .map_err(|err| other_error(format!("failed to encode SASL PLAIN bind request: {err:?}")))
+}
+
+async fn send_ldap_message<S>(stream: &mut S, message: &[u8]) -> AppResult<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(message).await?;
+    stream.flush().await?;
+    read_ldap_response(stream).await
+}
+
+async fn read_ldap_response<S>(stream: &mut S) -> AppResult<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut response = Vec::new();
+    let mut buf = vec![0_u8; 4096];
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(bytes_read)) => {
+                response.extend_from_slice(&buf[..bytes_read]);
+                if parse_ldap_messages(&response).is_ok() {
+                    break;
+                }
+            }
+            Ok(Err(err)) => return Err(Box::new(err)),
+            Err(_) if parse_ldap_messages(&response).is_ok() => break,
+            Err(_) => return Err(other_error("timed out waiting for LDAP response")),
+        }
+    }
+
+    ensure(
+        !response.is_empty(),
+        "LDAP server closed connection without a response",
+    )?;
+    Ok(response)
+}
+
+fn bind_response_code(response: &[u8]) -> AppResult<ParserResultCode> {
+    let (_, messages) = parse_ldap_messages(response)
+        .map_err(|err| other_error(format!("failed to parse bind response: {err:?}")))?;
+    ensure(messages.len() == 1, "expected exactly one bind response")?;
+    match &messages[0].protocol_op {
+        ParserProtocolOp::BindResponse(bind_response) => Ok(bind_response.result.result_code),
+        other => Err(other_error(format!(
+            "unexpected SASL bind response: {other:?}"
+        ))),
+    }
+}
+
+fn extended_response_code(response: &[u8]) -> AppResult<ParserResultCode> {
+    let (_, messages) = parse_ldap_messages(response)
+        .map_err(|err| other_error(format!("failed to parse extended response: {err:?}")))?;
+    ensure(
+        messages.len() == 1,
+        "expected exactly one extended response",
+    )?;
+    match &messages[0].protocol_op {
+        ParserProtocolOp::ExtendedResponse(response) => Ok(response.result.result_code),
+        other => Err(other_error(format!(
+            "unexpected extended response: {other:?}"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BindExpectation {
     Valid,
     WrongPassword,
     UnknownDn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaslPlainAuthcidFormat {
+    Dn,
+    RdnValue,
 }
 
 #[derive(Debug)]
@@ -898,6 +1375,206 @@ async fn run_concurrent_bind_benchmark(
 
     Ok(build_benchmark_stats_with_counts(
         &format!("concurrent_bind_fixture_users_c{concurrency}"),
+        latencies_ms,
+        total_started,
+        expected_attempts,
+        successes,
+        failures,
+        concurrency,
+    ))
+}
+
+async fn run_concurrent_sasl_plain_bind_benchmark(
+    args: &Args,
+    dns: &ScenarioDns,
+    concurrency: usize,
+    authcid_format: SaslPlainAuthcidFormat,
+) -> AppResult<BenchmarkStats> {
+    ensure(
+        concurrency > 0,
+        "--concurrent-bind-clients values must be greater than zero",
+    )?;
+
+    let expected_attempts = concurrency * args.concurrent_bind_iterations;
+    let (ready_tx, mut ready_rx) = mpsc::channel(concurrency);
+    let (start_tx, start_rx) = watch::channel(false);
+    let mut handles = Vec::with_capacity(concurrency);
+
+    for client_index in 0..concurrency {
+        let ready_tx = ready_tx.clone();
+        let mut start_rx = start_rx.clone();
+        let url = args.url.clone();
+        let starttls = args.starttls;
+        let insecure = args.insecure;
+        let users_ou_dn = dns.users_ou_dn.clone();
+        let name_prefix = args.name_prefix.clone();
+        let password = args.user_password.clone();
+        let wrong_password = format!("{}-wrong", args.user_password);
+        let preloaded_users = args.preloaded_users;
+        let iterations = args.concurrent_bind_iterations;
+        let warmup_iterations = args.concurrent_bind_warmup_iterations;
+        let operation_timeout = Duration::from_millis(args.concurrent_bind_operation_timeout_ms);
+        let valid_percent = args.concurrent_bind_valid_percent;
+        let wrong_password_percent = args.concurrent_bind_wrong_password_percent;
+        let hot_user_percent = args.concurrent_bind_hot_user_percent;
+        let hot_user_count = args.concurrent_bind_hot_user_count;
+
+        handles.push(tokio::spawn(async move {
+            let mut ldap =
+                match connect_raw_ldap_with_timeout(&url, starttls, insecure, operation_timeout)
+                    .await
+                {
+                    Ok(ldap) => ldap,
+                    Err(_) => {
+                        let _ = ready_tx.send(()).await;
+                        return ConcurrentBindWorkerResult {
+                            latencies_ms: Vec::new(),
+                            successes: 0,
+                            failures: iterations,
+                        };
+                    }
+                };
+
+            for warmup in 0..warmup_iterations {
+                let global_attempt = client_index * iterations + warmup;
+                let dn = fixture_bind_dn(
+                    global_attempt,
+                    preloaded_users,
+                    hot_user_count,
+                    hot_user_percent,
+                    &name_prefix,
+                    &users_ou_dn,
+                );
+                let authcid = match sasl_plain_authcid(&dn, authcid_format) {
+                    Ok(authcid) => authcid,
+                    Err(_) => {
+                        let _ = ready_tx.send(()).await;
+                        return ConcurrentBindWorkerResult {
+                            latencies_ms: Vec::new(),
+                            successes: 0,
+                            failures: iterations,
+                        };
+                    }
+                };
+                if sasl_plain_bind_with_timeout(
+                    &mut ldap,
+                    &dn,
+                    &authcid,
+                    &password,
+                    operation_timeout,
+                )
+                .await
+                .is_err()
+                {
+                    let _ = ready_tx.send(()).await;
+                    return ConcurrentBindWorkerResult {
+                        latencies_ms: Vec::new(),
+                        successes: 0,
+                        failures: iterations,
+                    };
+                }
+            }
+
+            let _ = ready_tx.send(()).await;
+            while !*start_rx.borrow() {
+                if start_rx.changed().await.is_err() {
+                    return ConcurrentBindWorkerResult {
+                        latencies_ms: Vec::new(),
+                        successes: 0,
+                        failures: iterations,
+                    };
+                }
+            }
+
+            let mut latencies_ms = Vec::with_capacity(iterations);
+            let mut successes = 0;
+            let mut failures = 0;
+            for iteration in 0..iterations {
+                let global_attempt = client_index * iterations + iteration;
+                let expectation =
+                    bind_expectation(global_attempt, valid_percent, wrong_password_percent);
+                let dn = match expectation {
+                    BindExpectation::UnknownDn => {
+                        format!("uid={name_prefix}-missing-{global_attempt:06},{users_ou_dn}")
+                    }
+                    BindExpectation::Valid | BindExpectation::WrongPassword => fixture_bind_dn(
+                        global_attempt,
+                        preloaded_users,
+                        hot_user_count,
+                        hot_user_percent,
+                        &name_prefix,
+                        &users_ou_dn,
+                    ),
+                };
+                let bind_password = match expectation {
+                    BindExpectation::Valid => password.as_str(),
+                    BindExpectation::WrongPassword | BindExpectation::UnknownDn => {
+                        wrong_password.as_str()
+                    }
+                };
+                let authcid = match sasl_plain_authcid(&dn, authcid_format) {
+                    Ok(authcid) => authcid,
+                    Err(_) => {
+                        failures += 1;
+                        latencies_ms.push(0.0);
+                        continue;
+                    }
+                };
+
+                let started = Instant::now();
+                if sasl_plain_bind_matches_expectation_with_timeout(
+                    &mut ldap,
+                    &dn,
+                    &authcid,
+                    bind_password,
+                    expectation,
+                    operation_timeout,
+                )
+                .await
+                {
+                    successes += 1;
+                } else {
+                    failures += 1;
+                }
+                latencies_ms.push(elapsed_ms(started.elapsed().as_secs_f64()));
+            }
+
+            ConcurrentBindWorkerResult {
+                latencies_ms,
+                successes,
+                failures,
+            }
+        }));
+    }
+
+    drop(ready_tx);
+    for _ in 0..concurrency {
+        if ready_rx.recv().await.is_none() {
+            break;
+        }
+    }
+
+    let total_started = Instant::now();
+    let _ = start_tx.send(true);
+
+    let mut latencies_ms = Vec::with_capacity(expected_attempts);
+    let mut successes = 0;
+    let mut failures = 0;
+    for handle in handles {
+        match handle.await {
+            Ok(result) => {
+                latencies_ms.extend(result.latencies_ms);
+                successes += result.successes;
+                failures += result.failures;
+            }
+            Err(_) => {
+                failures += args.concurrent_bind_iterations;
+            }
+        }
+    }
+
+    Ok(build_benchmark_stats_with_counts(
+        &format!("concurrent_sasl_plain_bind_fixture_users_c{concurrency}"),
         latencies_ms,
         total_started,
         expected_attempts,
@@ -1217,6 +1894,23 @@ async fn connect_with_timeout(
     }
 }
 
+async fn connect_raw_ldap_with_timeout(
+    url: &str,
+    starttls: bool,
+    insecure: bool,
+    timeout_duration: Duration,
+) -> AppResult<RawLdapClient> {
+    match tokio::time::timeout(
+        timeout_duration,
+        RawLdapClient::connect(url, starttls, insecure),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(other_error("concurrent SASL PLAIN connect timed out")),
+    }
+}
+
 async fn simple_bind_with_timeout(
     ldap: &mut Ldap,
     bind_dn: &str,
@@ -1226,6 +1920,26 @@ async fn simple_bind_with_timeout(
     match tokio::time::timeout(timeout_duration, simple_bind(ldap, bind_dn, password)).await {
         Ok(result) => result,
         Err(_) => Err(other_error("concurrent bind operation timed out")),
+    }
+}
+
+async fn sasl_plain_bind_with_timeout(
+    ldap: &mut RawLdapClient,
+    bind_dn: &str,
+    authcid: &str,
+    password: &str,
+    timeout_duration: Duration,
+) -> AppResult<()> {
+    match tokio::time::timeout(
+        timeout_duration,
+        ldap.sasl_plain_bind(bind_dn, authcid, password),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(other_error(
+            "concurrent SASL PLAIN bind operation timed out",
+        )),
     }
 }
 
@@ -1246,6 +1960,22 @@ async fn bind_matches_expectation_with_timeout(
         },
         Ok(Err(_)) | Err(_) => false,
     }
+}
+
+async fn sasl_plain_bind_matches_expectation_with_timeout(
+    ldap: &mut RawLdapClient,
+    bind_dn: &str,
+    authcid: &str,
+    password: &str,
+    expectation: BindExpectation,
+    timeout_duration: Duration,
+) -> bool {
+    (tokio::time::timeout(
+        timeout_duration,
+        ldap.sasl_plain_bind_matches_expectation(bind_dn, authcid, password, expectation),
+    )
+    .await)
+        .unwrap_or_default()
 }
 
 async fn create_benchmark_tree(ldap: &mut Ldap, dns: &ScenarioDns) -> AppResult<()> {
@@ -1541,6 +2271,32 @@ fn parse_concurrent_index_search_clients(raw: &str) -> AppResult<Vec<usize>> {
     parse_concurrent_client_list(raw, "--concurrent-index-search-clients")
 }
 
+fn parse_sasl_plain_authcid_format(raw: &str) -> AppResult<SaslPlainAuthcidFormat> {
+    match raw {
+        "dn" => Ok(SaslPlainAuthcidFormat::Dn),
+        "rdn-value" => Ok(SaslPlainAuthcidFormat::RdnValue),
+        other => Err(other_error(format!(
+            "--sasl-plain-authcid-format must be one of: dn, rdn-value; got {other:?}"
+        ))),
+    }
+}
+
+fn sasl_plain_authcid(bind_dn: &str, format: SaslPlainAuthcidFormat) -> AppResult<String> {
+    match format {
+        SaslPlainAuthcidFormat::Dn => Ok(bind_dn.to_string()),
+        SaslPlainAuthcidFormat::RdnValue => bind_dn
+            .split_once('=')
+            .and_then(|(_, rest)| rest.split_once(',').map(|(value, _)| value.to_string()))
+            .or_else(|| {
+                bind_dn
+                    .split_once('=')
+                    .map(|(_, value)| value.trim().to_string())
+            })
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| other_error(format!("failed to derive RDN value from {bind_dn:?}"))),
+    }
+}
+
 fn parse_concurrent_client_list(raw: &str, argument_name: &str) -> AppResult<Vec<usize>> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
@@ -1652,6 +2408,48 @@ mod tests {
     #[test]
     fn parse_concurrent_index_search_clients_rejects_zero() {
         assert!(parse_concurrent_index_search_clients("1,0,4").is_err());
+    }
+
+    #[test]
+    fn sasl_plain_authcid_can_use_rdn_value() {
+        assert_eq!(
+            sasl_plain_authcid(
+                "uid=bench-user-000001,ou=users,dc=example,dc=com",
+                SaslPlainAuthcidFormat::RdnValue
+            )
+            .unwrap(),
+            "bench-user-000001"
+        );
+        assert_eq!(
+            parse_sasl_plain_authcid_format("dn").unwrap(),
+            SaslPlainAuthcidFormat::Dn
+        );
+    }
+
+    #[test]
+    fn sasl_plain_bind_request_uses_dn_in_request_name_and_authcid() {
+        let request =
+            encode_sasl_plain_bind_request(7, "uid=user,dc=example,dc=com", "user", "secret")
+                .unwrap();
+        let (_, messages) = parse_ldap_messages(&request).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ParserProtocolOp::BindRequest(bind_request) => {
+                assert_eq!(bind_request.name.0.as_ref(), "uid=user,dc=example,dc=com");
+                match &bind_request.authentication {
+                    ldap_parser::ldap::AuthenticationChoice::Sasl(credentials) => {
+                        assert_eq!(credentials.mechanism.0.as_ref(), "PLAIN");
+                        assert_eq!(
+                            credentials.credentials.as_deref(),
+                            Some(b"\0user\0secret".as_ref())
+                        );
+                    }
+                    other => panic!("unexpected auth choice: {other:?}"),
+                }
+            }
+            other => panic!("unexpected protocol op: {other:?}"),
+        }
     }
 
     #[test]

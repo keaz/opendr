@@ -172,6 +172,14 @@ If tests fail:
   --concurrent-bind-hot-user-percent 80 \
   --concurrent-bind-hot-user-count 100 \
   --concurrent-bind-operation-timeout-ms 5000
+
+# SASL PLAIN fixture-user comparison
+./scripts/perf_docker_matrix.sh \
+  --profile-set sasl \
+  --products opendr,opendj \
+  --sasl-plain-authcid-format rdn-value \
+  --skip-sasl-plain-admin-benchmark \
+  --concurrent-bind-clients 1,4,8,16,32,64,128
 ```
 
 **Profiles**:
@@ -179,6 +187,8 @@ If tests fail:
 - `standard`: light, moderate, heavy
 - `full`: light, moderate, heavy, stress
 - `concurrency`: single `auth-concurrency` profile for focused concurrent bind comparison
+- `index`: single `index` profile for equality, presence, substring, ordering, and concurrent mixed index-search probes
+- `sasl`: single `sasl-auth` profile for SASL PLAIN fixture-user bind latency and concurrent throughput/failure probes
 
 **Key options**:
 - `--cpu`: container CPU limit, default `2`
@@ -192,6 +202,9 @@ If tests fail:
 - `--concurrent-bind-wrong-password-percent`: percent of auth-concurrency attempts using wrong passwords; the remainder is unknown DN, default `0`
 - `--concurrent-bind-hot-user-percent`: percent of auth-concurrency attempts targeting the hot-user set, default `80`
 - `--concurrent-bind-hot-user-count`: number of hot users used by the auth-concurrency distribution, default `1`
+- `--sasl-plain-benchmark`: enable serial and, when concurrent bind clients are configured, concurrent SASL PLAIN fixture-user bind probes
+- `--sasl-plain-authcid-format`: SASL PLAIN authcid format, `dn` or `rdn-value`; use `rdn-value` for the OpenDJ fixture-user comparison
+- `--skip-sasl-plain-admin-benchmark`: skip the admin/root SASL PLAIN probe for products that do not accept SASL PLAIN for the directory-manager account
 - `--products`: comma-separated subset of `opendr,opendj`
 
 **Artifacts**:

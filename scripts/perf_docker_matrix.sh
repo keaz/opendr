@@ -12,6 +12,9 @@ CPU_LIMIT="2"
 MEMORY_LIMIT="4g"
 BENCHMARK_TIMEOUT_SECONDS="180"
 INDEX_BENCHMARK="false"
+SASL_PLAIN_BENCHMARK="false"
+SASL_PLAIN_AUTHCID_FORMAT="dn"
+SKIP_SASL_PLAIN_ADMIN_BENCHMARK="false"
 CONCURRENT_INDEX_SEARCH_CLIENTS=""
 CONCURRENT_INDEX_SEARCH_ITERATIONS="20"
 CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS="1"
@@ -48,13 +51,18 @@ Usage: scripts/perf_docker_matrix.sh [options]
 
 Options:
   --output-dir PATH         Output directory for the matrix run
-  --profile-set VALUE      One of: smoke, standard, full, concurrency, index (default: full)
+  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl (default: full)
   --products LIST          Comma-separated subset of: opendr,opendj
   --sample-interval SEC    Container stats sample interval (default: 0.25)
   --cpu VALUE              Docker CPU limit for each server container (default: 2)
   --memory VALUE           Docker memory limit for each server container (default: 4g)
   --benchmark-timeout SEC  Max seconds to allow each benchmark profile (default: 180)
   --index-benchmark        Add equality, presence, substring, and ordering search probes
+  --sasl-plain-benchmark   Add serial and concurrent SASL PLAIN bind probes over StartTLS
+  --sasl-plain-authcid-format VALUE
+                          SASL PLAIN authcid format: dn or rdn-value (default: dn)
+  --skip-sasl-plain-admin-benchmark
+                          Skip the admin/root SASL PLAIN bind probe; useful for OpenDJ fixture-user comparisons
   --concurrent-index-search-clients LIST
                           Comma-separated concurrent index-search client levels; empty disables (default: disabled)
   --concurrent-index-search-iterations N
@@ -126,6 +134,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --index-benchmark)
       INDEX_BENCHMARK="true"
+      shift
+      ;;
+    --sasl-plain-benchmark)
+      SASL_PLAIN_BENCHMARK="true"
+      shift
+      ;;
+    --sasl-plain-authcid-format)
+      SASL_PLAIN_AUTHCID_FORMAT="$2"
+      shift 2
+      ;;
+    --skip-sasl-plain-admin-benchmark)
+      SKIP_SASL_PLAIN_ADMIN_BENCHMARK="true"
       shift
       ;;
     --concurrent-index-search-clients)
@@ -244,6 +264,11 @@ if [[ "${PERF_CLIENT_NETWORK}" != "server" && "${PERF_CLIENT_NETWORK}" != "host-
   exit 1
 fi
 
+if [[ "${SASL_PLAIN_AUTHCID_FORMAT}" != "dn" && "${SASL_PLAIN_AUTHCID_FORMAT}" != "rdn-value" ]]; then
+  echo "--sasl-plain-authcid-format must be dn or rdn-value" >&2
+  exit 1
+fi
+
 declare -a LOAD_PROFILES
 case "${PROFILE_SET}" in
   smoke)
@@ -286,8 +311,17 @@ case "${PROFILE_SET}" in
       OPENDR_BACKEND_INDEXES_TOML="${DEFAULT_OPENDR_INDEX_BENCHMARK_TOML}"
     fi
     ;;
+  sasl)
+    LOAD_PROFILES=(
+      "sasl-auth:2500:3:3:1"
+    )
+    SASL_PLAIN_BENCHMARK="true"
+    if [[ -z "${CONCURRENT_BIND_CLIENTS}" ]]; then
+      CONCURRENT_BIND_CLIENTS="1,4,8,16,32,64,128"
+    fi
+    ;;
   *)
-    echo "--profile-set must be one of: smoke, standard, full, concurrency, index" >&2
+    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl" >&2
     exit 1
     ;;
 esac
@@ -529,6 +563,11 @@ build_dependencies() {
   echo "Building release benchmark client..."
   cargo build --release --bin ldap_perf_client
 
+  if [[ -n "${PERF_CLIENT_IMAGE}" ]]; then
+    echo "Building perf client Docker image ${PERF_CLIENT_IMAGE}..."
+    docker build --target perf-client -t "${PERF_CLIENT_IMAGE}" "${REPO_ROOT}"
+  fi
+
   if contains_product "opendr"; then
     echo "Building OpenDR Docker image ${OPENDR_IMAGE}..."
     docker build -t "${OPENDR_IMAGE}" "${REPO_ROOT}"
@@ -580,6 +619,9 @@ write_run_metadata() {
   "write_iterations": ${write_iterations},
   "warmup_iterations": ${warmup_iterations},
   "index_benchmark": ${INDEX_BENCHMARK},
+  "sasl_plain_benchmark": ${SASL_PLAIN_BENCHMARK},
+  "sasl_plain_authcid_format": "${SASL_PLAIN_AUTHCID_FORMAT}",
+  "skip_sasl_plain_admin_benchmark": ${SKIP_SASL_PLAIN_ADMIN_BENCHMARK},
   "concurrent_index_search_clients": "${CONCURRENT_INDEX_SEARCH_CLIENTS}",
   "concurrent_index_search_iterations": ${CONCURRENT_INDEX_SEARCH_ITERATIONS},
   "concurrent_index_search_warmup_iterations": ${CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS},
@@ -944,6 +986,15 @@ run_profile() {
   if [[ "${INDEX_BENCHMARK}" == "true" ]]; then
     benchmark_cmd+=(--index-benchmark)
   fi
+  if [[ "${SASL_PLAIN_BENCHMARK}" == "true" ]]; then
+    benchmark_cmd+=(
+      --sasl-plain-benchmark
+      --sasl-plain-authcid-format "${SASL_PLAIN_AUTHCID_FORMAT}"
+    )
+    if [[ "${SKIP_SASL_PLAIN_ADMIN_BENCHMARK}" == "true" ]]; then
+      benchmark_cmd+=(--skip-sasl-plain-admin-benchmark)
+    fi
+  fi
   if [[ -n "${CONCURRENT_INDEX_SEARCH_CLIENTS}" ]]; then
     benchmark_cmd+=(
       --concurrent-index-search-clients "${CONCURRENT_INDEX_SEARCH_CLIENTS}"
@@ -1144,6 +1195,41 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
         (item.get("throughput_ops_per_sec", 0.0) for item in concurrent_bind_runs),
         default=None,
     )
+    concurrent_sasl_plain_bind_runs = [
+        item
+        for item in bench_map.values()
+        if item.get("operation", "").startswith("concurrent_sasl_plain_bind_fixture_users_c")
+    ]
+    successful_concurrent_sasl_plain_bind_runs = [
+        item
+        for item in concurrent_sasl_plain_bind_runs
+        if item.get("failure_rate_percent", 100.0) == 0.0
+    ]
+    max_concurrent_sasl_plain_bind_clients_tested = max(
+        (item.get("concurrency", 0) for item in concurrent_sasl_plain_bind_runs),
+        default=None,
+    )
+    max_concurrent_sasl_plain_bind_clients_zero_failure = max(
+        (item.get("concurrency", 0) for item in successful_concurrent_sasl_plain_bind_runs),
+        default=None,
+    )
+    max_concurrent_sasl_plain_bind_failure_rate_percent = None
+    if max_concurrent_sasl_plain_bind_clients_tested is not None:
+        max_tested_sasl_runs = [
+            item
+            for item in concurrent_sasl_plain_bind_runs
+            if item.get("concurrency") == max_concurrent_sasl_plain_bind_clients_tested
+        ]
+        if max_tested_sasl_runs:
+            max_concurrent_sasl_plain_bind_failure_rate_percent = max_tested_sasl_runs[0].get("failure_rate_percent")
+    peak_concurrent_sasl_plain_bind_success_throughput = max(
+        (item.get("success_throughput_ops_per_sec", 0.0) for item in concurrent_sasl_plain_bind_runs),
+        default=None,
+    )
+    peak_concurrent_sasl_plain_bind_attempt_throughput = max(
+        (item.get("throughput_ops_per_sec", 0.0) for item in concurrent_sasl_plain_bind_runs),
+        default=None,
+    )
     concurrent_index_search_runs = [
         item
         for item in bench_map.values()
@@ -1192,6 +1278,9 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "write_iterations": metadata["write_iterations"],
             "warmup_iterations": metadata["warmup_iterations"],
             "index_benchmark": metadata.get("index_benchmark", False),
+            "sasl_plain_benchmark": metadata.get("sasl_plain_benchmark", False),
+            "sasl_plain_authcid_format": metadata.get("sasl_plain_authcid_format", "dn"),
+            "skip_sasl_plain_admin_benchmark": metadata.get("skip_sasl_plain_admin_benchmark", False),
             "concurrent_index_search_clients": metadata.get("concurrent_index_search_clients", ""),
             "concurrent_index_search_iterations": metadata.get("concurrent_index_search_iterations", 0),
             "concurrent_index_search_warmup_iterations": metadata.get("concurrent_index_search_warmup_iterations", 0),
@@ -1223,6 +1312,8 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "data_after_bytes": footprint["data_after_bytes"],
             "root_dse_mean_ms": bench_value("root_dse_search", "mean_ms"),
             "bind_admin_mean_ms": bench_value("bind_admin", "mean_ms"),
+            "sasl_plain_bind_admin_mean_ms": bench_value("sasl_plain_bind_admin", "mean_ms"),
+            "sasl_plain_bind_fixture_user_mean_ms": bench_value("sasl_plain_bind_fixture_user", "mean_ms"),
             "search_subtree_mean_ms": bench_value("search_subtree_fixture_users", "mean_ms"),
             "search_subtree_throughput": bench_value("search_subtree_fixture_users", "throughput_ops_per_sec"),
             "search_subtree_failure_rate_percent": bench_value("search_subtree_fixture_users", "failure_rate_percent"),
@@ -1256,6 +1347,11 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "max_concurrent_bind_failure_rate_percent": max_concurrent_bind_failure_rate_percent,
             "peak_concurrent_bind_success_throughput": peak_concurrent_bind_success_throughput,
             "peak_concurrent_bind_attempt_throughput": peak_concurrent_bind_attempt_throughput,
+            "max_concurrent_sasl_plain_bind_clients_tested": max_concurrent_sasl_plain_bind_clients_tested,
+            "max_concurrent_sasl_plain_bind_clients_zero_failure": max_concurrent_sasl_plain_bind_clients_zero_failure,
+            "max_concurrent_sasl_plain_bind_failure_rate_percent": max_concurrent_sasl_plain_bind_failure_rate_percent,
+            "peak_concurrent_sasl_plain_bind_success_throughput": peak_concurrent_sasl_plain_bind_success_throughput,
+            "peak_concurrent_sasl_plain_bind_attempt_throughput": peak_concurrent_sasl_plain_bind_attempt_throughput,
         }
     )
 
@@ -1288,7 +1384,7 @@ summary_md = root / "comparison-summary.md"
 summary_csv = root / "comparison-summary.csv"
 
 csv_lines = [
-    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,index_benchmark,concurrent_index_search_clients,concurrent_index_search_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,index_equality_uid_mean_ms,index_equality_uid_throughput,index_presence_mail_mean_ms,index_presence_mail_throughput,index_substring_description_mean_ms,index_substring_description_throughput,index_ordering_sn_ge_mean_ms,index_ordering_sn_ge_throughput,index_ordering_sn_le_mean_ms,index_ordering_sn_le_throughput,max_concurrent_index_search_clients_tested,max_concurrent_index_search_clients_zero_failure,max_concurrent_index_search_failure_rate_percent,peak_concurrent_index_search_success_throughput,peak_concurrent_index_search_attempt_throughput,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput"
+    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,index_benchmark,sasl_plain_benchmark,sasl_plain_authcid_format,skip_sasl_plain_admin_benchmark,concurrent_index_search_clients,concurrent_index_search_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,sasl_plain_bind_admin_mean_ms,sasl_plain_bind_fixture_user_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,index_equality_uid_mean_ms,index_equality_uid_throughput,index_presence_mail_mean_ms,index_presence_mail_throughput,index_substring_description_mean_ms,index_substring_description_throughput,index_ordering_sn_ge_mean_ms,index_ordering_sn_ge_throughput,index_ordering_sn_le_mean_ms,index_ordering_sn_le_throughput,max_concurrent_index_search_clients_tested,max_concurrent_index_search_clients_zero_failure,max_concurrent_index_search_failure_rate_percent,peak_concurrent_index_search_success_throughput,peak_concurrent_index_search_attempt_throughput,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput,max_concurrent_sasl_plain_bind_clients_tested,max_concurrent_sasl_plain_bind_clients_zero_failure,max_concurrent_sasl_plain_bind_failure_rate_percent,peak_concurrent_sasl_plain_bind_success_throughput,peak_concurrent_sasl_plain_bind_attempt_throughput"
 ]
 for run in runs:
     csv_lines.append(
@@ -1303,6 +1399,9 @@ for run in runs:
                 str(run["read_iterations"]),
                 str(run["write_iterations"]),
                 str(run["index_benchmark"]).lower(),
+                str(run["sasl_plain_benchmark"]).lower(),
+                str(run["sasl_plain_authcid_format"]),
+                str(run["skip_sasl_plain_admin_benchmark"]).lower(),
                 str(run["concurrent_index_search_clients"]).replace(",", ";"),
                 str(run["concurrent_index_search_iterations"]),
                 str(run["concurrent_bind_clients"]).replace(",", ";"),
@@ -1325,6 +1424,8 @@ for run in runs:
                 str(int(run["data_after_bytes"])),
                 csv_value(run["root_dse_mean_ms"]),
                 csv_value(run["bind_admin_mean_ms"]),
+                csv_value(run["sasl_plain_bind_admin_mean_ms"]),
+                csv_value(run["sasl_plain_bind_fixture_user_mean_ms"]),
                 csv_value(run["search_subtree_mean_ms"]),
                 csv_value(run["search_subtree_throughput"]),
                 csv_value(run["search_subtree_failure_rate_percent"]),
@@ -1358,6 +1459,11 @@ for run in runs:
                 csv_value(run["max_concurrent_bind_failure_rate_percent"]),
                 csv_value(run["peak_concurrent_bind_success_throughput"]),
                 csv_value(run["peak_concurrent_bind_attempt_throughput"]),
+                fmt_int(run["max_concurrent_sasl_plain_bind_clients_tested"]),
+                fmt_int(run["max_concurrent_sasl_plain_bind_clients_zero_failure"]),
+                csv_value(run["max_concurrent_sasl_plain_bind_failure_rate_percent"]),
+                csv_value(run["peak_concurrent_sasl_plain_bind_success_throughput"]),
+                csv_value(run["peak_concurrent_sasl_plain_bind_attempt_throughput"]),
             ]
         )
     )
@@ -1382,6 +1488,9 @@ if runs:
             f"- Benchmark client network: `{reference.get('benchmark_client_network', 'host')}`",
             f"- Timeout budget per profile: `{reference['timeout_seconds']}` seconds",
             f"- Index benchmark probes: `{str(reference.get('index_benchmark', False)).lower()}`",
+            f"- SASL PLAIN bind probes: `{str(reference.get('sasl_plain_benchmark', False)).lower()}`",
+            f"- SASL PLAIN authcid format: `{reference.get('sasl_plain_authcid_format', 'dn')}`",
+            f"- Skip SASL PLAIN admin probe: `{str(reference.get('skip_sasl_plain_admin_benchmark', False)).lower()}`",
             f"- Concurrent index-search clients: `{reference.get('concurrent_index_search_clients', '') or 'disabled'}`",
             f"- Concurrent index-search iterations per client: `{reference.get('concurrent_index_search_iterations', 0)}`",
             f"- Concurrent index-search operation timeout: `{reference.get('concurrent_index_search_operation_timeout_ms', 0)}` ms",
@@ -1393,8 +1502,8 @@ if runs:
             "",
             "## Load Profiles",
             "",
-            "| Profile | Preloaded Users | Read Iterations | Write Iterations | Concurrent Index Search Clients | Concurrent Index Search Iterations/Client | Concurrent Bind Clients | Concurrent Bind Iterations/Client |",
-            "|---|---:|---:|---:|---|---:|---|---:|",
+            "| Profile | Preloaded Users | Read Iterations | Write Iterations | SASL PLAIN | SASL Authcid Format | Skip SASL Admin | Concurrent Index Search Clients | Concurrent Index Search Iterations/Client | Concurrent Bind Clients | Concurrent Bind Iterations/Client |",
+            "|---|---:|---:|---:|---|---|---|---|---:|---|---:|",
         ]
     )
     seen_profiles = set()
@@ -1403,7 +1512,7 @@ if runs:
             continue
         seen_profiles.add(run["profile"])
         lines.append(
-            f"| {run['profile']} | {run['preloaded_users']} | {run['read_iterations']} | {run['write_iterations']} | {run.get('concurrent_index_search_clients', '') or 'disabled'} | {run.get('concurrent_index_search_iterations', 0)} | {run.get('concurrent_bind_clients', '') or 'disabled'} | {run.get('concurrent_bind_iterations', 0)} |"
+            f"| {run['profile']} | {run['preloaded_users']} | {run['read_iterations']} | {run['write_iterations']} | {str(run.get('sasl_plain_benchmark', False)).lower()} | {run.get('sasl_plain_authcid_format', 'dn')} | {str(run.get('skip_sasl_plain_admin_benchmark', False)).lower()} | {run.get('concurrent_index_search_clients', '') or 'disabled'} | {run.get('concurrent_index_search_iterations', 0)} | {run.get('concurrent_bind_clients', '') or 'disabled'} | {run.get('concurrent_bind_iterations', 0)} |"
         )
 
     lines.extend(
@@ -1411,14 +1520,29 @@ if runs:
             "",
             "## Top-Line Comparison",
             "",
-            "| Product | Profile | Status | Total Runtime ms | Records After Setup | DB After | CPU Avg % | CPU Max % | Memory Avg | Memory Max | Subtree Search Mean ms | Subtree Search ops/s | Add Mean ms | Modify Mean ms | Delete Mean ms | Password Modify Mean ms | Max Concurrent Bind Clients Tested | Max 0% Failure Concurrent Bind Clients | Max-Test Failure % | Peak Concurrent Bind Success ops/s |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Product | Profile | Status | Total Runtime ms | Records After Setup | DB After | CPU Avg % | CPU Max % | Memory Avg | Memory Max | Subtree Search Mean ms | Subtree Search ops/s | Simple Bind Admin Mean ms | SASL PLAIN Admin Mean ms | SASL PLAIN Fixture User Mean ms | Add Mean ms | Modify Mean ms | Delete Mean ms | Password Modify Mean ms | Max Concurrent Bind Clients Tested | Max 0% Failure Concurrent Bind Clients | Max-Test Failure % | Peak Concurrent Bind Success ops/s |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for run in runs:
         lines.append(
-            f"| {run['product']} | {run['profile']} | {run['status']} | {fmt_number(run['total_elapsed_ms'])} | {fmt_int(run['records_after_setup'])} | {human_bytes(int(run['db_after_bytes']))} | {run['cpu_avg_percent']:.2f} | {run['cpu_max_percent']:.2f} | {human_bytes(int(run['memory_avg_bytes']))} | {human_bytes(int(run['memory_max_bytes']))} | {fmt_number(run['search_subtree_mean_ms'])} | {fmt_number(run['search_subtree_throughput'], 2)} | {fmt_number(run['add_mean_ms'])} | {fmt_number(run['modify_mean_ms'])} | {fmt_number(run['delete_mean_ms'])} | {fmt_number(run['password_modify_mean_ms'])} | {fmt_int(run['max_concurrent_bind_clients_tested'])} | {fmt_int(run['max_concurrent_bind_clients_zero_failure'])} | {fmt_number(run['max_concurrent_bind_failure_rate_percent'], 2)} | {fmt_number(run['peak_concurrent_bind_success_throughput'], 2)} |"
+            f"| {run['product']} | {run['profile']} | {run['status']} | {fmt_number(run['total_elapsed_ms'])} | {fmt_int(run['records_after_setup'])} | {human_bytes(int(run['db_after_bytes']))} | {run['cpu_avg_percent']:.2f} | {run['cpu_max_percent']:.2f} | {human_bytes(int(run['memory_avg_bytes']))} | {human_bytes(int(run['memory_max_bytes']))} | {fmt_number(run['search_subtree_mean_ms'])} | {fmt_number(run['search_subtree_throughput'], 2)} | {fmt_number(run['bind_admin_mean_ms'])} | {fmt_number(run['sasl_plain_bind_admin_mean_ms'])} | {fmt_number(run['sasl_plain_bind_fixture_user_mean_ms'])} | {fmt_number(run['add_mean_ms'])} | {fmt_number(run['modify_mean_ms'])} | {fmt_number(run['delete_mean_ms'])} | {fmt_number(run['password_modify_mean_ms'])} | {fmt_int(run['max_concurrent_bind_clients_tested'])} | {fmt_int(run['max_concurrent_bind_clients_zero_failure'])} | {fmt_number(run['max_concurrent_bind_failure_rate_percent'], 2)} | {fmt_number(run['peak_concurrent_bind_success_throughput'], 2)} |"
         )
+
+    if any(run.get("sasl_plain_benchmark") for run in runs):
+        lines.extend(
+            [
+                "",
+                "## SASL PLAIN Bind Comparison",
+                "",
+                "| Product | Profile | Admin Mean ms | Fixture User Mean ms | Max Concurrent SASL PLAIN Bind Clients Tested | Max 0% Failure Concurrent SASL PLAIN Bind Clients | Max-Test Failure % | Peak Concurrent SASL PLAIN Bind Success ops/s |",
+                "|---|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for run in runs:
+            lines.append(
+                f"| {run['product']} | {run['profile']} | {fmt_number(run['sasl_plain_bind_admin_mean_ms'])} | {fmt_number(run['sasl_plain_bind_fixture_user_mean_ms'])} | {fmt_int(run['max_concurrent_sasl_plain_bind_clients_tested'])} | {fmt_int(run['max_concurrent_sasl_plain_bind_clients_zero_failure'])} | {fmt_number(run['max_concurrent_sasl_plain_bind_failure_rate_percent'], 2)} | {fmt_number(run['peak_concurrent_sasl_plain_bind_success_throughput'], 2)} |"
+            )
 
     if any(run.get("index_benchmark") for run in runs):
         lines.extend(

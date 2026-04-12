@@ -411,6 +411,19 @@ const concurrentBindThroughput: BarChartDatum[] = [
   { label: "OpenDJ", value: 10805.43, color: "#f2b26d" },
 ];
 
+const saslPlainBindLatency = {
+  labels: ["Light", "Moderate", "Heavy", "Stress"],
+  series: [
+    { label: "OpenDR FSM", values: [0.059, 0.059, 0.063, 0.062], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [0.383, 0.425, 0.331, 0.474], color: "#f2b26d" },
+  ],
+};
+
+const saslPlainBindThroughput: BarChartDatum[] = [
+  { label: "OpenDR FSM", value: 99330.02, color: "#7ce8c8" },
+  { label: "OpenDJ", value: 16091.05, color: "#f2b26d" },
+];
+
 const indexSearchLatency = {
   labels: ["uid eq", "mail present", "desc substring", "sn >=", "sn <="],
   series: [
@@ -845,6 +858,22 @@ cargo build --release`}</code></pre>
   --output-dir target/perf/docker-matrix-concurrent-bind-fsm-opendr-config-128-20260411`}</code></pre>
                 </section>
                 <section>
+                  <h3>SASL PLAIN comparison run</h3>
+                  <pre><code>{`./scripts/perf_docker_matrix.sh \\
+  --profile-set sasl \\
+  --products opendr,opendj \\
+  --opendr-runtime fsm \\
+  --benchmark-timeout 240 \\
+  --concurrent-bind-clients 1,4,8,16,32,64,128 \\
+  --concurrent-bind-iterations 20 \\
+  --concurrent-bind-warmup-iterations 1 \\
+  --concurrent-bind-operation-timeout-ms 5000 \\
+  --sasl-plain-authcid-format rdn-value \\
+  --skip-sasl-plain-admin-benchmark \\
+  --perf-client-image opendr:docker-perf-client \\
+  --output-dir target/perf/docker-matrix-sasl-plain-concurrency-20260412`}</code></pre>
+                </section>
+                <section>
                   <h3>Index-type comparison run</h3>
                   <pre><code>{`./scripts/perf_docker_matrix.sh \\
   --profile-set index \\
@@ -922,6 +951,34 @@ cargo build --release`}</code></pre>
                     title: "Peak successful bind throughput",
                     description: "Higher is better. Tuned OpenDR FSM versus OpenDJ in the 128-client concurrent-bind profile.",
                     data: concurrentBindThroughput,
+                    unit: "ops/s",
+                  })}
+                />
+                <GroupedBarChart
+                  title="SASL PLAIN bind mean"
+                  description="Lower is better. Fixture-user SASL PLAIN bind latency from the Docker full profile."
+                  labels={saslPlainBindLatency.labels}
+                  series={saslPlainBindLatency.series}
+                  unit="ms"
+                  onExpand={() => setExpandedChart({
+                    kind: "grouped",
+                    title: "SASL PLAIN bind mean",
+                    description: "Lower is better. Fixture-user SASL PLAIN bind latency from the Docker full profile.",
+                    labels: saslPlainBindLatency.labels,
+                    series: saslPlainBindLatency.series,
+                    unit: "ms",
+                  })}
+                />
+                <SimpleBarChart
+                  title="Peak SASL PLAIN throughput"
+                  description="Higher is better. Peak fixture-user SASL PLAIN successful binds from the sasl-auth profile."
+                  data={saslPlainBindThroughput}
+                  unit="ops/s"
+                  onExpand={() => setExpandedChart({
+                    kind: "simple",
+                    title: "Peak SASL PLAIN throughput",
+                    description: "Higher is better. Peak fixture-user SASL PLAIN successful binds from the sasl-auth profile.",
+                    data: saslPlainBindThroughput,
                     unit: "ops/s",
                   })}
                 />
