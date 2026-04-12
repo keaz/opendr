@@ -70,12 +70,12 @@ use crate::server::{
     entry_is_referral as directory_entry_is_referral, extract_search_hint,
     handle_sync_search_request, increment_control_counter, log_add_audit_event, log_anonymous_bind,
     log_compare_audit, log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event,
-    log_modify_audit_event, log_password_modify_audit_event, log_simple_bind_failure,
-    log_simple_bind_success, parse_sync_request_control, referral_urls_for_entry,
-    reject_sync_request, resolve_search_base_dn, resolve_search_candidate_entry,
-    CancelRequestOutcome, ConnectionOperationRegistry, ConnectionSession, LegacySecurityConfig,
-    LegacyServerConfig, PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError,
-    SyncRequestError,
+    log_modify_audit_event, log_password_modify_audit_event, log_sasl_bind,
+    log_simple_bind_failure, log_simple_bind_success, parse_sync_request_control,
+    referral_urls_for_entry, reject_sync_request, resolve_search_base_dn,
+    resolve_search_candidate_entry, CancelRequestOutcome, ConnectionOperationRegistry,
+    ConnectionSession, LegacySecurityConfig, LegacyServerConfig, PagedSearchCursor, RequestContext,
+    SearchRequestSignature, ServerError, SyncRequestError,
 };
 use crate::shutdown::ShutdownCoordinator;
 use crate::sync_controls::SYNC_REQUEST_OID;
@@ -778,6 +778,7 @@ async fn process_ldap_message(
                 fsm_set,
                 request.message_id,
                 bind_req,
+                request.is_secure,
                 request_context,
                 runtime_context.metrics.as_deref(),
             )
@@ -2685,7 +2686,7 @@ async fn try_handle_virtual_search_request_with_fsm_runtime(
             request.is_secure,
             runtime_context.tls_handler.is_some(),
             &supported_control_oids,
-            &crate::search_protocol::supported_sasl_mechanisms(),
+            &crate::search_protocol::supported_fsm_sasl_mechanisms(),
         )
         .await
         {
@@ -4243,6 +4244,7 @@ async fn handle_bind_with_fsm(
     fsm_set: &mut ConnectionFsmSet,
     message_id: i32,
     bind_req: ldap_parser::ldap::BindRequest<'_>,
+    connection_is_secure: bool,
     request_context: &RequestContext,
     metrics: Option<&MetricsCollector>,
 ) -> Result<(), String> {
@@ -4250,13 +4252,20 @@ async fn handle_bind_with_fsm(
     use ldap_parser::ldap::AuthenticationChoice;
 
     if bind_req.version != 3 {
-        send_bind_error(fsm_set, message_id as u32, "unsupported LDAP version").await?;
+        send_bind_result(
+            fsm_set,
+            message_id as u32,
+            ResultCode::ProtocolError,
+            "unsupported LDAP version",
+        )
+        .await?;
         return Ok(());
     }
 
+    let bind_name = bind_req.name.0.as_ref().trim().to_owned();
     match bind_req.authentication {
         AuthenticationChoice::Simple(password) => {
-            let dn = bind_req.name.0.as_ref().trim().to_owned();
+            let dn = bind_name;
             let is_anonymous_bind = dn.is_empty() && password.as_ref().is_empty();
             let auth_event = AuthEvent::BindRequest {
                 dn: dn.clone(),
@@ -4314,11 +4323,225 @@ async fn handle_bind_with_fsm(
                 }
             }
         }
-        AuthenticationChoice::Sasl(_) => {
+        AuthenticationChoice::Sasl(credentials) => {
+            handle_sasl_bind_with_fsm(
+                fsm_set,
+                message_id as u32,
+                bind_name,
+                credentials,
+                connection_is_secure,
+                request_context,
+                metrics,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_sasl_bind_with_fsm(
+    fsm_set: &mut ConnectionFsmSet,
+    message_id: u32,
+    request_name: String,
+    credentials: ldap_parser::ldap::SaslCredentials<'_>,
+    connection_is_secure: bool,
+    request_context: &RequestContext,
+    metrics: Option<&MetricsCollector>,
+) -> Result<(), String> {
+    use crate::fsm::{AuthEvent, StateMachine};
+
+    let mechanism = credentials.mechanism.0.as_ref().trim().to_owned();
+    reset_auth_state(fsm_set).await?;
+
+    if !mechanism.eq_ignore_ascii_case("PLAIN") {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_unsupported_mechanism");
+        }
+        log_sasl_bind(
+            request_context,
+            request_name.as_str(),
+            mechanism.as_str(),
+            false,
+            Some("unsupported SASL mechanism"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::AuthMethodNotSupported,
+            "only SASL PLAIN is supported",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !connection_is_secure {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_confidentiality_required");
+        }
+        log_sasl_bind(
+            request_context,
+            request_name.as_str(),
+            "PLAIN",
+            false,
+            Some("SASL PLAIN requires TLS"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::ConfidentialityRequired,
+            "SASL PLAIN requires TLS",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let (authzid, authcid, password) = match credentials
+        .credentials
+        .as_deref()
+        .ok_or_else(|| "SASL PLAIN requires credentials".to_string())
+        .and_then(crate::sasl_mechanisms::MultiMechanismHandler::parse_plain_credentials)
+    {
+        Ok(parsed) => parsed,
+        Err(err) => {
             if let Some(metrics) = metrics {
-                metrics.record_fsm_state(FsmType::Auth, "sasl_not_supported");
+                metrics.record_fsm_state(FsmType::Auth, "sasl_malformed_credentials");
             }
-            send_bind_error(fsm_set, message_id as u32, "SASL not supported").await?;
+            log_sasl_bind(
+                request_context,
+                request_name.as_str(),
+                "PLAIN",
+                false,
+                Some(&err),
+            )
+            .await;
+            send_bind_result(fsm_set, message_id, ResultCode::InvalidCredentials, &err).await?;
+            return Ok(());
+        }
+    };
+
+    let bind_dn = if request_name.is_empty() {
+        authcid.clone()
+    } else {
+        request_name
+    };
+
+    if bind_dn.is_empty() {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+        }
+        log_sasl_bind(
+            request_context,
+            "anonymous",
+            "PLAIN",
+            false,
+            Some("empty SASL identity"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::InvalidCredentials,
+            "empty SASL identity",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !authzid.is_empty() && !authzid.eq_ignore_ascii_case(&bind_dn) {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+        }
+        log_sasl_bind(
+            request_context,
+            bind_dn.as_str(),
+            "PLAIN",
+            false,
+            Some("proxy authorization is not supported"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::InappropriateAuthentication,
+            "proxy authorization is not supported",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let auth_event = AuthEvent::BindRequest {
+        dn: bind_dn.clone(),
+        password,
+    };
+
+    match fsm_set.auth_mut() {
+        AuthenticationFsm::Simple(auth_fsm) => match auth_fsm.handle_event(auth_event).await {
+            Ok(_) if fsm_set.is_authenticated() => {
+                if let Some(metrics) = metrics {
+                    metrics.record_fsm_state(FsmType::Auth, "sasl_bound");
+                }
+                log_sasl_bind(request_context, bind_dn.as_str(), "PLAIN", true, None).await;
+                send_bind_success(fsm_set, message_id).await?;
+            }
+            Ok(_) => {
+                if let Some(metrics) = metrics {
+                    metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+                }
+                log_sasl_bind(
+                    request_context,
+                    bind_dn.as_str(),
+                    "PLAIN",
+                    false,
+                    Some("invalid credentials"),
+                )
+                .await;
+                send_bind_error(fsm_set, message_id, "invalid credentials").await?;
+            }
+            Err(err) => {
+                error!("SASL PLAIN auth FSM error for {}: {}", bind_dn, err);
+                let backend_error =
+                    matches!(err, crate::auth_fsm::AuthError::DirectoryError { .. });
+                if let Some(metrics) = metrics {
+                    metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+                }
+                let (result_code, diagnostic) = if backend_error {
+                    (ResultCode::Unavailable, "backend failure")
+                } else {
+                    (ResultCode::InvalidCredentials, "authentication failed")
+                };
+                log_sasl_bind(
+                    request_context,
+                    bind_dn.as_str(),
+                    "PLAIN",
+                    false,
+                    Some(diagnostic),
+                )
+                .await;
+                send_bind_result(fsm_set, message_id, result_code, diagnostic).await?;
+            }
+        },
+        AuthenticationFsm::Sasl(_) => {
+            if let Some(metrics) = metrics {
+                metrics.record_fsm_state(FsmType::Auth, "sasl_not_configured");
+            }
+            log_sasl_bind(
+                request_context,
+                bind_dn.as_str(),
+                "PLAIN",
+                false,
+                Some("SASL not configured"),
+            )
+            .await;
+            send_bind_result(
+                fsm_set,
+                message_id,
+                ResultCode::Unavailable,
+                "SASL not configured",
+            )
+            .await?;
         }
     }
 
@@ -4335,20 +4558,7 @@ async fn reset_auth_state(fsm_set: &mut ConnectionFsmSet) -> Result<(), String> 
 }
 
 async fn send_bind_success(fsm_set: &mut ConnectionFsmSet, message_id: u32) -> Result<(), String> {
-    use crate::parser::encode_bind_response;
-
-    let response = encode_bind_response(message_id, ResultCode::Success, "", "")
-        .map_err(|e| format!("Encode error: {:?}", e))?;
-
-    let stream = fsm_set
-        .connection_mut()
-        .stream_mut()
-        .ok_or("No active stream")?;
-    stream
-        .write_all(&response)
-        .await
-        .map_err(|e| format!("Write error: {}", e))?;
-    Ok(())
+    send_bind_result(fsm_set, message_id, ResultCode::Success, "").await
 }
 
 async fn send_bind_error(
@@ -4356,9 +4566,24 @@ async fn send_bind_error(
     message_id: u32,
     diagnostic: &str,
 ) -> Result<(), String> {
+    send_bind_result(
+        fsm_set,
+        message_id,
+        ResultCode::InvalidCredentials,
+        diagnostic,
+    )
+    .await
+}
+
+async fn send_bind_result(
+    fsm_set: &mut ConnectionFsmSet,
+    message_id: u32,
+    result_code: ResultCode,
+    diagnostic: &str,
+) -> Result<(), String> {
     use crate::parser::encode_bind_response;
 
-    let response = encode_bind_response(message_id, ResultCode::InvalidCredentials, "", diagnostic)
+    let response = encode_bind_response(message_id, result_code, "", diagnostic)
         .map_err(|e| format!("Encode error: {:?}", e))?;
 
     let stream = fsm_set
@@ -4642,7 +4867,10 @@ mod tests {
         SyncRefreshMode, SyncRequestControl, SyncStateControl, SyncStateType, SYNC_DONE_OID,
         SYNC_STATE_OID,
     };
-    use ldap_parser::ldap::{ProtocolOp, ResultCode as ParserResultCode};
+    use ldap_parser::ldap::{
+        AuthenticationChoice, BindRequest, LdapDN, LdapString, ProtocolOp,
+        ResultCode as ParserResultCode, SaslCredentials,
+    };
     use ldap_parser::parse_ldap_messages;
     use rasn::der;
     use rasn_ldap::{
@@ -4654,9 +4882,10 @@ mod tests {
         Control as RasnControl, Filter as RasnFilter, LdapMessage as RasnLdapMessage,
         ModifyDnRequest as RasnModifyDnRequest, ModifyRequest as RasnModifyRequest,
         ModifyRequestChanges as RasnModifyRequestChanges, PartialAttribute as RasnPartialAttribute,
-        ProtocolOp as RasnProtocolOp, SearchRequest as RasnSearchRequest,
-        SearchRequestDerefAliases, SearchRequestScope,
+        ProtocolOp as RasnProtocolOp, SaslCredentials as RasnSaslCredentials,
+        SearchRequest as RasnSearchRequest, SearchRequestDerefAliases, SearchRequestScope,
     };
+    use std::borrow::Cow;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -4798,6 +5027,56 @@ mod tests {
             rasn_ldap::ProtocolOp::BindRequest(bind_request),
         );
         der::encode(&message).unwrap()
+    }
+
+    fn encode_sasl_plain_bind_request(message_id: u32, bind_dn: &str, password: &str) -> Vec<u8> {
+        let credentials = format!("\0{bind_dn}\0{password}").into_bytes();
+        let bind_request = RasnBindRequest::new(
+            3,
+            bind_dn.as_bytes().to_vec().into(),
+            RasnAuthChoice::Sasl(RasnSaslCredentials::new(
+                b"PLAIN".to_vec().into(),
+                Some(credentials.into()),
+            )),
+        );
+        let message = RasnLdapMessage::new(message_id, RasnProtocolOp::BindRequest(bind_request));
+        der::encode(&message).unwrap()
+    }
+
+    fn sasl_plain_bind_request(bind_dn: &str, password: &[u8]) -> BindRequest<'static> {
+        let mut credentials = Vec::new();
+        credentials.push(0);
+        credentials.extend_from_slice(bind_dn.as_bytes());
+        credentials.push(0);
+        credentials.extend_from_slice(password);
+
+        BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned(bind_dn.to_string())),
+            authentication: AuthenticationChoice::Sasl(SaslCredentials {
+                mechanism: LdapString(Cow::Owned("PLAIN".to_string())),
+                credentials: Some(Cow::Owned(credentials)),
+            }),
+        }
+    }
+
+    fn simple_bind_request(bind_dn: &str, password: &[u8]) -> BindRequest<'static> {
+        BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned(bind_dn.to_string())),
+            authentication: AuthenticationChoice::Simple(Cow::Owned(password.to_vec())),
+        }
+    }
+
+    fn sasl_bind_request_with_mechanism(mechanism: &str) -> BindRequest<'static> {
+        BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned("cn=admin,dc=example,dc=org".to_string())),
+            authentication: AuthenticationChoice::Sasl(SaslCredentials {
+                mechanism: LdapString(Cow::Owned(mechanism.to_string())),
+                credentials: None,
+            }),
+        }
     }
 
     fn encode_root_dse_search_request(message_id: u32) -> Vec<u8> {
@@ -6681,6 +6960,188 @@ mod tests {
                 assert_eq!(
                     response.response_value.as_ref().unwrap().as_ref(),
                     b"dn:cn=admin,dc=example,dc=org"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_bind_with_fsm_accepts_secure_sasl_plain() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut fsm_set = ConnectionFsmSet::new(server_stream, backend, None);
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            31,
+            sasl_plain_bind_request("cn=admin,dc=example,dc=org", b"secret"),
+            true,
+            &RequestContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            fsm_set.authenticated_dn(),
+            Some("cn=admin,dc=example,dc=org")
+        );
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_bind_with_fsm_rejects_secure_sasl_plain_wrong_password() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut fsm_set = ConnectionFsmSet::new(server_stream, backend, None);
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            32,
+            sasl_plain_bind_request("cn=admin,dc=example,dc=org", b"wrong"),
+            true,
+            &RequestContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(fsm_set.authenticated_dn(), None);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(
+                    bind_response.result.result_code,
+                    ParserResultCode::InvalidCredentials
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_bind_with_fsm_rejects_unsupported_sasl_mechanism() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut fsm_set = ConnectionFsmSet::new(server_stream, backend, None);
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            33,
+            sasl_bind_request_with_mechanism("GSSAPI"),
+            true,
+            &RequestContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(fsm_set.authenticated_dn(), None);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(
+                    bind_response.result.result_code,
+                    ParserResultCode::AuthMethodNotSupported
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_bind_with_fsm_failed_sasl_bind_clears_previous_authentication() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut fsm_set = ConnectionFsmSet::new(server_stream, backend, None);
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            34,
+            simple_bind_request("cn=admin,dc=example,dc=org", b"secret"),
+            true,
+            &RequestContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert_eq!(
+            fsm_set.authenticated_dn(),
+            Some("cn=admin,dc=example,dc=org")
+        );
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            35,
+            sasl_bind_request_with_mechanism("GSSAPI"),
+            true,
+            &RequestContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(
+                    bind_response.result.result_code,
+                    ParserResultCode::AuthMethodNotSupported
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert_eq!(fsm_set.authenticated_dn(), None);
+    }
+
+    #[tokio::test]
+    async fn handle_connection_rejects_sasl_plain_without_confidentiality() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_sasl_plain_bind_request(
+                36,
+                "cn=admin,dc=example,dc=org",
+                "secret",
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(
+                    bind_response.result.result_code,
+                    ParserResultCode::ConfidentialityRequired
                 );
             }
             other => panic!("unexpected response: {:?}", other),

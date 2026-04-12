@@ -126,6 +126,14 @@ pub fn supported_extensions(connection_is_secure: bool, starttls_available: bool
 }
 
 pub fn supported_sasl_mechanisms() -> Vec<String> {
+    supported_legacy_sasl_mechanisms()
+}
+
+pub fn supported_legacy_sasl_mechanisms() -> Vec<String> {
+    vec!["PLAIN".to_string()]
+}
+
+pub fn supported_fsm_sasl_mechanisms() -> Vec<String> {
     vec!["PLAIN".to_string()]
 }
 
@@ -174,7 +182,11 @@ mod tests {
 
     #[test]
     fn supported_sasl_mechanisms_are_explicit() {
-        assert_eq!(supported_sasl_mechanisms(), vec!["PLAIN".to_string()]);
+        assert_eq!(
+            supported_legacy_sasl_mechanisms(),
+            vec!["PLAIN".to_string()]
+        );
+        assert_eq!(supported_fsm_sasl_mechanisms(), vec!["PLAIN".to_string()]);
     }
 
     #[tokio::test]

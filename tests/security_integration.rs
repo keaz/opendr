@@ -67,7 +67,7 @@ async fn test_tls_config_defaults() {
 // ========================================================================
 
 struct TestCredentialVerifier {
-    valid_users: Vec<(String, String)>, // (username, dn)
+    valid_users: Vec<(String, String, Vec<u8>)>, // (username, dn, password)
 }
 
 impl TestCredentialVerifier {
@@ -77,11 +77,17 @@ impl TestCredentialVerifier {
                 (
                     "alice".to_string(),
                     "cn=alice,dc=example,dc=org".to_string(),
+                    b"password".to_vec(),
                 ),
-                ("bob".to_string(), "cn=bob,dc=example,dc=org".to_string()),
+                (
+                    "bob".to_string(),
+                    "cn=bob,dc=example,dc=org".to_string(),
+                    b"password".to_vec(),
+                ),
                 (
                     "admin".to_string(),
                     "cn=admin,dc=example,dc=org".to_string(),
+                    b"password".to_vec(),
                 ),
             ],
         }
@@ -90,16 +96,24 @@ impl TestCredentialVerifier {
 
 #[async_trait]
 impl CredentialVerifier for TestCredentialVerifier {
-    async fn verify_credentials(&self, _mechanism: &str, identity: &str) -> Result<bool, String> {
-        Ok(self.valid_users.iter().any(|(user, _)| user == identity))
+    async fn verify_credentials(
+        &self,
+        _mechanism: &str,
+        identity: &str,
+        credential: &[u8],
+    ) -> Result<bool, String> {
+        Ok(self
+            .valid_users
+            .iter()
+            .any(|(user, _, password)| user == identity && password == credential))
     }
 
     async fn get_user_dn(&self, identity: &str) -> Result<Option<String>, String> {
         Ok(self
             .valid_users
             .iter()
-            .find(|(user, _)| user == identity)
-            .map(|(_, dn)| dn.clone()))
+            .find(|(user, _, _)| user == identity)
+            .map(|(_, dn, _)| dn.clone()))
     }
 }
 
@@ -149,31 +163,23 @@ async fn test_sasl_plain_authentication_failure() {
 }
 
 #[tokio::test]
-async fn test_sasl_digest_md5_authentication() {
+async fn test_sasl_plain_authentication_wrong_password_fails() {
     let verifier_arc = Arc::new(TestCredentialVerifier::new());
     let mechanism_handler = Box::new(MultiMechanismHandler::new(verifier_arc.clone()));
     let verifier_box: Box<dyn CredentialVerifier> = Box::new(TestCredentialVerifier::new());
     let mut fsm = SaslFsmImpl::new(mechanism_handler, verifier_box);
 
-    // Initiate DIGEST-MD5 authentication
+    let credentials = b"\0alice\0wrong";
     let result = fsm
         .handle_event(SaslEvent::InitiateBind {
-            mechanism: "DIGEST-MD5".to_string(),
-            initial_data: None,
+            mechanism: "PLAIN".to_string(),
+            initial_data: Some(credentials.to_vec()),
         })
         .await;
 
-    assert!(result.is_ok());
-    assert!(fsm.needs_more_steps());
-
-    // Verify challenge was generated
-    let challenge_data = result.unwrap();
-    assert!(challenge_data.is_some());
-
-    let challenge = String::from_utf8(challenge_data.unwrap()).unwrap();
-    assert!(challenge.contains("realm="));
-    assert!(challenge.contains("nonce="));
-    assert!(challenge.contains("qop="));
+    assert!(result.is_err());
+    assert!(fsm.is_terminal());
+    assert_eq!(fsm.authenticated_identity(), None);
 }
 
 #[tokio::test]
@@ -183,8 +189,8 @@ async fn test_sasl_multiple_mechanisms() {
 
     // Test supported mechanisms
     assert!(mechanism_handler.supports_mechanism("PLAIN").await);
-    assert!(mechanism_handler.supports_mechanism("DIGEST-MD5").await);
-    assert!(mechanism_handler.supports_mechanism("CRAM-MD5").await);
+    assert!(!mechanism_handler.supports_mechanism("DIGEST-MD5").await);
+    assert!(!mechanism_handler.supports_mechanism("CRAM-MD5").await);
     assert!(!mechanism_handler.supports_mechanism("GSSAPI").await);
 }
 
@@ -201,11 +207,7 @@ async fn test_sasl_mechanism_properties() {
     );
 
     let digest_props = mechanism_handler.get_mechanism_properties("DIGEST-MD5");
-    assert_eq!(digest_props.get("steps"), Some(&"2".to_string()));
-    assert_eq!(
-        digest_props.get("security"),
-        Some(&"hash-based".to_string())
-    );
+    assert!(digest_props.is_empty());
 }
 
 // ========================================================================

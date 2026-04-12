@@ -218,8 +218,8 @@ requests `+` or explicit operational attribute names.
 
 ## Known Implementation Boundaries
 
-- FSM runtime simple and anonymous bind are wired. SASL FSM modules exist, but
-  the FSM server dispatch currently returns SASL as unsupported.
+- FSM runtime simple bind, anonymous bind, and SASL PLAIN over confidential
+  transport are wired. Other SASL mechanisms are not production-enabled.
 - `access_control.rules_file` is parsed but not loaded by the shipped startup
   path.
 - `performance.indexing_enabled` and `performance.cache_size` are wired into

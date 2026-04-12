@@ -13,10 +13,10 @@
 //!    - TLS handler implementation with rustls
 //!
 //! 2. SASL Authentication:
-//!    - Multiple SASL mechanism support (PLAIN, DIGEST-MD5, CRAM-MD5)
-//!    - Multi-roundtrip challenge/response authentication
+//!    - Production-supported SASL PLAIN authentication over TLS
 //!    - Credential verification
-//!    - Session management
+//!    - Unsupported mechanism rejection for challenge/response placeholders
+//!    - FSM session management
 //!
 //! ## Usage
 //!
@@ -46,7 +46,7 @@ struct DemoCredentialVerifier {
 #[derive(Debug, Clone)]
 struct UserCredentials {
     dn: String,
-    _password_hash: String,
+    password: Vec<u8>,
 }
 
 impl DemoCredentialVerifier {
@@ -58,7 +58,7 @@ impl DemoCredentialVerifier {
             "alice".to_string(),
             UserCredentials {
                 dn: "cn=alice,ou=users,dc=example,dc=org".to_string(),
-                _password_hash: "hashed_password_alice".to_string(),
+                password: b"password123".to_vec(),
             },
         );
 
@@ -66,7 +66,7 @@ impl DemoCredentialVerifier {
             "bob".to_string(),
             UserCredentials {
                 dn: "cn=bob,ou=users,dc=example,dc=org".to_string(),
-                _password_hash: "hashed_password_bob".to_string(),
+                password: b"password456".to_vec(),
             },
         );
 
@@ -74,7 +74,7 @@ impl DemoCredentialVerifier {
             "admin".to_string(),
             UserCredentials {
                 dn: "cn=admin,dc=example,dc=org".to_string(),
-                _password_hash: "hashed_password_admin".to_string(),
+                password: b"adminpass".to_vec(),
             },
         );
 
@@ -84,14 +84,26 @@ impl DemoCredentialVerifier {
 
 #[async_trait]
 impl CredentialVerifier for DemoCredentialVerifier {
-    async fn verify_credentials(&self, mechanism: &str, identity: &str) -> Result<bool, String> {
+    async fn verify_credentials(
+        &self,
+        mechanism: &str,
+        identity: &str,
+        credential: &[u8],
+    ) -> Result<bool, String> {
         println!(
             "  [CredentialVerifier] Verifying {} authentication for user: {}",
             mechanism, identity
         );
 
-        // In production, implement proper credential verification based on mechanism
-        Ok(self.users.contains_key(identity))
+        if mechanism != "PLAIN" {
+            return Ok(false);
+        }
+
+        // Demo only. Production verifiers should compare against a password hash.
+        Ok(self
+            .users
+            .get(identity)
+            .is_some_and(|creds| creds.password.as_slice() == credential))
     }
 
     async fn get_user_dn(&self, identity: &str) -> Result<Option<String>, String> {
@@ -109,12 +121,7 @@ impl CredentialVerifier for DemoCredentialVerifier {
             identity, mechanism
         );
 
-        // Admin can use all mechanisms, others only DIGEST-MD5 and CRAM-MD5
-        if identity == "admin" {
-            Ok(true)
-        } else {
-            Ok(mechanism != "PLAIN") // Enforce secure mechanisms for non-admin
-        }
+        Ok(mechanism == "PLAIN" && self.users.contains_key(identity))
     }
 }
 
@@ -175,7 +182,7 @@ async fn demo_tls_setup() {
     println!("   - Certificate-based client authentication (optional)");
 }
 
-/// Demonstrate SASL authentication with different mechanisms
+/// Demonstrate SASL authentication with production-supported mechanisms
 async fn demo_sasl_authentication() {
     println!("\n=== SASL Authentication Demo ===\n");
 
@@ -188,7 +195,7 @@ async fn demo_sasl_authentication() {
     println!("     - admin (administrator)");
 
     // 2. Create SASL mechanism handler
-    println!("\n2. Creating multi-mechanism SASL handler...");
+    println!("\n2. Creating production-supported SASL handler...");
     let mechanism_handler = Arc::new(MultiMechanismHandler::new(credential_verifier.clone()));
     println!("   ✓ SASL handler created");
     println!("   Supported mechanisms:");
@@ -213,16 +220,12 @@ async fn demo_sasl_authentication() {
     println!("\n3. Testing PLAIN mechanism (requires TLS)...");
     demo_plain_authentication(mechanism_handler.clone()).await;
 
-    // 4. Demonstrate DIGEST-MD5 authentication
-    println!("\n4. Testing DIGEST-MD5 mechanism (multi-step)...");
-    demo_digest_md5_authentication(mechanism_handler.clone()).await;
+    // 4. Confirm challenge/response placeholders are not production-enabled
+    println!("\n4. Confirming unsupported challenge/response mechanisms...");
+    demo_unsupported_sasl_mechanisms(mechanism_handler.clone()).await;
 
-    // 5. Demonstrate CRAM-MD5 authentication
-    println!("\n5. Testing CRAM-MD5 mechanism...");
-    demo_cram_md5_authentication(mechanism_handler.clone()).await;
-
-    // 6. Demonstrate SASL FSM with session management
-    println!("\n6. Testing SASL FSM with full session lifecycle...");
+    // 5. Demonstrate SASL FSM with session management
+    println!("\n5. Testing SASL FSM with full session lifecycle...");
     demo_sasl_fsm_lifecycle(mechanism_handler.clone(), credential_verifier.clone()).await;
 }
 
@@ -254,91 +257,17 @@ async fn demo_plain_authentication(handler: Arc<MultiMechanismHandler>) {
     }
 }
 
-/// Demonstrate DIGEST-MD5 mechanism authentication
-async fn demo_digest_md5_authentication(handler: Arc<MultiMechanismHandler>) {
-    println!("   [DIGEST-MD5] Starting authentication...");
-
-    // Step 1: Start authentication (get challenge)
-    match handler.start_authentication("DIGEST-MD5", None).await {
-        Ok(SaslChallengeResult::Challenge(challenge)) => {
-            let challenge_str = String::from_utf8_lossy(&challenge);
-            println!("   → Challenge received:");
-            println!("     {}", challenge_str);
-
-            // Step 2: Client would construct response with username, realm, nonce, etc.
-            let response = format!(
-                "username=\"alice\",realm=\"ldap.example.org\",nonce=\"{}\",response=\"abcd1234\"",
-                "test-nonce"
-            );
-
-            println!("   ← Sending response:");
-            println!("     {}", response);
-
-            // Step 3: Process response
-            match handler
-                .process_response("DIGEST-MD5", 1, response.as_bytes())
-                .await
-            {
-                Ok(SaslChallengeResult::Success { dn }) => {
-                    println!("   ✓ Authentication successful!");
-                    println!("     - Authenticated DN: {}", dn);
-                    println!("     - Steps completed: 2 (multi-step mechanism)");
-                }
-                Ok(SaslChallengeResult::Failure(reason)) => {
-                    println!("   ✗ Authentication failed: {}", reason);
-                }
-                Ok(SaslChallengeResult::Challenge(next_challenge)) => {
-                    println!("   → Additional challenge received (step 3)");
-                    println!("     {} bytes", next_challenge.len());
-                }
-                Err(e) => {
-                    println!("   ✗ Error processing response: {}", e);
-                }
+/// Demonstrate unsupported mechanism rejection
+async fn demo_unsupported_sasl_mechanisms(handler: Arc<MultiMechanismHandler>) {
+    for mechanism in ["DIGEST-MD5", "CRAM-MD5", "GSSAPI"] {
+        println!("   [{}] Starting authentication...", mechanism);
+        match handler.start_authentication(mechanism, None).await {
+            Ok(result) => {
+                println!("   ! Unexpected result: {:?}", result);
             }
-        }
-        Ok(SaslChallengeResult::Success { .. }) => {
-            println!("   ! Unexpected immediate success");
-        }
-        Ok(SaslChallengeResult::Failure(reason)) => {
-            println!("   ✗ Failed to start: {}", reason);
-        }
-        Err(e) => {
-            println!("   ✗ Error: {}", e);
-        }
-    }
-}
-
-/// Demonstrate CRAM-MD5 mechanism authentication
-async fn demo_cram_md5_authentication(handler: Arc<MultiMechanismHandler>) {
-    println!("   [CRAM-MD5] Starting authentication...");
-
-    // Step 1: Get challenge
-    match handler.start_authentication("CRAM-MD5", None).await {
-        Ok(SaslChallengeResult::Challenge(challenge)) => {
-            println!("   → Challenge received: {} bytes", challenge.len());
-
-            // Step 2: Client would compute HMAC-MD5 response
-            let response = "alice computed-hmac-hash";
-            println!("   ← Sending response: {}", response);
-
-            match handler
-                .process_response("CRAM-MD5", 1, response.as_bytes())
-                .await
-            {
-                Ok(SaslChallengeResult::Success { dn }) => {
-                    println!("   ✓ Authentication successful!");
-                    println!("     - Authenticated DN: {}", dn);
-                }
-                Ok(SaslChallengeResult::Failure(reason)) => {
-                    println!("   ✗ Authentication failed: {}", reason);
-                }
-                _ => {
-                    println!("   ! Unexpected result");
-                }
+            Err(e) => {
+                println!("   ✓ Rejected as unsupported: {}", e);
             }
-        }
-        _ => {
-            println!("   ✗ Failed to get challenge");
         }
     }
 }
@@ -428,25 +357,23 @@ async fn demo_tls_sasl_integration() {
     println!("   - Server verifies credentials over secure channel");
     println!("   ✓ Security: Credentials protected by TLS encryption\n");
 
-    println!("2. SASL DIGEST-MD5 (with or without TLS):");
-    println!("   - Client connects via LDAP or LDAPS");
+    println!("2. SASL DIGEST-MD5 (unsupported built-in mechanism):");
     println!("   - Client initiates SASL DIGEST-MD5 bind");
-    println!("   - Server sends challenge with nonce and realm");
-    println!("   - Client computes MD5 response hash");
-    println!("   - Server verifies response");
-    println!("   ✓ Security: Credentials never sent in plaintext\n");
+    println!("   - Built-in handler rejects it as not production-supported");
+    println!("   - Root DSE does not advertise DIGEST-MD5");
+    println!("   ✓ Security: Avoids incomplete challenge/response verification\n");
 
     println!("3. LDAPS (LDAP over TLS) with SASL:");
     println!("   - Client connects directly to LDAPS (port 636)");
     println!("   - TLS handshake occurs immediately");
-    println!("   - Client can use any SASL mechanism over secure channel");
+    println!("   - Client uses SASL PLAIN over the secure channel");
     println!("   ✓ Security: All traffic encrypted from connection start\n");
 
-    println!("4. Client Certificate Authentication:");
+    println!("4. Client Certificate Authentication (future/custom):");
     println!("   - Client connects with TLS client certificate");
     println!("   - Server validates client certificate");
-    println!("   - SASL EXTERNAL mechanism maps certificate to user DN");
-    println!("   - No password required");
+    println!("   - A custom SASL EXTERNAL handler maps certificate to user DN");
+    println!("   - The built-in handler does not advertise EXTERNAL");
     println!("   ✓ Security: Public key cryptography for authentication\n");
 }
 
@@ -463,17 +390,17 @@ fn demo_security_best_practices() {
 
     println!("2. SASL Mechanism Selection:");
     println!("   ✓ Require TLS for PLAIN mechanism");
-    println!("   ✓ Prefer DIGEST-MD5 or stronger mechanisms");
-    println!("   ✓ Implement mechanism selection policies per user/role");
-    println!("   ✓ Disable weak mechanisms in production");
+    println!("   ✓ Advertise only mechanisms that are fully implemented");
+    println!("   ✓ Use custom handlers only after proof verification is implemented");
+    println!("   ✓ Disable incomplete challenge/response mechanisms in production");
     println!("   ✓ Log authentication attempts for auditing\n");
 
     println!("3. Session Management:");
     println!("   ✓ Implement authentication timeouts");
     println!("   ✓ Limit failed authentication attempts");
-    println!("   ✓ Use unique nonces for challenge/response");
+    println!("   ✓ Enforce bounded initial response sizes");
     println!("   ✓ Clear sensitive data after authentication");
-    println!("   ✓ Implement session replay protection\n");
+    println!("   ✓ Keep connection security state explicit\n");
 
     println!("4. Credential Verification:");
     println!("   ✓ Use secure password hashing (bcrypt, argon2)");
@@ -498,8 +425,8 @@ async fn main() {
     println!("\n=== Summary ===\n");
     println!("This demo showcased:");
     println!("✓ TLS configuration and handler implementation");
-    println!("✓ Multiple SASL mechanism support (PLAIN, DIGEST-MD5, CRAM-MD5)");
-    println!("✓ Multi-roundtrip challenge/response authentication");
+    println!("✓ Production-supported SASL PLAIN authentication");
+    println!("✓ Unsupported SASL mechanism rejection");
     println!("✓ SASL FSM state machine with session management");
     println!("✓ Integration scenarios combining TLS and SASL");
     println!("✓ Security best practices for production deployment");
@@ -508,7 +435,7 @@ async fn main() {
     println!("1. Generate TLS certificates for testing: openssl req -x509 -newkey rsa:4096 ...");
     println!("2. Configure production TLS settings in config/server.toml");
     println!("3. Implement custom CredentialVerifier for your user database");
-    println!("4. Enable desired SASL mechanisms based on security requirements");
+    println!("4. Add custom SASL mechanisms only with complete proof verification");
     println!("5. Review and apply security best practices");
 
     println!("\n✨ Demo complete!\n");

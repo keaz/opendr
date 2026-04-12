@@ -797,8 +797,8 @@ cargo build --release`}</code></pre>
 
               <div className="callout warning">
                 <strong>Current distinction:</strong> FSM simple bind and
-                anonymous bind are wired. SASL FSM modules exist, but SASL bind
-                currently returns unsupported in the FSM server dispatch path.
+                anonymous bind are wired. SASL PLAIN is supported over LDAPS or
+                StartTLS; other SASL mechanisms are not production-enabled.
               </div>
             </section>
 

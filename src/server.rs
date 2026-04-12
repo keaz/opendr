@@ -2361,7 +2361,7 @@ pub(crate) async fn log_simple_bind_failure(
         .await;
 }
 
-async fn log_sasl_bind(
+pub(crate) async fn log_sasl_bind(
     request_context: &RequestContext,
     user_dn: &str,
     mechanism: &str,
@@ -3000,7 +3000,7 @@ async fn try_handle_virtual_search_request(
 
     if base_dn.is_empty() {
         let supported_control_oids = active_runtime_control_registry().supported_control_oids();
-        let supported_sasl_mechanisms = crate::search_protocol::supported_sasl_mechanisms();
+        let supported_sasl_mechanisms = crate::search_protocol::supported_legacy_sasl_mechanisms();
         let attributes = match crate::search_protocol::build_root_dse_attributes(
             backend,
             &runtime_config.naming_contexts,

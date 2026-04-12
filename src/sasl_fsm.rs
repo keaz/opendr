@@ -19,11 +19,9 @@
 //! ## Supported SASL Mechanisms
 //!
 //! The FSM supports pluggable SASL mechanisms through the `SaslMechanismHandler` trait:
-//! - PLAIN
-//! - DIGEST-MD5
-//! - CRAM-MD5
-//! - GSSAPI (Kerberos)
-//! - Custom mechanisms
+//! - PLAIN is provided by the built-in production handler.
+//! - Additional mechanisms can be supplied by custom handlers once they verify the
+//!   client proof for that mechanism.
 //!
 //! ## Multi-Roundtrip Support
 //!
@@ -54,7 +52,7 @@
 //! # struct MockCredentialVerifier;
 //! # #[async_trait::async_trait]
 //! # impl CredentialVerifier for MockCredentialVerifier {
-//! #     async fn verify_credentials(&self, mechanism: &str, identity: &str) -> Result<bool, String> { Ok(true) }
+//! #     async fn verify_credentials(&self, mechanism: &str, identity: &str, credential: &[u8]) -> Result<bool, String> { Ok(true) }
 //! #     async fn get_user_dn(&self, identity: &str) -> Result<Option<String>, String> { Ok(Some("cn=user".to_string())) }
 //! # }
 //! #
@@ -205,17 +203,28 @@ pub trait SaslMechanismHandler: Send + Sync {
 /// credential storage backends to be used.
 #[async_trait]
 pub trait CredentialVerifier: Send + Sync {
-    /// Verify user credentials for a SASL mechanism
+    /// Verify user credentials for a SASL mechanism.
+    ///
+    /// For SASL PLAIN, `credential` is the client-provided password bytes. Other
+    /// mechanisms must pass the mechanism-specific proof bytes that the verifier
+    /// needs to validate; production handlers should not accept mechanisms whose
+    /// proofs they cannot verify.
     ///
     /// # Arguments
     /// * `mechanism` - SASL mechanism used
     /// * `identity` - User identity/username
+    /// * `credential` - Password bytes or mechanism-specific client proof
     ///
     /// # Returns
     /// * `Ok(true)` if credentials are valid
     /// * `Ok(false)` if credentials are invalid
     /// * `Err(String)` if verification fails
-    async fn verify_credentials(&self, mechanism: &str, identity: &str) -> Result<bool, String>;
+    async fn verify_credentials(
+        &self,
+        mechanism: &str,
+        identity: &str,
+        credential: &[u8],
+    ) -> Result<bool, String>;
 
     /// Get the distinguished name for a user identity
     ///
@@ -902,6 +911,7 @@ mod tests {
             &self,
             mechanism: &str,
             identity: &str,
+            _credential: &[u8],
         ) -> Result<bool, String> {
             self.call_log
                 .lock()

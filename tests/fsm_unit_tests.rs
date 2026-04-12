@@ -223,7 +223,12 @@ struct MockCredentialVerifier;
 
 #[async_trait]
 impl CredentialVerifier for MockCredentialVerifier {
-    async fn verify_credentials(&self, _mechanism: &str, _identity: &str) -> Result<bool, String> {
+    async fn verify_credentials(
+        &self,
+        _mechanism: &str,
+        _identity: &str,
+        _credential: &[u8],
+    ) -> Result<bool, String> {
         Ok(true)
     }
 

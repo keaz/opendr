@@ -86,16 +86,15 @@ Use `fsm` for new deployments and development. It integrates connection pooling,
 resource limits, rate limiting, metrics, audit, TLS transport, and graceful
 shutdown with the current runtime model.
 
-Use `legacy` when you need to compare behavior against the older handler path or
-when testing legacy-only behavior such as SASL PLAIN integration. The shipped
-binary rejects non-default `rate_limit.burst_size` in legacy mode, so keep that
-default if you switch runtime.
+Use `legacy` when you need to compare behavior against the older handler path.
+The shipped binary rejects non-default `rate_limit.burst_size` in legacy mode,
+so keep that default if you switch runtime.
 
 Current runtime caveats:
 
-- FSM bind supports simple and anonymous bind. SASL FSMs exist, but the FSM
-  server dispatch path currently reports SASL as unsupported.
-- Legacy runtime has SASL PLAIN coverage over secure transport.
+- FSM bind supports simple bind, anonymous bind, and SASL PLAIN over
+  confidential transport.
+- SASL DIGEST-MD5 and CRAM-MD5 are not production-enabled.
 - Both runtimes share backend, TLS, metrics, audit, and many protocol helper
   modules.
 
@@ -288,7 +287,7 @@ Troubleshooting TLS:
 
 FSM runtime supports:
 
-- LDAPv3 simple bind and anonymous bind
+- LDAPv3 simple bind, anonymous bind, and SASL PLAIN over LDAPS or StartTLS
 - search
 - add, modify, delete, ModifyDN
 - compare
@@ -581,8 +580,8 @@ Bind fails:
 - Confirm the bind DN includes the base DN if needed, for example
   `cn=manager,dc=example,dc=com`.
 - After StartTLS, bind again because the auth state is reset.
-- SASL in the FSM runtime is not wired; use simple bind or the legacy runtime
-  path where appropriate.
+- SASL PLAIN requires LDAPS or StartTLS. Other SASL mechanisms are not
+  production-enabled.
 
 Search fails:
 

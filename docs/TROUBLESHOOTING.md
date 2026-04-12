@@ -77,11 +77,11 @@ bind as:
 cn=manager,dc=example,dc=com
 ```
 
-### SASL fails in `fsm`
+### SASL PLAIN fails in `fsm`
 
-The standalone SASL FSM exists, but the current FSM server bind dispatch reports
-SASL as unsupported. Use simple bind on `fsm`, or use the legacy runtime for the
-covered SASL PLAIN over secure transport path.
+SASL PLAIN in the FSM runtime requires confidential transport. Use LDAPS or run
+StartTLS before binding. DIGEST-MD5, CRAM-MD5, and other SASL mechanisms are not
+production-enabled.
 
 ### Bind fails after StartTLS
 
