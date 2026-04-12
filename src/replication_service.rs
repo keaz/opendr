@@ -36,9 +36,11 @@
 //! ```
 
 use log::{error, info, warn};
+use serde::Serialize;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::Notify;
@@ -69,6 +71,9 @@ pub struct ReplicationService {
 
     /// Provider lifecycle state shared with inbound replication stream handlers.
     provider_lifecycle: Option<Arc<ReplicationProviderLifecycle>>,
+
+    /// Runtime status shared with the management console.
+    status: Arc<ReplicationStatusRegistry>,
 }
 
 /// Replication configuration extracted from ServerConfig
@@ -86,6 +91,16 @@ pub enum ReplicationMode {
     Provider,
     Consumer,
     Both,
+}
+
+impl ReplicationMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Consumer => "consumer",
+            Self::Both => "both",
+        }
+    }
 }
 
 /// Provider service configuration
@@ -118,6 +133,204 @@ pub struct ConsumerServiceConfig {
     pub state_persistence_timeout_secs: u64,
     pub change_buffer_size: usize,
     pub state_storage_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplicationStatusSnapshot {
+    pub enabled: bool,
+    pub mode: String,
+    pub provider: ProviderReplicationStatus,
+    pub consumer: ConsumerReplicationStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderReplicationStatus {
+    pub enabled: bool,
+    pub running: bool,
+    pub draining: bool,
+    pub active_sessions: usize,
+    pub changelog_capacity: Option<usize>,
+    pub changelog_enabled: bool,
+    pub max_batch_size: Option<usize>,
+    pub enable_streaming: Option<bool>,
+    pub heartbeat_interval_secs: Option<u64>,
+    pub max_concurrent_consumers: Option<usize>,
+    pub consumer_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsumerReplicationStatus {
+    pub enabled: bool,
+    pub running: bool,
+    pub listening: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_url: Option<String>,
+    pub max_batch_size: Option<usize>,
+    pub max_retry_attempts: Option<u32>,
+    pub retry_delay_secs: Option<u64>,
+    pub heartbeat_interval_secs: Option<u64>,
+    pub change_buffer_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted_cookie: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+pub struct ReplicationStatusRegistry {
+    snapshot: StdRwLock<ReplicationStatusSnapshot>,
+    provider_lifecycle: StdRwLock<Option<Arc<ReplicationProviderLifecycle>>>,
+    consumer_cookie_path: StdRwLock<Option<PathBuf>>,
+}
+
+impl ReplicationStatusRegistry {
+    fn new(config: &ReplicationConfig) -> Arc<Self> {
+        let provider = config.provider_config.as_ref();
+        let consumer = config.consumer_config.as_ref();
+        Arc::new(Self {
+            snapshot: StdRwLock::new(ReplicationStatusSnapshot {
+                enabled: config.enabled,
+                mode: if config.enabled {
+                    config.mode.as_str().to_string()
+                } else {
+                    "disabled".to_string()
+                },
+                provider: ProviderReplicationStatus {
+                    enabled: provider.is_some(),
+                    running: false,
+                    draining: false,
+                    active_sessions: 0,
+                    changelog_capacity: provider.map(|settings| settings.changelog_capacity),
+                    changelog_enabled: provider
+                        .map(|settings| settings.changelog_enabled)
+                        .unwrap_or(false),
+                    max_batch_size: provider.map(|settings| settings.max_batch_size),
+                    enable_streaming: provider.map(|settings| settings.enable_streaming),
+                    heartbeat_interval_secs: provider
+                        .map(|settings| settings.heartbeat_interval_secs),
+                    max_concurrent_consumers: provider
+                        .map(|settings| settings.max_concurrent_consumers),
+                    consumer_timeout_secs: provider.map(|settings| settings.consumer_timeout_secs),
+                    last_error: None,
+                },
+                consumer: ConsumerReplicationStatus {
+                    enabled: consumer.is_some(),
+                    running: false,
+                    listening: false,
+                    provider_url: consumer.map(|settings| settings.provider_url.clone()),
+                    max_batch_size: consumer.map(|settings| settings.max_batch_size),
+                    max_retry_attempts: consumer.map(|settings| settings.max_retry_attempts),
+                    retry_delay_secs: consumer.map(|settings| settings.retry_delay_secs),
+                    heartbeat_interval_secs: consumer
+                        .map(|settings| settings.heartbeat_interval_secs),
+                    change_buffer_size: consumer.map(|settings| settings.change_buffer_size),
+                    persisted_cookie: consumer.map(|_| false),
+                    last_error: None,
+                },
+            }),
+            provider_lifecycle: StdRwLock::new(None),
+            consumer_cookie_path: StdRwLock::new(consumer.map(|settings| {
+                PathBuf::from(&settings.state_storage_path).join("replication_cookie.txt")
+            })),
+        })
+    }
+
+    fn update(&self, update: impl FnOnce(&mut ReplicationStatusSnapshot)) {
+        let mut snapshot = self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut snapshot);
+    }
+
+    fn set_provider_lifecycle(&self, lifecycle: Option<Arc<ReplicationProviderLifecycle>>) {
+        let mut provider_lifecycle = self
+            .provider_lifecycle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *provider_lifecycle = lifecycle;
+    }
+
+    fn set_provider_running(&self, running: bool) {
+        self.update(|snapshot| {
+            snapshot.provider.running = running;
+            if running {
+                snapshot.provider.last_error = None;
+            }
+        });
+    }
+
+    fn set_provider_draining(&self, draining: bool) {
+        self.update(|snapshot| {
+            snapshot.provider.draining = draining;
+        });
+    }
+
+    fn set_provider_error(&self, error: impl Into<String>) {
+        self.update(|snapshot| {
+            snapshot.provider.running = false;
+            snapshot.provider.last_error = Some(error.into());
+        });
+    }
+
+    fn set_consumer_running(&self, running: bool) {
+        self.update(|snapshot| {
+            snapshot.consumer.running = running;
+            if !running {
+                snapshot.consumer.listening = false;
+            }
+            if running {
+                snapshot.consumer.last_error = None;
+            }
+        });
+    }
+
+    fn set_consumer_listening(&self, listening: bool) {
+        self.update(|snapshot| {
+            snapshot.consumer.listening = listening;
+            if listening {
+                snapshot.consumer.running = true;
+                snapshot.consumer.last_error = None;
+            }
+        });
+    }
+
+    fn set_consumer_error(&self, error: impl Into<String>) {
+        self.update(|snapshot| {
+            snapshot.consumer.listening = false;
+            snapshot.consumer.last_error = Some(error.into());
+        });
+    }
+
+    pub fn snapshot(&self) -> ReplicationStatusSnapshot {
+        let mut snapshot = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        if let Some(lifecycle) = self
+            .provider_lifecycle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            snapshot.provider.active_sessions = lifecycle.active_session_count();
+            snapshot.provider.draining = lifecycle.is_draining();
+        }
+
+        if let Some(cookie_path) = self
+            .consumer_cookie_path
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            snapshot.consumer.persisted_cookie = Some(cookie_path.exists());
+        }
+
+        snapshot
+    }
 }
 
 impl fmt::Debug for ConsumerServiceConfig {
@@ -179,6 +392,8 @@ impl ReplicationService {
         } else {
             None
         };
+        let status = ReplicationStatusRegistry::new(&repl_config);
+        status.set_provider_lifecycle(provider_lifecycle.clone());
 
         // Create changelog if replication enabled
         let changelog = if should_track_changelog {
@@ -215,6 +430,7 @@ impl ReplicationService {
             original_backend: backend,
             config: repl_config,
             provider_lifecycle,
+            status,
         })
     }
 
@@ -313,6 +529,11 @@ impl ReplicationService {
         self.changelog.clone()
     }
 
+    /// Get the runtime replication status registry.
+    pub fn status(&self) -> Arc<ReplicationStatusRegistry> {
+        self.status.clone()
+    }
+
     /// Start the replication provider service
     ///
     /// # Arguments
@@ -339,14 +560,16 @@ impl ReplicationService {
             .provider_config
             .as_ref()
             .ok_or_else(|| "Provider config not available".to_string())?;
-        let provider_lifecycle = self
-            .provider_lifecycle
-            .clone()
-            .ok_or_else(|| "Provider lifecycle not initialized".to_string())?;
+        let provider_lifecycle = self.provider_lifecycle.clone().ok_or_else(|| {
+            self.status
+                .set_provider_error("Provider lifecycle not initialized");
+            "Provider lifecycle not initialized".to_string()
+        })?;
 
-        self.changelog
-            .as_ref()
-            .ok_or_else(|| "Changelog not initialized".to_string())?;
+        self.changelog.as_ref().ok_or_else(|| {
+            self.status.set_provider_error("Changelog not initialized");
+            "Changelog not initialized".to_string()
+        })?;
 
         info!(
             "Starting replication provider service with inbound stream sessions (streaming={}, heartbeat={}s)",
@@ -358,6 +581,8 @@ impl ReplicationService {
         let mut shutdown_rx = shutdown.subscribe();
         let graceful_drain = shutdown.graceful_drain_enabled();
         let drain_timeout = shutdown.drain_timeout();
+        let status = self.status.clone();
+        status.set_provider_running(true);
 
         // Spawn provider service task
         let handle = tokio::spawn(async move {
@@ -370,9 +595,11 @@ impl ReplicationService {
 
             info!("Replication provider service shutting down");
             provider_lifecycle.begin_shutdown();
+            status.set_provider_draining(true);
 
             if !graceful_drain {
                 info!("Replication provider service shutdown will not wait for session drain");
+                status.set_provider_running(false);
                 return;
             }
 
@@ -392,6 +619,7 @@ impl ReplicationService {
                     );
                 }
             }
+            status.set_provider_running(false);
         });
 
         Ok(Some(handle))
@@ -425,9 +653,10 @@ impl ReplicationService {
             .ok_or_else(|| "Consumer config not available".to_string())?;
 
         if Self::uses_local_provider_runtime(&consumer_config.provider_url) {
-            return Err(
-                "listener-based replication requires ldap:// or ldaps:// provider_url; local:// and in-memory:// are not supported".to_string()
-            );
+            let message =
+                "listener-based replication requires ldap:// or ldaps:// provider_url; local:// and in-memory:// are not supported";
+            self.status.set_consumer_error(message);
+            return Err(message.to_string());
         }
 
         info!("Starting replication consumer service");
@@ -498,6 +727,8 @@ impl ReplicationService {
         let retry_delay = Duration::from_secs(consumer_config.retry_delay_secs);
 
         let provider_url = consumer_config.provider_url.clone();
+        let status = self.status.clone();
+        status.set_consumer_running(true);
 
         // Spawn consumer service task
         let handle = tokio::spawn(async move {
@@ -508,11 +739,13 @@ impl ReplicationService {
             loop {
                 if let Err(e) = consumer_fsm.reset().await {
                     error!("Failed to reset consumer FSM: {:?}", e);
+                    status.set_consumer_error(format!("consumer FSM reset failed: {e:?}"));
                     tokio::select! {
                         _ = tokio::time::sleep(retry_delay) => {}
                         _ = shutdown_rx.recv() => {
                             info!("Replication consumer service shutting down");
                             let _ = consumer_fsm.stop_live_listening().await;
+                            status.set_consumer_running(false);
                             info!("Replication consumer service stopped");
                             return;
                         }
@@ -528,14 +761,19 @@ impl ReplicationService {
                 match consumer_fsm.handle_event(event).await {
                     Ok(_) if consumer_fsm.is_listening_state() => {
                         info!("Replication consumer entered listening mode");
+                        status.set_consumer_listening(true);
                     }
                     Ok(_) => {
                         error!("Replication consumer completed without entering listening mode");
+                        status.set_consumer_error(
+                            "consumer completed without entering listening mode",
+                        );
                         tokio::select! {
                             _ = tokio::time::sleep(retry_delay) => {}
                             _ = shutdown_rx.recv() => {
                                 info!("Replication consumer service shutting down");
                                 let _ = consumer_fsm.stop_live_listening().await;
+                                status.set_consumer_running(false);
                                 info!("Replication consumer service stopped");
                                 return;
                             }
@@ -544,11 +782,13 @@ impl ReplicationService {
                     }
                     Err(e) => {
                         error!("Initial listening sync failed: {:?}", e);
+                        status.set_consumer_error(format!("initial listening sync failed: {e:?}"));
                         tokio::select! {
                             _ = tokio::time::sleep(retry_delay) => {}
                             _ = shutdown_rx.recv() => {
                                 info!("Replication consumer service shutting down");
                                 let _ = consumer_fsm.stop_live_listening().await;
+                                status.set_consumer_running(false);
                                 info!("Replication consumer service stopped");
                                 return;
                             }
@@ -562,6 +802,7 @@ impl ReplicationService {
                         _ = shutdown_rx.recv() => {
                             info!("Replication consumer service shutting down");
                             let _ = consumer_fsm.stop_live_listening().await;
+                            status.set_consumer_running(false);
                             info!("Replication consumer service stopped");
                             return;
                         }
@@ -570,6 +811,7 @@ impl ReplicationService {
                                 Ok(Some(change)) => {
                                     if let Err(e) = consumer_fsm.handle_event(ReplicationConsumerEvent::ChangeReceived(change)).await {
                                         error!("Failed to process live replication change: {:?}", e);
+                                        status.set_consumer_error(format!("live replication change failed: {e:?}"));
                                         let _ = consumer_fsm.stop_live_listening().await;
                                         break;
                                     }
@@ -579,6 +821,7 @@ impl ReplicationService {
                                 }
                                 Err(e) => {
                                     error!("Listening channel failed: {:?}", e);
+                                    status.set_consumer_error(format!("listening channel failed: {e:?}"));
                                     let _ = consumer_fsm.stop_live_listening().await;
                                     break;
                                 }
@@ -592,6 +835,7 @@ impl ReplicationService {
                     _ = shutdown_rx.recv() => {
                         info!("Replication consumer service shutting down");
                         let _ = consumer_fsm.stop_live_listening().await;
+                        status.set_consumer_running(false);
                         info!("Replication consumer service stopped");
                         return;
                     }
@@ -769,6 +1013,26 @@ mod tests {
         assert!(service.is_provider());
         assert!(!service.is_consumer());
         assert!(service.changelog().is_some());
+    }
+
+    #[test]
+    fn test_replication_status_snapshot_tracks_provider_sessions() {
+        let config = create_test_config();
+        let backend = Arc::new(MockBackend::new());
+
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let lifecycle = service.provider_lifecycle.as_ref().unwrap();
+        let guard = lifecycle.register_session().unwrap();
+
+        let snapshot = service.status().snapshot();
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.mode, "provider");
+        assert!(snapshot.provider.enabled);
+        assert_eq!(snapshot.provider.active_sessions, 1);
+        assert!(!snapshot.consumer.enabled);
+
+        drop(guard);
+        assert_eq!(service.status().snapshot().provider.active_sessions, 0);
     }
 
     #[test]

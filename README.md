@@ -341,6 +341,8 @@ changelog_capacity = 100000
 [monitoring]
 enabled = true
 metrics_port = 9090
+console_enabled = true
+console_path = "/console"
 
 [rate_limit]
 enabled = true
@@ -415,7 +417,7 @@ curl http://localhost:9090/metrics
 ### Health Checks
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:9090/health
 ```
 
 Response:
@@ -431,6 +433,22 @@ Response:
   "uptime_seconds": 3600
 }
 ```
+
+### Management Console
+
+OpenDR serves a read-only management console from the monitoring listener when
+monitoring is enabled:
+
+```bash
+open http://127.0.0.1:9090/console
+```
+
+The console accepts the configured root DN and password, for example
+`cn=admin,dc=example,dc=com` when `root_user_dn = "cn=admin"` and
+`base_dn = "dc=example,dc=com"`. Sessions are process-local, use HttpOnly
+SameSite cookies, and expire on restart or after the configured TTL.
+See [`docs/MANAGEMENT_CONSOLE.md`](docs/MANAGEMENT_CONSOLE.md) for the endpoint
+map, overview payload, and operating notes.
 
 ## Production Deployment
 

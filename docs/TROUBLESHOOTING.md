@@ -273,7 +273,10 @@ Default endpoints:
 ```bash
 curl http://127.0.0.1:9090/metrics
 curl http://127.0.0.1:9090/health
+open http://127.0.0.1:9090/console
 ```
 
 If these fail, check `[monitoring] metrics_address`, `metrics_port`,
-`metrics_path`, and `health_path`, and confirm no other process owns the port.
+`metrics_path`, `health_path`, and `console_path`, and confirm no other process
+owns the port. Console login requires the configured root DN and password.
+Use `docs/MANAGEMENT_CONSOLE.md` for the console route map and login details.

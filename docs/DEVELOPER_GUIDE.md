@@ -538,6 +538,9 @@ metrics_address = "127.0.0.1"
 metrics_port = 9090
 metrics_path = "/metrics"
 health_path = "/health"
+console_enabled = true
+console_path = "/console"
+console_session_ttl_secs = 3600
 ```
 
 Endpoints:
@@ -545,7 +548,16 @@ Endpoints:
 ```bash
 curl http://127.0.0.1:9090/metrics
 curl http://127.0.0.1:9090/health
+open http://127.0.0.1:9090/console
 ```
+
+The management console is read-only and uses LDAP authentication against the
+configured root DN. If `root_user_dn` is an RDN, OpenDR combines it with
+`base_dn` for console login, for example `cn=admin,dc=example,dc=com`.
+Sessions use HttpOnly SameSite cookies, live only in the server process, and
+expire on restart or after `console_session_ttl_secs`.
+See [`MANAGEMENT_CONSOLE.md`](./MANAGEMENT_CONSOLE.md) for the route map and
+overview payload fields.
 
 Audit defaults to JSON format at `./logs/audit.log` and can log
 authentication, authorization, modifications, and connection events.

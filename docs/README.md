@@ -17,6 +17,7 @@ deploys the site.
 
 - [Developer operations guide](./DEVELOPER_GUIDE.md)
 - [Configuration reference](./CONFIGURATION.md)
+- [Management console](./MANAGEMENT_CONSOLE.md)
 - [Troubleshooting guide](./TROUBLESHOOTING.md)
 - [Backup and restore](./BACKUP_RESTORE.md)
 - [Replication guide](./REPLICATION_GUIDE.md)

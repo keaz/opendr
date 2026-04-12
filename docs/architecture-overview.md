@@ -125,7 +125,7 @@ flowchart TB
 | TLS | `src/tls.rs`, `src/connection_fsm.rs` | LDAPS and StartTLS transport upgrade |
 | Replication | `src/replication*.rs`, `src/backend_changelog_wrapper.rs` | Provider changelog, LDAP Sync provider sessions, consumer state |
 | Backup | `src/backup.rs`, `src/bin/opendr_backup.rs`, `src/bin/opendr_restore.rs` | LMDB full backup, changelog incremental backup, offline restore |
-| Monitoring | `src/monitoring_runtime.rs`, `src/metrics.rs` | Prometheus metrics and JSON health |
+| Monitoring | `src/monitoring_runtime.rs`, `src/metrics.rs` | Prometheus metrics, JSON health, read-only console UI, and overview API |
 | Audit and ACI | `src/audit.rs`, `src/aci.rs` | Security event logging and access-control engine |
 
 ## Runtime Selection

@@ -485,6 +485,18 @@ pub struct MonitoringSettings {
     /// Health check path
     #[serde(default = "default_health_path")]
     pub health_path: String,
+
+    /// Enable the browser management console on the monitoring listener.
+    #[serde(default = "default_true")]
+    pub console_enabled: bool,
+
+    /// Base path for the browser management console.
+    #[serde(default = "default_console_path")]
+    pub console_path: String,
+
+    /// Management console session timeout in seconds.
+    #[serde(default = "default_console_session_ttl_secs")]
+    pub console_session_ttl_secs: u64,
 }
 
 /// Audit logging settings
@@ -775,6 +787,12 @@ fn default_metrics_path() -> String {
 fn default_health_path() -> String {
     "/health".to_string()
 }
+fn default_console_path() -> String {
+    "/console".to_string()
+}
+fn default_console_session_ttl_secs() -> u64 {
+    3600
+}
 
 fn default_audit_log_file() -> PathBuf {
     PathBuf::from("./logs/audit.log")
@@ -923,6 +941,9 @@ impl Default for MonitoringSettings {
             metrics_port: default_metrics_port(),
             metrics_path: default_metrics_path(),
             health_path: default_health_path(),
+            console_enabled: true,
+            console_path: default_console_path(),
+            console_session_ttl_secs: default_console_session_ttl_secs(),
         }
     }
 }

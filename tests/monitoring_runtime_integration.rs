@@ -6,7 +6,10 @@ use ldap_parser::parse_ldap_messages;
 use opendr::backend::MockBackend;
 use opendr::config::MonitoringSettings;
 use opendr::metrics::MetricsCollector;
-use opendr::monitoring_runtime::{spawn_monitoring_server, ComponentStatus, RuntimeHealthRegistry};
+use opendr::monitoring_runtime::{
+    spawn_monitoring_server, spawn_monitoring_server_with_context, ComponentStatus,
+    MonitoringRuntimeContext, RuntimeHealthRegistry,
+};
 use opendr::server;
 use rasn::der;
 use rasn_ldap::{AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest};
@@ -46,9 +49,40 @@ async fn connect_with_retry(port: u16) -> tokio::net::TcpStream {
 }
 
 async fn http_get(port: u16, path: &str) -> (String, String) {
+    http_request(port, "GET", path, &[], "").await
+}
+
+async fn http_post(
+    port: u16,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> (String, String) {
+    http_request(port, "POST", path, headers, body).await
+}
+
+async fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (String, String) {
     let addr = format!("127.0.0.1:{port}");
     let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
     stream.write_all(request.as_bytes()).await.unwrap();
 
     let mut response = Vec::new();
@@ -57,6 +91,20 @@ async fn http_get(port: u16, path: &str) -> (String, String) {
     let response = String::from_utf8(response).unwrap();
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();
     (headers.to_string(), body.to_string())
+}
+
+fn response_cookie(headers: &str) -> String {
+    headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("set-cookie") {
+                Some(value.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .expect("response did not include set-cookie")
 }
 
 async fn wait_for_metrics(port: u16, expected: &str) -> String {
@@ -108,6 +156,7 @@ async fn monitoring_server_exports_live_metrics_and_health() {
         metrics_port: monitoring_port,
         metrics_path: "/metrics".to_string(),
         health_path: "/health".to_string(),
+        ..MonitoringSettings::default()
     };
 
     let (shutdown_tx, _) = broadcast::channel(8);
@@ -192,6 +241,122 @@ async fn monitoring_server_exports_live_metrics_and_health() {
         .await
         .unwrap()
         .unwrap();
+    timeout(Duration::from_secs(2), monitoring_task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn management_console_requires_root_session() {
+    let monitoring_port = reserve_port().await;
+    let backend = Arc::new(MockBackend::default());
+    let metrics = MetricsCollector::new();
+    metrics.record_connection_accepted();
+    let health = RuntimeHealthRegistry::new();
+    health
+        .set_component(
+            "backend",
+            ComponentStatus::Healthy,
+            Some("memory backend initialized".to_string()),
+        )
+        .await;
+
+    let settings = MonitoringSettings {
+        enabled: true,
+        metrics_address: "127.0.0.1".to_string(),
+        metrics_port: monitoring_port,
+        metrics_path: "/metrics".to_string(),
+        health_path: "/health".to_string(),
+        console_path: "/console".to_string(),
+        console_session_ttl_secs: 60,
+        ..MonitoringSettings::default()
+    };
+    let (shutdown_tx, _) = broadcast::channel(8);
+    let monitoring_task = spawn_monitoring_server_with_context(
+        settings,
+        metrics.clone(),
+        health.clone(),
+        MonitoringRuntimeContext {
+            console_backend: Some(backend),
+            console_admin_dn: Some("cn=admin,dc=example,dc=org".to_string()),
+            replication_status: None,
+        },
+        shutdown_tx.subscribe(),
+    )
+    .unwrap();
+
+    wait_for_port(monitoring_port).await;
+
+    let (headers, body) = http_get(monitoring_port, "/console/api/overview").await;
+    assert!(headers.contains("401 Unauthorized"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+        "unauthorized"
+    );
+
+    let (headers, _) = http_post(
+        monitoring_port,
+        "/console/login",
+        r#"{"dn":"uid=user,dc=example,dc=org","password":"secret"}"#,
+        &[],
+    )
+    .await;
+    assert!(headers.contains("401 Unauthorized"));
+
+    let (headers, body) = http_post(
+        monitoring_port,
+        "/console/login",
+        r#"{"dn":"cn=admin,dc=example,dc=org","password":"secret"}"#,
+        &[],
+    )
+    .await;
+    assert!(headers.contains("200 OK"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["authenticated"],
+        true
+    );
+    let cookie = response_cookie(&headers);
+
+    let (headers, body) = http_request(
+        monitoring_port,
+        "GET",
+        "/console/api/overview",
+        &[("Cookie", &cookie)],
+        "",
+    )
+    .await;
+    assert!(headers.contains("200 OK"));
+    let overview: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(overview["health"]["status"], "healthy");
+    assert_eq!(overview["connections"]["active"], 1);
+    assert!(overview["operations"].as_array().unwrap().len() >= 10);
+
+    let (headers, body) = http_post(
+        monitoring_port,
+        "/console/logout",
+        "",
+        &[("Cookie", &cookie)],
+    )
+    .await;
+    assert!(headers.contains("200 OK"));
+    assert!(response_cookie(&headers).contains("Max-Age=0"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["authenticated"],
+        false
+    );
+
+    let (headers, _) = http_request(
+        monitoring_port,
+        "GET",
+        "/console/api/overview",
+        &[("Cookie", &cookie)],
+        "",
+    )
+    .await;
+    assert!(headers.contains("401 Unauthorized"));
+
+    let _ = shutdown_tx.send(());
     timeout(Duration::from_secs(2), monitoring_task)
         .await
         .unwrap()

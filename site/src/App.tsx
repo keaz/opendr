@@ -294,19 +294,25 @@ extended = 20`,
   },
   {
     title: "`[monitoring]`",
-    intro: "HTTP endpoints for Prometheus metrics and JSON health.",
+    intro: "HTTP endpoints for Prometheus metrics, JSON health, and the read-only management console.",
     snippet: `[monitoring]
 enabled = true
 metrics_address = "127.0.0.1"
 metrics_port = 9090
 metrics_path = "/metrics"
-health_path = "/health"`,
+health_path = "/health"
+console_enabled = true
+console_path = "/console"
+console_session_ttl_secs = 3600`,
     options: [
       ["enabled", "Starts or disables the monitoring HTTP endpoint."],
       ["metrics_address", "Address the monitoring server binds to."],
       ["metrics_port", "Port for monitoring HTTP traffic."],
       ["metrics_path", "Prometheus text endpoint path."],
       ["health_path", "JSON health endpoint path."],
+      ["console_enabled", "Serves the read-only management console from the monitoring listener."],
+      ["console_path", "Browser console base path."],
+      ["console_session_ttl_secs", "Process-local console session timeout in seconds."],
     ],
   },
   {
@@ -370,7 +376,7 @@ const operationsRows = [
   ["Controls", "Paged results, server-side sort, ManageDsaIT, and LDAP Sync controls are supported."],
   ["Schema", "Core schema validates required attributes, structural classes, unknown attributes, and single-value constraints."],
   ["ACI", "Default allow or deny policy is built at startup. Rule file loading is not wired yet."],
-  ["Monitoring", "Prometheus metrics and JSON health are served from the configured monitoring address and paths."],
+  ["Monitoring", "Prometheus metrics, JSON health, and the read-only management console are served from the configured monitoring listener."],
 ];
 
 const troubleshootingRows = [
@@ -524,6 +530,7 @@ function App() {
         <nav aria-label="Top navigation">
           <a href={docsHref("DEVELOPER_GUIDE.md")}>Developer Guide</a>
           <a href={docsHref("CONFIGURATION.md")}>Configuration</a>
+          <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Management Console</a>
           <a href={docsHref("TROUBLESHOOTING.md")}>Troubleshooting</a>
           <a className="topbar-cta" href="https://github.com/keaz/opendr">GitHub</a>
         </nav>
@@ -584,6 +591,7 @@ function App() {
               <div className="chapter-links">
                 <a href={docsHref("DEVELOPER_GUIDE.md")}>Open full developer guide</a>
                 <a href={docsHref("CONFIGURATION.md")}>Open configuration reference</a>
+                <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Open management console guide</a>
                 <a href={docsHref("TROUBLESHOOTING.md")}>Open troubleshooting guide</a>
               </div>
             </section>
@@ -1214,6 +1222,12 @@ types = ["ordering"]`}</code></pre>
               </p>
 
               <KeyValueTable headings={["Area", "Current behavior"]} rows={operationsRows} />
+              <p>
+                The management console is available at <code>/console</code> by
+                default on the monitoring port and requires the configured root
+                DN and password.
+              </p>
+              <a className="text-link" href={docsHref("MANAGEMENT_CONSOLE.md")}>Read the management console runbook</a>
             </section>
 
             <section className="chapter" id="troubleshooting" aria-labelledby="troubleshooting-title">
@@ -1318,6 +1332,7 @@ pnpm preview`}</code></pre>
         <nav aria-label="Footer navigation">
           <a href={docsHref("DEVELOPER_GUIDE.md")}>Developer Guide</a>
           <a href={docsHref("CONFIGURATION.md")}>Configuration</a>
+          <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Management Console</a>
           <a href={docsHref("BACKUP_RESTORE.md")}>Backup Restore</a>
           <a href={docsHref("REPLICATION_GUIDE.md")}>Replication</a>
         </nav>

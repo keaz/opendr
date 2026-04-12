@@ -11,7 +11,10 @@ use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBac
 use opendr::config::ServerConfig;
 use opendr::fsm_server;
 use opendr::metrics::MetricsCollector;
-use opendr::monitoring_runtime::{spawn_monitoring_server, ComponentStatus, RuntimeHealthRegistry};
+use opendr::monitoring_runtime::{
+    console_admin_dn, spawn_monitoring_server_with_context, ComponentStatus,
+    MonitoringRuntimeContext, RuntimeHealthRegistry,
+};
 use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
@@ -358,10 +361,18 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let monitoring_handle = if let (Some(metrics), Some(health)) =
         (monitoring_metrics.clone(), monitoring_health.clone())
     {
-        Some(spawn_monitoring_server(
+        Some(spawn_monitoring_server_with_context(
             config.monitoring.clone(),
             metrics,
             health,
+            MonitoringRuntimeContext {
+                console_backend: Some(backend.clone()),
+                console_admin_dn: Some(console_admin_dn(
+                    &config.server.root_user_dn,
+                    &config.server.base_dn,
+                )),
+                replication_status: Some(replication_service.status()),
+            },
             shutdown_clone.subscribe(),
         )?)
     } else {

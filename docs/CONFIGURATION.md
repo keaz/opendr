@@ -265,6 +265,9 @@ metrics_address = "127.0.0.1"
 metrics_port = 9090
 metrics_path = "/metrics"
 health_path = "/health"
+console_enabled = true
+console_path = "/console"
+console_session_ttl_secs = 3600
 ```
 
 | Key | Default | Notes |
@@ -274,8 +277,16 @@ health_path = "/health"
 | `metrics_port` | `9090` | Port for the monitoring HTTP server |
 | `metrics_path` | `/metrics` | Prometheus text metrics path |
 | `health_path` | `/health` | JSON health response path |
+| `console_enabled` | `true` | Serves the read-only management console from the monitoring listener |
+| `console_path` | `/console` | Browser console base path |
+| `console_session_ttl_secs` | `3600` | Process-local console session TTL |
 
-The monitoring runtime serves Prometheus text and JSON health over HTTP GET.
+The monitoring runtime serves Prometheus text, JSON health, and the management
+console. The console is read-only in v1, uses the configured root DN for LDAP
+admin login, and stores sessions in memory. Keep `metrics_address` bound to a
+trusted interface unless a separate network control protects the monitoring
+listener. See [`MANAGEMENT_CONSOLE.md`](./MANAGEMENT_CONSOLE.md) for the route
+map and overview payload.
 
 ## Audit
 
