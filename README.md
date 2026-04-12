@@ -206,6 +206,23 @@ cd /srv/opendr-consumer && opendr
 
 For LMDB-backed instances, generate the `{SSHA512}` root password with `opendr-setup` or reuse the generated hash from an existing server config, then mount it through `root_password_file` or export it via `root_password_env`.
 
+LMDB index configuration supports the legacy shortcut and typed indexes. `indexed_attributes = ["cn", "uid"]` maintains equality and presence keys. Use typed entries when a custom attribute needs substring or ordering candidates:
+
+```toml
+[backend]
+indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou"]
+
+[[backend.indexes]]
+attribute = "cn"
+types = ["substring"]
+
+[[backend.indexes]]
+attribute = "entryCSN"
+types = ["ordering"]
+```
+
+When a new index is configured after data already exists, the LMDB backend rebuilds the configured attribute index keys during startup without modifying LDAP entries, operational attributes, or CSNs. Approximate-match filters currently use the equality index path because OpenDR's approximate-match semantics are case-insensitive equality.
+
 ### 5. Verify Listener-Based Replication
 
 Add data to the provider:

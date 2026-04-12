@@ -13,8 +13,9 @@ use std::time::Instant;
 use ldap_parser::ldap::SearchScope;
 use opendr::backend::{
     DirectoryBackend, DirectoryEntry, Modification, ModifyOperation, SearchCandidateHint,
+    SearchSubstringPart,
 };
-use opendr::backend_lmdb::{IndexConfig, LmdbBackend};
+use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBackend};
 use tempfile::TempDir;
 
 /// Helper to create a test backend with default configuration
@@ -26,8 +27,25 @@ fn create_test_backend(temp_dir: &TempDir) -> LmdbBackend {
 fn create_custom_backend(temp_dir: &TempDir, indexed_attrs: Vec<String>) -> LmdbBackend {
     let config = IndexConfig {
         indexed_attributes: indexed_attrs,
+        attribute_indexes: Vec::new(),
     };
     LmdbBackend::new_with_config(temp_dir.path(), 100, 1, config).unwrap()
+}
+
+fn create_typed_backend(
+    temp_dir: &TempDir,
+    attribute_indexes: Vec<AttributeIndexConfig>,
+) -> LmdbBackend {
+    LmdbBackend::new_with_config(
+        temp_dir.path(),
+        100,
+        1,
+        IndexConfig {
+            indexed_attributes: Vec::new(),
+            attribute_indexes,
+        },
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -348,6 +366,199 @@ async fn test_custom_index_configuration() {
 
     let results = backend.search_by_index("title", "Senior Engineer").unwrap();
     assert_eq!(results.len(), 1);
+}
+
+#[tokio::test]
+async fn test_typed_substring_index_configuration_and_candidates() {
+    let temp_dir = TempDir::new().unwrap();
+    let backend = create_typed_backend(
+        &temp_dir,
+        vec![AttributeIndexConfig {
+            attribute: "description".to_string(),
+            index_types: vec![IndexType::Substring],
+        }],
+    );
+
+    assert!(backend.is_indexed("description"));
+    assert!(backend.has_attribute_index("description", IndexType::Substring));
+    assert!(!backend.has_attribute_index("description", IndexType::Equality));
+    assert!(!backend.has_attribute_index("description", IndexType::Presence));
+    assert!(!backend.has_attribute_index("description", IndexType::Ordering));
+
+    let mut alice_attributes = HashMap::new();
+    alice_attributes.insert("description".to_string(), vec!["alpha marker".to_string()]);
+    let alice = DirectoryEntry::new("uid=alice,ou=people,dc=example,dc=org", alice_attributes);
+    backend.add_entry(alice, vec![]).await.unwrap();
+
+    let mut bob_attributes = HashMap::new();
+    bob_attributes.insert("description".to_string(), vec!["omega marker".to_string()]);
+    let bob = DirectoryEntry::new("uid=bob,ou=people,dc=example,dc=org", bob_attributes);
+    backend.add_entry(bob, vec![]).await.unwrap();
+
+    assert!(backend
+        .search_by_index("description", "alpha marker")
+        .unwrap()
+        .is_empty());
+
+    let results = backend
+        .search_entries_with_hint(
+            "ou=people,dc=example,dc=org",
+            SearchScope(2),
+            Some(SearchCandidateHint::Substring {
+                attribute: "description".to_string(),
+                parts: vec![SearchSubstringPart::Any("pha".to_string())],
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].dn, "uid=alice,ou=people,dc=example,dc=org");
+}
+
+#[tokio::test]
+async fn test_typed_ordering_index_configuration_and_candidates() {
+    let temp_dir = TempDir::new().unwrap();
+    let backend = create_typed_backend(
+        &temp_dir,
+        vec![AttributeIndexConfig {
+            attribute: "serialNumber".to_string(),
+            index_types: vec![IndexType::Ordering],
+        }],
+    );
+
+    assert!(backend.is_indexed("serialNumber"));
+    assert!(backend.has_attribute_index("serialNumber", IndexType::Ordering));
+    assert!(!backend.has_attribute_index("serialNumber", IndexType::Equality));
+    assert!(!backend.has_attribute_index("serialNumber", IndexType::Presence));
+    assert!(!backend.has_attribute_index("serialNumber", IndexType::Substring));
+
+    for (uid, serial) in [("low", "010"), ("mid", "020"), ("high", "030")] {
+        let mut attributes = HashMap::new();
+        attributes.insert("serialNumber".to_string(), vec![serial.to_string()]);
+        backend
+            .add_entry(
+                DirectoryEntry::new(format!("uid={uid},ou=people,dc=example,dc=org"), attributes),
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+
+    assert!(backend
+        .search_by_index("serialNumber", "020")
+        .unwrap()
+        .is_empty());
+
+    let greater_or_equal = backend
+        .search_entries_with_hint(
+            "ou=people,dc=example,dc=org",
+            SearchScope(2),
+            Some(SearchCandidateHint::GreaterOrEqual {
+                attribute: "serialNumber".to_string(),
+                value: "020".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.dn)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        greater_or_equal,
+        vec![
+            "uid=mid,ou=people,dc=example,dc=org".to_string(),
+            "uid=high,ou=people,dc=example,dc=org".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_typed_indexes_are_backfilled_for_existing_data() {
+    let temp_dir = TempDir::new().unwrap();
+
+    {
+        let backend = create_typed_backend(&temp_dir, Vec::new());
+
+        for (uid, description, serial) in [
+            ("alice", "alpha marker", "010"),
+            ("bob", "omega marker", "020"),
+            ("carol", "gamma marker", "030"),
+        ] {
+            let mut attributes = HashMap::new();
+            attributes.insert("description".to_string(), vec![description.to_string()]);
+            attributes.insert("serialNumber".to_string(), vec![serial.to_string()]);
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        format!("uid={uid},ou=people,dc=example,dc=org"),
+                        attributes,
+                    ),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let backend = create_typed_backend(
+        &temp_dir,
+        vec![
+            AttributeIndexConfig {
+                attribute: "description".to_string(),
+                index_types: vec![IndexType::Substring],
+            },
+            AttributeIndexConfig {
+                attribute: "serialNumber".to_string(),
+                index_types: vec![IndexType::Ordering],
+            },
+        ],
+    );
+
+    assert!(backend.has_attribute_index("description", IndexType::Substring));
+    assert!(backend.has_attribute_index("serialNumber", IndexType::Ordering));
+
+    let substring_results = backend
+        .search_entries_with_hint(
+            "ou=people,dc=example,dc=org",
+            SearchScope(2),
+            Some(SearchCandidateHint::Substring {
+                attribute: "description".to_string(),
+                parts: vec![SearchSubstringPart::Any("pha".to_string())],
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(substring_results.len(), 1);
+    assert_eq!(
+        substring_results[0].dn,
+        "uid=alice,ou=people,dc=example,dc=org"
+    );
+
+    let ordering_results = backend
+        .search_entries_with_hint(
+            "ou=people,dc=example,dc=org",
+            SearchScope(2),
+            Some(SearchCandidateHint::LessOrEqual {
+                attribute: "serialNumber".to_string(),
+                value: "020".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.dn)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        ordering_results,
+        vec![
+            "uid=alice,ou=people,dc=example,dc=org".to_string(),
+            "uid=bob,ou=people,dc=example,dc=org".to_string(),
+        ]
+    );
 }
 
 #[tokio::test]
