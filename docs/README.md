@@ -25,6 +25,9 @@ Measured OpenDR vs OpenDJ benchmark results under fixed Docker limits (`2` CPU /
 ### 📘 [WARP.md](../WARP.md)
 Development guide for working with the codebase, including build commands, testing strategies, and code navigation tips.
 
+### 🔁 [Replication Guide](./REPLICATION_GUIDE.md)
+Listener-based provider-consumer replication setup, configuration, and verification.
+
 ## Quick Start Guide
 
 1. **Understanding the Architecture**: Read the [Architecture Overview](./architecture-overview.md) to understand the FSM-based design

@@ -61,7 +61,7 @@ use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tokio::task::JoinHandle;
 
-use crate::backend::DirectoryBackend;
+use crate::backend::{DirectoryBackend, Modification, ModifyOperation};
 use crate::csn::{Csn, CsnGenerator};
 use crate::replication_consumer_fsm::*;
 use crate::replication_provider_fsm::*;
@@ -517,6 +517,37 @@ fn replication_entries_match(
     desired: &crate::backend::DirectoryEntry,
 ) -> bool {
     existing.dn == desired.dn && existing.attributes == desired.attributes
+}
+
+fn replication_replace_modifications(
+    existing: &crate::backend::DirectoryEntry,
+    desired: &crate::backend::DirectoryEntry,
+) -> Vec<Modification> {
+    let mut modifications = Vec::new();
+
+    let mut existing_attributes: Vec<_> = existing.attributes.keys().cloned().collect();
+    existing_attributes.sort();
+    for attribute in existing_attributes {
+        if !desired.attributes.contains_key(&attribute) {
+            modifications.push(Modification {
+                operation: ModifyOperation::Delete,
+                attribute,
+                values: Vec::new(),
+            });
+        }
+    }
+
+    let mut desired_attributes: Vec<_> = desired.attributes.iter().collect();
+    desired_attributes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (attribute, values) in desired_attributes {
+        modifications.push(Modification {
+            operation: ModifyOperation::Replace,
+            attribute: attribute.clone(),
+            values: values.clone(),
+        });
+    }
+
+    modifications
 }
 
 fn replication_target_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {
@@ -1576,12 +1607,25 @@ impl BatchProcessor for BatchProcessorImpl {
                             {
                                 info!("Replicated ADD already applied: {}", dn);
                             }
-                            Some(_) => {
-                                return Err(ConsumerError::ProcessingError {
-                                    message: format!(
-                                        "Conflicting entry already exists while replaying ADD for {dn}"
-                                    ),
-                                });
+                            Some(existing_entry) => {
+                                let modifications =
+                                    replication_replace_modifications(&existing_entry, &dir_entry);
+                                let actor_dn = dir_entry
+                                    .operational_attributes
+                                    .creators_name
+                                    .clone()
+                                    .or_else(|| {
+                                        dir_entry.operational_attributes.modifiers_name.clone()
+                                    });
+                                self.backend
+                                    .modify_entry_with_actor(dn, modifications, actor_dn)
+                                    .await
+                                    .map_err(|e| ConsumerError::ProcessingError {
+                                        message: format!(
+                                            "Failed to reconcile existing ADD target for {dn}: {e}"
+                                        ),
+                                    })?;
+                                info!("Replicated ADD reconciled existing entry: {}", dn);
                             }
                             None => {
                                 return Err(ConsumerError::ProcessingError {
@@ -1609,7 +1653,6 @@ impl BatchProcessor for BatchProcessorImpl {
                     .map_err(|e| ConsumerError::ProcessingError {
                         message: format!("Failed to deserialize modify data for {dn}: {e}"),
                     })?;
-                use crate::backend::{Modification, ModifyOperation};
                 let modifications: Vec<Modification> = dir_entry
                     .attributes
                     .iter()
@@ -2480,18 +2523,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batch_processor_add_conflict_returns_error() {
+    async fn test_batch_processor_add_conflict_reconciles_existing_entry() {
         let backend = Arc::new(MockBackend::new());
         let batch_processor = BatchProcessorImpl::new(backend.clone());
         let existing = DirectoryEntry::new(
             "cn=user1,dc=example,dc=org",
-            HashMap::from([("cn".to_string(), vec!["local".to_string()])]),
+            HashMap::from([
+                ("cn".to_string(), vec!["local".to_string()]),
+                ("description".to_string(), vec!["local-only".to_string()]),
+            ]),
         );
         backend.add_entry(existing, Vec::new()).await.unwrap();
 
         let replicated = DirectoryEntry::new(
             "cn=user1,dc=example,dc=org",
-            HashMap::from([("cn".to_string(), vec!["provider".to_string()])]),
+            HashMap::from([
+                ("cn".to_string(), vec!["provider".to_string()]),
+                ("sn".to_string(), vec!["User".to_string()]),
+            ]),
         );
         let encoded = encode_change_bytes(
             &ChangeType::Add,
@@ -2499,18 +2548,13 @@ mod tests {
             serde_json::to_vec(&replicated).unwrap().as_slice(),
         );
 
-        let err = batch_processor.apply_entry(&encoded).await.unwrap_err();
-        assert!(matches!(err, ConsumerError::ProcessingError { .. }));
-        assert_eq!(
-            backend
-                .get_entry("cn=user1,dc=example,dc=org")
-                .await
-                .unwrap()
-                .unwrap()
-                .attributes
-                .get("cn"),
-            Some(&vec!["local".to_string()])
-        );
+        batch_processor.apply_entry(&encoded).await.unwrap();
+        let stored = backend
+            .get_entry("cn=user1,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attributes, replicated.attributes);
     }
 
     #[tokio::test]

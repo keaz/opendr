@@ -1,98 +1,60 @@
-# OpenDR Multi-Master Configuration Example
+# OpenDR dual-role replication example.
 #
-# This configuration sets up OpenDR in "both" mode for multi-master replication.
-# The server acts as both a provider (serving changes) and consumer (receiving changes).
-#
-# Multi-Master Topology:
-# Server A (this) <---> Server B (other-master.example.com)
-#
-# Both servers accept writes and replicate to each other.
+# "both" mode starts a provider service and a listener-based consumer service
+# in the same process. If more than one node accepts writes, deploy an external
+# conflict-resolution strategy.
 
 [server]
-# Network binding
-bind_address = "0.0.0.0:389"
-bind_address_ldaps = "0.0.0.0:636"
-
-# Directory structure
+bind_address = "0.0.0.0"
+ldap_port = 1389
+ldaps_port = 1636
+replica_id = 10
 base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "CHANGE_THIS_PASSWORD"
-
-# Server identification (unique for each master)
-server_id = "master-a"                     # Change to "master-b" on other server
-server_name = "Multi-Master LDAP Server A"
+root_user_dn = "cn=manager"
+root_password_file = "/run/secrets/opendr-master-root-password-hash"
+organization_name = "Example Master A"
 
 [backend]
-# Storage backend configuration
-backend_type = "Lmdb"
-lmdb_path = "/var/lib/opendr/master-a/data"
-lmdb_map_size = 10737418240                 # 10GB
-max_readers = 126
-
-# Indexed attributes
-indexed_attributes = [
-    "cn",
-    "uid",
-    "mail",
-    "objectClass",
-    "ou",
-    "sn",
-    "givenName",
-]
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/master-a/data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 126
+indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou", "sn", "givenName"]
 
 [replication]
-# Enable replication
 enabled = true
-
-# Server role: "both" (acts as both provider and consumer)
 mode = "both"
 
-# Provider settings (for serving changes to other master)
+# Provider side
 changelog_capacity = 100000
+changelog_enabled = true
 max_batch_size = 100
+enable_streaming = true
+max_concurrent_consumers = 100
+consumer_timeout_secs = 300
 
-# Consumer settings (for receiving changes from other master)
-provider_url = "ldap://master-b.example.com:389" # URL of other master
-# provider_url = "ldaps://master-b.example.com:636"  # For TLS
-
-# Authentication for connecting to other master
-replication_bind_dn = "cn=replication,dc=example,dc=com"
-replication_bind_password = "CHANGE_THIS_PASSWORD"
-
-# Synchronization settings
-sync_interval_secs = 10 # Faster sync for multi-master (10s)
-provider_timeout = 30   # Timeout for provider requests (seconds)
+# Consumer side
+provider_url = "ldap://master-b.example.com:1389"
+bind_dn = "cn=replication,dc=example,dc=com"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
 max_retry_attempts = 5
-retry_backoff_secs = 5
-
-# State persistence
-state_storage_path = "/var/lib/opendr/master-a/replication_state"
+retry_delay_secs = 5
+enable_change_listening = true
+heartbeat_interval_secs = 60
+provider_timeout_secs = 30
 state_persistence_timeout_secs = 10
-
-# Change listening
-listen_for_changes = true
-listen_timeout_secs = 300
-
-# Conflict resolution (future feature)
-# conflict_resolution_strategy = "last_write_wins"
-# server_priority = 1  # Higher priority wins conflicts
+change_buffer_size = 1000
+state_storage_path = "/var/lib/opendr/master-a/replication_state"
 
 [tls]
-# TLS/SSL configuration
 enabled = true
 cert_file = "/etc/opendr/certs/master-a.crt"
 key_file = "/etc/opendr/certs/master-a.key"
 ca_file = "/etc/opendr/certs/ca.crt"
-
-# Verify certificates
-verify_provider_cert = true
 require_client_cert = true
-
-# Minimum TLS version ("1.2" or "1.3")
 min_tls_version = "1.2"
 
 [resources]
-# Resource limits (higher for multi-master)
 max_connections = 1000
 max_connections_per_ip = 50
 max_operations_per_connection = 200
@@ -101,84 +63,20 @@ max_total_memory_mb = 2048
 idle_timeout_secs = 600
 
 [rate_limit]
-# Rate limiting
 enabled = true
 global_requests_per_second = 10000
 per_client_requests_per_second = 1000
 adaptive_enabled = true
 
-# Whitelist other master
-whitelist = ["10.0.1.0/24"] # Other master's IP range
-
 [monitoring]
-# Metrics and monitoring
 enabled = true
-prometheus_port = 9090
-health_check_port = 8080
-
-# Multi-master specific metrics
-track_changelog_size = true
-track_active_consumers = true
-track_replication_lag = true
-track_sync_success_rate = true
-track_bidirectional_sync = true
+metrics_port = 9090
 
 [audit]
-# Audit logging
 enabled = true
 log_file = "/var/log/opendr/master-a-audit.log"
-log_format = "json"
-log_level = "info"
-
-# Log all replication events
+format = "json"
+level = "info"
 log_authentication = true
 log_authorization = true
-log_data_modification = true
-log_replication_events = true
-
-[access_control]
-# Access control for multi-master
-enabled = true
-
-# Allow replication user full access
-# aci: (target="ldap:///dc=example,dc=com")(targetattr="*")
-#      (version 3.0; acl "Replication Full Access";
-#       allow (all) userdn="ldap:///cn=replication,dc=example,dc=com";)
-
-[performance]
-# Performance tuning for multi-master
-worker_threads = 8
-io_threads = 4
-connection_backlog = 128
-
-# Cache settings
-schema_cache_size_mb = 100
-entry_cache_size_mb = 512
-entry_cache_ttl_secs = 300
-
-# Write conflict detection window
-# conflict_detection_window_secs = 60
-
-## Multi-Master Setup Notes:
-##
-## 1. Deploy both servers with this configuration (update server_id and paths)
-## 2. Update provider_url on each server to point to the other
-## 3. Create replication user on both servers:
-##    dn: cn=replication,dc=example,dc=com
-##    objectClass: simpleSecurityObject
-##    objectClass: organizationalRole
-##    cn: replication
-##    userPassword: {SSHA}...
-##    description: Multi-master replication account
-##
-## 4. Start both servers
-## 5. Initialize base data on one server
-## 6. Wait for replication to propagate
-## 7. Both servers will accept writes and replicate changes
-##
-## Important Considerations:
-## - Use shorter sync intervals (10-30s) for better consistency
-## - Monitor replication lag carefully
-## - Test conflict scenarios in staging environment
-## - Have rollback plan for replication failures
-## - Consider using odd number of masters for tie-breaking (future)
+log_modifications = true

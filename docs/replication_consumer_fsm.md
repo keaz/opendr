@@ -6,7 +6,7 @@ This document provides documentation for the LDAP Content Synchronization Consum
 
 The Replication Consumer FSM implements the consumer side of LDAP Content Synchronization as defined in RFC 4533. It manages the complete lifecycle of replication consumption: requesting data from a provider, applying batches of entries, persisting state, and listening for real-time changes.
 
-When `enable_change_listening` is enabled, the FSM transitions from refresh into a long-lived listening phase. The listener is started from the freshly persisted cookie so the handoff from refresh to live streaming does not skip changes. If listening is disabled or unavailable, the implementation falls back to periodic refresh cycles.
+The FSM transitions from refresh into a long-lived listening phase. The listener is started from the freshly persisted cookie so the handoff from refresh to live streaming does not skip changes. Poll-based consumer replication has been removed, and listener mode is required for runtime consumer replication.
 
 ### Purpose
 
@@ -349,7 +349,7 @@ impl BatchProcessor for DirectoryBatchProcessor {
 | `provider_timeout` | `Duration` | 30s | Timeout for provider operations |
 | `max_retry_attempts` | `u32` | 3 | Maximum retry attempts for failed operations |
 | `retry_delay` | `Duration` | 5s | Delay between retry attempts |
-| `enable_change_listening` | `bool` | true | Enable real-time change listening after sync |
+| `enable_change_listening` | `bool` | true | Required for runtime consumer replication; false is rejected by server config validation |
 | `heartbeat_interval` | `Duration` | 60s | Interval for provider connection heartbeats |
 | `change_buffer_size` | `usize` | 1000 | Buffer size for change notifications |
 | `state_persistence_timeout` | `Duration` | 10s | Timeout for state persistence operations |

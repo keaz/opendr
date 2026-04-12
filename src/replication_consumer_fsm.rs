@@ -682,7 +682,7 @@ pub struct ConsumerConfig {
     pub max_retry_attempts: u32,
     /// Delay between retry attempts
     pub retry_delay: Duration,
-    /// Enable change listening after initial sync
+    /// Enable change listening after initial sync. Consumer replication always forces this on.
     pub enable_change_listening: bool,
     /// Heartbeat interval for maintaining provider connection
     pub heartbeat_interval: Duration,
@@ -799,8 +799,9 @@ impl ReplicationConsumerFsmImpl {
         batch_processor: Box<dyn BatchProcessor>,
         state_manager: Box<dyn StateManager>,
         change_listener: Box<dyn ChangeListener>,
-        config: ConsumerConfig,
+        mut config: ConsumerConfig,
     ) -> Self {
+        config.enable_change_listening = true;
         Self {
             state: ReplicationConsumerState::RequestingFromCookie { cookie: None },
             config,
@@ -1132,20 +1133,15 @@ impl ReplicationConsumerFsmImpl {
 
         let entry_count = initial_sync_result?;
 
-        if self.config.enable_change_listening {
-            let current_cookie = self.current_cookie.clone();
-            self.run_listening_operation(
-                "start listening for live changes",
-                self.change_listener
-                    .start_listening(current_cookie.as_deref()),
-            )
-            .await?;
+        let current_cookie = self.current_cookie.clone();
+        self.run_listening_operation(
+            "start listening for live changes",
+            self.change_listener
+                .start_listening(current_cookie.as_deref()),
+        )
+        .await?;
 
-            self.state = ReplicationConsumerState::Listening;
-        } else {
-            self.state = ReplicationConsumerState::Completed;
-            self.successful_sessions += 1;
-        }
+        self.state = ReplicationConsumerState::Listening;
 
         Ok(Some(entry_count))
     }
@@ -1301,21 +1297,15 @@ impl ReplicationConsumerFsmImpl {
         // Update current cookie
         self.current_cookie = Some(cookie);
 
-        // Transition to listening state if configured
-        if self.config.enable_change_listening {
-            let current_cookie = self.current_cookie.clone();
-            self.run_listening_operation(
-                "start listening for live changes",
-                self.change_listener
-                    .start_listening(current_cookie.as_deref()),
-            )
-            .await?;
+        let current_cookie = self.current_cookie.clone();
+        self.run_listening_operation(
+            "start listening for live changes",
+            self.change_listener
+                .start_listening(current_cookie.as_deref()),
+        )
+        .await?;
 
-            self.state = ReplicationConsumerState::Listening;
-        } else {
-            self.state = ReplicationConsumerState::Completed;
-            self.successful_sessions += 1;
-        }
+        self.state = ReplicationConsumerState::Listening;
 
         Ok(Some(self.entries_applied))
     }
@@ -2133,7 +2123,7 @@ pub mod tests {
             provider_timeout: Duration::from_secs(60),
             max_retry_attempts: 5,
             retry_delay: Duration::from_secs(10),
-            enable_change_listening: false,
+            enable_change_listening: true,
             heartbeat_interval: Duration::from_secs(120),
             change_buffer_size: 2000,
             state_persistence_timeout: Duration::from_secs(20),
@@ -2154,7 +2144,7 @@ pub mod tests {
 
         assert_eq!(fsm.config().max_batch_size, 200);
         assert_eq!(fsm.config().max_retry_attempts, 5);
-        assert!(!fsm.config().enable_change_listening);
+        assert!(fsm.config().enable_change_listening);
     }
 
     // State transition tests
@@ -2186,7 +2176,6 @@ pub mod tests {
     async fn test_start_consumption_honors_max_batch_size() {
         let config = ConsumerConfig {
             max_batch_size: 2,
-            enable_change_listening: false,
             ..Default::default()
         };
         let mock_provider = MockProviderConnection::new().with_entries(vec![vec![
@@ -2292,7 +2281,7 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_consumption_without_live_listener_completes() {
+    async fn test_start_consumption_forces_live_listener() {
         let config = ConsumerConfig {
             enable_change_listening: false,
             ..Default::default()
@@ -2322,11 +2311,11 @@ pub mod tests {
         assert!(result.is_ok());
         assert!(matches!(
             fsm.current_state(),
-            ReplicationConsumerState::Completed
+            ReplicationConsumerState::Listening
         ));
         assert!(
-            !*listening.lock().unwrap(),
-            "change listener should stay inactive when listening is disabled"
+            *listening.lock().unwrap(),
+            "change listener should be active even if legacy config disabled it"
         );
     }
 
@@ -2696,7 +2685,7 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_state_persisted_no_listening() {
+    async fn test_state_persisted_forces_listening() {
         let config = ConsumerConfig {
             enable_change_listening: false,
             ..Default::default()
@@ -2732,12 +2721,9 @@ pub mod tests {
         assert!(result.is_ok());
         assert!(matches!(
             fsm.current_state(),
-            ReplicationConsumerState::Completed
+            ReplicationConsumerState::Listening
         ));
-        assert!(!fsm.is_listening());
-
-        let (_, successful, _, _, _) = fsm.get_stats();
-        assert_eq!(successful, 1);
+        assert!(fsm.is_listening());
     }
 
     #[tokio::test]

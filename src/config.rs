@@ -395,7 +395,7 @@ pub struct ReplicationSettings {
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
 
-    /// Maximum retry attempts for listening/polling reconnects
+    /// Maximum retry attempts for listener reconnects
     #[serde(default = "default_max_retry_attempts")]
     pub max_retry_attempts: u32,
 
@@ -403,7 +403,7 @@ pub struct ReplicationSettings {
     #[serde(default = "default_retry_delay_secs")]
     pub retry_delay_secs: u64,
 
-    /// Keep a long-lived listener open for post-refresh changes
+    /// Keep a long-lived listener open for post-refresh changes. Consumer replication requires this.
     #[serde(default = "default_true", alias = "listen_for_changes")]
     pub enable_change_listening: bool,
 
@@ -1383,6 +1383,11 @@ impl ServerConfig {
                 if self.replication.provider_url.is_none() {
                     return Err(ConfigError::ValidationError(
                         "provider_url required for consumer mode".to_string(),
+                    ));
+                }
+                if !self.replication.enable_change_listening {
+                    return Err(ConfigError::ValidationError(
+                        "poll-based replication has been removed; enable_change_listening must be true for consumer and both modes".to_string(),
                     ));
                 }
                 let _ = self.resolved_replication_bind_password()?;

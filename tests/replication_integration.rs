@@ -672,7 +672,7 @@ async fn test_consumer_fsm_receive_real_time_changes() {
 }
 
 #[tokio::test]
-async fn test_consumer_fsm_conflicting_full_sync_add_does_not_advance_cookie() {
+async fn test_consumer_fsm_conflicting_full_sync_add_reconciles_and_advances_cookie() {
     let provider_backend = Arc::new(create_test_backend().await);
     let changelog_provider = Arc::new(ChangelogProviderImpl::new(
         ChangelogTracker::new(),
@@ -694,8 +694,11 @@ async fn test_consumer_fsm_conflicting_full_sync_add_does_not_advance_cookie() {
 
     let state_path = unique_state_path();
     let cookie_path = std::path::Path::new(&state_path).join("replication_cookie.txt");
-    let mut fsm =
-        create_consumer_fsm_with_state_path(consumer_backend, changelog_provider, state_path);
+    let mut fsm = create_consumer_fsm_with_state_path(
+        consumer_backend.clone(),
+        changelog_provider,
+        state_path,
+    );
 
     let result = fsm
         .handle_event(ReplicationConsumerEvent::StartConsumption {
@@ -704,9 +707,18 @@ async fn test_consumer_fsm_conflicting_full_sync_add_does_not_advance_cookie() {
         })
         .await;
 
-    assert!(result.is_err());
-    assert_eq!(fsm.current_cookie(), None);
-    assert!(!cookie_path.exists());
+    assert!(result.is_ok());
+    assert!(fsm.current_cookie().is_some());
+    assert!(cookie_path.exists());
+    let reconciled = consumer_backend
+        .get_entry("cn=user1,dc=example,dc=org")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reconciled.attributes.get("cn"),
+        Some(&vec!["user1".to_string()])
+    );
 }
 
 #[tokio::test]

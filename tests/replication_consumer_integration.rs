@@ -392,7 +392,6 @@ async fn test_consumer_custom_listening_config_propagates() {
     config.replication.sync_interval_secs = 20;
     config.replication.max_retry_attempts = 7;
     config.replication.retry_delay_secs = 13;
-    config.replication.enable_change_listening = false;
     config.replication.heartbeat_interval_secs = 47;
     config.replication.state_storage_path = std::path::PathBuf::from("/tmp/opendr/repl_state");
 
@@ -403,7 +402,7 @@ async fn test_consumer_custom_listening_config_propagates() {
     assert_eq!(consumer_cfg.sync_interval_secs, 20);
     assert_eq!(consumer_cfg.max_retry_attempts, 7);
     assert_eq!(consumer_cfg.retry_delay_secs, 13);
-    assert!(!consumer_cfg.enable_change_listening);
+    assert!(consumer_cfg.enable_change_listening);
     assert_eq!(consumer_cfg.heartbeat_interval_secs, 47);
     assert_eq!(consumer_cfg.state_storage_path, "/tmp/opendr/repl_state");
 }
@@ -526,50 +525,24 @@ async fn test_consumer_service_reconnects_and_resumes_from_persisted_cookie() {
 }
 
 #[tokio::test]
-async fn test_consumer_service_polling_mode_waits_for_next_sync_cycle() {
-    let (provider_backend, provider_shutdown, provider_task, provider_url) =
+async fn test_consumer_service_rejects_poll_based_replication() {
+    let (_provider_backend, provider_shutdown, provider_task, provider_url) =
         start_provider_server().await;
     let state_dir = TempDir::new().unwrap();
     let consumer_backend = Arc::new(MockBackend::new());
-
-    let initial_entry = create_test_entry("cn=poll-initial,dc=example,dc=org", "poll-initial");
-    provider_backend
-        .add_entry(initial_entry.clone(), Vec::new())
-        .await
-        .unwrap();
 
     let mut config = create_consumer_config();
     config.replication.provider_url = Some(provider_url);
     config.replication.bind_dn = None;
     config.replication.bind_password = None;
     config.replication.enable_change_listening = false;
-    config.replication.sync_interval_secs = 1;
     config.replication.state_storage_path = state_dir.path().to_path_buf();
 
-    let service = ReplicationService::from_config(&config, consumer_backend.clone()).unwrap();
-    let shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig::default()));
-    let handle = service
-        .start_consumer(shutdown.clone())
-        .await
-        .unwrap()
-        .expect("polling consumer handle should be present");
+    let err = match ReplicationService::from_config(&config, consumer_backend) {
+        Ok(_) => panic!("disabled listener config should be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("poll-based replication has been removed"));
 
-    wait_for_entry(consumer_backend.as_ref(), &initial_entry.dn).await;
-
-    let delayed_entry = create_test_entry("cn=poll-delayed,dc=example,dc=org", "poll-delayed");
-    provider_backend
-        .add_entry(delayed_entry.clone(), Vec::new())
-        .await
-        .unwrap();
-
-    assert_entry_absent_for(
-        consumer_backend.as_ref(),
-        &delayed_entry.dn,
-        Duration::from_millis(300),
-    )
-    .await;
-    wait_for_entry(consumer_backend.as_ref(), &delayed_entry.dn).await;
-
-    shutdown_consumer(shutdown, handle, "polling consumer").await;
     shutdown_provider(&provider_shutdown, provider_task).await;
 }
