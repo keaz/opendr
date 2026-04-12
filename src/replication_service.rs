@@ -49,8 +49,7 @@ use crate::backend::DirectoryBackend;
 use crate::backend_changelog_wrapper::ChangelogBackendWrapper;
 use crate::config::ServerConfig;
 use crate::replication::{
-    ChangeListenerImpl, ChangelogProviderImpl, ChangelogTracker, LdapChangeListener,
-    ProviderConnectionImpl,
+    ChangelogProviderImpl, ChangelogTracker, LdapChangeListener, ProviderConnectionImpl,
 };
 use crate::shutdown::ShutdownCoordinator;
 
@@ -260,6 +259,13 @@ impl ReplicationService {
 
         let consumer_config = if mode == ReplicationMode::Consumer || mode == ReplicationMode::Both
         {
+            if !config.replication.enable_change_listening {
+                return Err(
+                    "poll-based replication has been removed; enable_change_listening must be true"
+                        .to_string(),
+                );
+            }
+
             let provider_url = config
                 .replication
                 .provider_url
@@ -418,11 +424,9 @@ impl ReplicationService {
             .as_ref()
             .ok_or_else(|| "Consumer config not available".to_string())?;
 
-        if consumer_config.enable_change_listening
-            && Self::uses_local_provider_runtime(&consumer_config.provider_url)
-        {
+        if Self::uses_local_provider_runtime(&consumer_config.provider_url) {
             return Err(
-                "listening mode requires ldap:// or ldaps:// provider_url; local:// and in-memory:// remain polling-only compatibility URLs".to_string()
+                "listener-based replication requires ldap:// or ldaps:// provider_url; local:// and in-memory:// are not supported".to_string()
             );
         }
 
@@ -458,17 +462,13 @@ impl ReplicationService {
         ));
 
         let change_listener: Box<dyn crate::replication_consumer_fsm::ChangeListener> =
-            if consumer_config.enable_change_listening {
-                Box::new(LdapChangeListener::new(
-                    consumer_config.provider_url.clone(),
-                    consumer_config.base_dn.clone(),
-                    consumer_config.provider_bind_dn.clone(),
-                    consumer_config.provider_bind_password.clone(),
-                    consumer_config.change_buffer_size,
-                ))
-            } else {
-                Box::new(ChangeListenerImpl::new())
-            };
+            Box::new(LdapChangeListener::new(
+                consumer_config.provider_url.clone(),
+                consumer_config.base_dn.clone(),
+                consumer_config.provider_bind_dn.clone(),
+                consumer_config.provider_bind_password.clone(),
+                consumer_config.change_buffer_size,
+            ));
 
         // Create consumer FSM configuration
         let fsm_config = ConsumerConfig {
@@ -495,9 +495,7 @@ impl ReplicationService {
 
         // Get shutdown receiver
         let mut shutdown_rx = shutdown.subscribe();
-        let sync_interval = Duration::from_secs(consumer_config.sync_interval_secs);
         let retry_delay = Duration::from_secs(consumer_config.retry_delay_secs);
-        let enable_change_listening = consumer_config.enable_change_listening;
 
         let provider_url = consumer_config.provider_url.clone();
 
@@ -506,12 +504,33 @@ impl ReplicationService {
             info!("Replication consumer service started");
 
             use crate::fsm::{ReplicationConsumerEvent, StateMachine};
-            use tokio::time::interval;
 
-            if enable_change_listening {
-                loop {
-                    if let Err(e) = consumer_fsm.reset().await {
-                        error!("Failed to reset consumer FSM: {:?}", e);
+            loop {
+                if let Err(e) = consumer_fsm.reset().await {
+                    error!("Failed to reset consumer FSM: {:?}", e);
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry_delay) => {}
+                        _ = shutdown_rx.recv() => {
+                            info!("Replication consumer service shutting down");
+                            let _ = consumer_fsm.stop_live_listening().await;
+                            info!("Replication consumer service stopped");
+                            return;
+                        }
+                    }
+                    continue;
+                }
+
+                let event = ReplicationConsumerEvent::StartConsumption {
+                    provider_url: provider_url.clone(),
+                    cookie: None,
+                };
+
+                match consumer_fsm.handle_event(event).await {
+                    Ok(_) if consumer_fsm.is_listening_state() => {
+                        info!("Replication consumer entered listening mode");
+                    }
+                    Ok(_) => {
+                        error!("Replication consumer completed without entering listening mode");
                         tokio::select! {
                             _ = tokio::time::sleep(retry_delay) => {}
                             _ = shutdown_rx.recv() => {
@@ -523,115 +542,60 @@ impl ReplicationService {
                         }
                         continue;
                     }
-
-                    let event = ReplicationConsumerEvent::StartConsumption {
-                        provider_url: provider_url.clone(),
-                        cookie: None,
-                    };
-
-                    match consumer_fsm.handle_event(event).await {
-                        Ok(_) if consumer_fsm.is_listening_state() => {
-                            info!("Replication consumer entered listening mode");
-                        }
-                        Ok(_) => {
-                            info!("Replication consumer completed without entering listening mode");
-                            tokio::select! {
-                                _ = tokio::time::sleep(retry_delay) => {}
-                                _ = shutdown_rx.recv() => {
-                                    info!("Replication consumer service shutting down");
-                                    let _ = consumer_fsm.stop_live_listening().await;
-                                    info!("Replication consumer service stopped");
-                                    return;
-                                }
-                            }
-                            continue;
-                        }
-                        Err(e) => {
-                            error!("Initial listening sync failed: {:?}", e);
-                            tokio::select! {
-                                _ = tokio::time::sleep(retry_delay) => {}
-                                _ = shutdown_rx.recv() => {
-                                    info!("Replication consumer service shutting down");
-                                    let _ = consumer_fsm.stop_live_listening().await;
-                                    info!("Replication consumer service stopped");
-                                    return;
-                                }
-                            }
-                            continue;
-                        }
-                    }
-
-                    loop {
+                    Err(e) => {
+                        error!("Initial listening sync failed: {:?}", e);
                         tokio::select! {
+                            _ = tokio::time::sleep(retry_delay) => {}
                             _ = shutdown_rx.recv() => {
                                 info!("Replication consumer service shutting down");
                                 let _ = consumer_fsm.stop_live_listening().await;
                                 info!("Replication consumer service stopped");
                                 return;
                             }
-                            change = consumer_fsm.next_live_change() => {
-                                match change {
-                                    Ok(Some(change)) => {
-                                        if let Err(e) = consumer_fsm.handle_event(ReplicationConsumerEvent::ChangeReceived(change)).await {
-                                            error!("Failed to process live replication change: {:?}", e);
-                                            let _ = consumer_fsm.stop_live_listening().await;
-                                            break;
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        tokio::time::sleep(Duration::from_millis(100)).await;
-                                    }
-                                    Err(e) => {
-                                        error!("Listening channel failed: {:?}", e);
-                                        let _ = consumer_fsm.stop_live_listening().await;
-                                        break;
-                                    }
-                                }
-                            }
                         }
+                        continue;
                     }
+                }
 
+                loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(retry_delay) => {}
                         _ = shutdown_rx.recv() => {
                             info!("Replication consumer service shutting down");
                             let _ = consumer_fsm.stop_live_listening().await;
                             info!("Replication consumer service stopped");
                             return;
                         }
-                    }
-                }
-            } else {
-                let mut sync_timer = interval(sync_interval);
-
-                loop {
-                    tokio::select! {
-                        _ = sync_timer.tick() => {
-                            info!("Starting replication sync cycle");
-
-                            if let Err(e) = consumer_fsm.reset().await {
-                                error!("Failed to reset consumer FSM: {:?}", e);
-                                continue;
+                        change = consumer_fsm.next_live_change() => {
+                            match change {
+                                Ok(Some(change)) => {
+                                    if let Err(e) = consumer_fsm.handle_event(ReplicationConsumerEvent::ChangeReceived(change)).await {
+                                        error!("Failed to process live replication change: {:?}", e);
+                                        let _ = consumer_fsm.stop_live_listening().await;
+                                        break;
+                                    }
+                                }
+                                Ok(None) => {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                                Err(e) => {
+                                    error!("Listening channel failed: {:?}", e);
+                                    let _ = consumer_fsm.stop_live_listening().await;
+                                    break;
+                                }
                             }
-
-                            let event = ReplicationConsumerEvent::StartConsumption {
-                                provider_url: provider_url.clone(),
-                                cookie: None,
-                            };
-
-                            match consumer_fsm.handle_event(event).await {
-                                Ok(_) => info!("Replication sync cycle completed successfully"),
-                                Err(e) => error!("Replication sync cycle failed: {:?}", e),
-                            }
-                        }
-                        _ = shutdown_rx.recv() => {
-                            info!("Replication consumer service shutting down");
-                            break;
                         }
                     }
                 }
 
-                info!("Replication consumer service stopped");
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {}
+                    _ = shutdown_rx.recv() => {
+                        info!("Replication consumer service shutting down");
+                        let _ = consumer_fsm.stop_live_listening().await;
+                        info!("Replication consumer service stopped");
+                        return;
+                    }
+                }
             }
         });
 
@@ -1028,31 +992,24 @@ mod tests {
 
         let err = service.start_consumer(shutdown).await.unwrap_err();
 
-        assert!(err.contains("listening mode requires ldap:// or ldaps:// provider_url"));
+        assert!(
+            err.contains("listener-based replication requires ldap:// or ldaps:// provider_url")
+        );
     }
 
-    #[tokio::test]
-    async fn test_consumer_service_allows_local_provider_url_when_listening_disabled() {
-        use crate::shutdown::{ShutdownConfig, ShutdownCoordinator};
-
+    #[test]
+    fn test_consumer_service_rejects_disabled_listening() {
         let mut config = create_test_config();
         config.replication.mode = "consumer".to_string();
-        config.replication.provider_url = Some("in-memory://provider".to_string());
+        config.replication.provider_url = Some("ldap://provider:389".to_string());
         config.replication.enable_change_listening = false;
-        config.replication.sync_interval_secs = 30;
         let backend = Arc::new(MockBackend::new());
 
-        let service = ReplicationService::from_config(&config, backend).unwrap();
-        let shutdown = Arc::new(ShutdownCoordinator::new(ShutdownConfig::default()));
-
-        let handle = service.start_consumer(shutdown.clone()).await.unwrap();
-
-        assert!(handle.is_some());
-
-        shutdown.initiate_shutdown().await;
-        if let Some(h) = handle {
-            let _ = h.await;
-        }
+        let err = match ReplicationService::from_config(&config, backend) {
+            Ok(_) => panic!("disabled listener config should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("poll-based replication has been removed"));
     }
 
     #[test]
@@ -1115,7 +1072,6 @@ mod tests {
         config.replication.max_batch_size = 250;
         config.replication.max_retry_attempts = 7;
         config.replication.retry_delay_secs = 11;
-        config.replication.enable_change_listening = false;
         config.replication.heartbeat_interval_secs = 45;
         config.replication.provider_timeout_secs = 90;
         config.replication.state_persistence_timeout_secs = 18;
@@ -1131,7 +1087,7 @@ mod tests {
         assert_eq!(consumer_cfg.max_batch_size, 250);
         assert_eq!(consumer_cfg.max_retry_attempts, 7);
         assert_eq!(consumer_cfg.retry_delay_secs, 11);
-        assert!(!consumer_cfg.enable_change_listening);
+        assert!(consumer_cfg.enable_change_listening);
         assert_eq!(consumer_cfg.heartbeat_interval_secs, 45);
         assert_eq!(consumer_cfg.provider_timeout_secs, 90);
         assert_eq!(consumer_cfg.state_persistence_timeout_secs, 18);

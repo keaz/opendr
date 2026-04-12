@@ -689,7 +689,7 @@ async fn test_setup_handler_generates_canonical_consumer_replication_config() {
                 sync_interval_secs: 45,
                 max_retry_attempts: 8,
                 retry_delay_secs: 12,
-                enable_change_listening: false,
+                enable_change_listening: true,
                 heartbeat_interval_secs: 50,
                 max_batch_size: 250,
                 provider_timeout_secs: 80,
@@ -734,7 +734,7 @@ async fn test_setup_handler_generates_canonical_consumer_replication_config() {
     );
     assert_eq!(loaded_config.replication.max_retry_attempts, 8);
     assert_eq!(loaded_config.replication.retry_delay_secs, 12);
-    assert!(!loaded_config.replication.enable_change_listening);
+    assert!(loaded_config.replication.enable_change_listening);
     assert_eq!(loaded_config.replication.heartbeat_interval_secs, 50);
     assert_eq!(loaded_config.replication.max_batch_size, 250);
     assert_eq!(loaded_config.replication.provider_timeout_secs, 80);

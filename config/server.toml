@@ -57,7 +57,6 @@ mode = "consumer"
 provider_url = "ldap://localhost:1389"
 bind_dn = "cn=manager,dc=example,dc=com"
 bind_password_file = "/run/secrets/opendr-replication-bind-password"
-sync_interval_secs = 15
 max_retry_attempts = 3
 retry_delay_secs = 5
 enable_change_listening = true

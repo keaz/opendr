@@ -1,120 +1,64 @@
-# OpenDR Provider Server Configuration Example
-# 
-# This configuration sets up OpenDR as a replication provider (master).
-# The provider tracks all directory changes and serves them to consumers.
+# OpenDR listener-based replication provider example.
 
 [server]
-# Network binding
-bind_address = "0.0.0.0:389"
-bind_address_ldaps = "0.0.0.0:636"
-
-# Directory structure
+bind_address = "0.0.0.0"
+ldap_port = 1389
+ldaps_port = 1636
+replica_id = 1
 base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "CHANGE_THIS_PASSWORD" # Use strong password in production
-
-# Server identification
-server_id = "provider-01"
-server_name = "Provider LDAP Server"
+root_user_dn = "cn=manager"
+root_password_file = "/run/secrets/opendr-provider-root-password-hash"
+organization_name = "Example Provider"
 
 [backend]
-# Storage backend configuration
-backend_type = "Lmdb"
-lmdb_path = "/var/lib/opendr/provider/data"
-lmdb_map_size = 10737418240                 # 10GB
-max_readers = 126
-
-# Indexed attributes for fast searches
-indexed_attributes = [
-    "cn",
-    "uid",
-    "mail",
-    "objectClass",
-    "ou",
-    "sn",
-    "givenName",
-]
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/provider/data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 126
+indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou", "sn", "givenName"]
 
 [replication]
-# Enable replication
 enabled = true
-
-# Server role: "provider" (master) serves changes to consumers
 mode = "provider"
-
-# Changelog settings
-changelog_capacity = 100000 # Maximum changelog entries in memory
-max_batch_size = 100        # Maximum entries per sync batch
-provider_timeout = 30       # Timeout for consumer operations (seconds)
-
-# Consumer credentials (for authentication)
-# Create these users in your directory:
-# dn: cn=replication,dc=example,dc=com
-# objectClass: simpleSecurityObject
-# objectClass: organizationalRole
-# cn: replication
-# userPassword: {SSHA}...
-# description: Replication service account
+changelog_capacity = 100000
+changelog_enabled = true
+max_batch_size = 100
+enable_streaming = true
+heartbeat_interval_secs = 60
+max_concurrent_consumers = 100
+consumer_timeout_secs = 300
+state_storage_path = "/var/lib/opendr/provider/replication_state"
 
 [tls]
-# TLS/SSL configuration for secure connections
 enabled = true
 cert_file = "/etc/opendr/certs/provider.crt"
 key_file = "/etc/opendr/certs/provider.key"
 ca_file = "/etc/opendr/certs/ca.crt"
-
-# Minimum TLS version ("1.2" or "1.3")
 min_tls_version = "1.2"
 
 [resources]
-# Resource limits
 max_connections = 1000
-max_connections_per_ip = 50         # Higher for consumers
+max_connections_per_ip = 50
 max_operations_per_connection = 200
 max_memory_per_connection_mb = 10
 max_total_memory_mb = 2048
 idle_timeout_secs = 600
 
 [rate_limit]
-# Rate limiting (relaxed for replication consumers)
 enabled = true
 global_requests_per_second = 10000
 per_client_requests_per_second = 1000
 adaptive_enabled = true
 
-# Whitelist replication consumers
-whitelist = ["10.0.1.0/24"] # Consumer subnet
-
 [monitoring]
-# Metrics and monitoring
 enabled = true
-prometheus_port = 9090
-health_check_port = 8080
-
-# Replication-specific metrics
-track_changelog_size = true
-track_active_consumers = true
-track_replication_lag = true
+metrics_port = 9090
 
 [audit]
-# Audit logging
 enabled = true
 log_file = "/var/log/opendr/provider-audit.log"
-log_format = "json"
-log_level = "info"
-
-# Log replication events
+format = "json"
+level = "info"
 log_authentication = true
 log_authorization = true
-log_data_modification = true
-
-[performance]
-# Performance tuning for high-volume replication
-worker_threads = 8
-io_threads = 4
-connection_backlog = 128
-
-# Cache settings
-schema_cache_size_mb = 100
-entry_cache_size_mb = 512
-entry_cache_ttl_secs = 300
+log_modifications = true

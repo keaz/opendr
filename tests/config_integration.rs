@@ -354,7 +354,7 @@ sync_interval_secs = 15
 max_batch_size = 250
 max_retry_attempts = 9
 retry_delay_secs = 11
-enable_change_listening = false
+enable_change_listening = true
 enable_streaming = false
 heartbeat_interval_secs = 45
 max_concurrent_consumers = 14
@@ -371,7 +371,7 @@ state_storage_path = "/var/lib/opendr/replication_state"
     assert_eq!(config.replication.max_batch_size, 250);
     assert_eq!(config.replication.max_retry_attempts, 9);
     assert_eq!(config.replication.retry_delay_secs, 11);
-    assert!(!config.replication.enable_change_listening);
+    assert!(config.replication.enable_change_listening);
     assert!(!config.replication.enable_streaming);
     assert_eq!(config.replication.heartbeat_interval_secs, 45);
     assert_eq!(config.replication.max_concurrent_consumers, 14);
@@ -383,6 +383,26 @@ state_storage_path = "/var/lib/opendr/replication_state"
         config.replication.state_storage_path,
         PathBuf::from("/var/lib/opendr/replication_state")
     );
+}
+
+#[test]
+fn test_validation_rejects_poll_based_replication() {
+    let toml = r#"
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:389"
+enable_change_listening = false
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    let result = config.validate();
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("poll-based replication has been removed"));
 }
 
 #[test]

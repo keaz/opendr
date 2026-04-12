@@ -136,7 +136,7 @@ pub struct ConsumerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_bind_password_file: Option<PathBuf>,
 
-    /// Synchronization interval in seconds
+    /// Legacy refresh interval in seconds. Listener-based replication is mandatory.
     pub sync_interval_secs: u64,
 
     /// Maximum retry attempts for failed operations
@@ -145,7 +145,7 @@ pub struct ConsumerConfig {
     /// Delay between retry attempts in seconds
     pub retry_delay_secs: u64,
 
-    /// Enable continuous listening for changes
+    /// Enable continuous listening for changes. Consumer replication requires this.
     pub enable_change_listening: bool,
 
     /// Heartbeat interval in seconds
@@ -832,7 +832,7 @@ impl SetupHandler {
 
                 let sync_interval = self
                     .prompt_with_default(
-                        "Synchronization interval (seconds)",
+                        "Legacy refresh interval (seconds; listener mode is always used)",
                         &consumer_config.sync_interval_secs.to_string(),
                     )
                     .await?;
@@ -860,11 +860,8 @@ impl SetupHandler {
                     .parse()
                     .map_err(|_| "Invalid number".to_string())?;
 
-                let listening = self
-                    .prompt_with_default("Enable continuous change listening? (yes/no)", "yes")
-                    .await?;
-                consumer_config.enable_change_listening =
-                    listening.to_lowercase() == "yes" || listening.to_lowercase() == "y";
+                consumer_config.enable_change_listening = true;
+                println!("Continuous change listening is required for replication and is enabled.");
 
                 let heartbeat_interval = self
                     .prompt_with_default(
@@ -985,7 +982,10 @@ impl SetupHandler {
                         "  Password Source: {}",
                         replication_password_source_summary(consumer)
                     );
-                    println!("  Sync Interval:  {} seconds", consumer.sync_interval_secs);
+                    println!(
+                        "  Listener Mode:  Enabled (legacy refresh interval: {} seconds)",
+                        consumer.sync_interval_secs
+                    );
                     println!("  Retry Attempts: {}", consumer.max_retry_attempts);
                     println!(
                         "  State Path:     {}",
@@ -1208,6 +1208,12 @@ impl SetupHandler {
                 }
                 if consumer.retry_delay_secs == 0 {
                     return Err("Retry delay must be > 0".to_string());
+                }
+                if !consumer.enable_change_listening {
+                    return Err(
+                        "Poll-based replication has been removed; change listening must be enabled"
+                            .to_string(),
+                    );
                 }
                 if consumer.heartbeat_interval_secs == 0 {
                     return Err("Consumer heartbeat interval must be > 0".to_string());

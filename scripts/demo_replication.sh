@@ -163,23 +163,27 @@ main() {
     step "Creating temporary directory structure..."
     mkdir -p "$TEMP_DIR"/{provider,consumer}/{data,config}
     mkdir -p "$TEMP_DIR/consumer/replication_state"
+    cp "$PROJECT_ROOT/config/log4rs.yml" "$TEMP_DIR/provider/config/log4rs.yml"
+    cp "$PROJECT_ROOT/config/log4rs.yml" "$TEMP_DIR/consumer/config/log4rs.yml"
     log "Directory structure created"
     
     # Create provider configuration
     step "Creating provider configuration..."
     cat > "$TEMP_DIR/provider/config/server.toml" <<EOF
 [server]
-bind_address = "127.0.0.1:$PROVIDER_PORT"
+bind_address = "127.0.0.1"
+ldap_port = $PROVIDER_PORT
+replica_id = 1
 base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "provider_admin"
-server_id = "provider-demo"
+root_user_dn = "cn=admin"
+root_password = "provider_admin"
+organization_name = "Example Provider"
 
 [backend]
-backend_type = "Lmdb"
-lmdb_path = "$TEMP_DIR/provider/data"
-lmdb_map_size = 1073741824
-max_readers = 126
+backend_type = "memory"
+data_directory = "$TEMP_DIR/provider/data"
+lmdb_max_size = 1073741824
+lmdb_max_readers = 126
 
 [replication]
 enabled = true
@@ -195,6 +199,9 @@ enabled = false
 
 [rate_limit]
 enabled = false
+
+[access_control]
+enabled = false
 EOF
     log "Provider configuration created"
     
@@ -202,23 +209,29 @@ EOF
     step "Creating consumer configuration..."
     cat > "$TEMP_DIR/consumer/config/server.toml" <<EOF
 [server]
-bind_address = "127.0.0.1:$CONSUMER_PORT"
+bind_address = "127.0.0.1"
+ldap_port = $CONSUMER_PORT
+replica_id = 2
 base_dn = "dc=example,dc=com"
-admin_dn = "cn=admin,dc=example,dc=com"
-admin_password = "consumer_admin"
-server_id = "consumer-demo"
+root_user_dn = "cn=admin"
+root_password = "consumer_admin"
+organization_name = "Example Consumer"
 
 [backend]
-backend_type = "Lmdb"
-lmdb_path = "$TEMP_DIR/consumer/data"
-lmdb_map_size = 1073741824
-max_readers = 126
+backend_type = "memory"
+data_directory = "$TEMP_DIR/consumer/data"
+lmdb_max_size = 1073741824
+lmdb_max_readers = 126
 
 [replication]
 enabled = true
 mode = "consumer"
 provider_url = "ldap://127.0.0.1:$PROVIDER_PORT"
-sync_interval_secs = 5
+bind_dn = "cn=admin,dc=example,dc=com"
+bind_password = "provider_admin"
+max_retry_attempts = 3
+retry_delay_secs = 1
+enable_change_listening = true
 state_storage_path = "$TEMP_DIR/consumer/replication_state"
 
 [monitoring]
@@ -229,14 +242,15 @@ enabled = false
 
 [rate_limit]
 enabled = false
+
+[access_control]
+enabled = false
 EOF
     log "Consumer configuration created"
     
     # Start provider server
     step "Starting provider server on port $PROVIDER_PORT..."
-    "$PROJECT_ROOT/target/release/opendr" \
-        --config "$TEMP_DIR/provider/config/server.toml" \
-        > "$TEMP_DIR/provider/server.log" 2>&1 &
+    (cd "$TEMP_DIR/provider" && "$PROJECT_ROOT/target/release/opendr" > server.log 2>&1) &
     PROVIDER_PID=$!
     echo $PROVIDER_PID > "$TEMP_DIR/provider.pid"
     log "Provider server started (PID: $PROVIDER_PID)"
@@ -251,72 +265,57 @@ EOF
     fi
     log "Provider server is ready"
     
-    # Add base entries to provider
-    step "Adding base entries to provider..."
-    ldapadd -x -H "ldap://127.0.0.1:$PROVIDER_PORT" \
-        -D "cn=admin,dc=example,dc=com" \
-        -w "provider_admin" <<EOF
-dn: dc=example,dc=com
-objectClass: top
-objectClass: domain
-dc: example
-
-dn: ou=people,dc=example,dc=com
-objectClass: organizationalUnit
-ou: people
-
-dn: ou=groups,dc=example,dc=com
-objectClass: organizationalUnit
-ou: groups
-
-dn: cn=Alice Smith,ou=people,dc=example,dc=com
-objectClass: person
-cn: Alice Smith
-sn: Smith
-
-dn: cn=Bob Jones,ou=people,dc=example,dc=com
-objectClass: person
-cn: Bob Jones
-sn: Jones
-EOF
-    log "Base entries added to provider"
-    
     # Start consumer server
     step "Starting consumer server on port $CONSUMER_PORT..."
-    "$PROJECT_ROOT/target/release/opendr" \
-        --config "$TEMP_DIR/consumer/config/server.toml" \
-        > "$TEMP_DIR/consumer/server.log" 2>&1 &
+    (cd "$TEMP_DIR/consumer" && "$PROJECT_ROOT/target/release/opendr" > server.log 2>&1) &
     CONSUMER_PID=$!
     echo $CONSUMER_PID > "$TEMP_DIR/consumer.pid"
     log "Consumer server started (PID: $CONSUMER_PID)"
     
-    # Wait for consumer to be ready and sync
-    log "Waiting for consumer to be ready and perform initial sync..."
-    sleep 10
+    # Wait for consumer to be ready and enter listener mode
+    log "Waiting for consumer to enter listener mode..."
+    for i in {1..30}; do
+        if grep -q "Replication consumer entered listening mode" "$TEMP_DIR/consumer/server.log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
     if ! kill -0 $CONSUMER_PID 2>/dev/null; then
         error "Consumer server failed to start"
         cat "$TEMP_DIR/consumer/server.log"
         exit 1
     fi
+    if ! grep -q "Replication consumer entered listening mode" "$TEMP_DIR/consumer/server.log" 2>/dev/null; then
+        error "Consumer did not enter listener mode"
+        cat "$TEMP_DIR/consumer/server.log"
+        exit 1
+    fi
     log "Consumer server is ready"
     
-    # Verify replication
-    step "Verifying initial replication..."
-    PROVIDER_COUNT=$(ldapsearch -x -H "ldap://127.0.0.1:$PROVIDER_PORT" \
-        -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" \
-        -w "provider_admin" "(objectClass=*)" dn 2>/dev/null | grep "^dn:" | wc -l)
-    
-    CONSUMER_COUNT=$(ldapsearch -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
-        -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" \
-        -w "consumer_admin" "(objectClass=*)" dn 2>/dev/null | grep "^dn:" | wc -l)
-    
-    log "Provider entry count: $PROVIDER_COUNT"
-    log "Consumer entry count: $CONSUMER_COUNT"
-    
-    if [ "$PROVIDER_COUNT" -eq "$CONSUMER_COUNT" ] && [ "$PROVIDER_COUNT" -gt 0 ]; then
-        log "✓ Initial replication successful!"
+    # Add data after the consumer is listening so this verifies the live path.
+    step "Adding initial live entries to provider..."
+    ldapadd -x -H "ldap://127.0.0.1:$PROVIDER_PORT" \
+        -D "cn=admin,dc=example,dc=com" \
+        -w "provider_admin" <<EOF
+dn: cn=Alice Smith,ou=People,dc=example,dc=com
+objectClass: person
+cn: Alice Smith
+sn: Smith
+
+dn: cn=Bob Jones,ou=People,dc=example,dc=com
+objectClass: person
+cn: Bob Jones
+sn: Jones
+EOF
+    sleep 2
+    if ldapsearch -LLL -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
+        -b "ou=People,dc=example,dc=com" \
+        -D "cn=admin,dc=example,dc=com" \
+        -w "consumer_admin" \
+        "(cn=Alice Smith)" dn 2>/dev/null | grep -q "^dn: cn=Alice Smith,ou=People,dc=example,dc=com$"; then
+        log "✓ Initial live entry replicated successfully!"
     else
-        error "✗ Initial replication failed (counts don't match)"
+        error "✗ Initial live entry replication failed"
         exit 1
     fi
     
@@ -325,7 +324,7 @@ EOF
     ldapadd -x -H "ldap://127.0.0.1:$PROVIDER_PORT" \
         -D "cn=admin,dc=example,dc=com" \
         -w "provider_admin" <<EOF
-dn: cn=Charlie Brown,ou=people,dc=example,dc=com
+dn: cn=Charlie Brown,ou=People,dc=example,dc=com
 objectClass: person
 cn: Charlie Brown
 sn: Brown
@@ -337,11 +336,11 @@ EOF
     sleep 6
     
     # Verify on consumer
-    if ldapsearch -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
-        -b "ou=people,dc=example,dc=com" \
+    if ldapsearch -LLL -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
+        -b "ou=People,dc=example,dc=com" \
         -D "cn=admin,dc=example,dc=com" \
         -w "consumer_admin" \
-        "(cn=Charlie Brown)" dn 2>/dev/null | grep -q "cn=Charlie Brown"; then
+        "(cn=Charlie Brown)" dn 2>/dev/null | grep -q "^dn: cn=Charlie Brown,ou=People,dc=example,dc=com$"; then
         log "✓ Add operation replicated successfully!"
     else
         error "✗ Add operation replication failed"
@@ -353,7 +352,7 @@ EOF
     ldapmodify -x -H "ldap://127.0.0.1:$PROVIDER_PORT" \
         -D "cn=admin,dc=example,dc=com" \
         -w "provider_admin" <<EOF
-dn: cn=Alice Smith,ou=people,dc=example,dc=com
+dn: cn=Alice Smith,ou=People,dc=example,dc=com
 changetype: modify
 add: description
 description: Modified via replication test
@@ -365,12 +364,12 @@ EOF
     sleep 6
     
     # Verify on consumer
-    if ldapsearch -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
-        -b "ou=people,dc=example,dc=com" \
+    if ldapsearch -LLL -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
+        -b "ou=People,dc=example,dc=com" \
         -D "cn=admin,dc=example,dc=com" \
         -w "consumer_admin" \
         "(cn=Alice Smith)" description 2>/dev/null | \
-        grep -q "Modified via replication test"; then
+        grep -q "^description: Modified via replication test$"; then
         log "✓ Modify operation replicated successfully!"
     else
         error "✗ Modify operation replication failed"
@@ -382,7 +381,7 @@ EOF
     ldapdelete -x -H "ldap://127.0.0.1:$PROVIDER_PORT" \
         -D "cn=admin,dc=example,dc=com" \
         -w "provider_admin" \
-        "cn=Bob Jones,ou=people,dc=example,dc=com"
+        "cn=Bob Jones,ou=People,dc=example,dc=com"
     log "Deleted Bob Jones from provider"
     
     # Wait for replication
@@ -390,11 +389,11 @@ EOF
     sleep 6
     
     # Verify on consumer (should not exist)
-    if ! ldapsearch -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
-        -b "ou=people,dc=example,dc=com" \
+    if ! ldapsearch -LLL -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
+        -b "ou=People,dc=example,dc=com" \
         -D "cn=admin,dc=example,dc=com" \
         -w "consumer_admin" \
-        "(cn=Bob Jones)" dn 2>/dev/null | grep -q "cn=Bob Jones"; then
+        "(cn=Bob Jones)" dn 2>/dev/null | grep -q "^dn: cn=Bob Jones,ou=People,dc=example,dc=com$"; then
         log "✓ Delete operation replicated successfully!"
     else
         error "✗ Delete operation replication failed"
@@ -403,11 +402,11 @@ EOF
     
     # Final verification
     step "Final verification..."
-    FINAL_PROVIDER_COUNT=$(ldapsearch -x -H "ldap://127.0.0.1:$PROVIDER_PORT" \
+    FINAL_PROVIDER_COUNT=$(ldapsearch -LLL -x -H "ldap://127.0.0.1:$PROVIDER_PORT" \
         -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" \
         -w "provider_admin" "(objectClass=*)" dn 2>/dev/null | grep "^dn:" | wc -l)
     
-    FINAL_CONSUMER_COUNT=$(ldapsearch -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
+    FINAL_CONSUMER_COUNT=$(ldapsearch -LLL -x -H "ldap://127.0.0.1:$CONSUMER_PORT" \
         -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" \
         -w "consumer_admin" "(objectClass=*)" dn 2>/dev/null | grep "^dn:" | wc -l)
     
