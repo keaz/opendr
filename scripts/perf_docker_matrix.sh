@@ -11,6 +11,11 @@ SAMPLE_INTERVAL="0.25"
 CPU_LIMIT="2"
 MEMORY_LIMIT="4g"
 BENCHMARK_TIMEOUT_SECONDS="180"
+INDEX_BENCHMARK="false"
+CONCURRENT_INDEX_SEARCH_CLIENTS=""
+CONCURRENT_INDEX_SEARCH_ITERATIONS="20"
+CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS="1"
+CONCURRENT_INDEX_SEARCH_OPERATION_TIMEOUT_MS="5000"
 CONCURRENT_BIND_CLIENTS=""
 CONCURRENT_BIND_ITERATIONS="20"
 CONCURRENT_BIND_WARMUP_ITERATIONS="1"
@@ -25,6 +30,8 @@ OPENDR_IMAGE="opendr:docker-perf"
 OPENDJ_IMAGE="openidentityplatform/opendj:5.0.4"
 PRODUCTS="opendr,opendj"
 OPENDR_RUNTIME="fsm"
+DEFAULT_OPENDR_INDEX_BENCHMARK_TOML=$'[[backend.indexes]]\nattribute = "description"\ntypes = ["substring"]\n\n[[backend.indexes]]\nattribute = "sn"\ntypes = ["ordering"]'
+OPENDR_BACKEND_INDEXES_TOML=""
 PERF_CLIENT_IMAGE=""
 PERF_CLIENT_HOST="127.0.0.1"
 PERF_CLIENT_NETWORK="server"
@@ -41,12 +48,21 @@ Usage: scripts/perf_docker_matrix.sh [options]
 
 Options:
   --output-dir PATH         Output directory for the matrix run
-  --profile-set VALUE      One of: smoke, standard, full, concurrency (default: full)
+  --profile-set VALUE      One of: smoke, standard, full, concurrency, index (default: full)
   --products LIST          Comma-separated subset of: opendr,opendj
   --sample-interval SEC    Container stats sample interval (default: 0.25)
   --cpu VALUE              Docker CPU limit for each server container (default: 2)
   --memory VALUE           Docker memory limit for each server container (default: 4g)
   --benchmark-timeout SEC  Max seconds to allow each benchmark profile (default: 180)
+  --index-benchmark        Add equality, presence, substring, and ordering search probes
+  --concurrent-index-search-clients LIST
+                          Comma-separated concurrent index-search client levels; empty disables (default: disabled)
+  --concurrent-index-search-iterations N
+                          Index-search operations per concurrent client level (default: 20)
+  --concurrent-index-search-warmup-iterations N
+                          Warmup index searches per concurrent client before timed probe (default: 1)
+  --concurrent-index-search-operation-timeout-ms N
+                          Per-search timeout for concurrent index-search probe (default: 5000)
   --concurrent-bind-clients LIST
                           Comma-separated concurrent bind client levels; empty disables (default: disabled)
   --concurrent-bind-iterations N
@@ -67,6 +83,8 @@ Options:
   --root-password VALUE    Root password used for both products
   --opendr-image TAG       Local OpenDR image tag (default: opendr:docker-perf)
   --opendr-runtime VALUE   OpenDR server runtime: legacy or fsm (default: fsm)
+  --opendr-backend-indexes-toml VALUE
+                          TOML snippet appended to OpenDR Docker server.toml for typed backend indexes
   --opendj-image TAG       OpenDJ image tag (default: openidentityplatform/opendj:5.0.4)
   --perf-client-image TAG  Optional Docker image for ldap_perf_client instead of the host binary
   --perf-client-host HOST  Hostname the Dockerized perf client uses for published LDAP ports (default: 127.0.0.1)
@@ -104,6 +122,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --benchmark-timeout)
       BENCHMARK_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --index-benchmark)
+      INDEX_BENCHMARK="true"
+      shift
+      ;;
+    --concurrent-index-search-clients)
+      CONCURRENT_INDEX_SEARCH_CLIENTS="$2"
+      shift 2
+      ;;
+    --concurrent-index-search-iterations)
+      CONCURRENT_INDEX_SEARCH_ITERATIONS="$2"
+      shift 2
+      ;;
+    --concurrent-index-search-warmup-iterations)
+      CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS="$2"
+      shift 2
+      ;;
+    --concurrent-index-search-operation-timeout-ms)
+      CONCURRENT_INDEX_SEARCH_OPERATION_TIMEOUT_MS="$2"
       shift 2
       ;;
     --concurrent-bind-clients)
@@ -152,6 +190,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --opendr-runtime)
       OPENDR_RUNTIME="$2"
+      shift 2
+      ;;
+    --opendr-backend-indexes-toml)
+      OPENDR_BACKEND_INDEXES_TOML="$2"
       shift 2
       ;;
     --opendj-image)
@@ -232,8 +274,20 @@ case "${PROFILE_SET}" in
       CONCURRENT_BIND_CLIENTS="1,4,8,16,32,64,128"
     fi
     ;;
+  index)
+    LOAD_PROFILES=(
+      "index:1000:30:10:2"
+    )
+    INDEX_BENCHMARK="true"
+    if [[ -z "${CONCURRENT_INDEX_SEARCH_CLIENTS}" ]]; then
+      CONCURRENT_INDEX_SEARCH_CLIENTS="1,4,8,16,32"
+    fi
+    if [[ -z "${OPENDR_BACKEND_INDEXES_TOML}" ]]; then
+      OPENDR_BACKEND_INDEXES_TOML="${DEFAULT_OPENDR_INDEX_BENCHMARK_TOML}"
+    fi
+    ;;
   *)
-    echo "--profile-set must be one of: smoke, standard, full, concurrency" >&2
+    echo "--profile-set must be one of: smoke, standard, full, concurrency, index" >&2
     exit 1
     ;;
 esac
@@ -525,6 +579,11 @@ write_run_metadata() {
   "read_iterations": ${read_iterations},
   "write_iterations": ${write_iterations},
   "warmup_iterations": ${warmup_iterations},
+  "index_benchmark": ${INDEX_BENCHMARK},
+  "concurrent_index_search_clients": "${CONCURRENT_INDEX_SEARCH_CLIENTS}",
+  "concurrent_index_search_iterations": ${CONCURRENT_INDEX_SEARCH_ITERATIONS},
+  "concurrent_index_search_warmup_iterations": ${CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS},
+  "concurrent_index_search_operation_timeout_ms": ${CONCURRENT_INDEX_SEARCH_OPERATION_TIMEOUT_MS},
   "concurrent_bind_clients": "${CONCURRENT_BIND_CLIENTS}",
   "concurrent_bind_iterations": ${CONCURRENT_BIND_ITERATIONS},
   "concurrent_bind_warmup_iterations": ${CONCURRENT_BIND_WARMUP_ITERATIONS},
@@ -630,6 +689,57 @@ EOF
   cat "${benchmark_summary}" >> "${file}"
 }
 
+configure_opendj_index_benchmark_indexes() {
+  local container="$1"
+
+  if [[ "${INDEX_BENCHMARK}" != "true" ]]; then
+    return 0
+  fi
+
+  local dsconfig=(docker exec "${container}" /opt/opendj/bin/dsconfig)
+  local dsconfig_options=(
+    --hostname localhost
+    --port 4444
+    --bindDN "cn=admin"
+    --bindPassword "${ROOT_PASSWORD}"
+    --trustAll
+    --no-prompt)
+
+  echo "Configuring OpenDJ index benchmark indexes..."
+  "${dsconfig[@]}" create-backend-index \
+    "${dsconfig_options[@]}" \
+    --backend-name userRoot \
+    --index-name description \
+    --set index-type:substring \
+    >/dev/null 2>&1 || true
+  "${dsconfig[@]}" set-backend-index-prop \
+    "${dsconfig_options[@]}" \
+    --backend-name userRoot \
+    --index-name description \
+    --set index-type:substring \
+    >/dev/null
+
+  "${dsconfig[@]}" set-backend-index-prop \
+    "${dsconfig_options[@]}" \
+    --backend-name userRoot \
+    --index-name mail \
+    --set index-type:presence \
+    >/dev/null
+
+  "${dsconfig[@]}" create-backend-index \
+    "${dsconfig_options[@]}" \
+    --backend-name userRoot \
+    --index-name sn \
+    --set index-type:ordering \
+    >/dev/null 2>&1 || true
+  "${dsconfig[@]}" set-backend-index-prop \
+    "${dsconfig_options[@]}" \
+    --backend-name userRoot \
+    --index-name sn \
+    --set index-type:ordering \
+    >/dev/null
+}
+
 run_profile() {
   local product="$1"
   local profile_name="$2"
@@ -676,6 +786,7 @@ run_profile() {
         -e OPENDR_BASE_DN="${BASE_DN}" \
         -e OPENDR_ROOT_USER_DN="cn=admin" \
         -e OPENDR_ROOT_PASSWORD="${ROOT_PASSWORD}" \
+        -e OPENDR_BACKEND_INDEXES_TOML="${OPENDR_BACKEND_INDEXES_TOML}" \
         "${image}" \
         >/dev/null
       ;;
@@ -744,6 +855,10 @@ run_profile() {
     docker rm -f "${CURRENT_CONTAINER}" >/dev/null 2>&1 || true
     CURRENT_CONTAINER=""
     return 0
+  fi
+
+  if [[ "${product}" == "opendj" ]]; then
+    configure_opendj_index_benchmark_indexes "${CURRENT_CONTAINER}"
   fi
 
   local db_before_bytes data_before_bytes db_after_bytes data_after_bytes
@@ -824,6 +939,17 @@ run_profile() {
       --concurrent-bind-wrong-password-percent "${CONCURRENT_BIND_WRONG_PASSWORD_PERCENT}"
       --concurrent-bind-hot-user-percent "${CONCURRENT_BIND_HOT_USER_PERCENT}"
       --concurrent-bind-hot-user-count "${CONCURRENT_BIND_HOT_USER_COUNT}"
+    )
+  fi
+  if [[ "${INDEX_BENCHMARK}" == "true" ]]; then
+    benchmark_cmd+=(--index-benchmark)
+  fi
+  if [[ -n "${CONCURRENT_INDEX_SEARCH_CLIENTS}" ]]; then
+    benchmark_cmd+=(
+      --concurrent-index-search-clients "${CONCURRENT_INDEX_SEARCH_CLIENTS}"
+      --concurrent-index-search-iterations "${CONCURRENT_INDEX_SEARCH_ITERATIONS}"
+      --concurrent-index-search-warmup-iterations "${CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS}"
+      --concurrent-index-search-operation-timeout-ms "${CONCURRENT_INDEX_SEARCH_OPERATION_TIMEOUT_MS}"
     )
   fi
 
@@ -1018,6 +1144,41 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
         (item.get("throughput_ops_per_sec", 0.0) for item in concurrent_bind_runs),
         default=None,
     )
+    concurrent_index_search_runs = [
+        item
+        for item in bench_map.values()
+        if item.get("operation", "").startswith("concurrent_index_search_c")
+    ]
+    successful_concurrent_index_search_runs = [
+        item
+        for item in concurrent_index_search_runs
+        if item.get("failure_rate_percent", 100.0) == 0.0
+    ]
+    max_concurrent_index_search_clients_tested = max(
+        (item.get("concurrency", 0) for item in concurrent_index_search_runs),
+        default=None,
+    )
+    max_concurrent_index_search_clients_zero_failure = max(
+        (item.get("concurrency", 0) for item in successful_concurrent_index_search_runs),
+        default=None,
+    )
+    max_concurrent_index_search_failure_rate_percent = None
+    if max_concurrent_index_search_clients_tested is not None:
+        max_tested_index_runs = [
+            item
+            for item in concurrent_index_search_runs
+            if item.get("concurrency") == max_concurrent_index_search_clients_tested
+        ]
+        if max_tested_index_runs:
+            max_concurrent_index_search_failure_rate_percent = max_tested_index_runs[0].get("failure_rate_percent")
+    peak_concurrent_index_search_success_throughput = max(
+        (item.get("success_throughput_ops_per_sec", 0.0) for item in concurrent_index_search_runs),
+        default=None,
+    )
+    peak_concurrent_index_search_attempt_throughput = max(
+        (item.get("throughput_ops_per_sec", 0.0) for item in concurrent_index_search_runs),
+        default=None,
+    )
 
     runs.append(
         {
@@ -1030,6 +1191,11 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "read_iterations": metadata["read_iterations"],
             "write_iterations": metadata["write_iterations"],
             "warmup_iterations": metadata["warmup_iterations"],
+            "index_benchmark": metadata.get("index_benchmark", False),
+            "concurrent_index_search_clients": metadata.get("concurrent_index_search_clients", ""),
+            "concurrent_index_search_iterations": metadata.get("concurrent_index_search_iterations", 0),
+            "concurrent_index_search_warmup_iterations": metadata.get("concurrent_index_search_warmup_iterations", 0),
+            "concurrent_index_search_operation_timeout_ms": metadata.get("concurrent_index_search_operation_timeout_ms", 0),
             "concurrent_bind_clients": metadata.get("concurrent_bind_clients", ""),
             "concurrent_bind_iterations": metadata.get("concurrent_bind_iterations", 0),
             "concurrent_bind_warmup_iterations": metadata.get("concurrent_bind_warmup_iterations", 0),
@@ -1070,6 +1236,21 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "delete_failure_rate_percent": bench_value("delete_entries", "failure_rate_percent"),
             "password_modify_mean_ms": bench_value("password_modify_fixture_user", "mean_ms"),
             "password_modify_failure_rate_percent": bench_value("password_modify_fixture_user", "failure_rate_percent"),
+            "index_equality_uid_mean_ms": bench_value("index_equality_uid", "mean_ms"),
+            "index_equality_uid_throughput": bench_value("index_equality_uid", "throughput_ops_per_sec"),
+            "index_presence_mail_mean_ms": bench_value("index_presence_mail", "mean_ms"),
+            "index_presence_mail_throughput": bench_value("index_presence_mail", "throughput_ops_per_sec"),
+            "index_substring_description_mean_ms": bench_value("index_substring_description", "mean_ms"),
+            "index_substring_description_throughput": bench_value("index_substring_description", "throughput_ops_per_sec"),
+            "index_ordering_sn_ge_mean_ms": bench_value("index_ordering_sn_ge", "mean_ms"),
+            "index_ordering_sn_ge_throughput": bench_value("index_ordering_sn_ge", "throughput_ops_per_sec"),
+            "index_ordering_sn_le_mean_ms": bench_value("index_ordering_sn_le", "mean_ms"),
+            "index_ordering_sn_le_throughput": bench_value("index_ordering_sn_le", "throughput_ops_per_sec"),
+            "max_concurrent_index_search_clients_tested": max_concurrent_index_search_clients_tested,
+            "max_concurrent_index_search_clients_zero_failure": max_concurrent_index_search_clients_zero_failure,
+            "max_concurrent_index_search_failure_rate_percent": max_concurrent_index_search_failure_rate_percent,
+            "peak_concurrent_index_search_success_throughput": peak_concurrent_index_search_success_throughput,
+            "peak_concurrent_index_search_attempt_throughput": peak_concurrent_index_search_attempt_throughput,
             "max_concurrent_bind_clients_tested": max_concurrent_bind_clients_tested,
             "max_concurrent_bind_clients_zero_failure": max_concurrent_bind_clients_zero_failure,
             "max_concurrent_bind_failure_rate_percent": max_concurrent_bind_failure_rate_percent,
@@ -1107,7 +1288,7 @@ summary_md = root / "comparison-summary.md"
 summary_csv = root / "comparison-summary.csv"
 
 csv_lines = [
-    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput"
+    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,index_benchmark,concurrent_index_search_clients,concurrent_index_search_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,index_equality_uid_mean_ms,index_equality_uid_throughput,index_presence_mail_mean_ms,index_presence_mail_throughput,index_substring_description_mean_ms,index_substring_description_throughput,index_ordering_sn_ge_mean_ms,index_ordering_sn_ge_throughput,index_ordering_sn_le_mean_ms,index_ordering_sn_le_throughput,max_concurrent_index_search_clients_tested,max_concurrent_index_search_clients_zero_failure,max_concurrent_index_search_failure_rate_percent,peak_concurrent_index_search_success_throughput,peak_concurrent_index_search_attempt_throughput,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput"
 ]
 for run in runs:
     csv_lines.append(
@@ -1121,6 +1302,9 @@ for run in runs:
                 str(run["preloaded_users"]),
                 str(run["read_iterations"]),
                 str(run["write_iterations"]),
+                str(run["index_benchmark"]).lower(),
+                str(run["concurrent_index_search_clients"]).replace(",", ";"),
+                str(run["concurrent_index_search_iterations"]),
                 str(run["concurrent_bind_clients"]).replace(",", ";"),
                 str(run["concurrent_bind_iterations"]),
                 str(run["concurrent_bind_valid_percent"]),
@@ -1154,6 +1338,21 @@ for run in runs:
                 csv_value(run["delete_failure_rate_percent"]),
                 csv_value(run["password_modify_mean_ms"]),
                 csv_value(run["password_modify_failure_rate_percent"]),
+                csv_value(run["index_equality_uid_mean_ms"]),
+                csv_value(run["index_equality_uid_throughput"]),
+                csv_value(run["index_presence_mail_mean_ms"]),
+                csv_value(run["index_presence_mail_throughput"]),
+                csv_value(run["index_substring_description_mean_ms"]),
+                csv_value(run["index_substring_description_throughput"]),
+                csv_value(run["index_ordering_sn_ge_mean_ms"]),
+                csv_value(run["index_ordering_sn_ge_throughput"]),
+                csv_value(run["index_ordering_sn_le_mean_ms"]),
+                csv_value(run["index_ordering_sn_le_throughput"]),
+                fmt_int(run["max_concurrent_index_search_clients_tested"]),
+                fmt_int(run["max_concurrent_index_search_clients_zero_failure"]),
+                csv_value(run["max_concurrent_index_search_failure_rate_percent"]),
+                csv_value(run["peak_concurrent_index_search_success_throughput"]),
+                csv_value(run["peak_concurrent_index_search_attempt_throughput"]),
                 fmt_int(run["max_concurrent_bind_clients_tested"]),
                 fmt_int(run["max_concurrent_bind_clients_zero_failure"]),
                 csv_value(run["max_concurrent_bind_failure_rate_percent"]),
@@ -1182,6 +1381,10 @@ if runs:
             f"- Benchmark client host: `{reference.get('benchmark_client_host', '127.0.0.1')}`",
             f"- Benchmark client network: `{reference.get('benchmark_client_network', 'host')}`",
             f"- Timeout budget per profile: `{reference['timeout_seconds']}` seconds",
+            f"- Index benchmark probes: `{str(reference.get('index_benchmark', False)).lower()}`",
+            f"- Concurrent index-search clients: `{reference.get('concurrent_index_search_clients', '') or 'disabled'}`",
+            f"- Concurrent index-search iterations per client: `{reference.get('concurrent_index_search_iterations', 0)}`",
+            f"- Concurrent index-search operation timeout: `{reference.get('concurrent_index_search_operation_timeout_ms', 0)}` ms",
             f"- Concurrent bind clients: `{reference.get('concurrent_bind_clients', '') or 'disabled'}`",
             f"- Concurrent bind iterations per client: `{reference.get('concurrent_bind_iterations', 0)}`",
             f"- Concurrent bind auth mix: valid `{reference.get('concurrent_bind_valid_percent', 100)}%`, wrong password `{reference.get('concurrent_bind_wrong_password_percent', 0)}%`, unknown DN `{100 - int(reference.get('concurrent_bind_valid_percent', 100)) - int(reference.get('concurrent_bind_wrong_password_percent', 0))}%`",
@@ -1190,8 +1393,8 @@ if runs:
             "",
             "## Load Profiles",
             "",
-            "| Profile | Preloaded Users | Read Iterations | Write Iterations | Concurrent Bind Clients | Concurrent Bind Iterations/Client |",
-            "|---|---:|---:|---:|---|---:|",
+            "| Profile | Preloaded Users | Read Iterations | Write Iterations | Concurrent Index Search Clients | Concurrent Index Search Iterations/Client | Concurrent Bind Clients | Concurrent Bind Iterations/Client |",
+            "|---|---:|---:|---:|---|---:|---|---:|",
         ]
     )
     seen_profiles = set()
@@ -1200,7 +1403,7 @@ if runs:
             continue
         seen_profiles.add(run["profile"])
         lines.append(
-            f"| {run['profile']} | {run['preloaded_users']} | {run['read_iterations']} | {run['write_iterations']} | {run.get('concurrent_bind_clients', '') or 'disabled'} | {run.get('concurrent_bind_iterations', 0)} |"
+            f"| {run['profile']} | {run['preloaded_users']} | {run['read_iterations']} | {run['write_iterations']} | {run.get('concurrent_index_search_clients', '') or 'disabled'} | {run.get('concurrent_index_search_iterations', 0)} | {run.get('concurrent_bind_clients', '') or 'disabled'} | {run.get('concurrent_bind_iterations', 0)} |"
         )
 
     lines.extend(
@@ -1216,6 +1419,21 @@ if runs:
         lines.append(
             f"| {run['product']} | {run['profile']} | {run['status']} | {fmt_number(run['total_elapsed_ms'])} | {fmt_int(run['records_after_setup'])} | {human_bytes(int(run['db_after_bytes']))} | {run['cpu_avg_percent']:.2f} | {run['cpu_max_percent']:.2f} | {human_bytes(int(run['memory_avg_bytes']))} | {human_bytes(int(run['memory_max_bytes']))} | {fmt_number(run['search_subtree_mean_ms'])} | {fmt_number(run['search_subtree_throughput'], 2)} | {fmt_number(run['add_mean_ms'])} | {fmt_number(run['modify_mean_ms'])} | {fmt_number(run['delete_mean_ms'])} | {fmt_number(run['password_modify_mean_ms'])} | {fmt_int(run['max_concurrent_bind_clients_tested'])} | {fmt_int(run['max_concurrent_bind_clients_zero_failure'])} | {fmt_number(run['max_concurrent_bind_failure_rate_percent'], 2)} | {fmt_number(run['peak_concurrent_bind_success_throughput'], 2)} |"
         )
+
+    if any(run.get("index_benchmark") for run in runs):
+        lines.extend(
+            [
+                "",
+                "## Index Search Comparison",
+                "",
+                "| Product | Profile | Equality uid mean ms | Presence mail mean ms | Substring description mean ms | Ordering sn >= mean ms | Ordering sn <= mean ms | Max Concurrent Index Search Clients Tested | Max 0% Failure Concurrent Index Search Clients | Max-Test Failure % | Peak Concurrent Index Search Success ops/s |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for run in runs:
+            lines.append(
+                f"| {run['product']} | {run['profile']} | {fmt_number(run['index_equality_uid_mean_ms'])} | {fmt_number(run['index_presence_mail_mean_ms'])} | {fmt_number(run['index_substring_description_mean_ms'])} | {fmt_number(run['index_ordering_sn_ge_mean_ms'])} | {fmt_number(run['index_ordering_sn_le_mean_ms'])} | {fmt_int(run['max_concurrent_index_search_clients_tested'])} | {fmt_int(run['max_concurrent_index_search_clients_zero_failure'])} | {fmt_number(run['max_concurrent_index_search_failure_rate_percent'], 2)} | {fmt_number(run['peak_concurrent_index_search_success_throughput'], 2)} |"
+            )
 
     incomplete_runs = [run for run in runs if run["status"] != "success"]
     if incomplete_runs:
