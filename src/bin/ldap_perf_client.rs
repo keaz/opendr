@@ -54,6 +54,21 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     warmup_iterations: usize,
 
+    #[arg(long, default_value_t = false)]
+    index_benchmark: bool,
+
+    #[arg(long, default_value = "")]
+    concurrent_index_search_clients: String,
+
+    #[arg(long, default_value_t = 20)]
+    concurrent_index_search_iterations: usize,
+
+    #[arg(long, default_value_t = 1)]
+    concurrent_index_search_warmup_iterations: usize,
+
+    #[arg(long, default_value_t = 5000)]
+    concurrent_index_search_operation_timeout_ms: u64,
+
     #[arg(long, default_value = "")]
     concurrent_bind_clients: String,
 
@@ -141,6 +156,15 @@ struct BenchmarkStats {
     max_ms: f64,
 }
 
+#[derive(Debug, Clone)]
+struct IndexSearchSpec {
+    operation: &'static str,
+    base_dn: String,
+    filter: String,
+    expected_count: usize,
+    expected_dn: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -164,6 +188,9 @@ async fn run(args: Args) -> AppResult<()> {
         "--write-iterations must be greater than zero",
     )?;
     let concurrent_bind_clients = parse_concurrent_bind_clients(&args.concurrent_bind_clients)?;
+    let concurrent_index_search_clients =
+        parse_concurrent_index_search_clients(&args.concurrent_index_search_clients)?;
+    let run_index_benchmarks = args.index_benchmark || !concurrent_index_search_clients.is_empty();
     if !concurrent_bind_clients.is_empty() {
         ensure(
             args.concurrent_bind_iterations > 0,
@@ -186,6 +213,20 @@ async fn run(args: Args) -> AppResult<()> {
         ensure(
             args.concurrent_bind_hot_user_percent <= 100,
             "--concurrent-bind-hot-user-percent must be <= 100",
+        )?;
+    }
+    if !concurrent_index_search_clients.is_empty() {
+        ensure(
+            args.concurrent_index_search_iterations > 0,
+            "--concurrent-index-search-iterations must be greater than zero when --concurrent-index-search-clients is set",
+        )?;
+        ensure(
+            args.concurrent_index_search_warmup_iterations > 0,
+            "--concurrent-index-search-warmup-iterations must be greater than zero when --concurrent-index-search-clients is set",
+        )?;
+        ensure(
+            args.concurrent_index_search_operation_timeout_ms > 0,
+            "--concurrent-index-search-operation-timeout-ms must be greater than zero when --concurrent-index-search-clients is set",
         )?;
     }
 
@@ -416,10 +457,21 @@ async fn run(args: Args) -> AppResult<()> {
         subtree_search_started,
     ));
 
+    if run_index_benchmarks {
+        progress("benchmark.index_searches");
+        benchmarks.extend(run_index_search_benchmarks(&mut admin_ops, &args, &dns).await?);
+
+        for concurrency in &concurrent_index_search_clients {
+            progress(&format!("benchmark.concurrent_index_search.c{concurrency}"));
+            benchmarks
+                .push(run_concurrent_index_search_benchmark(&args, &dns, *concurrency).await?);
+        }
+    }
+
     progress("benchmark.compare_fixture_user_sn");
     for _ in 0..args.warmup_iterations {
         let equal = admin_ops
-            .compare(&dns.control_user_dn, "sn", "BenchmarkUser0")
+            .compare(&dns.control_user_dn, "sn", "BenchmarkUser000000")
             .await?
             .equal()?;
         ensure(equal, "compare did not match expected surname")?;
@@ -429,7 +481,7 @@ async fn run(args: Args) -> AppResult<()> {
     for _ in 0..args.read_iterations {
         let started = Instant::now();
         let equal = admin_ops
-            .compare(&dns.control_user_dn, "sn", "BenchmarkUser0")
+            .compare(&dns.control_user_dn, "sn", "BenchmarkUser000000")
             .await?
             .equal()?;
         ensure(equal, "compare did not match expected surname")?;
@@ -855,6 +907,271 @@ async fn run_concurrent_bind_benchmark(
     ))
 }
 
+async fn run_index_search_benchmarks(
+    ldap: &mut Ldap,
+    args: &Args,
+    dns: &ScenarioDns,
+) -> AppResult<Vec<BenchmarkStats>> {
+    let mut benchmarks = Vec::new();
+    for spec in index_search_specs(args, dns) {
+        progress(&format!("benchmark.{}", spec.operation));
+        for _ in 0..args.warmup_iterations {
+            verify_index_search(ldap, &spec).await?;
+        }
+
+        let mut latencies = Vec::with_capacity(args.read_iterations);
+        let started_all = Instant::now();
+        for _ in 0..args.read_iterations {
+            let started = Instant::now();
+            verify_index_search(ldap, &spec).await?;
+            latencies.push(elapsed_ms(started.elapsed().as_secs_f64()));
+        }
+        benchmarks.push(build_benchmark_stats(
+            spec.operation,
+            latencies,
+            started_all,
+        ));
+    }
+
+    Ok(benchmarks)
+}
+
+#[derive(Debug)]
+struct ConcurrentIndexSearchWorkerResult {
+    latencies_ms: Vec<f64>,
+    successes: usize,
+    failures: usize,
+}
+
+async fn run_concurrent_index_search_benchmark(
+    args: &Args,
+    dns: &ScenarioDns,
+    concurrency: usize,
+) -> AppResult<BenchmarkStats> {
+    ensure(
+        concurrency > 0,
+        "--concurrent-index-search-clients values must be greater than zero",
+    )?;
+
+    let specs = index_search_specs(args, dns);
+    let expected_attempts = concurrency * args.concurrent_index_search_iterations;
+    let (ready_tx, mut ready_rx) = mpsc::channel(concurrency);
+    let (start_tx, start_rx) = watch::channel(false);
+    let mut handles = Vec::with_capacity(concurrency);
+
+    for client_index in 0..concurrency {
+        let ready_tx = ready_tx.clone();
+        let mut start_rx = start_rx.clone();
+        let url = args.url.clone();
+        let starttls = args.starttls;
+        let insecure = args.insecure;
+        let bind_dn = args.bind_dn.clone();
+        let password = args.password.clone();
+        let specs = specs.clone();
+        let iterations = args.concurrent_index_search_iterations;
+        let warmup_iterations = args.concurrent_index_search_warmup_iterations;
+        let operation_timeout =
+            Duration::from_millis(args.concurrent_index_search_operation_timeout_ms);
+
+        handles.push(tokio::spawn(async move {
+            let mut ldap =
+                match connect_with_timeout(&url, starttls, insecure, operation_timeout).await {
+                    Ok(ldap) => ldap,
+                    Err(_) => {
+                        let _ = ready_tx.send(()).await;
+                        return ConcurrentIndexSearchWorkerResult {
+                            latencies_ms: Vec::new(),
+                            successes: 0,
+                            failures: iterations,
+                        };
+                    }
+                };
+
+            if simple_bind_with_timeout(&mut ldap, &bind_dn, &password, operation_timeout)
+                .await
+                .is_err()
+            {
+                let _ = ready_tx.send(()).await;
+                let _ = ldap.unbind().await;
+                return ConcurrentIndexSearchWorkerResult {
+                    latencies_ms: Vec::new(),
+                    successes: 0,
+                    failures: iterations,
+                };
+            }
+
+            for warmup in 0..warmup_iterations {
+                let spec = &specs[(client_index + warmup) % specs.len()];
+                if !index_search_matches_with_timeout(&mut ldap, spec, operation_timeout).await {
+                    let _ = ready_tx.send(()).await;
+                    let _ = ldap.unbind().await;
+                    return ConcurrentIndexSearchWorkerResult {
+                        latencies_ms: Vec::new(),
+                        successes: 0,
+                        failures: iterations,
+                    };
+                }
+            }
+
+            let _ = ready_tx.send(()).await;
+            while !*start_rx.borrow() {
+                if start_rx.changed().await.is_err() {
+                    let _ = ldap.unbind().await;
+                    return ConcurrentIndexSearchWorkerResult {
+                        latencies_ms: Vec::new(),
+                        successes: 0,
+                        failures: iterations,
+                    };
+                }
+            }
+
+            let mut latencies_ms = Vec::with_capacity(iterations);
+            let mut successes = 0;
+            let mut failures = 0;
+            for iteration in 0..iterations {
+                let spec = &specs[(client_index * iterations + iteration) % specs.len()];
+                let started = Instant::now();
+                if index_search_matches_with_timeout(&mut ldap, spec, operation_timeout).await {
+                    successes += 1;
+                } else {
+                    failures += 1;
+                }
+                latencies_ms.push(elapsed_ms(started.elapsed().as_secs_f64()));
+            }
+
+            let _ = ldap.unbind().await;
+            ConcurrentIndexSearchWorkerResult {
+                latencies_ms,
+                successes,
+                failures,
+            }
+        }));
+    }
+
+    drop(ready_tx);
+    for _ in 0..concurrency {
+        if ready_rx.recv().await.is_none() {
+            break;
+        }
+    }
+
+    let total_started = Instant::now();
+    let _ = start_tx.send(true);
+
+    let mut latencies_ms = Vec::with_capacity(expected_attempts);
+    let mut successes = 0;
+    let mut failures = 0;
+    for handle in handles {
+        match handle.await {
+            Ok(result) => {
+                latencies_ms.extend(result.latencies_ms);
+                successes += result.successes;
+                failures += result.failures;
+            }
+            Err(_) => {
+                failures += args.concurrent_index_search_iterations;
+            }
+        }
+    }
+
+    Ok(build_benchmark_stats_with_counts(
+        &format!("concurrent_index_search_c{concurrency}"),
+        latencies_ms,
+        total_started,
+        expected_attempts,
+        successes,
+        failures,
+        concurrency,
+    ))
+}
+
+fn index_search_specs(args: &Args, dns: &ScenarioDns) -> Vec<IndexSearchSpec> {
+    let midpoint = args.preloaded_users / 2;
+    let midpoint_sn = format!("BenchmarkUser{midpoint:06}");
+
+    vec![
+        IndexSearchSpec {
+            operation: "index_equality_uid",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: format!("(uid={})", dns.control_user_uid),
+            expected_count: 1,
+            expected_dn: Some(dns.control_user_dn.clone()),
+        },
+        IndexSearchSpec {
+            operation: "index_presence_mail",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: "(mail=*)".to_string(),
+            expected_count: args.preloaded_users,
+            expected_dn: Some(dns.control_user_dn.clone()),
+        },
+        IndexSearchSpec {
+            operation: "index_substring_description",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: "(description=*fixture user 000000*)".to_string(),
+            expected_count: 1,
+            expected_dn: Some(dns.control_user_dn.clone()),
+        },
+        IndexSearchSpec {
+            operation: "index_ordering_sn_ge",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: format!("(sn>={midpoint_sn})"),
+            expected_count: args.preloaded_users - midpoint,
+            expected_dn: None,
+        },
+        IndexSearchSpec {
+            operation: "index_ordering_sn_le",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: format!("(sn<={midpoint_sn})"),
+            expected_count: midpoint + 1,
+            expected_dn: None,
+        },
+    ]
+}
+
+async fn verify_index_search(ldap: &mut Ldap, spec: &IndexSearchSpec) -> AppResult<()> {
+    let entries = search_entries(
+        ldap,
+        &spec.base_dn,
+        Scope::Subtree,
+        &spec.filter,
+        vec!["uid", "cn", "sn", "mail", "description"],
+    )
+    .await?;
+    ensure(
+        entries.len() == spec.expected_count,
+        format!(
+            "{} expected {} entries for {}, got {}",
+            spec.operation,
+            spec.expected_count,
+            spec.filter,
+            entries.len()
+        ),
+    )?;
+    if let Some(expected_dn) = &spec.expected_dn {
+        ensure(
+            entries
+                .iter()
+                .any(|entry| entry.dn.eq_ignore_ascii_case(expected_dn)),
+            format!(
+                "{} result for {} did not include expected DN {}",
+                spec.operation, spec.filter, expected_dn
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+async fn index_search_matches_with_timeout(
+    ldap: &mut Ldap,
+    spec: &IndexSearchSpec,
+    timeout_duration: Duration,
+) -> bool {
+    match tokio::time::timeout(timeout_duration, verify_index_search(ldap, spec)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
 fn bind_expectation(
     global_attempt: usize,
     valid_percent: u8,
@@ -963,11 +1280,11 @@ async fn preload_users(
                 ),
                 (
                     "sn".to_string(),
-                    string_set([format!("BenchmarkUser{index}")]),
+                    string_set([format!("BenchmarkUser{index:06}")]),
                 ),
                 (
                     "description".to_string(),
-                    string_set([format!("Benchmark fixture user {index}")]),
+                    string_set([format!("Benchmark fixture user {index:06}")]),
                 ),
                 (
                     "mail".to_string(),
@@ -1217,6 +1534,14 @@ fn print_human_summary(report: &BenchmarkReport) {
 }
 
 fn parse_concurrent_bind_clients(raw: &str) -> AppResult<Vec<usize>> {
+    parse_concurrent_client_list(raw, "--concurrent-bind-clients")
+}
+
+fn parse_concurrent_index_search_clients(raw: &str) -> AppResult<Vec<usize>> {
+    parse_concurrent_client_list(raw, "--concurrent-index-search-clients")
+}
+
+fn parse_concurrent_client_list(raw: &str, argument_name: &str) -> AppResult<Vec<usize>> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1224,15 +1549,13 @@ fn parse_concurrent_bind_clients(raw: &str) -> AppResult<Vec<usize>> {
     let mut values = Vec::new();
     for value in raw.split(',') {
         let value = value.trim();
-        ensure(!value.is_empty(), "empty --concurrent-bind-clients value")?;
+        ensure(!value.is_empty(), format!("empty {argument_name} value"))?;
         let parsed = value.parse::<usize>().map_err(|err| {
-            other_error(format!(
-                "invalid --concurrent-bind-clients value {value:?}: {err}"
-            ))
+            other_error(format!("invalid {argument_name} value {value:?}: {err}"))
         })?;
         ensure(
             parsed > 0,
-            "--concurrent-bind-clients values must be greater than zero",
+            format!("{argument_name} values must be greater than zero"),
         )?;
         values.push(parsed);
     }
@@ -1318,6 +1641,17 @@ mod tests {
     #[test]
     fn parse_concurrent_bind_clients_rejects_zero() {
         assert!(parse_concurrent_bind_clients("1,0,4").is_err());
+    }
+
+    #[test]
+    fn parse_concurrent_index_search_clients_sorts_and_deduplicates() {
+        let values = parse_concurrent_index_search_clients("32, 4, 8, 4").unwrap();
+        assert_eq!(values, vec![4, 8, 32]);
+    }
+
+    #[test]
+    fn parse_concurrent_index_search_clients_rejects_zero() {
+        assert!(parse_concurrent_index_search_clients("1,0,4").is_err());
     }
 
     #[test]

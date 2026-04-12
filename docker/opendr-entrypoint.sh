@@ -25,6 +25,7 @@ mkdir -p "${CONFIG_DIR}" "${CERT_DIR}" "${DATA_DIR}"
 : "${OPENDR_MAX_MEMORY_PER_CONNECTION:=10485760}"
 : "${OPENDR_MAX_TOTAL_MEMORY:=2147483648}"
 : "${OPENDR_CONNECTION_IDLE_TIMEOUT_SECS:=600}"
+: "${OPENDR_BACKEND_INDEXES_TOML:=}"
 
 if [[ ! -f "${CERT_DIR}/server.crt" || ! -f "${CERT_DIR}/server.key" ]]; then
   openssl req \
@@ -87,6 +88,10 @@ enabled = false
 [rate_limit]
 enabled = false
 EOF
+
+if [[ -n "${OPENDR_BACKEND_INDEXES_TOML}" ]]; then
+  printf '\n%s\n' "${OPENDR_BACKEND_INDEXES_TOML}" >> "${CONFIG_DIR}/server.toml"
+fi
 
 cat > "${CONFIG_DIR}/log4rs.yml" <<'EOF'
 appenders:
