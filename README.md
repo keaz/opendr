@@ -262,6 +262,7 @@ Listener mode is active when the consumer logs `Replication consumer entered lis
 
 ### Operations
 - [Monitoring](docs/MONITORING.md) - Metrics and health checks
+- [Backup and Restore](docs/BACKUP_RESTORE.md) - Online LMDB backup and offline restore runbook
 - [Setup Guide](SETUP_GUIDE.md) - Deployment and configuration
 
 ### Development

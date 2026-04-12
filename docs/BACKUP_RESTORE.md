@@ -1,151 +1,374 @@
-# OpenDR Backup and Restore Design
+# OpenDR Backup and Restore
 
-This document defines the first backup and restore path for OpenDR's LMDB backend.
+This guide describes how to back up and restore OpenDR when the server uses the
+LMDB backend.
 
-## Goals
+## Support Matrix
 
-- Support a full backup of an LMDB-backed OpenDR instance while the LDAP server is running.
-- Support incremental backups from a previous backup checkpoint when the provider changelog is enabled and retained.
-- Restore into a stopped, empty data directory.
-- Make every backup self-describing through a manifest that restore tooling can validate.
+| Operation | Supported | Server state |
+| --- | --- | --- |
+| Full LMDB backup | Yes | Source server may keep running |
+| Incremental LMDB backup | Yes, with provider changelog retention | Source server may keep running |
+| Full restore | Yes | Target server must be stopped |
+| Full plus incremental restore | Yes | Target server must be stopped |
+| Hot restore into a running server | No | Stop the target server first |
+| In-memory backend backup | No | Use LMDB for durable backups |
 
-## Backend Constraints
+Full backup uses LMDB's online copy API (`mdb_env_copy2`) through a read-only
+source environment. It produces a consistent LMDB snapshot while the LDAP server
+continues serving traffic.
 
-OpenDR stores persistent entries in a single LMDB environment. The environment contains the entries database, password database, DN index, metadata database, and optional attribute index databases.
+Incremental backup is changelog-based. It records the provider changelog entries
+after the parent backup checkpoint. It is not a page-level LMDB incremental.
 
-LMDB provides online environment copy APIs such as `mdb_env_copy2`. Those APIs create a consistent copy using a read-only transaction. This is suitable for full online backup, with the usual LMDB caveat that long-running read transactions can increase source file growth while writers continue.
+## Required Configuration
 
-LMDB does not provide a native incremental backup API. Page-level incremental backup is not selected for the first implementation because it would require tracking LMDB pages outside the safe abstractions currently used by OpenDR.
+Backup and restore only support the `lmdb` backend:
 
-## Selected Strategy
-
-### Full Backup
-
-A full backup opens the source LMDB environment read-only and copies it with `mdb_env_copy2` into an empty backup data directory. The backup tool then opens the copied environment and reads the copied `contextCSN`. The manifest uses that copied checkpoint as the backup's end checkpoint, so concurrent writes after the LMDB snapshot are not accidentally included in the manifest.
-
-The backup output layout is:
-
-```text
-backup-dir/
-  manifest.json
-  data/
-    data.mdb
+```toml
+[backend]
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 256
 ```
 
-`lock.mdb` is intentionally not required in the backup; LMDB recreates it when the restored environment is opened.
+For full backups, no replication setting is required.
 
-### Incremental Backup
+For incremental backups, configure the server as a replication provider or both
+mode and keep the provider changelog on persistent storage:
 
-An incremental backup is a changelog segment from the previous backup's `end_context_csn` to the latest retained provider changelog entry.
+```toml
+[server]
+replica_id = 1
 
-The source of truth is the persisted provider changelog at:
+[replication]
+enabled = true
+mode = "provider"
+changelog_capacity = 100000
+state_storage_path = "/var/lib/opendr/replication_state"
+```
+
+For `mode = "both"`, also provide the consumer fields required by replication,
+such as `provider_url`, `bind_dn`, and one of `bind_password`,
+`bind_password_env`, or `bind_password_file`.
+
+The incremental backup tool reads:
 
 ```text
 <replication.state_storage_path>/provider_changelog.json
 ```
 
-The backup tool validates the chain before writing an incremental backup:
+If that file is missing, disabled, or pruned past the parent backup checkpoint,
+the incremental backup fails. Take a new full backup in that case.
 
-- the parent manifest exists and belongs to the same backup format;
-- the parent manifest has an `end_context_csn`;
-- the persisted changelog still contains a complete window after the parent checkpoint;
-- if the LMDB backend's current `contextCSN` is newer than the latest retained changelog entry, the backup fails because a concurrent write may not yet be present in the changelog snapshot.
+## Backup Layout
 
-The backup output layout is:
+A full backup directory contains:
 
 ```text
-backup-dir/
+full-20260412/
+  manifest.json
+  data/
+    data.mdb
+```
+
+`lock.mdb` is not required in the backup. LMDB recreates it when the restored
+environment is opened.
+
+An incremental backup directory contains:
+
+```text
+inc-20260412-01/
   manifest.json
   changes.json
 ```
 
-This makes incremental backup safe for provider or both-mode deployments that persist the changelog and retain enough entries. If replication/changelog is disabled or the parent checkpoint has been pruned, incremental backup is rejected with an explicit error. Operators should take a new full backup in that case.
+Every `manifest.json` includes:
 
-### Deferred Alternatives
+- backup format version
+- backup ID and parent backup ID
+- backup type: `full` or `incremental`
+- source backend type and source data directory
+- source base DN and replica ID
+- LMDB map size
+- OpenDR crate version
+- creation timestamp
+- checkpoint CSNs
+- file paths, sizes, and SHA-256 checksums
 
-Page-level incrementals and filesystem snapshot integration are deferred. They would require platform-specific behavior or tighter LMDB page tracking than OpenDR currently exposes.
+Restore validates the manifest and file checksums before copying data or
+applying incremental changes.
 
-## Manifest
+## Create A Full Online Backup
 
-Each backup has a `manifest.json` with:
-
-- backup format version;
-- backup ID;
-- backup type: `full` or `incremental`;
-- parent backup ID for incrementals;
-- source backend type;
-- source data directory;
-- source base DN;
-- source replica ID;
-- source LMDB map size;
-- start and end context CSNs;
-- creation timestamp;
-- OpenDR crate version;
-- file paths, sizes, and SHA-256 checksums.
-
-The manifest stores both a `snapshot_context_csn` and an `end_context_csn`. For full backups, `snapshot_context_csn` is read from the copied LMDB snapshot. When a provider changelog is available, `end_context_csn` is the pre-copy changelog high-water mark used as the incremental chain checkpoint. This can be older than the copied snapshot; later incremental replay may therefore reapply an already-copied operation, and the replay path treats duplicate add/delete/rename operations idempotently.
-
-Restore treats the manifest as authoritative and validates checksums before copying or applying data.
-
-## CLI Usage
-
-Create a full online backup:
+Use this while OpenDR is running:
 
 ```bash
-cargo run --bin opendr-backup -- full \
-  --config config/server.toml \
-  --target /var/backups/opendr/full-20260411
+opendr-backup --config /etc/opendr/server.toml full \
+  --target /var/backups/opendr/full-20260412
 ```
 
-Create an incremental backup from a previous full or incremental backup:
+For development builds:
 
 ```bash
-cargo run --bin opendr-backup -- incremental \
-  --config config/server.toml \
-  --parent /var/backups/opendr/full-20260411 \
-  --target /var/backups/opendr/inc-20260411-01
+cargo run --bin opendr-backup -- --config config/server.toml full \
+  --target /tmp/opendr-backups/full-20260412
 ```
 
-Inspect and verify a backup manifest:
+The target directory must be empty or absent. The command creates it if needed.
+
+Use `--json` when automation needs the backup ID and checkpoint values:
 
 ```bash
-cargo run --bin opendr-backup -- inspect \
-  --backup /var/backups/opendr/full-20260411
+opendr-backup --config /etc/opendr/server.toml --json full \
+  --target /var/backups/opendr/full-20260412
 ```
 
-Dry-run a restore:
+Optional compact mode:
 
 ```bash
-cargo run --bin opendr-restore -- \
-  --backup /var/backups/opendr/full-20260411 \
-  --incremental /var/backups/opendr/inc-20260411-01 \
+opendr-backup --config /etc/opendr/server.toml full \
+  --target /var/backups/opendr/full-20260412-compact \
+  --compact
+```
+
+Compact mode can reduce backup size but may take longer.
+
+## Create Incremental Backups
+
+Start with a full backup:
+
+```bash
+opendr-backup --config /etc/opendr/server.toml full \
+  --target /var/backups/opendr/full-20260412
+```
+
+Create the first incremental from that full backup:
+
+```bash
+opendr-backup --config /etc/opendr/server.toml incremental \
+  --parent /var/backups/opendr/full-20260412 \
+  --target /var/backups/opendr/inc-20260412-01
+```
+
+Create the next incremental from the previous incremental:
+
+```bash
+opendr-backup --config /etc/opendr/server.toml incremental \
+  --parent /var/backups/opendr/inc-20260412-01 \
+  --target /var/backups/opendr/inc-20260412-02
+```
+
+Keep the full backup and all incrementals in order. A restore chain is valid only
+when each incremental points to the backup ID from the previous manifest.
+
+## Inspect A Backup
+
+Verify checksums and print manifest metadata:
+
+```bash
+opendr-backup inspect --backup /var/backups/opendr/full-20260412
+```
+
+JSON output:
+
+```bash
+opendr-backup --json inspect --backup /var/backups/opendr/full-20260412
+```
+
+Run this after copying backups to remote storage to confirm the transfer did not
+corrupt files.
+
+## Restore To A New Data Directory
+
+Restores are offline. Stop the target OpenDR server before restoring into its
+configured data directory.
+
+Dry-run first:
+
+```bash
+opendr-restore \
+  --backup /var/backups/opendr/full-20260412 \
+  --incremental /var/backups/opendr/inc-20260412-01 \
+  --incremental /var/backups/opendr/inc-20260412-02 \
   --target-data-dir /var/lib/opendr/data-restored \
   --dry-run
 ```
 
-Restore offline into an empty target data directory:
+Run the restore:
 
 ```bash
-cargo run --bin opendr-restore -- \
-  --backup /var/backups/opendr/full-20260411 \
-  --incremental /var/backups/opendr/inc-20260411-01 \
+opendr-restore \
+  --backup /var/backups/opendr/full-20260412 \
+  --incremental /var/backups/opendr/inc-20260412-01 \
+  --incremental /var/backups/opendr/inc-20260412-02 \
   --target-data-dir /var/lib/opendr/data-restored
 ```
 
-## Restore Model
+Point OpenDR at the restored directory:
 
-Restore is offline in the first implementation. The target server must be stopped, and the target data directory must be empty unless the operator uses an explicit force flag.
+```toml
+[backend]
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/data-restored"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 256
+```
 
-For a full restore, the restore tool validates the manifest and copies the `data/` directory to the target data directory.
+Then start the server and validate a known entry:
 
-For incremental restore, the restore tool first restores the full backup and then applies each incremental manifest in order. Incrementals must form a continuous parent chain. Changelog replay uses the same change payload shape as OpenDR replication, then sets the restored backend's `contextCSN` to the final manifest checkpoint.
+```bash
+ldapsearch -x \
+  -H ldap://127.0.0.1:1389 \
+  -D "cn=admin,dc=example,dc=org" \
+  -w "$OPENDR_ADMIN_PASSWORD" \
+  -b "dc=example,dc=org" \
+  "(objectClass=*)"
+```
 
-The first implementation does not support hot restore, partial subtree restore, or cross-version data migration beyond manifest compatibility checks.
+## Restore In Place
+
+Use this when replacing the configured production data directory. Keep the
+server stopped for the entire procedure.
+
+1. Stop OpenDR.
+2. Move the current data directory aside:
+
+   ```bash
+   mv /var/lib/opendr/data /var/lib/opendr/data.before-restore
+   mkdir -p /var/lib/opendr/data
+   ```
+
+3. Dry-run the restore:
+
+   ```bash
+   opendr-restore \
+     --backup /var/backups/opendr/full-20260412 \
+     --incremental /var/backups/opendr/inc-20260412-01 \
+     --target-data-dir /var/lib/opendr/data \
+     --dry-run
+   ```
+
+4. Restore:
+
+   ```bash
+   opendr-restore \
+     --backup /var/backups/opendr/full-20260412 \
+     --incremental /var/backups/opendr/inc-20260412-01 \
+     --target-data-dir /var/lib/opendr/data
+   ```
+
+5. Start OpenDR.
+6. Validate LDAP bind and search.
+7. Remove `/var/lib/opendr/data.before-restore` only after validation and any
+   operational hold period.
+
+If you intentionally want restore to replace a non-empty target directory, pass
+`--force`:
+
+```bash
+opendr-restore \
+  --backup /var/backups/opendr/full-20260412 \
+  --target-data-dir /var/lib/opendr/data \
+  --force
+```
+
+Prefer the move-aside flow above for production because it gives an immediate
+rollback path.
+
+## Validation Checklist
+
+Before backup:
+
+- Confirm `[backend].backend_type = "lmdb"`.
+- Confirm `data_directory` points at the active LMDB directory.
+- For incrementals, confirm provider or both replication mode is enabled and
+  `state_storage_path` is persistent.
+- Confirm the backup target filesystem has enough free space.
+
+After backup:
+
+- Run `opendr-backup inspect --backup <backup-dir>`.
+- Copy the backup directory to remote storage.
+- Run `opendr-backup inspect` again on the copied backup.
+- Record the backup ID, parent backup ID, and checkpoint CSN from the manifest.
+
+Before restore:
+
+- Stop the target OpenDR server.
+- Verify the restore chain order: full, then each incremental in sequence.
+- Run `opendr-restore --dry-run`.
+- Restore into a new or empty directory unless using `--force` deliberately.
+
+After restore:
+
+- Start OpenDR with the restored `data_directory`.
+- Verify admin bind succeeds.
+- Search for known entries that existed at the backup point.
+- For restored incrementals, verify entries modified after the full backup are
+  present.
+- Monitor startup logs for LMDB or schema errors.
 
 ## Operational Notes
 
 - Full online backup can run while the LDAP server is serving reads and writes.
-- Full online backup may increase source LMDB file growth if it overlaps heavy write traffic.
-- Incremental backup requires provider changelog persistence and adequate changelog retention.
-- A stale or incomplete changelog window is a hard failure for incremental backup.
-- Restore should be validated before use with `--dry-run` where possible.
+- A full online backup is a point-in-time LMDB snapshot. Writes committed after
+  the LMDB copy snapshot are not included in that full backup.
+- Full online backup may increase source LMDB file growth if it overlaps heavy
+  write traffic, because LMDB must preserve pages visible to the read
+  transaction.
+- Incremental backup requires provider changelog persistence and adequate
+  changelog retention.
+- If `changelog_capacity` is too small for the write volume between backups,
+  the required window may be pruned. Increase `changelog_capacity` or take full
+  backups more often.
+- Restore does not perform cross-version migrations. Treat manifest format and
+  OpenDR version changes as compatibility boundaries.
+- Restore does not merge with existing data. It restores a full LMDB data
+  directory and then applies an ordered incremental chain.
+
+## Troubleshooting
+
+### `backup only supports the lmdb backend`
+
+The configured backend is not `lmdb`. Change `[backend].backend_type` to `lmdb`
+and use a persistent `data_directory`.
+
+### `<target> must be empty`
+
+The backup target directory already contains files. Use a new directory or
+remove the incomplete backup target after confirming it is safe to delete.
+
+### `provider changelog not found`
+
+Incremental backup cannot find
+`<replication.state_storage_path>/provider_changelog.json`. Enable replication
+provider or both mode, keep changelog persistence on durable storage, and take a
+new full backup before retrying incrementals.
+
+### `persisted changelog is behind backend contextCSN`
+
+The current LMDB backend contains changes newer than the persisted changelog
+snapshot. Retry after the provider changelog is persisted, or take a new full
+backup.
+
+### `is not empty; pass --force to replace it`
+
+Restore refuses to overwrite the target data directory by default. Prefer moving
+the current directory aside and restoring into a new empty directory. Use
+`--force` only when replacement is intentional.
+
+## Test Coverage
+
+Backup/restore behavior is covered by:
+
+```bash
+cargo test --test backup_restore_integration
+cargo test --test backup_restore_server_integration
+```
+
+The server integration test starts OpenDR with LMDB, writes data through LDAP,
+creates a full backup while the source server is still running, restores the
+backup into another data directory, starts a second OpenDR server, and verifies
+the LDAP data from the restored server.
