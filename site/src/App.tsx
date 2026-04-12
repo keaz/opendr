@@ -809,9 +809,10 @@ cargo build --release`}</code></pre>
               </table>
 
               <div className="callout warning">
-                <strong>Current distinction:</strong> FSM simple bind and
-                anonymous bind are wired. SASL PLAIN is supported over LDAPS or
-                StartTLS; other SASL mechanisms are not production-enabled.
+                <strong>Authentication support:</strong> FSM and legacy
+                runtimes support simple bind, anonymous bind, and SASL PLAIN
+                over LDAPS or StartTLS. Other SASL mechanisms are not
+                production-enabled.
               </div>
             </section>
 
