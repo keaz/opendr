@@ -330,7 +330,43 @@ rules_file = "/etc/opendr/aci.toml"
 | --- | --- | --- |
 | `enabled` | `true` | Enables ACI engine construction |
 | `default_policy` | `deny` | `allow` or `deny` |
-| `rules_file` | unset | Parsed but not loaded by the shipped startup path yet |
+| `rules_file` | unset | TOML rule file loaded at startup when access control is enabled |
+
+The `rules_file` points to a TOML file with one or more `[[rules]]` tables. Rules
+are evaluated by descending `priority`; an explicit deny or grant wins before the
+default policy is applied. `effect` accepts `grant`, `allow`, or `deny`.
+Permissions are `read`, `search`, `compare`, `add`, `modify`, `delete`, `write`,
+and `proxy`; `write` grants add, modify, and delete checks.
+
+```toml
+[[rules]]
+name = "operators-search"
+effect = "grant"
+priority = 50
+permissions = ["search"]
+target = { subtree = "dc=example,dc=com" }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
+
+[[rules]]
+name = "operators-read-visible-attrs"
+effect = "grant"
+priority = 40
+permissions = ["read"]
+target = { subtree = "dc=example,dc=com", attributes = ["cn", "mail", "objectClass"] }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
+
+[[rules]]
+name = "hide-passwords"
+effect = "deny"
+priority = 100
+permissions = ["read"]
+target = { subtree = "dc=example,dc=com", attributes = ["userPassword"] }
+subject = { all_authenticated = true }
+```
+
+Each rule target sets one of `dn`, `subtree`, or `attributes`, or combines
+`attributes` with `dn` or `subtree`. Each subject sets exactly one of `user`,
+`group`, `all_authenticated`, `all`, or `self_entry`.
 
 ## Performance
 

@@ -220,8 +220,8 @@ requests `+` or explicit operational attribute names.
 
 - FSM runtime simple bind, anonymous bind, and SASL PLAIN over confidential
   transport are wired. Other SASL mechanisms are not production-enabled.
-- `access_control.rules_file` is parsed but not loaded by the shipped startup
-  path.
+- The ACI engine loads `access_control.rules_file` at startup and enforces
+  operation-level and attribute-level rules in the server paths.
 - `performance.indexing_enabled` and `performance.cache_size` are wired into
   startup; other performance fields are parsed for forward compatibility.
 - Restore applies incrementals with default LMDB index configuration; keep the

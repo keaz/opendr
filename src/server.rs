@@ -2511,6 +2511,87 @@ pub(crate) async fn authorize_operation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn authorize_attribute_permissions(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    message_id: u32,
+    response_op: ResponseOp,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+    attribute_permission: Permission,
+    operation: &str,
+    target_dn: &str,
+    attributes: &[String],
+) -> Result<bool, ServerError> {
+    for attribute in attributes {
+        if !authorize_operation(
+            socket,
+            Some(backend),
+            message_id,
+            response_op,
+            session,
+            request_context,
+            attribute_permission,
+            operation,
+            target_dn,
+            Some(attribute),
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+pub(crate) async fn filter_search_entry_for_read_access(
+    backend: &dyn DirectoryBackend,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+    entry: DirectoryEntry,
+) -> Option<DirectoryEntry> {
+    let Some(security) = request_context.security.as_ref() else {
+        return Some(entry);
+    };
+    let Some(aci_engine) = security.access_control.as_ref() else {
+        return Some(entry);
+    };
+
+    if is_root_dn(session, request_context) {
+        return Some(entry);
+    }
+
+    match aci_engine
+        .filter_readable_entry_with_backend(session.bound_dn(), &entry, backend)
+        .await
+    {
+        Ok(filtered_entry) => filtered_entry,
+        Err(err) => {
+            warn!("Failed to apply search read ACI for {}: {}", entry.dn, err);
+            None
+        }
+    }
+}
+
+pub(crate) async fn filter_search_entries_for_read_access(
+    backend: &dyn DirectoryBackend,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+    entries: Vec<DirectoryEntry>,
+) -> Vec<DirectoryEntry> {
+    let mut readable_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(entry) =
+            filter_search_entry_for_read_access(backend, session, request_context, entry).await
+        {
+            readable_entries.push(entry);
+        }
+    }
+    readable_entries
+}
+
 fn parse_sasl_plain_credentials(
     credentials: Option<&[u8]>,
 ) -> Result<(String, String, Vec<u8>), &'static str> {
@@ -3696,6 +3777,8 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         &request,
         deref_aliases,
         manage_dsa_it,
+        session,
+        request_context,
         search_deadline,
     )
     .await
@@ -3949,6 +4032,7 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_search_result_set(
     backend: &dyn DirectoryBackend,
     effective_base_dn: &str,
@@ -3956,6 +4040,8 @@ async fn collect_search_result_set(
     request: &SearchRequest<'_>,
     deref_aliases: ldap_parser::ldap::DerefAliases,
     manage_dsa_it: bool,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
     search_deadline: Option<Instant>,
 ) -> Result<SearchResultSet, SearchExecutionError> {
     if request.scope == ldap_parser::ldap::SearchScope::BaseObject {
@@ -3966,6 +4052,8 @@ async fn collect_search_result_set(
             request,
             deref_aliases,
             manage_dsa_it,
+            session,
+            request_context,
             search_deadline,
         )
         .await;
@@ -4028,6 +4116,12 @@ async fn collect_search_result_set(
             continue;
         }
 
+        let Some(entry) =
+            filter_search_entry_for_read_access(backend, session, request_context, entry).await
+        else {
+            continue;
+        };
+
         if !entry_matches_filter(&entry, &request.filter) {
             continue;
         }
@@ -4060,6 +4154,7 @@ async fn collect_search_result_set(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_base_object_search_result_set(
     backend: &dyn DirectoryBackend,
     effective_base_dn: &str,
@@ -4067,6 +4162,8 @@ async fn collect_base_object_search_result_set(
     request: &SearchRequest<'_>,
     deref_aliases: ldap_parser::ldap::DerefAliases,
     manage_dsa_it: bool,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
     search_deadline: Option<Instant>,
 ) -> Result<SearchResultSet, SearchExecutionError> {
     trace_search(format_args!(
@@ -4143,6 +4240,17 @@ async fn collect_base_object_search_result_set(
             time_limit_hit: false,
         });
     }
+
+    let Some(entry) =
+        filter_search_entry_for_read_access(backend, session, request_context, entry).await
+    else {
+        return Ok(SearchResultSet {
+            entries: Vec::new(),
+            references: Vec::new(),
+            size_limit_hit: false,
+            time_limit_hit: false,
+        });
+    };
 
     if !entry_matches_filter(&entry, &request.filter) {
         return Ok(SearchResultSet {
@@ -4569,6 +4677,8 @@ async fn build_sync_search_entry_from_change(
     base_dn: &str,
     request: &SearchRequest<'_>,
     attribute_selection: &[String],
+    session: &ConnectionSession,
+    request_context: &RequestContext,
 ) -> Result<Option<SyncSearchEntry>, ServerError> {
     let cookie = Some(sync_cookie_from_csn(&change.csn));
     match change.change_type {
@@ -4577,9 +4687,15 @@ async fn build_sync_search_entry_from_change(
             let Some(entry) = serialized_entry_from_change(change) else {
                 return Ok(None);
             };
-            if !sync_scope_matches(&entry.dn, base_dn, request.scope)
-                || !entry_matches_filter(&entry, &request.filter)
-            {
+            if !sync_scope_matches(&entry.dn, base_dn, request.scope) {
+                return Ok(None);
+            }
+            let Some(entry) =
+                filter_search_entry_for_read_access(backend, session, request_context, entry).await
+            else {
+                return Ok(None);
+            };
+            if !entry_matches_filter(&entry, &request.filter) {
                 return Ok(None);
             }
             let state = if matches!(
@@ -4603,6 +4719,11 @@ async fn build_sync_search_entry_from_change(
             if !sync_scope_matches(&entry.dn, base_dn, request.scope) {
                 return Ok(None);
             }
+            let Some(entry) =
+                filter_search_entry_for_read_access(backend, session, request_context, entry).await
+            else {
+                return Ok(None);
+            };
             if !entry.attributes.is_empty() && !entry_matches_filter(&entry, &request.filter) {
                 return Ok(None);
             }
@@ -4639,9 +4760,15 @@ async fn build_sync_search_entry_from_change(
                         "renamed entry {target_dn} missing during sync replay"
                     )))
                 })?;
-            if !sync_scope_matches(&entry.dn, base_dn, request.scope)
-                || !entry_matches_filter(&entry, &request.filter)
-            {
+            if !sync_scope_matches(&entry.dn, base_dn, request.scope) {
+                return Ok(None);
+            }
+            let Some(entry) =
+                filter_search_entry_for_read_access(backend, session, request_context, entry).await
+            else {
+                return Ok(None);
+            };
+            if !entry_matches_filter(&entry, &request.filter) {
                 return Ok(None);
             }
             Ok(Some(SyncSearchEntry {
@@ -4822,6 +4949,8 @@ pub(crate) async fn handle_sync_search_request(
             request,
             request.deref_aliases,
             manage_dsa_it,
+            connection_session,
+            request_context,
             search_deadline,
         )
         .await
@@ -4878,6 +5007,8 @@ pub(crate) async fn handle_sync_search_request(
                 base_dn,
                 request,
                 attribute_selection,
+                connection_session,
+                request_context,
             )
             .await?
             {
@@ -5024,6 +5155,8 @@ pub(crate) async fn handle_sync_search_request(
                     base_dn,
                     request,
                     attribute_selection,
+                    connection_session,
+                    request_context,
                 )
                 .await?
                 {
@@ -5555,6 +5688,23 @@ pub(crate) async fn handle_modify_request_with_context(
         return Ok(());
     }
 
+    if !authorize_attribute_permissions(
+        socket,
+        backend,
+        message_id,
+        ResponseOp::Modify,
+        session,
+        request_context,
+        Permission::Modify,
+        "modify",
+        &dn,
+        &modified_attributes,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     match backend
         .modify_entry_with_actor(&dn, modifications, session.bound_dn().map(str::to_string))
         .await
@@ -5652,6 +5802,24 @@ pub(crate) async fn handle_add_request_with_context(
         "add",
         &dn,
         None,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let added_attributes = entry.attributes.keys().cloned().collect::<Vec<_>>();
+    if !authorize_attribute_permissions(
+        socket,
+        backend,
+        message_id,
+        ResponseOp::Add,
+        session,
+        request_context,
+        Permission::Add,
+        "add",
+        &dn,
+        &added_attributes,
     )
     .await?
     {

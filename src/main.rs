@@ -68,13 +68,22 @@ async fn build_legacy_security_config(
     };
 
     let access_control = if config.access_control.enabled {
-        Some(Arc::new(
-            match config.access_control.default_policy.as_str() {
-                "allow" => AciEngine::permissive(),
-                "deny" => AciEngine::restrictive(),
-                other => return Err(format!("unsupported access control policy: {}", other).into()),
-            },
-        ))
+        let engine = match config.access_control.default_policy.as_str() {
+            "allow" => AciEngine::permissive(),
+            "deny" => AciEngine::restrictive(),
+            other => return Err(format!("unsupported access control policy: {}", other).into()),
+        };
+
+        if let Some(rules_file) = config.access_control.rules_file.as_ref() {
+            let loaded_rules = engine.load_rules_from_file(rules_file).await?;
+            log::info!(
+                "Loaded {} ACI rule(s) from {}",
+                loaded_rules,
+                rules_file.display()
+            );
+        }
+
+        Some(Arc::new(engine))
     } else {
         None
     };
@@ -932,5 +941,54 @@ mod tests {
             .authenticate("cn=manager,dc=example,dc=org", b"wrong")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn build_legacy_security_config_loads_aci_rules_file() {
+        let mut rules_file = NamedTempFile::new().unwrap();
+        write!(
+            rules_file,
+            r#"
+[[rules]]
+name = "reader-cn"
+effect = "grant"
+priority = 10
+permissions = ["read"]
+target = {{ subtree = "dc=example,dc=com", attributes = ["cn"] }}
+subject = {{ user = "cn=reader,dc=example,dc=com" }}
+"#
+        )
+        .unwrap();
+
+        let mut config = ServerConfig::default();
+        config.audit.enabled = false;
+        config.access_control.enabled = true;
+        config.access_control.default_policy = "deny".to_string();
+        config.access_control.rules_file = Some(rules_file.path().to_path_buf());
+
+        let security = build_legacy_security_config(&config)
+            .await
+            .unwrap()
+            .unwrap();
+        let aci_engine = security.access_control.as_ref().unwrap();
+
+        assert!(aci_engine
+            .check_permission(
+                Some("cn=reader,dc=example,dc=com"),
+                "uid=target,dc=example,dc=com",
+                Some("cn"),
+                opendr::aci::Permission::Read,
+            )
+            .await
+            .is_ok());
+        assert!(aci_engine
+            .check_permission(
+                Some("cn=reader,dc=example,dc=com"),
+                "uid=target,dc=example,dc=com",
+                Some("mail"),
+                opendr::aci::Permission::Read,
+            )
+            .await
+            .is_err());
     }
 }

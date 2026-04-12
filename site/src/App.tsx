@@ -340,7 +340,7 @@ log_connections = true`,
   },
   {
     title: "`[access_control]`",
-    intro: "Default ACI policy wiring used by the current startup path.",
+    intro: "ACI engine policy and startup-loaded rule file.",
     snippet: `[access_control]
 enabled = true
 default_policy = "deny"
@@ -348,7 +348,7 @@ rules_file = "/etc/opendr/aci.toml"`,
     options: [
       ["enabled", "Enables construction of the access-control engine."],
       ["default_policy", "Default decision when no rule allows the request. Use deny unless you are doing local bring-up."],
-      ["rules_file", "Parsed as a config option, but the shipped startup path does not load this file yet."],
+      ["rules_file", "TOML rule file loaded at startup when access control is enabled."],
     ],
   },
   {
@@ -370,12 +370,36 @@ query_optimization = true`,
   },
 ];
 
+const aciRulesExample = `[[rules]]
+name = "operators-search"
+effect = "grant"
+priority = 50
+permissions = ["search"]
+target = { subtree = "dc=example,dc=com" }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
+
+[[rules]]
+name = "operators-read-visible-attrs"
+effect = "grant"
+priority = 40
+permissions = ["read"]
+target = { subtree = "dc=example,dc=com", attributes = ["cn", "mail", "objectClass"] }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
+
+[[rules]]
+name = "hide-passwords"
+effect = "deny"
+priority = 100
+permissions = ["read"]
+target = { subtree = "dc=example,dc=com", attributes = ["userPassword"] }
+subject = { all_authenticated = true }`;
+
 const operationsRows = [
   ["LDAP operations", "Simple bind, anonymous bind, search, add, modify, delete, ModifyDN, compare, abandon, and unbind."],
   ["Extended operations", "StartTLS, Password Modify, WhoAmI, and Cancel are wired in the FSM server path."],
   ["Controls", "Paged results, server-side sort, ManageDsaIT, and LDAP Sync controls are supported."],
   ["Schema", "Core schema validates required attributes, structural classes, unknown attributes, and single-value constraints."],
-  ["ACI", "Default allow or deny policy is built at startup. Rule file loading is not wired yet."],
+  ["ACI", "Startup loads TOML ACI rules, then applies operation-level and attribute-level checks for search and write paths."],
   ["Monitoring", "Prometheus metrics, JSON health, and the read-only management console are served from the configured monitoring listener."],
 ];
 
@@ -1085,6 +1109,15 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
                     <KeyValueTable headings={["Option", "How to configure it"]} rows={item.options} />
                   </section>
                 ))}
+                <section className="config-section">
+                  <h3><code>aci.toml</code></h3>
+                  <p>
+                    Rules grant or deny permissions by priority, target, and
+                    subject. Attribute targets limit which values are returned
+                    by search or accepted by writes.
+                  </p>
+                  <pre><code>{aciRulesExample}</code></pre>
+                </section>
               </div>
 
               <a className="text-link" href={docsHref("CONFIGURATION.md")}>Read the complete configuration reference</a>

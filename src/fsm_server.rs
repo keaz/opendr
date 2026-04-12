@@ -66,16 +66,17 @@ use crate::search_fsm::{
     EntryFormatter, SearchBackend, SearchEntry, SearchFsmConfig, SearchFsmError, SearchFsmImpl,
 };
 use crate::server::{
-    authorize_operation, build_entry_from_add_request, compute_new_dn,
-    entry_is_referral as directory_entry_is_referral, extract_search_hint,
-    handle_sync_search_request, increment_control_counter, log_add_audit_event, log_anonymous_bind,
-    log_compare_audit, log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event,
-    log_modify_audit_event, log_password_modify_audit_event, log_sasl_bind,
-    log_simple_bind_failure, log_simple_bind_success, parse_sync_request_control,
-    referral_urls_for_entry, reject_sync_request, resolve_search_base_dn,
-    resolve_search_candidate_entry, CancelRequestOutcome, ConnectionOperationRegistry,
-    ConnectionSession, LegacySecurityConfig, LegacyServerConfig, PagedSearchCursor, RequestContext,
-    SearchRequestSignature, ServerError, SyncRequestError,
+    authorize_attribute_permissions, authorize_operation, build_entry_from_add_request,
+    compute_new_dn, entry_is_referral as directory_entry_is_referral, extract_search_hint,
+    filter_search_entries_for_read_access, handle_sync_search_request, increment_control_counter,
+    log_add_audit_event, log_anonymous_bind, log_compare_audit, log_delete_audit_event,
+    log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
+    log_password_modify_audit_event, log_sasl_bind, log_simple_bind_failure,
+    log_simple_bind_success, parse_sync_request_control, referral_urls_for_entry,
+    reject_sync_request, resolve_search_base_dn, resolve_search_candidate_entry,
+    CancelRequestOutcome, ConnectionOperationRegistry, ConnectionSession, LegacySecurityConfig,
+    LegacyServerConfig, PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError,
+    SyncRequestError,
 };
 use crate::shutdown::ShutdownCoordinator;
 use crate::sync_controls::SYNC_REQUEST_OID;
@@ -1536,6 +1537,14 @@ async fn handle_search_request_with_fsm_runtime(
             }
         }
     }
+
+    preloaded_entries = filter_search_entries_for_read_access(
+        backend.as_ref(),
+        &session,
+        request_context,
+        preloaded_entries,
+    )
+    .await;
     if let Some(requested_sort) = requested_sort.as_ref() {
         sort_native_search_entries(&mut preloaded_entries, requested_sort);
     }
@@ -3084,6 +3093,30 @@ async fn handle_modify_request_with_fsm_runtime(
         return Ok(());
     }
 
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_attribute_permissions(
+            stream,
+            backend.as_ref(),
+            request.message_id as u32,
+            ResponseOp::Modify,
+            &session,
+            request_context,
+            Permission::Modify,
+            "modify",
+            &dn,
+            &modified_attributes,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
     let write_config = WriteFsmConfig {
         strict_schema_validation: false,
         enable_aci_checks: false,
@@ -3188,6 +3221,31 @@ async fn handle_add_request_with_fsm_runtime(
             "add",
             &dn,
             None,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    let added_attributes = entry.attributes.keys().cloned().collect::<Vec<_>>();
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_attribute_permissions(
+            stream,
+            backend.as_ref(),
+            request.message_id as u32,
+            ResponseOp::Add,
+            &session,
+            request_context,
+            Permission::Add,
+            "add",
+            &dn,
+            &added_attributes,
         )
         .await
         .map_err(|err| err.to_string())?
@@ -5408,6 +5466,14 @@ mod tests {
     async fn spawn_test_connection(
         backend: Arc<dyn DirectoryBackend>,
     ) -> (tokio::task::JoinHandle<()>, TcpStream) {
+        spawn_test_connection_with_runtime_context(backend, FsmServerRuntimeContext::default())
+            .await
+    }
+
+    async fn spawn_test_connection_with_runtime_context(
+        backend: Arc<dyn DirectoryBackend>,
+        runtime_context: FsmServerRuntimeContext,
+    ) -> (tokio::task::JoinHandle<()>, TcpStream) {
         let config = FsmServerConfig {
             cleanup_interval: Duration::from_millis(50),
             ..FsmServerConfig::default()
@@ -5418,15 +5484,17 @@ mod tests {
             .acquire_connection(server_stream.peer_addr().unwrap())
             .await
             .unwrap();
+        let client_ip = server_stream.peer_addr().ok().map(|addr| addr.ip());
 
         let server_task = tokio::spawn(async move {
-            let _ = handle_connection(
-                server_stream,
+            let _ = handle_connection_with_transport(
+                ConnectionTransport::plain(server_stream),
                 backend,
                 config,
+                runtime_context,
                 pool.clone(),
                 conn_id,
-                None,
+                client_ip,
                 None,
             )
             .await;
@@ -5759,6 +5827,122 @@ mod tests {
                 assert_eq!(entry.attributes[0].attr_type.0.as_ref(), "cn");
                 assert_eq!(entry.attributes[0].attr_vals.len(), 1);
                 assert_eq!(entry.attributes[0].attr_vals[0].0.as_ref(), b"alice");
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        match &messages[1].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_filters_search_attributes_with_aci() {
+        let backend = Arc::new(MockBackend::from_credentials([(
+            "cn=admin,dc=example,dc=org",
+            b"secret".to_vec(),
+        )]));
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=target,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["target".to_string()]),
+                        ("sn".to_string(), vec!["Target".to_string()]),
+                        ("userPassword".to_string(), vec!["secret".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let aci_engine = Arc::new(crate::aci::AciEngine::restrictive());
+        aci_engine
+            .add_rule(
+                crate::aci::AciRuleBuilder::grant("admin-search")
+                    .target_subtree("dc=example,dc=org")
+                    .permission(crate::aci::Permission::Search)
+                    .subject_user("cn=admin,dc=example,dc=org")
+                    .build()
+                    .unwrap(),
+            )
+            .await;
+        aci_engine
+            .add_rule(
+                crate::aci::AciRuleBuilder::grant("admin-visible-attrs")
+                    .target_subtree("dc=example,dc=org")
+                    .target_attributes(vec!["cn".to_string(), "objectClass".to_string()])
+                    .permission(crate::aci::Permission::Read)
+                    .subject_user("cn=admin,dc=example,dc=org")
+                    .build()
+                    .unwrap(),
+            )
+            .await;
+
+        let runtime_context = FsmServerRuntimeContext {
+            security: Some(Arc::new(LegacySecurityConfig {
+                audit_logger: None,
+                audit_config: crate::server::LegacyAuditConfig::default(),
+                access_control: Some(aci_engine),
+                root_dn: Some("cn=directory manager,dc=example,dc=org".to_string()),
+            })),
+            ..FsmServerRuntimeContext::default()
+        };
+        let backend_for_server: Arc<dyn DirectoryBackend> = backend;
+        let (server_task, mut client_stream) =
+            spawn_test_connection_with_runtime_context(backend_for_server, runtime_context).await;
+
+        client_stream
+            .write_all(&encode_bind_request(1))
+            .await
+            .unwrap();
+        let bind_response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, bind_messages) = parse_ldap_messages(&bind_response).unwrap();
+        assert!(matches!(
+            bind_messages.first().map(|message| &message.protocol_op),
+            Some(ProtocolOp::BindResponse(response))
+                if response.result.result_code == ParserResultCode::Success
+        ));
+
+        client_stream
+            .write_all(&encode_search_request(
+                12,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::Present(b"objectClass".to_vec().into()),
+                &["cn", "sn", "userPassword", "objectClass"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(entry.object_name.0.as_ref(), "cn=target,dc=example,dc=org");
+                let attribute_names: Vec<&str> = entry
+                    .attributes
+                    .iter()
+                    .map(|attribute| attribute.attr_type.0.as_ref())
+                    .collect();
+                assert!(attribute_names.contains(&"cn"));
+                assert!(attribute_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("objectClass")));
+                assert!(!attribute_names.contains(&"sn"));
+                assert!(!attribute_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("userPassword")));
             }
             other => panic!("unexpected response: {:?}", other),
         }

@@ -505,13 +505,34 @@ auto_ban_duration_secs = 3600
 
 [access_control]
 enabled = true
-# Define ACIs in configuration or via LDAP
+default_policy = "deny"
+rules_file = "/etc/opendr/aci.toml"
 
 [resources]
 max_connections = 1000
 max_connections_per_ip = 10
 max_memory_per_connection = 10485760
 connection_idle_timeout_secs = 300
+```
+
+Example `/etc/opendr/aci.toml`:
+
+```toml
+[[rules]]
+name = "operators-search"
+effect = "grant"
+priority = 50
+permissions = ["search"]
+target = { subtree = "dc=example,dc=com" }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
+
+[[rules]]
+name = "operators-read-visible-attrs"
+effect = "grant"
+priority = 40
+permissions = ["read"]
+target = { subtree = "dc=example,dc=com", attributes = ["cn", "mail", "objectClass"] }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
 ```
 
 ## Testing

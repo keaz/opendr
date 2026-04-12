@@ -236,13 +236,13 @@ Important rules:
 - Consumer and both replication modes require `provider_url` and
   `enable_change_listening = true`.
 - Poll-based consumer replication has been removed.
+- `access_control.rules_file` is loaded at startup when access control is
+  enabled. See `docs/CONFIGURATION.md` for the TOML rule format.
 - Byte-based resource fields are `max_memory_per_connection` and
   `max_total_memory`.
 
 Runtime fields that are parsed but currently limited:
 
-- `access_control.rules_file` is parsed but the shipped startup path only builds
-  a default allow or deny ACI engine.
 - `performance.worker_threads`, `performance.schema_validation`, and
   `performance.query_optimization` are parsed. Current startup wiring actively
   uses `performance.indexing_enabled` and `performance.cache_size`.
