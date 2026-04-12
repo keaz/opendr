@@ -236,13 +236,13 @@ Important rules:
 - Consumer and both replication modes require `provider_url` and
   `enable_change_listening = true`.
 - Poll-based consumer replication has been removed.
+- `access_control.rules_file` is loaded at startup when access control is
+  enabled. See `docs/CONFIGURATION.md` for the TOML rule format.
 - Byte-based resource fields are `max_memory_per_connection` and
   `max_total_memory`.
 
 Runtime fields that are parsed but currently limited:
 
-- `access_control.rules_file` is parsed but the shipped startup path only builds
-  a default allow or deny ACI engine.
 - `performance.worker_threads`, `performance.schema_validation`, and
   `performance.query_optimization` are parsed. Current startup wiring actively
   uses `performance.indexing_enabled` and `performance.cache_size`.
@@ -538,6 +538,9 @@ metrics_address = "127.0.0.1"
 metrics_port = 9090
 metrics_path = "/metrics"
 health_path = "/health"
+console_enabled = true
+console_path = "/console"
+console_session_ttl_secs = 3600
 ```
 
 Endpoints:
@@ -545,7 +548,16 @@ Endpoints:
 ```bash
 curl http://127.0.0.1:9090/metrics
 curl http://127.0.0.1:9090/health
+open http://127.0.0.1:9090/console
 ```
+
+The management console is read-only and uses LDAP authentication against the
+configured root DN. If `root_user_dn` is an RDN, OpenDR combines it with
+`base_dn` for console login, for example `cn=admin,dc=example,dc=com`.
+Sessions use HttpOnly SameSite cookies, live only in the server process, and
+expire on restart or after `console_session_ttl_secs`.
+See [`MANAGEMENT_CONSOLE.md`](./MANAGEMENT_CONSOLE.md) for the route map and
+overview payload fields.
 
 Audit defaults to JSON format at `./logs/audit.log` and can log
 authentication, authorization, modifications, and connection events.

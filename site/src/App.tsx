@@ -294,19 +294,25 @@ extended = 20`,
   },
   {
     title: "`[monitoring]`",
-    intro: "HTTP endpoints for Prometheus metrics and JSON health.",
+    intro: "HTTP endpoints for Prometheus metrics, JSON health, and the read-only management console.",
     snippet: `[monitoring]
 enabled = true
 metrics_address = "127.0.0.1"
 metrics_port = 9090
 metrics_path = "/metrics"
-health_path = "/health"`,
+health_path = "/health"
+console_enabled = true
+console_path = "/console"
+console_session_ttl_secs = 3600`,
     options: [
       ["enabled", "Starts or disables the monitoring HTTP endpoint."],
       ["metrics_address", "Address the monitoring server binds to."],
       ["metrics_port", "Port for monitoring HTTP traffic."],
       ["metrics_path", "Prometheus text endpoint path."],
       ["health_path", "JSON health endpoint path."],
+      ["console_enabled", "Serves the read-only management console from the monitoring listener."],
+      ["console_path", "Browser console base path."],
+      ["console_session_ttl_secs", "Process-local console session timeout in seconds."],
     ],
   },
   {
@@ -334,7 +340,7 @@ log_connections = true`,
   },
   {
     title: "`[access_control]`",
-    intro: "Default ACI policy wiring used by the current startup path.",
+    intro: "ACI engine policy and startup-loaded rule file.",
     snippet: `[access_control]
 enabled = true
 default_policy = "deny"
@@ -342,7 +348,7 @@ rules_file = "/etc/opendr/aci.toml"`,
     options: [
       ["enabled", "Enables construction of the access-control engine."],
       ["default_policy", "Default decision when no rule allows the request. Use deny unless you are doing local bring-up."],
-      ["rules_file", "Parsed as a config option, but the shipped startup path does not load this file yet."],
+      ["rules_file", "TOML rule file loaded at startup when access control is enabled."],
     ],
   },
   {
@@ -364,13 +370,37 @@ query_optimization = true`,
   },
 ];
 
+const aciRulesExample = `[[rules]]
+name = "operators-search"
+effect = "grant"
+priority = 50
+permissions = ["search"]
+target = { subtree = "dc=example,dc=com" }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
+
+[[rules]]
+name = "operators-read-visible-attrs"
+effect = "grant"
+priority = 40
+permissions = ["read"]
+target = { subtree = "dc=example,dc=com", attributes = ["cn", "mail", "objectClass"] }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
+
+[[rules]]
+name = "hide-passwords"
+effect = "deny"
+priority = 100
+permissions = ["read"]
+target = { subtree = "dc=example,dc=com", attributes = ["userPassword"] }
+subject = { all_authenticated = true }`;
+
 const operationsRows = [
   ["LDAP operations", "Simple bind, anonymous bind, search, add, modify, delete, ModifyDN, compare, abandon, and unbind."],
   ["Extended operations", "StartTLS, Password Modify, WhoAmI, and Cancel are wired in the FSM server path."],
   ["Controls", "Paged results, server-side sort, ManageDsaIT, and LDAP Sync controls are supported."],
   ["Schema", "Core schema validates required attributes, structural classes, unknown attributes, and single-value constraints."],
-  ["ACI", "Default allow or deny policy is built at startup. Rule file loading is not wired yet."],
-  ["Monitoring", "Prometheus metrics and JSON health are served from the configured monitoring address and paths."],
+  ["ACI", "Startup loads TOML ACI rules, then applies operation-level and attribute-level checks for search and write paths."],
+  ["Monitoring", "Prometheus metrics, JSON health, and the read-only management console are served from the configured monitoring listener."],
 ];
 
 const troubleshootingRows = [
@@ -524,6 +554,7 @@ function App() {
         <nav aria-label="Top navigation">
           <a href={docsHref("DEVELOPER_GUIDE.md")}>Developer Guide</a>
           <a href={docsHref("CONFIGURATION.md")}>Configuration</a>
+          <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Management Console</a>
           <a href={docsHref("TROUBLESHOOTING.md")}>Troubleshooting</a>
           <a className="topbar-cta" href="https://github.com/keaz/opendr">GitHub</a>
         </nav>
@@ -584,6 +615,7 @@ function App() {
               <div className="chapter-links">
                 <a href={docsHref("DEVELOPER_GUIDE.md")}>Open full developer guide</a>
                 <a href={docsHref("CONFIGURATION.md")}>Open configuration reference</a>
+                <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Open management console guide</a>
                 <a href={docsHref("TROUBLESHOOTING.md")}>Open troubleshooting guide</a>
               </div>
             </section>
@@ -1077,6 +1109,15 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
                     <KeyValueTable headings={["Option", "How to configure it"]} rows={item.options} />
                   </section>
                 ))}
+                <section className="config-section">
+                  <h3><code>aci.toml</code></h3>
+                  <p>
+                    Rules grant or deny permissions by priority, target, and
+                    subject. Attribute targets limit which values are returned
+                    by search or accepted by writes.
+                  </p>
+                  <pre><code>{aciRulesExample}</code></pre>
+                </section>
               </div>
 
               <a className="text-link" href={docsHref("CONFIGURATION.md")}>Read the complete configuration reference</a>
@@ -1214,6 +1255,12 @@ types = ["ordering"]`}</code></pre>
               </p>
 
               <KeyValueTable headings={["Area", "Current behavior"]} rows={operationsRows} />
+              <p>
+                The management console is available at <code>/console</code> by
+                default on the monitoring port and requires the configured root
+                DN and password.
+              </p>
+              <a className="text-link" href={docsHref("MANAGEMENT_CONSOLE.md")}>Read the management console runbook</a>
             </section>
 
             <section className="chapter" id="troubleshooting" aria-labelledby="troubleshooting-title">
@@ -1318,6 +1365,7 @@ pnpm preview`}</code></pre>
         <nav aria-label="Footer navigation">
           <a href={docsHref("DEVELOPER_GUIDE.md")}>Developer Guide</a>
           <a href={docsHref("CONFIGURATION.md")}>Configuration</a>
+          <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Management Console</a>
           <a href={docsHref("BACKUP_RESTORE.md")}>Backup Restore</a>
           <a href={docsHref("REPLICATION_GUIDE.md")}>Replication</a>
         </nav>

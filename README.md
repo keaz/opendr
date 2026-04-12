@@ -341,6 +341,8 @@ changelog_capacity = 100000
 [monitoring]
 enabled = true
 metrics_port = 9090
+console_enabled = true
+console_path = "/console"
 
 [rate_limit]
 enabled = true
@@ -415,7 +417,7 @@ curl http://localhost:9090/metrics
 ### Health Checks
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:9090/health
 ```
 
 Response:
@@ -431,6 +433,22 @@ Response:
   "uptime_seconds": 3600
 }
 ```
+
+### Management Console
+
+OpenDR serves a read-only management console from the monitoring listener when
+monitoring is enabled:
+
+```bash
+open http://127.0.0.1:9090/console
+```
+
+The console accepts the configured root DN and password, for example
+`cn=admin,dc=example,dc=com` when `root_user_dn = "cn=admin"` and
+`base_dn = "dc=example,dc=com"`. Sessions are process-local, use HttpOnly
+SameSite cookies, and expire on restart or after the configured TTL.
+See [`docs/MANAGEMENT_CONSOLE.md`](docs/MANAGEMENT_CONSOLE.md) for the endpoint
+map, overview payload, and operating notes.
 
 ## Production Deployment
 
@@ -487,13 +505,34 @@ auto_ban_duration_secs = 3600
 
 [access_control]
 enabled = true
-# Define ACIs in configuration or via LDAP
+default_policy = "deny"
+rules_file = "/etc/opendr/aci.toml"
 
 [resources]
 max_connections = 1000
 max_connections_per_ip = 10
 max_memory_per_connection = 10485760
 connection_idle_timeout_secs = 300
+```
+
+Example `/etc/opendr/aci.toml`:
+
+```toml
+[[rules]]
+name = "operators-search"
+effect = "grant"
+priority = 50
+permissions = ["search"]
+target = { subtree = "dc=example,dc=com" }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
+
+[[rules]]
+name = "operators-read-visible-attrs"
+effect = "grant"
+priority = 40
+permissions = ["read"]
+target = { subtree = "dc=example,dc=com", attributes = ["cn", "mail", "objectClass"] }
+subject = { group = "cn=directory-operators,ou=groups,dc=example,dc=com" }
 ```
 
 ## Testing

@@ -11,7 +11,10 @@ use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBac
 use opendr::config::ServerConfig;
 use opendr::fsm_server;
 use opendr::metrics::MetricsCollector;
-use opendr::monitoring_runtime::{spawn_monitoring_server, ComponentStatus, RuntimeHealthRegistry};
+use opendr::monitoring_runtime::{
+    console_admin_dn, spawn_monitoring_server_with_context, ComponentStatus,
+    MonitoringRuntimeContext, RuntimeHealthRegistry,
+};
 use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
@@ -65,13 +68,22 @@ async fn build_legacy_security_config(
     };
 
     let access_control = if config.access_control.enabled {
-        Some(Arc::new(
-            match config.access_control.default_policy.as_str() {
-                "allow" => AciEngine::permissive(),
-                "deny" => AciEngine::restrictive(),
-                other => return Err(format!("unsupported access control policy: {}", other).into()),
-            },
-        ))
+        let engine = match config.access_control.default_policy.as_str() {
+            "allow" => AciEngine::permissive(),
+            "deny" => AciEngine::restrictive(),
+            other => return Err(format!("unsupported access control policy: {}", other).into()),
+        };
+
+        if let Some(rules_file) = config.access_control.rules_file.as_ref() {
+            let loaded_rules = engine.load_rules_from_file(rules_file).await?;
+            log::info!(
+                "Loaded {} ACI rule(s) from {}",
+                loaded_rules,
+                rules_file.display()
+            );
+        }
+
+        Some(Arc::new(engine))
     } else {
         None
     };
@@ -358,10 +370,18 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let monitoring_handle = if let (Some(metrics), Some(health)) =
         (monitoring_metrics.clone(), monitoring_health.clone())
     {
-        Some(spawn_monitoring_server(
+        Some(spawn_monitoring_server_with_context(
             config.monitoring.clone(),
             metrics,
             health,
+            MonitoringRuntimeContext {
+                console_backend: Some(backend.clone()),
+                console_admin_dn: Some(console_admin_dn(
+                    &config.server.root_user_dn,
+                    &config.server.base_dn,
+                )),
+                replication_status: Some(replication_service.status()),
+            },
             shutdown_clone.subscribe(),
         )?)
     } else {
@@ -921,5 +941,54 @@ mod tests {
             .authenticate("cn=manager,dc=example,dc=org", b"wrong")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn build_legacy_security_config_loads_aci_rules_file() {
+        let mut rules_file = NamedTempFile::new().unwrap();
+        write!(
+            rules_file,
+            r#"
+[[rules]]
+name = "reader-cn"
+effect = "grant"
+priority = 10
+permissions = ["read"]
+target = {{ subtree = "dc=example,dc=com", attributes = ["cn"] }}
+subject = {{ user = "cn=reader,dc=example,dc=com" }}
+"#
+        )
+        .unwrap();
+
+        let mut config = ServerConfig::default();
+        config.audit.enabled = false;
+        config.access_control.enabled = true;
+        config.access_control.default_policy = "deny".to_string();
+        config.access_control.rules_file = Some(rules_file.path().to_path_buf());
+
+        let security = build_legacy_security_config(&config)
+            .await
+            .unwrap()
+            .unwrap();
+        let aci_engine = security.access_control.as_ref().unwrap();
+
+        assert!(aci_engine
+            .check_permission(
+                Some("cn=reader,dc=example,dc=com"),
+                "uid=target,dc=example,dc=com",
+                Some("cn"),
+                opendr::aci::Permission::Read,
+            )
+            .await
+            .is_ok());
+        assert!(aci_engine
+            .check_permission(
+                Some("cn=reader,dc=example,dc=com"),
+                "uid=target,dc=example,dc=com",
+                Some("mail"),
+                opendr::aci::Permission::Read,
+            )
+            .await
+            .is_err());
     }
 }
