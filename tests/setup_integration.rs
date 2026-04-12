@@ -3,7 +3,7 @@
 use opendr::config::ServerConfig;
 use opendr::setup::{
     BackendType, ConsumerConfig, ProviderConfig, ReplicationConfig, ReplicationRole, SetupConfig,
-    SetupHandler,
+    SetupHandler, TlsConfig,
 };
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -28,8 +28,10 @@ async fn test_non_interactive_setup() {
         root_password: "TestPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Test Org".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -54,8 +56,10 @@ async fn test_setup_with_sample_data() {
         root_password: "AdminPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Example Organization".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: true,
@@ -85,8 +89,10 @@ async fn test_setup_creates_admin_account() {
         root_password: "SecurePass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Test Org".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -116,8 +122,10 @@ async fn test_setup_creates_base_structure() {
         root_password: "TestPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Example Org".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -149,8 +157,10 @@ async fn test_setup_with_lmdb_backend() {
         root_password: "LmdbPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "LMDB Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::Lmdb,
         data_directory: data_dir.clone(),
         import_sample_data: false,
@@ -183,8 +193,10 @@ async fn test_password_validation() {
             root_password: password.to_string(),
             ldap_port: 1389,
             ldaps_port: 1636,
+            tls: TlsConfig::default(),
             hostname: "localhost".to_string(),
             organization_name: "Test".to_string(),
+            replica_id: 1,
             backend_type: BackendType::InMemory,
             data_directory: temp_dir.path().join("data"),
             import_sample_data: false,
@@ -202,8 +214,10 @@ async fn test_password_validation() {
         root_password: "StrongPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -227,8 +241,10 @@ async fn test_setup_state_persistence() {
         root_password: "StatePass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "State Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -253,8 +269,10 @@ async fn test_complex_dn_parsing() {
         root_password: "ComplexPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Complex DN Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -277,8 +295,10 @@ async fn test_setup_config_serialization() {
         root_password: "SerialPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Serial Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::Lmdb,
         data_directory: PathBuf::from("/tmp/data"),
         import_sample_data: true,
@@ -308,8 +328,10 @@ async fn test_password_hashing_uniqueness() {
         root_password: "HashPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Hash Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -351,8 +373,10 @@ async fn test_multiple_organizational_units() {
         root_password: "OuPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "OU Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -392,8 +416,10 @@ async fn test_replication_config_provider_serialization() {
         root_password: "ReplPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Replication Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::Lmdb,
         data_directory: PathBuf::from("/tmp/data"),
         import_sample_data: false,
@@ -441,8 +467,10 @@ async fn test_replication_config_consumer_serialization() {
         root_password: "ReplPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Replication Test".to_string(),
+        replica_id: 1,
         backend_type: BackendType::Lmdb,
         data_directory: PathBuf::from("/tmp/data"),
         import_sample_data: false,
@@ -454,6 +482,8 @@ async fn test_replication_config_consumer_serialization() {
                 provider_url: "ldap://provider.example.com:1389".to_string(),
                 provider_bind_dn: Some("cn=replication".to_string()),
                 provider_bind_password: Some("secret".to_string()),
+                provider_bind_password_env: None,
+                provider_bind_password_file: None,
                 max_batch_size: 100,
                 sync_interval_secs: 60,
                 max_retry_attempts: 3,
@@ -563,8 +593,10 @@ async fn test_setup_handler_generates_loadable_config() {
         root_password: "SecurePass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Example Org".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -637,8 +669,10 @@ async fn test_setup_handler_generates_canonical_consumer_replication_config() {
         root_password: "SecurePass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "localhost".to_string(),
         organization_name: "Example Org".to_string(),
+        replica_id: 1,
         backend_type: BackendType::InMemory,
         data_directory: temp_dir.path().join("data"),
         import_sample_data: false,
@@ -650,6 +684,8 @@ async fn test_setup_handler_generates_canonical_consumer_replication_config() {
                 provider_url: "ldap://provider.example.com:1389".to_string(),
                 provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
                 provider_bind_password: Some("replica-secret".to_string()),
+                provider_bind_password_env: None,
+                provider_bind_password_file: None,
                 sync_interval_secs: 45,
                 max_retry_attempts: 8,
                 retry_delay_secs: 12,
@@ -707,5 +743,297 @@ async fn test_setup_handler_generates_canonical_consumer_replication_config() {
     assert_eq!(
         loaded_config.replication.state_storage_path,
         PathBuf::from("/tmp/opendr-repl-state")
+    );
+}
+
+#[tokio::test]
+async fn test_setup_handler_generates_canonical_both_replication_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_dir = temp_dir.path().to_path_buf();
+    let handler = SetupHandler::new(&config_dir);
+
+    let config = SetupConfig {
+        base_dn: "dc=example,dc=com".to_string(),
+        root_user_dn: "cn=manager".to_string(),
+        root_password: "SecurePass123".to_string(),
+        ldap_port: 1389,
+        ldaps_port: 1636,
+        tls: TlsConfig::default(),
+        hostname: "localhost".to_string(),
+        organization_name: "Example Org".to_string(),
+        replica_id: 3,
+        backend_type: BackendType::Lmdb,
+        data_directory: temp_dir.path().join("data"),
+        import_sample_data: false,
+        replication: ReplicationConfig {
+            enabled: true,
+            role: ReplicationRole::Both,
+            provider: Some(ProviderConfig {
+                changelog_enabled: true,
+                changelog_max_entries: 200000,
+                max_batch_size: 200,
+                enable_streaming: true,
+                heartbeat_interval_secs: 60,
+                max_concurrent_consumers: 12,
+                consumer_timeout_secs: 360,
+            }),
+            consumer: Some(ConsumerConfig {
+                provider_url: "ldap://peer.example.com:1389".to_string(),
+                provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
+                provider_bind_password: None,
+                provider_bind_password_env: Some("OPENDR_REPLICATION_BIND_PASSWORD".to_string()),
+                provider_bind_password_file: None,
+                sync_interval_secs: 15,
+                max_retry_attempts: 5,
+                retry_delay_secs: 7,
+                enable_change_listening: true,
+                heartbeat_interval_secs: 60,
+                max_batch_size: 200,
+                provider_timeout_secs: 45,
+                state_persistence_timeout_secs: 20,
+                change_buffer_size: 2048,
+                state_storage_path: temp_dir.path().join("replication_state"),
+            }),
+        },
+    };
+
+    handler
+        .run_non_interactive_setup(config.clone())
+        .await
+        .unwrap();
+
+    let config_path = config_dir.join("server.toml");
+    let config_content = tokio::fs::read_to_string(&config_path).await.unwrap();
+
+    assert!(config_content.contains("runtime = \"fsm\""));
+    assert!(config_content.contains("replica_id = 3"));
+    assert!(config_content.contains("mode = \"both\""));
+    assert!(config_content.contains("bind_dn = \"cn=replication,dc=example,dc=com\""));
+    assert!(config_content.contains("bind_password_env = \"OPENDR_REPLICATION_BIND_PASSWORD\""));
+    assert!(config_content.contains("changelog_capacity = 200000"));
+    assert!(!config_content.contains("role = "));
+    assert!(!config_content.contains("provider_bind_dn"));
+    assert!(!config_content.contains("changelog_max_entries"));
+
+    let loaded_config = ServerConfig::from_toml_str(&config_content)
+        .map_err(|e| {
+            format!(
+                "Failed to deserialize server config: {}\nConfig content:\n{}",
+                e, config_content
+            )
+        })
+        .unwrap();
+
+    assert!(loaded_config.replication.enabled);
+    assert_eq!(loaded_config.server.replica_id, 3);
+    assert_eq!(loaded_config.replication.mode, "both");
+    assert_eq!(loaded_config.replication.changelog_capacity, 200000);
+    assert_eq!(
+        loaded_config.replication.provider_url.as_deref(),
+        Some("ldap://peer.example.com:1389")
+    );
+    assert_eq!(
+        loaded_config.replication.bind_password_env.as_deref(),
+        Some("OPENDR_REPLICATION_BIND_PASSWORD")
+    );
+    assert_eq!(
+        loaded_config.replication.state_storage_path,
+        temp_dir.path().join("replication_state")
+    );
+}
+
+#[tokio::test]
+async fn test_setup_handler_generates_loadable_tls_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_dir = temp_dir.path().to_path_buf();
+    let handler = SetupHandler::new(&config_dir);
+    let cert_dir = temp_dir.path().join("certs");
+    tokio::fs::create_dir_all(&cert_dir).await.unwrap();
+    let cert_file = cert_dir.join("server.crt");
+    let key_file = cert_dir.join("server.key");
+    let ca_file = cert_dir.join("ca.crt");
+    tokio::fs::write(&cert_file, "test certificate")
+        .await
+        .unwrap();
+    tokio::fs::write(&key_file, "test private key")
+        .await
+        .unwrap();
+    tokio::fs::write(&ca_file, "test ca").await.unwrap();
+
+    let config = SetupConfig {
+        base_dn: "dc=example,dc=com".to_string(),
+        root_user_dn: "cn=manager".to_string(),
+        root_password: "SecurePass123".to_string(),
+        ldap_port: 1389,
+        ldaps_port: 1636,
+        tls: TlsConfig {
+            enabled: true,
+            cert_file: cert_file.clone(),
+            key_file: key_file.clone(),
+            ca_file: Some(ca_file.clone()),
+            require_client_cert: true,
+            min_tls_version: "1.3".to_string(),
+        },
+        hostname: "localhost".to_string(),
+        organization_name: "Example Org".to_string(),
+        replica_id: 4,
+        backend_type: BackendType::InMemory,
+        data_directory: temp_dir.path().join("data"),
+        import_sample_data: false,
+        replication: ReplicationConfig::default(),
+    };
+
+    handler
+        .run_non_interactive_setup(config.clone())
+        .await
+        .unwrap();
+
+    let config_content = tokio::fs::read_to_string(config_dir.join("server.toml"))
+        .await
+        .unwrap();
+
+    assert!(config_content.contains("[tls]"));
+    assert!(config_content.contains("enabled = true"));
+    assert!(config_content.contains("require_client_cert = true"));
+    assert!(config_content.contains("min_tls_version = \"1.3\""));
+    assert!(config_content.contains(&cert_file.display().to_string()));
+    assert!(config_content.contains(&key_file.display().to_string()));
+    assert!(config_content.contains(&ca_file.display().to_string()));
+
+    let loaded_config = ServerConfig::from_toml_str(&config_content).unwrap();
+
+    assert!(loaded_config.tls.enabled);
+    assert_eq!(loaded_config.tls.cert_file, cert_file);
+    assert_eq!(loaded_config.tls.key_file, key_file);
+    assert_eq!(loaded_config.tls.ca_file, Some(ca_file));
+    assert!(loaded_config.tls.require_client_cert);
+    assert_eq!(loaded_config.tls.min_tls_version, "1.3");
+    assert!(loaded_config.validate().is_ok());
+}
+
+#[tokio::test]
+async fn test_setup_provider_creates_replication_state_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_dir = temp_dir.path().to_path_buf();
+    let handler = SetupHandler::new(&config_dir);
+    let data_directory = temp_dir.path().join("provider_data");
+    let state_directory = data_directory.join("replication_state");
+
+    let config = SetupConfig {
+        base_dn: "dc=example,dc=com".to_string(),
+        root_user_dn: "cn=manager".to_string(),
+        root_password: "SecurePass123".to_string(),
+        ldap_port: 1389,
+        ldaps_port: 1636,
+        tls: TlsConfig::default(),
+        hostname: "localhost".to_string(),
+        organization_name: "Example Org".to_string(),
+        replica_id: 11,
+        backend_type: BackendType::InMemory,
+        data_directory,
+        import_sample_data: false,
+        replication: ReplicationConfig {
+            enabled: true,
+            role: ReplicationRole::Provider,
+            provider: Some(ProviderConfig {
+                changelog_enabled: true,
+                changelog_max_entries: 10_000,
+                max_batch_size: 100,
+                enable_streaming: true,
+                heartbeat_interval_secs: 30,
+                max_concurrent_consumers: 10,
+                consumer_timeout_secs: 300,
+            }),
+            consumer: None,
+        },
+    };
+
+    handler.run_non_interactive_setup(config).await.unwrap();
+
+    assert!(
+        state_directory.exists(),
+        "provider replication state directory should be created at {:?}",
+        state_directory
+    );
+
+    let generated_config = tokio::fs::read_to_string(config_dir.join("server.toml"))
+        .await
+        .unwrap();
+    let loaded_config = ServerConfig::from_toml_str(&generated_config).unwrap();
+
+    assert_eq!(loaded_config.replication.mode, "provider");
+    assert_eq!(
+        loaded_config.replication.state_storage_path,
+        state_directory
+    );
+}
+
+#[tokio::test]
+async fn test_setup_consumer_file_secret_source_does_not_inline_secret() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_dir = temp_dir.path().to_path_buf();
+    let handler = SetupHandler::new(&config_dir);
+    let secret_file = temp_dir.path().join("replication-password.txt");
+    tokio::fs::write(&secret_file, "file-backed-replication-secret\n")
+        .await
+        .unwrap();
+
+    let config = SetupConfig {
+        base_dn: "dc=example,dc=com".to_string(),
+        root_user_dn: "cn=manager".to_string(),
+        root_password: "SecurePass123".to_string(),
+        ldap_port: 1389,
+        ldaps_port: 1636,
+        tls: TlsConfig::default(),
+        hostname: "localhost".to_string(),
+        organization_name: "Example Org".to_string(),
+        replica_id: 12,
+        backend_type: BackendType::InMemory,
+        data_directory: temp_dir.path().join("consumer_data"),
+        import_sample_data: false,
+        replication: ReplicationConfig {
+            enabled: true,
+            role: ReplicationRole::Consumer,
+            provider: None,
+            consumer: Some(ConsumerConfig {
+                provider_url: "ldap://provider.example.com:1389".to_string(),
+                provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
+                provider_bind_password: None,
+                provider_bind_password_env: None,
+                provider_bind_password_file: Some(secret_file.clone()),
+                sync_interval_secs: 60,
+                max_retry_attempts: 5,
+                retry_delay_secs: 10,
+                enable_change_listening: true,
+                heartbeat_interval_secs: 30,
+                max_batch_size: 100,
+                provider_timeout_secs: 45,
+                state_persistence_timeout_secs: 15,
+                change_buffer_size: 1024,
+                state_storage_path: temp_dir.path().join("consumer_replication_state"),
+            }),
+        },
+    };
+
+    handler.run_non_interactive_setup(config).await.unwrap();
+
+    let generated_config = tokio::fs::read_to_string(config_dir.join("server.toml"))
+        .await
+        .unwrap();
+
+    assert!(generated_config.contains("bind_password_file = "));
+    assert!(generated_config.contains(&secret_file.display().to_string()));
+    assert!(!generated_config.contains("bind_password = "));
+    assert!(!generated_config.contains("file-backed-replication-secret"));
+
+    let loaded_config = ServerConfig::from_toml_str(&generated_config).unwrap();
+
+    assert_eq!(
+        loaded_config.replication.bind_password_file,
+        Some(secret_file)
+    );
+    assert_eq!(
+        loaded_config.resolved_replication_bind_password().unwrap(),
+        Some("file-backed-replication-secret".to_string())
     );
 }

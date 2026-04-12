@@ -72,7 +72,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             // Check if already configured
             if handler.is_configured().await? {
                 eprintln!("\n⚠️  Server is already configured!");
-                eprintln!("To reconfigure, first run: opendr-setup reset\n");
+                eprintln!(
+                    "To reconfigure, first run: opendr-setup --config-dir {} reset\n",
+                    cli.config_dir.display()
+                );
                 return Err("Server already configured".to_string());
             }
 
@@ -122,11 +125,17 @@ async fn run(cli: Cli) -> Result<(), String> {
             if handler.is_configured().await? {
                 println!("✓ Server is configured and ready to use");
                 println!("\nStart the server with:");
-                println!("  opendr-server start");
+                println!(
+                    "  opendr --config {}",
+                    cli.config_dir.join("server.toml").display()
+                );
             } else {
                 println!("✗ Server is not configured");
                 println!("\nRun setup with:");
-                println!("  opendr-setup interactive");
+                println!(
+                    "  opendr-setup --config-dir {} interactive",
+                    cli.config_dir.display()
+                );
             }
         }
 
@@ -156,16 +165,19 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
 
             // Remove configuration files
-            let config_dir = cli.config_dir;
+            let config_dir = &cli.config_dir;
             if config_dir.exists() {
-                tokio::fs::remove_dir_all(&config_dir)
+                tokio::fs::remove_dir_all(config_dir)
                     .await
                     .map_err(|e| format!("Failed to remove config directory: {}", e))?;
             }
 
             println!("✓ Server configuration has been reset");
             println!("\nRun setup again with:");
-            println!("  opendr-setup interactive");
+            println!(
+                "  opendr-setup --config-dir {} interactive",
+                cli.config_dir.display()
+            );
         }
 
         Commands::HashPassword { password } => {

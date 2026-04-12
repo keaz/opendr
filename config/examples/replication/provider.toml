@@ -63,9 +63,8 @@ cert_file = "/etc/opendr/certs/provider.crt"
 key_file = "/etc/opendr/certs/provider.key"
 ca_file = "/etc/opendr/certs/ca.crt"
 
-# TLS version (TLS12 or TLS13)
-min_version = "TLS12"
-max_version = "TLS13"
+# Minimum TLS version ("1.2" or "1.3")
+min_tls_version = "1.2"
 
 [resources]
 # Resource limits

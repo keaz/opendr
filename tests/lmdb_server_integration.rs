@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use opendr::backend::{DirectoryBackend, DirectoryEntry};
 use opendr::backend_lmdb::LmdbBackend;
-use opendr::setup::{BackendType, ReplicationConfig, SetupConfig};
+use opendr::setup::{BackendType, ReplicationConfig, SetupConfig, TlsConfig};
 use tempfile::TempDir;
 
 /// Helper function to initialize LMDB backend with test data
@@ -341,8 +341,10 @@ async fn test_setup_config_with_lmdb_backend() {
         root_password: "ManagerPass123".to_string(),
         ldap_port: 1389,
         ldaps_port: 1636,
+        tls: TlsConfig::default(),
         hostname: "testhost".to_string(),
         organization_name: "Config Test Org".to_string(),
+        replica_id: 1,
         backend_type: BackendType::Lmdb,
         data_directory: temp_dir.path().to_path_buf(),
         import_sample_data: false,

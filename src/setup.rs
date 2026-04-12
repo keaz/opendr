@@ -1,6 +1,7 @@
 // First-time setup module for OpenDR LDAP server
 // Inspired by OpenDJ setup process
 
+use crate::config::ServerConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
@@ -25,11 +26,19 @@ pub struct SetupConfig {
     /// LDAPS port (secure LDAP)
     pub ldaps_port: u16,
 
+    /// TLS/SSL configuration
+    #[serde(default)]
+    pub tls: TlsConfig,
+
     /// Server hostname
     pub hostname: String,
 
     /// Organization name
     pub organization_name: String,
+
+    /// Replica ID used in generated CSNs. Must be unique per replicated node.
+    #[serde(default = "default_setup_replica_id")]
+    pub replica_id: u16,
 
     /// Storage backend type
     pub backend_type: BackendType,
@@ -51,7 +60,7 @@ pub struct ReplicationConfig {
     /// Enable replication
     pub enabled: bool,
 
-    /// Replication role: Provider or Consumer
+    /// Replication role: Provider, Consumer, or Both
     pub role: ReplicationRole,
 
     /// Provider-specific configuration
@@ -68,9 +77,14 @@ pub struct ReplicationConfig {
 #[serde(rename_all = "PascalCase")]
 pub enum ReplicationRole {
     /// Provider (master) server
+    #[serde(alias = "provider")]
     Provider,
     /// Consumer (replica) server
+    #[serde(alias = "consumer")]
     Consumer,
+    /// Provider and consumer on the same node
+    #[serde(alias = "both")]
+    Both,
 }
 
 /// Provider-specific replication configuration
@@ -114,6 +128,14 @@ pub struct ConsumerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_bind_password: Option<String>,
 
+    /// Environment variable containing the provider bind password
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_bind_password_env: Option<String>,
+
+    /// File containing the provider bind password
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_bind_password_file: Option<PathBuf>,
+
     /// Synchronization interval in seconds
     pub sync_interval_secs: u64,
 
@@ -150,6 +172,29 @@ pub struct ConsumerConfig {
     pub state_storage_path: PathBuf,
 }
 
+/// TLS/SSL configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Enable TLS/SSL and start the LDAPS listener
+    pub enabled: bool,
+
+    /// Server certificate file path
+    pub cert_file: PathBuf,
+
+    /// Server private key file path
+    pub key_file: PathBuf,
+
+    /// CA certificate file path for client certificate verification
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<PathBuf>,
+
+    /// Require client certificates
+    pub require_client_cert: bool,
+
+    /// Minimum TLS version: "1.2" or "1.3"
+    pub min_tls_version: String,
+}
+
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
@@ -181,6 +226,8 @@ impl Default for ConsumerConfig {
             provider_url: "ldap://provider.example.com:389".to_string(),
             provider_bind_dn: None,
             provider_bind_password: None,
+            provider_bind_password_env: None,
+            provider_bind_password_file: None,
             sync_interval_secs: 30,
             max_retry_attempts: 3,
             retry_delay_secs: 5,
@@ -191,6 +238,19 @@ impl Default for ConsumerConfig {
             state_persistence_timeout_secs: 10,
             change_buffer_size: 1000,
             state_storage_path: PathBuf::from("./data/replication_state"),
+        }
+    }
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_file: PathBuf::from("certs/server.crt"),
+            key_file: PathBuf::from("certs/server.key"),
+            ca_file: None,
+            require_client_cert: false,
+            min_tls_version: "1.2".to_string(),
         }
     }
 }
@@ -243,6 +303,10 @@ fn default_setup_change_buffer_size() -> usize {
     1000
 }
 
+fn default_setup_replica_id() -> u16 {
+    1
+}
+
 impl Default for SetupConfig {
     fn default() -> Self {
         Self {
@@ -251,13 +315,143 @@ impl Default for SetupConfig {
             root_password: String::new(),
             ldap_port: 1389,
             ldaps_port: 1636,
+            tls: TlsConfig::default(),
             hostname: "localhost".to_string(),
             organization_name: "Example Organization".to_string(),
+            replica_id: default_setup_replica_id(),
             backend_type: BackendType::Lmdb,
             data_directory: PathBuf::from("./data"),
             import_sample_data: false,
             replication: ReplicationConfig::default(),
         }
+    }
+}
+
+impl ReplicationRole {
+    fn as_runtime_mode(&self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Consumer => "consumer",
+            Self::Both => "both",
+        }
+    }
+
+    fn requires_provider(&self) -> bool {
+        matches!(self, Self::Provider | Self::Both)
+    }
+
+    fn requires_consumer(&self) -> bool {
+        matches!(self, Self::Consumer | Self::Both)
+    }
+}
+
+impl SetupConfig {
+    fn backend_type_name(&self) -> &str {
+        match self.backend_type {
+            BackendType::Lmdb => "lmdb",
+            BackendType::InMemory => "memory",
+            BackendType::Custom(ref name) => name.as_str(),
+        }
+    }
+
+    fn replication_state_storage_path(&self) -> Option<PathBuf> {
+        if !self.replication.enabled {
+            return None;
+        }
+
+        if self.replication.role.requires_consumer() {
+            return self
+                .replication
+                .consumer
+                .as_ref()
+                .map(|consumer| consumer.state_storage_path.clone());
+        }
+
+        Some(self.data_directory.join("replication_state"))
+    }
+
+    fn to_server_config(&self, hashed_root_password: String) -> Result<ServerConfig, String> {
+        let mut server_config = ServerConfig::default();
+
+        server_config.server.bind_address = self.hostname.clone();
+        server_config.server.ldap_port = self.ldap_port;
+        server_config.server.ldaps_port = self.ldaps_port;
+        server_config.server.hostname = self.hostname.clone();
+        server_config.server.runtime = "fsm".to_string();
+        server_config.server.replica_id = self.replica_id;
+        server_config.server.base_dn = self.base_dn.clone();
+        server_config.server.root_user_dn = self.root_user_dn.clone();
+        server_config.server.root_password = hashed_root_password;
+        server_config.server.organization_name = self.organization_name.clone();
+
+        server_config.tls.enabled = self.tls.enabled;
+        server_config.tls.cert_file = self.tls.cert_file.clone();
+        server_config.tls.key_file = self.tls.key_file.clone();
+        server_config.tls.ca_file = self.tls.ca_file.clone();
+        server_config.tls.require_client_cert = self.tls.require_client_cert;
+        server_config.tls.min_tls_version = self.tls.min_tls_version.clone();
+
+        server_config.backend.backend_type = self.backend_type_name().to_string();
+        server_config.backend.data_directory = self.data_directory.clone();
+        server_config.backend.import_sample_data = self.import_sample_data;
+
+        if self.replication.enabled {
+            server_config.replication.enabled = true;
+            server_config.replication.mode = self.replication.role.as_runtime_mode().to_string();
+
+            if let Some(state_path) = self.replication_state_storage_path() {
+                server_config.replication.state_storage_path = state_path;
+            }
+
+            if self.replication.role.requires_provider() {
+                let provider = self
+                    .replication
+                    .provider
+                    .as_ref()
+                    .ok_or_else(|| "Provider replication config is required".to_string())?;
+
+                server_config.replication.changelog_enabled = provider.changelog_enabled;
+                server_config.replication.changelog_capacity = provider.changelog_max_entries;
+                server_config.replication.max_batch_size = provider.max_batch_size;
+                server_config.replication.enable_streaming = provider.enable_streaming;
+                server_config.replication.heartbeat_interval_secs =
+                    provider.heartbeat_interval_secs;
+                server_config.replication.max_concurrent_consumers =
+                    provider.max_concurrent_consumers;
+                server_config.replication.consumer_timeout_secs = provider.consumer_timeout_secs;
+            }
+
+            if self.replication.role.requires_consumer() {
+                let consumer = self
+                    .replication
+                    .consumer
+                    .as_ref()
+                    .ok_or_else(|| "Consumer replication config is required".to_string())?;
+
+                server_config.replication.provider_url = Some(consumer.provider_url.clone());
+                server_config.replication.bind_dn = consumer.provider_bind_dn.clone();
+                server_config.replication.bind_password = consumer.provider_bind_password.clone();
+                server_config.replication.bind_password_env =
+                    consumer.provider_bind_password_env.clone();
+                server_config.replication.bind_password_file =
+                    consumer.provider_bind_password_file.clone();
+                server_config.replication.sync_interval_secs = consumer.sync_interval_secs;
+                server_config.replication.max_retry_attempts = consumer.max_retry_attempts;
+                server_config.replication.retry_delay_secs = consumer.retry_delay_secs;
+                server_config.replication.enable_change_listening =
+                    consumer.enable_change_listening;
+                server_config.replication.heartbeat_interval_secs =
+                    consumer.heartbeat_interval_secs;
+                server_config.replication.max_batch_size = consumer.max_batch_size;
+                server_config.replication.provider_timeout_secs = consumer.provider_timeout_secs;
+                server_config.replication.state_persistence_timeout_secs =
+                    consumer.state_persistence_timeout_secs;
+                server_config.replication.change_buffer_size = consumer.change_buffer_size;
+                server_config.replication.state_storage_path = consumer.state_storage_path.clone();
+            }
+        }
+
+        Ok(server_config)
     }
 }
 
@@ -314,135 +508,18 @@ impl SetupHandler {
 
     /// Save setup configuration
     async fn save_config(&self, config: &SetupConfig) -> Result<(), String> {
-        // Generate server.toml content in the expected format
-        let mut content = format!(
-            r#"# OpenDR LDAP Server Configuration
-# Generated by opendr-setup on {}
-
-[server]
-bind_address = "{}"
-ldap_port = {}
-base_dn = "{}"
-root_user_dn = "{}"
-root_password = "{{SSHA512}}{}"
-
-[backend]
-backend_type = "{}"
-"#,
+        let server_config = config.to_server_config(format!(
+            "{{SSHA512}}{}",
+            self.hash_password(&config.root_password)
+        ))?;
+        let server_config_toml = server_config
+            .to_toml_string()
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+        let content = format!(
+            "# OpenDR LDAP Server Configuration\n# Generated by opendr-setup on {}\n\n{}",
             chrono::Utc::now().to_rfc3339(),
-            config.hostname,
-            config.ldap_port,
-            config.base_dn,
-            config.root_user_dn,
-            self.hash_password(&config.root_password),
-            match config.backend_type {
-                BackendType::Lmdb => "lmdb",
-                BackendType::InMemory => "memory",
-                BackendType::Custom(ref s) => s.as_str(),
-            }
+            server_config_toml
         );
-
-        // Add backend-specific config
-        if config.backend_type == BackendType::Lmdb {
-            content.push_str(&format!(
-                r#"data_directory = "{}"
-lmdb_max_size = 10737418240  # 10GB
-lmdb_max_readers = 126
-"#,
-                config.data_directory.display()
-            ));
-        }
-
-        // Add replication configuration if enabled
-        if config.replication.enabled {
-            content.push_str("\n[replication]\n");
-            content.push_str(&format!("enabled = {}\n", config.replication.enabled));
-
-            match config.replication.role {
-                ReplicationRole::Provider => {
-                    content.push_str("mode = \"provider\"\n");
-                    if let Some(ref provider) = config.replication.provider {
-                        content.push_str(&format!(
-                            "changelog_enabled = {}\n",
-                            provider.changelog_enabled
-                        ));
-                        content.push_str(&format!(
-                            "changelog_capacity = {}\n",
-                            provider.changelog_max_entries
-                        ));
-                        content
-                            .push_str(&format!("max_batch_size = {}\n", provider.max_batch_size));
-                        content.push_str(&format!(
-                            "enable_streaming = {}\n",
-                            provider.enable_streaming
-                        ));
-                        content.push_str(&format!(
-                            "heartbeat_interval_secs = {}\n",
-                            provider.heartbeat_interval_secs
-                        ));
-                        content.push_str(&format!(
-                            "max_concurrent_consumers = {}\n",
-                            provider.max_concurrent_consumers
-                        ));
-                        content.push_str(&format!(
-                            "consumer_timeout_secs = {}\n",
-                            provider.consumer_timeout_secs
-                        ));
-                    }
-                }
-                ReplicationRole::Consumer => {
-                    content.push_str("mode = \"consumer\"\n");
-                    if let Some(ref consumer) = config.replication.consumer {
-                        content
-                            .push_str(&format!("provider_url = \"{}\"\n", consumer.provider_url));
-                        if let Some(ref bind_dn) = consumer.provider_bind_dn {
-                            content.push_str(&format!("bind_dn = \"{}\"\n", bind_dn));
-                        }
-                        if let Some(ref bind_pw) = consumer.provider_bind_password {
-                            content.push_str(&format!("bind_password = \"{}\"\n", bind_pw));
-                        }
-                        content.push_str(&format!(
-                            "sync_interval_secs = {}\n",
-                            consumer.sync_interval_secs
-                        ));
-                        content
-                            .push_str(&format!("max_batch_size = {}\n", consumer.max_batch_size));
-                        content.push_str(&format!(
-                            "max_retry_attempts = {}\n",
-                            consumer.max_retry_attempts
-                        ));
-                        content.push_str(&format!(
-                            "retry_delay_secs = {}\n",
-                            consumer.retry_delay_secs
-                        ));
-                        content.push_str(&format!(
-                            "enable_change_listening = {}\n",
-                            consumer.enable_change_listening
-                        ));
-                        content.push_str(&format!(
-                            "heartbeat_interval_secs = {}\n",
-                            consumer.heartbeat_interval_secs
-                        ));
-                        content.push_str(&format!(
-                            "provider_timeout_secs = {}\n",
-                            consumer.provider_timeout_secs
-                        ));
-                        content.push_str(&format!(
-                            "state_persistence_timeout_secs = {}\n",
-                            consumer.state_persistence_timeout_secs
-                        ));
-                        content.push_str(&format!(
-                            "change_buffer_size = {}\n",
-                            consumer.change_buffer_size
-                        ));
-                        content.push_str(&format!(
-                            "state_storage_path = \"{}\"\n",
-                            consumer.state_storage_path.display()
-                        ));
-                    }
-                }
-            }
-        }
 
         // Ensure parent directory exists
         if let Some(parent) = self.config_path.parent() {
@@ -514,12 +591,76 @@ lmdb_max_readers = 126
             .parse()
             .map_err(|_| "Invalid port number".to_string())?;
 
-        // 7. Hostname
+        // 7. TLS configuration
+        let enable_tls = self
+            .prompt_with_default("Enable TLS/LDAPS? (yes/no)", "no")
+            .await?;
+        config.tls.enabled = enable_tls.to_lowercase() == "yes" || enable_tls.to_lowercase() == "y";
+
+        if config.tls.enabled {
+            config.tls.cert_file = PathBuf::from(
+                self.prompt_with_default(
+                    "TLS certificate file",
+                    config.tls.cert_file.to_string_lossy().as_ref(),
+                )
+                .await?,
+            );
+            config.tls.key_file = PathBuf::from(
+                self.prompt_with_default(
+                    "TLS private key file",
+                    config.tls.key_file.to_string_lossy().as_ref(),
+                )
+                .await?,
+            );
+
+            let require_client_cert = self
+                .prompt_with_default("Require client certificates? (yes/no)", "no")
+                .await?;
+            config.tls.require_client_cert = require_client_cert.to_lowercase() == "yes"
+                || require_client_cert.to_lowercase() == "y";
+
+            let default_ca_file = if config.tls.require_client_cert {
+                "certs/ca.crt"
+            } else {
+                ""
+            };
+            let ca_file = self
+                .prompt_with_default(
+                    "CA certificate file (required for client certs, blank for none)",
+                    default_ca_file,
+                )
+                .await?;
+            config.tls.ca_file = if ca_file.trim().is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(ca_file))
+            };
+
+            config.tls.min_tls_version = self
+                .prompt_with_default(
+                    "Minimum TLS version (1.2 or 1.3)",
+                    &config.tls.min_tls_version,
+                )
+                .await?;
+        }
+
+        // 8. Hostname
         config.hostname = self
             .prompt_with_default("Enter the server hostname", &config.hostname)
             .await?;
 
-        // 8. Backend type
+        // 9. Replica ID
+        let replica_id = self
+            .prompt_with_default(
+                "Enter the replica ID (unique per replicated node)",
+                &config.replica_id.to_string(),
+            )
+            .await?;
+        config.replica_id = replica_id
+            .parse()
+            .map_err(|_| "Invalid replica ID".to_string())?;
+
+        // 10. Backend type
         println!("\nSelect storage backend:");
         println!("  1. LMDB (recommended for production)");
         println!("  2. In-Memory (for testing only)");
@@ -532,7 +673,7 @@ lmdb_max_readers = 126
             _ => return Err("Invalid backend choice".to_string()),
         };
 
-        // 9. Data directory (only for persistent backends)
+        // 11. Data directory (only for persistent backends)
         if config.backend_type != BackendType::InMemory {
             let data_dir = self
                 .prompt_with_default(
@@ -543,14 +684,14 @@ lmdb_max_readers = 126
             config.data_directory = PathBuf::from(data_dir);
         }
 
-        // 10. Sample data
+        // 12. Sample data
         let sample_data = self
             .prompt_with_default("Import sample data? (yes/no)", "no")
             .await?;
         config.import_sample_data =
             sample_data.to_lowercase() == "yes" || sample_data.to_lowercase() == "y";
 
-        // 11. Replication configuration
+        // 13. Replication configuration
         println!("\n╔════════════════════════════════════════════════╗");
         println!("║        Replication Configuration              ║");
         println!("╚════════════════════════════════════════════════╝\n");
@@ -566,155 +707,195 @@ lmdb_max_readers = 126
             println!("\nSelect replication role:");
             println!("  1. Provider (Master) - Source of directory data");
             println!("  2. Consumer (Replica) - Receives updates from provider");
+            println!("  3. Both - Provider and consumer on this node");
 
             let role_choice = self.prompt_with_default("Enter your choice", "1").await?;
 
             config.replication.role = match role_choice.as_str() {
                 "1" => ReplicationRole::Provider,
                 "2" => ReplicationRole::Consumer,
+                "3" => ReplicationRole::Both,
                 _ => return Err("Invalid replication role choice".to_string()),
             };
 
-            match config.replication.role {
-                ReplicationRole::Provider => {
-                    println!("\n--- Provider Configuration ---");
+            if config.replication.role.requires_provider() {
+                println!("\n--- Provider Configuration ---");
 
-                    let mut provider_config = ProviderConfig::default();
+                let mut provider_config = ProviderConfig::default();
 
-                    let changelog = self
-                        .prompt_with_default("Enable changelog tracking? (yes/no)", "yes")
-                        .await?;
-                    provider_config.changelog_enabled =
-                        changelog.to_lowercase() == "yes" || changelog.to_lowercase() == "y";
+                let changelog = self
+                    .prompt_with_default("Enable changelog tracking? (yes/no)", "yes")
+                    .await?;
+                provider_config.changelog_enabled =
+                    changelog.to_lowercase() == "yes" || changelog.to_lowercase() == "y";
 
-                    if provider_config.changelog_enabled {
-                        let max_entries = self
-                            .prompt_with_default(
-                                "Maximum changelog entries",
-                                &provider_config.changelog_max_entries.to_string(),
-                            )
-                            .await?;
-                        provider_config.changelog_max_entries = max_entries
-                            .parse()
-                            .map_err(|_| "Invalid number".to_string())?;
-                    }
-
-                    let batch_size = self
+                if provider_config.changelog_enabled {
+                    let max_entries = self
                         .prompt_with_default(
-                            "Maximum batch size (entries per sync)",
-                            &provider_config.max_batch_size.to_string(),
+                            "Maximum changelog entries",
+                            &provider_config.changelog_max_entries.to_string(),
                         )
                         .await?;
-                    provider_config.max_batch_size = batch_size
+                    provider_config.changelog_max_entries = max_entries
                         .parse()
                         .map_err(|_| "Invalid number".to_string())?;
-
-                    let streaming = self
-                        .prompt_with_default("Enable real-time streaming? (yes/no)", "yes")
-                        .await?;
-                    provider_config.enable_streaming =
-                        streaming.to_lowercase() == "yes" || streaming.to_lowercase() == "y";
-
-                    let heartbeat_interval = self
-                        .prompt_with_default(
-                            "Provider heartbeat interval (seconds)",
-                            &provider_config.heartbeat_interval_secs.to_string(),
-                        )
-                        .await?;
-                    provider_config.heartbeat_interval_secs = heartbeat_interval
-                        .parse()
-                        .map_err(|_| "Invalid number".to_string())?;
-
-                    config.replication.provider = Some(provider_config);
                 }
-                ReplicationRole::Consumer => {
-                    println!("\n--- Consumer Configuration ---");
 
-                    let mut consumer_config = ConsumerConfig::default();
+                let batch_size = self
+                    .prompt_with_default(
+                        "Maximum batch size (entries per sync)",
+                        &provider_config.max_batch_size.to_string(),
+                    )
+                    .await?;
+                provider_config.max_batch_size = batch_size
+                    .parse()
+                    .map_err(|_| "Invalid number".to_string())?;
 
-                    consumer_config.provider_url = self
-                        .prompt_with_default(
-                            "Provider URL (e.g., ldap://provider.example.com:389)",
-                            &consumer_config.provider_url,
+                let streaming = self
+                    .prompt_with_default("Enable real-time streaming? (yes/no)", "yes")
+                    .await?;
+                provider_config.enable_streaming =
+                    streaming.to_lowercase() == "yes" || streaming.to_lowercase() == "y";
+
+                let heartbeat_interval = self
+                    .prompt_with_default(
+                        "Provider heartbeat interval (seconds)",
+                        &provider_config.heartbeat_interval_secs.to_string(),
+                    )
+                    .await?;
+                provider_config.heartbeat_interval_secs = heartbeat_interval
+                    .parse()
+                    .map_err(|_| "Invalid number".to_string())?;
+
+                config.replication.provider = Some(provider_config);
+            }
+
+            if config.replication.role.requires_consumer() {
+                println!("\n--- Consumer Configuration ---");
+
+                let mut consumer_config = ConsumerConfig::default();
+
+                consumer_config.provider_url = self
+                    .prompt_with_default(
+                        "Provider URL (e.g., ldap://provider.example.com:389)",
+                        &consumer_config.provider_url,
+                    )
+                    .await?;
+
+                let use_auth = self
+                    .prompt_with_default("Authenticate to provider? (yes/no)", "no")
+                    .await?;
+
+                if use_auth.to_lowercase() == "yes" || use_auth.to_lowercase() == "y" {
+                    consumer_config.provider_bind_dn = Some(
+                        self.prompt_with_default(
+                            "Provider bind DN",
+                            "cn=replication,dc=example,dc=com",
                         )
-                        .await?;
+                        .await?,
+                    );
 
-                    let use_auth = self
-                        .prompt_with_default("Authenticate to provider? (yes/no)", "no")
-                        .await?;
+                    println!("\nSelect provider bind password source:");
+                    println!("  1. Enter password now");
+                    println!("  2. Environment variable");
+                    println!("  3. File path");
 
-                    if use_auth.to_lowercase() == "yes" || use_auth.to_lowercase() == "y" {
-                        consumer_config.provider_bind_dn = Some(
-                            self.prompt_with_default(
-                                "Provider bind DN",
-                                "cn=replication,dc=example,dc=com",
-                            )
-                            .await?,
-                        );
-
-                        consumer_config.provider_bind_password =
-                            Some(self.prompt_password("Provider bind password").await?);
+                    let password_source =
+                        self.prompt_with_default("Enter your choice", "1").await?;
+                    match password_source.as_str() {
+                        "1" => {
+                            consumer_config.provider_bind_password =
+                                Some(self.prompt_password("Provider bind password").await?);
+                        }
+                        "2" => {
+                            consumer_config.provider_bind_password_env = Some(
+                                self.prompt_with_default(
+                                    "Provider bind password environment variable",
+                                    "OPENDR_REPLICATION_BIND_PASSWORD",
+                                )
+                                .await?,
+                            );
+                        }
+                        "3" => {
+                            let password_file = self
+                                .prompt_with_default(
+                                    "Provider bind password file",
+                                    "/run/secrets/opendr-replication-bind-password",
+                                )
+                                .await?;
+                            consumer_config.provider_bind_password_file =
+                                Some(PathBuf::from(password_file));
+                        }
+                        _ => return Err("Invalid password source choice".to_string()),
                     }
-
-                    let sync_interval = self
-                        .prompt_with_default(
-                            "Synchronization interval (seconds)",
-                            &consumer_config.sync_interval_secs.to_string(),
-                        )
-                        .await?;
-                    consumer_config.sync_interval_secs = sync_interval
-                        .parse()
-                        .map_err(|_| "Invalid number".to_string())?;
-
-                    let retry_attempts = self
-                        .prompt_with_default(
-                            "Maximum retry attempts",
-                            &consumer_config.max_retry_attempts.to_string(),
-                        )
-                        .await?;
-                    consumer_config.max_retry_attempts = retry_attempts
-                        .parse()
-                        .map_err(|_| "Invalid number".to_string())?;
-
-                    let retry_delay = self
-                        .prompt_with_default(
-                            "Retry delay (seconds)",
-                            &consumer_config.retry_delay_secs.to_string(),
-                        )
-                        .await?;
-                    consumer_config.retry_delay_secs = retry_delay
-                        .parse()
-                        .map_err(|_| "Invalid number".to_string())?;
-
-                    let listening = self
-                        .prompt_with_default("Enable continuous change listening? (yes/no)", "yes")
-                        .await?;
-                    consumer_config.enable_change_listening =
-                        listening.to_lowercase() == "yes" || listening.to_lowercase() == "y";
-
-                    let heartbeat_interval = self
-                        .prompt_with_default(
-                            "Listening heartbeat interval (seconds)",
-                            &consumer_config.heartbeat_interval_secs.to_string(),
-                        )
-                        .await?;
-                    consumer_config.heartbeat_interval_secs = heartbeat_interval
-                        .parse()
-                        .map_err(|_| "Invalid number".to_string())?;
-
-                    let state_path = self
-                        .prompt_with_default(
-                            "Replication state storage path",
-                            consumer_config
-                                .state_storage_path
-                                .to_string_lossy()
-                                .as_ref(),
-                        )
-                        .await?;
-                    consumer_config.state_storage_path = PathBuf::from(state_path);
-
-                    config.replication.consumer = Some(consumer_config);
                 }
+
+                let sync_interval = self
+                    .prompt_with_default(
+                        "Synchronization interval (seconds)",
+                        &consumer_config.sync_interval_secs.to_string(),
+                    )
+                    .await?;
+                consumer_config.sync_interval_secs = sync_interval
+                    .parse()
+                    .map_err(|_| "Invalid number".to_string())?;
+
+                let retry_attempts = self
+                    .prompt_with_default(
+                        "Maximum retry attempts",
+                        &consumer_config.max_retry_attempts.to_string(),
+                    )
+                    .await?;
+                consumer_config.max_retry_attempts = retry_attempts
+                    .parse()
+                    .map_err(|_| "Invalid number".to_string())?;
+
+                let retry_delay = self
+                    .prompt_with_default(
+                        "Retry delay (seconds)",
+                        &consumer_config.retry_delay_secs.to_string(),
+                    )
+                    .await?;
+                consumer_config.retry_delay_secs = retry_delay
+                    .parse()
+                    .map_err(|_| "Invalid number".to_string())?;
+
+                let listening = self
+                    .prompt_with_default("Enable continuous change listening? (yes/no)", "yes")
+                    .await?;
+                consumer_config.enable_change_listening =
+                    listening.to_lowercase() == "yes" || listening.to_lowercase() == "y";
+
+                let heartbeat_interval = self
+                    .prompt_with_default(
+                        "Listening heartbeat interval (seconds)",
+                        &consumer_config.heartbeat_interval_secs.to_string(),
+                    )
+                    .await?;
+                consumer_config.heartbeat_interval_secs = heartbeat_interval
+                    .parse()
+                    .map_err(|_| "Invalid number".to_string())?;
+
+                let state_path = self
+                    .prompt_with_default(
+                        "Replication state storage path",
+                        consumer_config
+                            .state_storage_path
+                            .to_string_lossy()
+                            .as_ref(),
+                    )
+                    .await?;
+                consumer_config.state_storage_path = PathBuf::from(state_path);
+
+                if config.replication.role == ReplicationRole::Both {
+                    if let Some(provider_config) = config.replication.provider.as_mut() {
+                        provider_config.max_batch_size = consumer_config.max_batch_size;
+                        provider_config.heartbeat_interval_secs =
+                            consumer_config.heartbeat_interval_secs;
+                    }
+                }
+
+                config.replication.consumer = Some(consumer_config);
             }
         }
 
@@ -727,7 +908,32 @@ lmdb_max_readers = 126
         println!("  Root User DN:   {}", config.root_user_dn);
         println!("  LDAP Port:      {}", config.ldap_port);
         println!("  LDAPS Port:     {}", config.ldaps_port);
+        println!(
+            "  TLS/LDAPS:      {}",
+            if config.tls.enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        );
+        if config.tls.enabled {
+            println!("  TLS Cert:       {}", config.tls.cert_file.display());
+            println!("  TLS Key:        {}", config.tls.key_file.display());
+            if let Some(ref ca_file) = config.tls.ca_file {
+                println!("  TLS CA:         {}", ca_file.display());
+            }
+            println!(
+                "  Client Certs:   {}",
+                if config.tls.require_client_cert {
+                    "Required"
+                } else {
+                    "Not required"
+                }
+            );
+            println!("  Min TLS:        {}", config.tls.min_tls_version);
+        }
         println!("  Hostname:       {}", config.hostname);
+        println!("  Replica ID:     {}", config.replica_id);
         println!("  Backend:        {:?}", config.backend_type);
         if config.backend_type != BackendType::InMemory {
             println!("  Data Directory: {}", config.data_directory.display());
@@ -745,44 +951,46 @@ lmdb_max_readers = 126
         if config.replication.enabled {
             println!("\n  Replication:    Enabled");
             println!("  Role:           {:?}", config.replication.role);
-            match config.replication.role {
-                ReplicationRole::Provider => {
-                    if let Some(ref provider) = config.replication.provider {
-                        println!(
-                            "  Changelog:      {}",
-                            if provider.changelog_enabled {
-                                "Enabled"
-                            } else {
-                                "Disabled"
-                            }
-                        );
+            if config.replication.role.requires_provider() {
+                if let Some(ref provider) = config.replication.provider {
+                    println!(
+                        "  Changelog:      {}",
                         if provider.changelog_enabled {
-                            println!("  Max Entries:    {}", provider.changelog_max_entries);
+                            "Enabled"
+                        } else {
+                            "Disabled"
                         }
-                        println!("  Batch Size:     {}", provider.max_batch_size);
-                        println!(
-                            "  Streaming:      {}",
-                            if provider.enable_streaming {
-                                "Enabled"
-                            } else {
-                                "Disabled"
-                            }
-                        );
+                    );
+                    if provider.changelog_enabled {
+                        println!("  Max Entries:    {}", provider.changelog_max_entries);
                     }
+                    println!("  Batch Size:     {}", provider.max_batch_size);
+                    println!(
+                        "  Streaming:      {}",
+                        if provider.enable_streaming {
+                            "Enabled"
+                        } else {
+                            "Disabled"
+                        }
+                    );
                 }
-                ReplicationRole::Consumer => {
-                    if let Some(ref consumer) = config.replication.consumer {
-                        println!("  Provider URL:   {}", consumer.provider_url);
-                        if consumer.provider_bind_dn.is_some() {
-                            println!("  Auth:           Enabled");
-                        }
-                        println!("  Sync Interval:  {} seconds", consumer.sync_interval_secs);
-                        println!("  Retry Attempts: {}", consumer.max_retry_attempts);
-                        println!(
-                            "  State Path:     {}",
-                            consumer.state_storage_path.display()
-                        );
+            }
+            if config.replication.role.requires_consumer() {
+                if let Some(ref consumer) = config.replication.consumer {
+                    println!("  Provider URL:   {}", consumer.provider_url);
+                    if consumer.provider_bind_dn.is_some() {
+                        println!("  Auth:           Enabled");
                     }
+                    println!(
+                        "  Password Source: {}",
+                        replication_password_source_summary(consumer)
+                    );
+                    println!("  Sync Interval:  {} seconds", consumer.sync_interval_secs);
+                    println!("  Retry Attempts: {}", consumer.max_retry_attempts);
+                    println!(
+                        "  State Path:     {}",
+                        consumer.state_storage_path.display()
+                    );
                 }
             }
         } else {
@@ -827,17 +1035,15 @@ lmdb_max_readers = 126
                 .map_err(|e| format!("Failed to create data directory: {}", e))?;
         }
 
-        // 1b. Create replication state directory if consumer
-        if config.replication.enabled && config.replication.role == ReplicationRole::Consumer {
-            if let Some(ref consumer) = config.replication.consumer {
-                println!(
-                    "  ✓ Creating replication state directory: {}",
-                    consumer.state_storage_path.display()
-                );
-                fs::create_dir_all(&consumer.state_storage_path)
-                    .await
-                    .map_err(|e| format!("Failed to create replication state directory: {}", e))?;
-            }
+        // 1b. Create replication state directory if replication is enabled.
+        if let Some(replication_state_path) = config.replication_state_storage_path() {
+            println!(
+                "  ✓ Creating replication state directory: {}",
+                replication_state_path.display()
+            );
+            fs::create_dir_all(&replication_state_path)
+                .await
+                .map_err(|e| format!("Failed to create replication state directory: {}", e))?;
         }
 
         // 2. Initialize backend
@@ -876,7 +1082,7 @@ lmdb_max_readers = 126
 
         println!("\n✨ Setup completed successfully!\n");
         println!("You can now start the server with:");
-        println!("  opendr-server start\n");
+        println!("  opendr --config {}\n", self.config_path.display());
 
         Ok(())
     }
@@ -899,6 +1105,152 @@ lmdb_max_readers = 126
 
         if config.ldaps_port == 0 {
             return Err("Invalid LDAPS port".to_string());
+        }
+
+        if config.ldap_port == config.ldaps_port {
+            return Err("LDAP and LDAPS ports must be different".to_string());
+        }
+
+        if config.tls.enabled {
+            if config.tls.cert_file.as_os_str().is_empty() {
+                return Err("TLS certificate file cannot be empty".to_string());
+            }
+            if !config.tls.cert_file.exists() {
+                return Err(format!(
+                    "TLS certificate file not found: {}",
+                    config.tls.cert_file.display()
+                ));
+            }
+            if config.tls.key_file.as_os_str().is_empty() {
+                return Err("TLS private key file cannot be empty".to_string());
+            }
+            if !config.tls.key_file.exists() {
+                return Err(format!(
+                    "TLS private key file not found: {}",
+                    config.tls.key_file.display()
+                ));
+            }
+            if !["1.2", "1.3"].contains(&config.tls.min_tls_version.as_str()) {
+                return Err(format!(
+                    "Invalid minimum TLS version: {}",
+                    config.tls.min_tls_version
+                ));
+            }
+            if config.tls.require_client_cert && config.tls.ca_file.is_none() {
+                return Err("Client certificate verification requires a CA file".to_string());
+            }
+            if let Some(ref ca_file) = config.tls.ca_file {
+                if ca_file.as_os_str().is_empty() {
+                    return Err("TLS CA file cannot be empty".to_string());
+                }
+                if !ca_file.exists() {
+                    return Err(format!("TLS CA file not found: {}", ca_file.display()));
+                }
+            }
+        }
+
+        if config.replica_id == 0 {
+            return Err("Replica ID must be between 1 and 65535".to_string());
+        }
+
+        if config.replication.enabled {
+            if config.replication.role.requires_provider() {
+                let provider = config
+                    .replication
+                    .provider
+                    .as_ref()
+                    .ok_or_else(|| "Provider replication config is required".to_string())?;
+
+                if provider.changelog_max_entries == 0 {
+                    return Err("Changelog capacity must be > 0".to_string());
+                }
+                if provider.max_batch_size == 0 {
+                    return Err("Provider max batch size must be > 0".to_string());
+                }
+                if provider.heartbeat_interval_secs == 0 {
+                    return Err("Provider heartbeat interval must be > 0".to_string());
+                }
+                if provider.max_concurrent_consumers == 0 {
+                    return Err("Max concurrent consumers must be > 0".to_string());
+                }
+                if provider.consumer_timeout_secs == 0 {
+                    return Err("Consumer timeout must be > 0".to_string());
+                }
+            }
+
+            if config.replication.role.requires_consumer() {
+                let consumer = config
+                    .replication
+                    .consumer
+                    .as_ref()
+                    .ok_or_else(|| "Consumer replication config is required".to_string())?;
+
+                if consumer.provider_url.trim().is_empty() {
+                    return Err("Provider URL cannot be empty".to_string());
+                }
+
+                let password_sources = usize::from(consumer.provider_bind_password.is_some())
+                    + usize::from(consumer.provider_bind_password_env.is_some())
+                    + usize::from(consumer.provider_bind_password_file.is_some());
+
+                if password_sources > 1 {
+                    return Err(
+                        "Provider bind password may only use one of inline, env, or file"
+                            .to_string(),
+                    );
+                }
+
+                if consumer.sync_interval_secs == 0 {
+                    return Err("Sync interval must be > 0".to_string());
+                }
+                if consumer.max_retry_attempts == 0 {
+                    return Err("Max retry attempts must be > 0".to_string());
+                }
+                if consumer.retry_delay_secs == 0 {
+                    return Err("Retry delay must be > 0".to_string());
+                }
+                if consumer.heartbeat_interval_secs == 0 {
+                    return Err("Consumer heartbeat interval must be > 0".to_string());
+                }
+                if consumer.max_batch_size == 0 {
+                    return Err("Consumer max batch size must be > 0".to_string());
+                }
+                if consumer.provider_timeout_secs == 0 {
+                    return Err("Provider timeout must be > 0".to_string());
+                }
+                if consumer.state_persistence_timeout_secs == 0 {
+                    return Err("State persistence timeout must be > 0".to_string());
+                }
+                if consumer.change_buffer_size == 0 {
+                    return Err("Change buffer size must be > 0".to_string());
+                }
+            }
+
+            if config.replication.role == ReplicationRole::Both {
+                let provider = config
+                    .replication
+                    .provider
+                    .as_ref()
+                    .ok_or_else(|| "Provider replication config is required".to_string())?;
+                let consumer = config
+                    .replication
+                    .consumer
+                    .as_ref()
+                    .ok_or_else(|| "Consumer replication config is required".to_string())?;
+
+                if provider.max_batch_size != consumer.max_batch_size {
+                    return Err(
+                        "Both replication mode uses a single max_batch_size; provider and consumer values must match"
+                            .to_string(),
+                    );
+                }
+                if provider.heartbeat_interval_secs != consumer.heartbeat_interval_secs {
+                    return Err(
+                        "Both replication mode uses a single heartbeat_interval_secs; provider and consumer values must match"
+                            .to_string(),
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -1174,6 +1526,18 @@ fn extract_cn(dn: &str) -> Option<&str> {
     dn.split(',').next()?.split('=').nth(1)
 }
 
+fn replication_password_source_summary(config: &ConsumerConfig) -> &'static str {
+    if config.provider_bind_password.is_some() {
+        "Inline"
+    } else if config.provider_bind_password_env.is_some() {
+        "Environment"
+    } else if config.provider_bind_password_file.is_some() {
+        "File"
+    } else {
+        "None"
+    }
+}
+
 /// Parse DN into components
 fn parse_dn(dn: &str) -> Result<Vec<(String, String)>, String> {
     let mut components = Vec::new();
@@ -1192,6 +1556,279 @@ fn parse_dn(dn: &str) -> Result<Vec<(String, String)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn base_setup_config() -> SetupConfig {
+        SetupConfig {
+            base_dn: "dc=example,dc=com".to_string(),
+            root_user_dn: "cn=manager".to_string(),
+            root_password: "StrongPass123".to_string(),
+            ldap_port: 1389,
+            ldaps_port: 1636,
+            tls: TlsConfig::default(),
+            hostname: "ldap.example.com".to_string(),
+            organization_name: "Example Org".to_string(),
+            replica_id: 7,
+            backend_type: BackendType::Lmdb,
+            data_directory: PathBuf::from("/tmp/opendr/data"),
+            import_sample_data: false,
+            replication: ReplicationConfig::default(),
+        }
+    }
+
+    fn provider_config() -> ProviderConfig {
+        ProviderConfig {
+            changelog_enabled: true,
+            changelog_max_entries: 50_000,
+            max_batch_size: 250,
+            enable_streaming: true,
+            heartbeat_interval_secs: 45,
+            max_concurrent_consumers: 12,
+            consumer_timeout_secs: 360,
+        }
+    }
+
+    fn consumer_config() -> ConsumerConfig {
+        ConsumerConfig {
+            provider_url: "ldap://provider.example.com:1389".to_string(),
+            provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
+            provider_bind_password: None,
+            provider_bind_password_env: Some("OPENDR_REPLICATION_BIND_PASSWORD".to_string()),
+            provider_bind_password_file: None,
+            sync_interval_secs: 30,
+            max_retry_attempts: 5,
+            retry_delay_secs: 10,
+            enable_change_listening: true,
+            heartbeat_interval_secs: 45,
+            max_batch_size: 250,
+            provider_timeout_secs: 60,
+            state_persistence_timeout_secs: 15,
+            change_buffer_size: 2048,
+            state_storage_path: PathBuf::from("/tmp/opendr/replication_state"),
+        }
+    }
+
+    #[test]
+    fn test_replication_role_runtime_modes() {
+        assert_eq!(ReplicationRole::Provider.as_runtime_mode(), "provider");
+        assert!(ReplicationRole::Provider.requires_provider());
+        assert!(!ReplicationRole::Provider.requires_consumer());
+
+        assert_eq!(ReplicationRole::Consumer.as_runtime_mode(), "consumer");
+        assert!(!ReplicationRole::Consumer.requires_provider());
+        assert!(ReplicationRole::Consumer.requires_consumer());
+
+        assert_eq!(ReplicationRole::Both.as_runtime_mode(), "both");
+        assert!(ReplicationRole::Both.requires_provider());
+        assert!(ReplicationRole::Both.requires_consumer());
+    }
+
+    #[test]
+    fn test_provider_setup_config_maps_to_runtime_server_config() {
+        let mut config = base_setup_config();
+        config.replication = ReplicationConfig {
+            enabled: true,
+            role: ReplicationRole::Provider,
+            provider: Some(provider_config()),
+            consumer: None,
+        };
+
+        let server_config = config
+            .to_server_config("{SSHA512}hashed-root-password".to_string())
+            .unwrap();
+
+        assert_eq!(server_config.server.bind_address, "ldap.example.com");
+        assert_eq!(server_config.server.hostname, "ldap.example.com");
+        assert_eq!(server_config.server.runtime, "fsm");
+        assert_eq!(server_config.server.replica_id, 7);
+        assert_eq!(
+            server_config.server.root_password,
+            "{SSHA512}hashed-root-password"
+        );
+        assert_eq!(server_config.backend.backend_type, "lmdb");
+        assert_eq!(server_config.backend.data_directory, config.data_directory);
+        assert!(server_config.replication.enabled);
+        assert_eq!(server_config.replication.mode, "provider");
+        assert_eq!(server_config.replication.changelog_capacity, 50_000);
+        assert_eq!(server_config.replication.max_batch_size, 250);
+        assert_eq!(server_config.replication.max_concurrent_consumers, 12);
+        assert_eq!(
+            server_config.replication.state_storage_path,
+            PathBuf::from("/tmp/opendr/data/replication_state")
+        );
+        assert!(server_config.replication.provider_url.is_none());
+    }
+
+    #[test]
+    fn test_both_setup_config_maps_consumer_secret_source_to_runtime_config() {
+        let mut config = base_setup_config();
+        config.replication = ReplicationConfig {
+            enabled: true,
+            role: ReplicationRole::Both,
+            provider: Some(provider_config()),
+            consumer: Some(consumer_config()),
+        };
+
+        let server_config = config
+            .to_server_config("{SSHA512}hashed-root-password".to_string())
+            .unwrap();
+
+        assert_eq!(server_config.replication.mode, "both");
+        assert_eq!(server_config.replication.changelog_capacity, 50_000);
+        assert_eq!(
+            server_config.replication.provider_url.as_deref(),
+            Some("ldap://provider.example.com:1389")
+        );
+        assert_eq!(
+            server_config.replication.bind_dn.as_deref(),
+            Some("cn=replication,dc=example,dc=com")
+        );
+        assert_eq!(
+            server_config.replication.bind_password_env.as_deref(),
+            Some("OPENDR_REPLICATION_BIND_PASSWORD")
+        );
+        assert!(server_config.replication.bind_password.is_none());
+        assert!(server_config.replication.bind_password_file.is_none());
+        assert_eq!(server_config.replication.provider_timeout_secs, 60);
+        assert_eq!(server_config.replication.state_persistence_timeout_secs, 15);
+        assert_eq!(server_config.replication.change_buffer_size, 2048);
+        assert_eq!(
+            server_config.replication.state_storage_path,
+            PathBuf::from("/tmp/opendr/replication_state")
+        );
+    }
+
+    #[test]
+    fn test_tls_setup_config_maps_to_runtime_server_config() {
+        let mut config = base_setup_config();
+        config.tls = TlsConfig {
+            enabled: true,
+            cert_file: PathBuf::from("/etc/opendr/certs/server.crt"),
+            key_file: PathBuf::from("/etc/opendr/certs/server.key"),
+            ca_file: Some(PathBuf::from("/etc/opendr/certs/ca.crt")),
+            require_client_cert: true,
+            min_tls_version: "1.3".to_string(),
+        };
+
+        let server_config = config
+            .to_server_config("{SSHA512}hashed-root-password".to_string())
+            .unwrap();
+
+        assert!(server_config.tls.enabled);
+        assert_eq!(
+            server_config.tls.cert_file,
+            PathBuf::from("/etc/opendr/certs/server.crt")
+        );
+        assert_eq!(
+            server_config.tls.key_file,
+            PathBuf::from("/etc/opendr/certs/server.key")
+        );
+        assert_eq!(
+            server_config.tls.ca_file,
+            Some(PathBuf::from("/etc/opendr/certs/ca.crt"))
+        );
+        assert!(server_config.tls.require_client_cert);
+        assert_eq!(server_config.tls.min_tls_version, "1.3");
+    }
+
+    #[test]
+    fn test_validate_config_rejects_tls_client_certs_without_ca_file() {
+        let cert_file = tempfile::NamedTempFile::new().unwrap();
+        let key_file = tempfile::NamedTempFile::new().unwrap();
+        let mut config = base_setup_config();
+        config.tls = TlsConfig {
+            enabled: true,
+            cert_file: cert_file.path().to_path_buf(),
+            key_file: key_file.path().to_path_buf(),
+            ca_file: None,
+            require_client_cert: true,
+            min_tls_version: "1.2".to_string(),
+        };
+
+        let handler = SetupHandler::new("/tmp/test");
+        let error = handler.validate_config(&config).unwrap_err();
+
+        assert!(error.contains("requires a CA file"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_tls_version() {
+        let cert_file = tempfile::NamedTempFile::new().unwrap();
+        let key_file = tempfile::NamedTempFile::new().unwrap();
+        let mut config = base_setup_config();
+        config.tls = TlsConfig {
+            enabled: true,
+            cert_file: cert_file.path().to_path_buf(),
+            key_file: key_file.path().to_path_buf(),
+            ca_file: None,
+            require_client_cert: false,
+            min_tls_version: "1.1".to_string(),
+        };
+
+        let handler = SetupHandler::new("/tmp/test");
+        let error = handler.validate_config(&config).unwrap_err();
+
+        assert!(error.contains("Invalid minimum TLS version"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_multiple_consumer_password_sources() {
+        let mut consumer = consumer_config();
+        consumer.provider_bind_password = Some("inline-secret".to_string());
+        consumer.provider_bind_password_file = Some(PathBuf::from("/run/secrets/repl-password"));
+
+        let mut config = base_setup_config();
+        config.replication = ReplicationConfig {
+            enabled: true,
+            role: ReplicationRole::Consumer,
+            provider: None,
+            consumer: Some(consumer),
+        };
+
+        let handler = SetupHandler::new("/tmp/test");
+        let error = handler.validate_config(&config).unwrap_err();
+
+        assert!(error.contains("only use one of inline, env, or file"));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_mismatched_both_shared_runtime_fields() {
+        let mut consumer = consumer_config();
+        consumer.max_batch_size = 500;
+
+        let mut config = base_setup_config();
+        config.replication = ReplicationConfig {
+            enabled: true,
+            role: ReplicationRole::Both,
+            provider: Some(provider_config()),
+            consumer: Some(consumer),
+        };
+
+        let handler = SetupHandler::new("/tmp/test");
+        let error = handler.validate_config(&config).unwrap_err();
+
+        assert!(error.contains("single max_batch_size"));
+    }
+
+    #[test]
+    fn test_replication_password_source_summary() {
+        let mut consumer = ConsumerConfig::default();
+        assert_eq!(replication_password_source_summary(&consumer), "None");
+
+        consumer.provider_bind_password = Some("inline".to_string());
+        assert_eq!(replication_password_source_summary(&consumer), "Inline");
+
+        consumer.provider_bind_password = None;
+        consumer.provider_bind_password_env = Some("OPENDR_REPL_PASSWORD".to_string());
+        assert_eq!(
+            replication_password_source_summary(&consumer),
+            "Environment"
+        );
+
+        consumer.provider_bind_password_env = None;
+        consumer.provider_bind_password_file = Some(PathBuf::from("/run/secrets/repl"));
+        assert_eq!(replication_password_source_summary(&consumer), "File");
+    }
 
     #[test]
     fn test_parse_dn() {

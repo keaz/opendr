@@ -1309,6 +1309,19 @@ impl ServerConfig {
                     self.tls.key_file
                 )));
             }
+            if self.tls.require_client_cert && self.tls.ca_file.is_none() {
+                return Err(ConfigError::ValidationError(
+                    "Client certificate verification requires a CA file".to_string(),
+                ));
+            }
+            if let Some(ca_file) = &self.tls.ca_file {
+                if !ca_file.exists() {
+                    return Err(ConfigError::ValidationError(format!(
+                        "TLS CA file not found: {:?}",
+                        ca_file
+                    )));
+                }
+            }
             if !["1.2", "1.3"].contains(&self.tls.min_tls_version.as_str()) {
                 return Err(ConfigError::ValidationError(format!(
                     "Invalid TLS version: {}",
@@ -1762,6 +1775,37 @@ root_password_env = "OPENDR_TEST_ROOT_PASSWORD"
         config.replication.mode = "consumer".to_string();
         config.replication.provider_url = None;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tls_client_cert_requires_ca_file() {
+        let cert_file = NamedTempFile::new().unwrap();
+        let key_file = NamedTempFile::new().unwrap();
+        let mut config = ServerConfig::default();
+        config.tls.enabled = true;
+        config.tls.cert_file = cert_file.path().to_path_buf();
+        config.tls.key_file = key_file.path().to_path_buf();
+        config.tls.require_client_cert = true;
+        config.tls.ca_file = None;
+
+        let error = config.validate().unwrap_err().to_string();
+
+        assert!(error.contains("requires a CA file"));
+    }
+
+    #[test]
+    fn test_tls_ca_file_must_exist_when_configured() {
+        let cert_file = NamedTempFile::new().unwrap();
+        let key_file = NamedTempFile::new().unwrap();
+        let mut config = ServerConfig::default();
+        config.tls.enabled = true;
+        config.tls.cert_file = cert_file.path().to_path_buf();
+        config.tls.key_file = key_file.path().to_path_buf();
+        config.tls.ca_file = Some(PathBuf::from("/tmp/opendr-missing-ca-for-test.pem"));
+
+        let error = config.validate().unwrap_err().to_string();
+
+        assert!(error.contains("TLS CA file not found"));
     }
 
     #[test]
