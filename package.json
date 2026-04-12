@@ -1,0 +1,28 @@
+{
+  "name": "opendr-docs",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node site/scripts/copy-docs.mjs",
+    "check": "tsc --noEmit && node site/scripts/validate-mermaid.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "mermaid": "^11.12.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "jsdom": "^27.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0"
+  }
+}

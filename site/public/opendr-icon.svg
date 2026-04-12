@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">OpenDR icon</title>
+  <desc id="desc">Directory graph connected to a persistent data store.</desc>
+  <rect width="64" height="64" rx="8" fill="#06111f"/>
+  <path d="M32 14v11M20 34h24M20 34v8M44 34v8" fill="none" stroke="#7ce8c8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="32" cy="14" r="6" fill="#2dcaa2" stroke="#eef3ff" stroke-width="2"/>
+  <circle cx="20" cy="34" r="5" fill="#2dcaa2" stroke="#eef3ff" stroke-width="2"/>
+  <circle cx="44" cy="34" r="5" fill="#2dcaa2" stroke="#eef3ff" stroke-width="2"/>
+  <path d="M18 45c0-3.3 6.3-6 14-6s14 2.7 14 6v7c0 3.3-6.3 6-14 6s-14-2.7-14-6v-7Z" fill="#102033" stroke="#f2b26d" stroke-width="3"/>
+  <path d="M46 45c0 3.3-6.3 6-14 6s-14-2.7-14-6" fill="none" stroke="#f8d7ad" stroke-width="2.5"/>
+  <path d="M46 51c0 3.3-6.3 6-14 6s-14-2.7-14-6" fill="none" stroke="#f2b26d" stroke-width="2.5"/>
+</svg>

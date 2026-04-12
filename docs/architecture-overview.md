@@ -1,291 +1,229 @@
-# LDAP Server Architecture Overview
+# OpenDR Architecture Overview
 
-This document provides a high-level architectural overview of the opendr LDAP server, focusing on the FSM-based design and component relationships.
+OpenDR is a Rust LDAPv3 server with two listener runtimes behind the same
+`opendr` binary:
 
-## System Architecture Layers
+- `fsm`, the default and recommended runtime.
+- `legacy`, the older runtime retained for compatibility and targeted behavior
+  comparison.
 
-```mermaid
-graph TB
-    subgraph "Client Layer"
-        C[LDAP Client]
-    end
+The server entrypoint is `src/main.rs`. It loads configuration, initializes the
+backend, starts replication services, starts monitoring, builds TLS state, and
+dispatches LDAP and LDAPS listeners based on `server.runtime`.
 
-    subgraph "Transport Layer"
-        CF[ConnectionFsm<br/>TCP/TLS Management]
-        BF[BerDecoderFsm<br/>Message Parsing]
-    end
-
-    subgraph "Authentication Layer"
-        AF[AuthFsm<br/>Simple Bind]
-        SF[SaslFsm<br/>SASL Mechanisms]
-    end
-
-    subgraph "Operation Layer"
-        SeF[SearchFsm<br/>Search Operations]
-        WF[WriteFsm<br/>Add/Modify/Delete]
-        CoF[CompareFsm<br/>Compare Operations]
-        EF[ExtendedOpFsm<br/>Extended Operations]
-        RF[ReferralFsm<br/>Referral Handling]
-    end
-
-    subgraph "Replication Layer"
-        RPF[ReplicationProviderFsm<br/>RFC 4533 Provider]
-        RCF[ReplicationConsumerFsm<br/>RFC 4533 Consumer]
-    end
-
-    subgraph "Storage Layer"
-        BTF[BackendTxnFsm<br/>Transaction Management]
-        DB[DirectoryBackend<br/>Data Storage]
-        MB[MockBackend<br/>In-Memory Implementation]
-    end
-
-    C --> CF
-    CF --> BF
-    BF --> AF
-    BF --> SF
-    BF --> SeF
-    BF --> WF
-    BF --> CoF
-    BF --> EF
-    BF --> RF
-    SeF --> BTF
-    WF --> BTF
-    CoF --> BTF
-    BTF --> DB
-    DB --> MB
-    SeF --> RPF
-    SeF --> RCF
-
-    classDef transport fill:#e1f5fe
-    classDef auth fill:#f3e5f5
-    classDef operation fill:#e8f5e8
-    classDef replication fill:#fff3e0
-    classDef storage fill:#fce4ec
-
-    class CF,BF transport
-    class AF,SF auth
-    class SeF,WF,CoF,EF,RF operation
-    class RPF,RCF replication
-    class BTF,DB,MB storage
-```
-
-## Connection Lifecycle and FSM Management
+## Startup Flow
 
 ```mermaid
-graph LR
-    subgraph "Single LDAP Connection"
-        CFS[ConnectionFsmSet]
-        
-        subgraph "Core FSMs (1 each)"
-            CF[ConnectionFsm]
-            BF[BerDecoderFsm]
-            AUTH[AuthenticationFsm]
-        end
-        
-        subgraph "Operation FSMs (N parallel)"
-            OP1[SearchFsm #1]
-            OP2[WriteFsm #1]
-            OP3[SearchFsm #2]
-            OPN[... more operations]
-        end
-        
-        subgraph "Optional Replication (≤2)"
-            REP1[ReplicationProviderFsm]
-            REP2[ReplicationConsumerFsm]
-        end
-    end
-
-    CFS --> CF
-    CFS --> BF
-    CFS --> AUTH
-    CFS --> OP1
-    CFS --> OP2
-    CFS --> OP3
-    CFS --> OPN
-    CFS --> REP1
-    CFS --> REP2
-
-    AUTH --> AF[AuthFsm]
-    AUTH --> SF[SaslFsm]
+flowchart TD
+    A["opendr binary"] --> B["Parse --config and --log-config"]
+    B --> C["Initialize log4rs"]
+    C --> D["Load ServerConfig from TOML and OPENDR_* overrides"]
+    D --> E["Validate config and runtime compatibility"]
+    E --> F["Resolve root password source"]
+    F --> G["Initialize LMDB or memory backend"]
+    G --> H{"Replication mode"}
+    H -->|"provider or both"| I["Wrap backend with changelog support"]
+    H -->|"disabled or consumer"| J["Use backend directly"]
+    I --> K["Create replication service"]
+    J --> K
+    K --> L["Start provider task when configured"]
+    L --> M["Start consumer task when configured"]
+    M --> N["Start monitoring HTTP runtime when enabled"]
+    N --> O["Build rustls handler when TLS is enabled"]
+    O --> P["Start LDAP listener"]
+    P --> Q["Start LDAPS listener when TLS is enabled"]
+    Q --> R["Drain and stop on shutdown signal"]
 ```
 
-## FSM State Transition Example - Search Operation
-
-The Search FSM (`SearchFsmImpl`) demonstrates the comprehensive state management used throughout the system:
+## Request Flow
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Initializing : StartSearch Event
-    
-    Initializing --> FindingCandidates : Parameters Validated
-    
-    FindingCandidates --> Iterating : CandidatesFound(>0)
-    FindingCandidates --> Completed : CandidatesFound(0)
-    
-    Iterating --> EmittingEntries : EntryFound
-    Iterating --> Completed : All Candidates Processed
-    Iterating --> Abandoned : Abandon Event
-    Iterating --> TimeLimitExceeded : TimeLimit Event
-    Iterating --> SizeLimitExceeded : SizeLimit Event
-    
-    EmittingEntries --> Iterating : EntryEmitted
-    EmittingEntries --> Abandoned : Abandon Event
-    EmittingEntries --> TimeLimitExceeded : TimeLimit Event
-    EmittingEntries --> SizeLimitExceeded : SizeLimit Event
-    
-    Completed --> [*] : SearchComplete Event
-    Abandoned --> [*] : Operation Cancelled
-    TimeLimitExceeded --> [*] : Timeout Response Sent
-    SizeLimitExceeded --> [*] : Limit Response Sent
-
-    note right of Iterating
-        The Search FSM implements:
-        - Base/OneLevel/Subtree scopes
-        - Complex LDAP filter evaluation
-        - Size and time limit enforcement
-        - Batch candidate processing
-        - Performance metrics collection
-    end note
+flowchart LR
+    A["LDAP client"] --> B["TCP or TLS listener"]
+    B --> C["Connection pool and resource limits"]
+    C --> D["Rate-limit checks"]
+    D --> E["BER decoder"]
+    E --> F["LDAP parser"]
+    F --> G["Control validation"]
+    G --> H{"Operation"}
+    H -->|"Bind"| I["Auth FSM"]
+    H -->|"Search"| J["Search FSM"]
+    H -->|"Add, modify, delete, ModifyDN"| K["Write FSM"]
+    H -->|"Compare"| L["Compare FSM"]
+    H -->|"StartTLS, WhoAmI, Password Modify, Cancel"| M["Extended operation FSM"]
+    J --> N["DirectoryBackend"]
+    K --> N
+    L --> N
+    I --> N
+    M --> N
+    N --> O["LMDB or in-memory backend"]
+    O --> P["LDAP response encoder"]
+    P --> A
 ```
 
-## Concurrent Operation Flow
+The FSM runtime creates a connection-level `ConnectionFsmSet` that owns:
+
+- connection transport state
+- BER decoder state
+- authentication state
+- operation FSMs correlated by LDAP message ID
+
+Search, write, compare, and extended operations are independent FSM
+implementations. Provider replication streams are served as LDAP Sync search
+requests over the same server path.
+
+## Runtime Composition
+
+```mermaid
+flowchart TB
+    subgraph Entry["src/main.rs"]
+        A["Load and validate ServerConfig"]
+        B{"server.runtime"}
+    end
+
+    A --> B
+    B -->|"fsm"| C["src/fsm_server.rs"]
+    B -->|"legacy"| D["src/server.rs"]
+
+    subgraph FSM["FSM runtime"]
+        C --> E["ConnectionFsmSet"]
+        E --> F["ConnectionFsmImpl"]
+        E --> G["BerDecoderFsmImpl"]
+        E --> H["AuthenticationFsm"]
+        E --> I["Operation registry keyed by LDAP message ID"]
+        I --> J["SearchFsmImpl"]
+        I --> K["WriteFsmImpl"]
+        I --> L["CompareFsmImpl"]
+        I --> M["ExtendedOpFsmImpl"]
+    end
+
+    subgraph Shared["Shared services"]
+        N["DirectoryBackend"]
+        O["Schema validator"]
+        P["TLS handler"]
+        R["Metrics and audit"]
+    end
+
+    C --> N
+    D --> N
+    E --> O
+    E --> P
+    C --> R
+    D --> R
+```
+
+## Main Components
+
+| Component | Files | Responsibility |
+| --- | --- | --- |
+| Entrypoint | `src/main.rs` | Runtime selection, backend setup, replication task startup, TLS, monitoring, shutdown |
+| Configuration | `src/config.rs` | TOML/env loading, validation, defaults, secret resolution |
+| Setup | `src/setup.rs`, `src/bin/setup.rs` | Interactive and non-interactive first-time setup |
+| FSM listener | `src/fsm_server.rs`, `src/fsm_runtime.rs`, `src/fsm.rs` | Current listener path and operation FSM composition |
+| Legacy listener | `src/server.rs` | Older listener path and shared protocol helpers |
+| Backend | `src/backend.rs`, `src/backend_lmdb.rs` | Backend trait, in-memory test backend, LMDB backend |
+| TLS | `src/tls.rs`, `src/connection_fsm.rs` | LDAPS and StartTLS transport upgrade |
+| Replication | `src/replication*.rs`, `src/backend_changelog_wrapper.rs` | Provider changelog, LDAP Sync provider sessions, consumer state |
+| Backup | `src/backup.rs`, `src/bin/opendr_backup.rs`, `src/bin/opendr_restore.rs` | LMDB full backup, changelog incremental backup, offline restore |
+| Monitoring | `src/monitoring_runtime.rs`, `src/metrics.rs` | Prometheus metrics and JSON health |
+| Audit and ACI | `src/audit.rs`, `src/aci.rs` | Security event logging and access-control engine |
+
+## Runtime Selection
+
+```toml
+[server]
+runtime = "fsm"
+```
+
+Use `fsm` for new deployments. It integrates shutdown, connection pooling,
+resource limits, rate limiting, metrics, audit, TLS, and operation FSMs.
+
+Use `legacy` only for compatibility checks or legacy-specific debugging. The
+shipped binary rejects non-default `rate_limit.burst_size` when using `legacy`.
+
+## Storage
+
+The production backend is LMDB. It stores entries, password hashes, normalized
+DN lookup, context metadata, and configured attribute indexes in separate LMDB
+databases. Reads use LMDB multi-reader behavior and exact-DN entry/auth
+credential caches. Writes use a backend write lock.
+
+The in-memory backend is useful for tests and local experiments. It is not a
+durable backend.
+
+## Replication
+
+OpenDR replication is listener-based LDAP Sync replication:
+
+1. Provider writes are recorded through `ChangelogBackendWrapper`.
+2. The provider stores a bounded changelog and broadcasts live changes.
+3. A consumer performs an initial refresh from the provider.
+4. The consumer persists a replication cookie.
+5. The consumer keeps a refresh-and-persist search open for live updates.
+
+Provider state is persisted in:
+
+```text
+<replication.state_storage_path>/provider_changelog.json
+```
+
+Consumer state is persisted in:
+
+```text
+<replication.state_storage_path>/replication_cookie.txt
+```
+
+Poll-based consumer replication has been removed. Consumer and both modes
+require `enable_change_listening = true`.
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant Server as LDAP Server
-    participant Op1 as Search FSM #1
-    participant Op2 as Write FSM #1
-    participant Op3 as Search FSM #2
-    participant Backend
+    participant Writer as LDAP writer
+    participant Provider as Provider runtime
+    participant Wrapper as ChangelogBackendWrapper
+    participant Store as LMDB backend
+    participant Changelog as provider_changelog.json
+    participant Consumer as Consumer runtime task
+    participant Cookie as replication_cookie.txt
 
-    Note over Client,Backend: Multiple operations can run concurrently
-
-    Client->>Server: Search Request #1 (msgId=1)
-    Server->>Op1: Create SearchFsm
-    Op1->>Backend: Query candidates
-    
-    Client->>Server: Add Request (msgId=2)
-    Server->>Op2: Create WriteFsm
-    Op2->>Backend: Begin transaction
-    
-    Client->>Server: Search Request #2 (msgId=3)
-    Server->>Op3: Create SearchFsm
-    Op3->>Backend: Query candidates
-    
-    Backend-->>Op2: Transaction started
-    Op2->>Client: Add Response (msgId=2)
-    
-    Backend-->>Op1: Candidates found
-    Op1->>Client: Search Entries (msgId=1)
-    Op1->>Client: Search Done (msgId=1)
-    
-    Backend-->>Op3: Candidates found
-    Op3->>Client: Search Entries (msgId=3)
-    Op3->>Client: Search Done (msgId=3)
+    Consumer->>Provider: LDAP Sync refresh request with optional cookie
+    Provider->>Store: Search entries under base DN
+    Store-->>Provider: Current entries with entryUUID and entryCSN
+    Provider-->>Consumer: Present or add sync state controls
+    Consumer->>Store: Apply refreshed entries locally
+    Consumer->>Cookie: Persist refreshed cookie
+    Consumer->>Provider: Refresh-and-persist LDAP Sync search
+    Writer->>Provider: Add, modify, delete, or rename
+    Provider->>Wrapper: Commit write through provider wrapper
+    Wrapper->>Store: Persist directory change
+    Wrapper->>Changelog: Append bounded changelog entry
+    Wrapper-->>Provider: Broadcast live change
+    Provider-->>Consumer: Stream sync state control
+    Consumer->>Store: Apply live change
+    Consumer->>Cookie: Persist new cookie
 ```
 
-## Key Design Principles
+## Operational Attributes
 
-### 1. **Separation of Concerns**
-- **Transport**: Handle TCP/TLS and message framing
-- **Authentication**: Manage session identity and authorization
-- **Operations**: Execute LDAP protocol operations independently
-- **Storage**: Provide transactional data access
+Backend writes maintain operational attributes such as:
 
-### 2. **Concurrency Model**
-- Each operation is an independent FSM instance
-- Shared transport and authentication state
-- Parallel operation execution with message ID correlation
-- Backend transaction isolation
+- `entryCSN`
+- `entryUUID`
+- create and modify timestamps
+- creators and modifiers names
+- `contextCSN`
 
-### 3. **State Management**
-- Explicit state transitions through events
-- Timeout and abandonment support
-- Error state handling and recovery
-- Terminal state enforcement
+Operational attributes are hidden from normal search results unless the client
+requests `+` or explicit operational attribute names.
 
-### 4. **Extensibility**
-- Plugin architecture for new FSM types
-- Backend abstraction for different storage engines
-- Extended operation framework
-- Replication protocol support
+## Known Implementation Boundaries
 
-### 5. **Type Safety**
-- Rust trait system ensures compile-time correctness
-- Associated types for state/event/error specifications
-- Dynamic dispatch through trait objects
-- Memory safety without garbage collection
-
-## Implementation Status
-
-The FSM architecture has been progressively implemented with a focus on completeness and production readiness:
-
-### ✅ **Implemented FSMs**
-
-1. **Connection FSM** (`connection_fsm.rs`)
-   - TCP/TLS connection management
-   - Network error handling and recovery
-   - Connection state tracking
-
-2. **BER Decoder FSM** (`ber_decoder_fsm.rs`)
-   - LDAP message parsing and validation
-   - Incremental message assembly
-   - Buffer management and overflow protection
-
-3. **Authentication FSM** (`auth_fsm.rs`)
-   - Simple bind authentication
-   - Anonymous bind support
-   - User credential validation
-
-4. **SASL FSM** (`sasl_fsm.rs`)
-   - SASL mechanism framework
-   - Multi-step authentication flows
-   - Credential verification abstractions
-
-5. **Search FSM** (`search_fsm.rs`)
-   - Complete LDAP search functionality
-   - All search scopes (base, onelevel, subtree)
-   - Size and time limits with enforcement
-   - Complex filter evaluation support
-   - Entry formatting and attribute projection
-   - Performance metrics and monitoring
-   - Comprehensive error handling and abandonment
-
-6. **Write FSM** (`write_fsm.rs`) 
-   - Complete LDAP write operations (Add, Modify, ModifyDN, Delete)
-   - Schema validation and compliance checking
-   - Access Control Information (ACI) evaluation
-   - Transaction management with commit/rollback
-   - Entry validation and constraint checking
-   - Comprehensive error handling and audit logging
-   - Performance metrics and monitoring
-
-7. **Compare FSM** (`compare_fsm.rs`) ⭐ **Latest Implementation**
-   - Complete LDAP compare operations
-   - Lightweight entry retrieval with attribute filtering
-   - Binary-safe and case-insensitive attribute comparisons
-   - Multi-value attribute handling (true if any value matches)
-   - Access control integration for compare permissions
-   - Performance monitoring and comprehensive error handling
-   - Support for operational attribute restrictions
-
-### 🚧 **Planned FSMs**
-
-- **Extended Operation FSM**: Custom LDAP extensions
-- **Referral FSM**: LDAP referral handling
-- **Replication Provider FSM**: RFC 4533 replication
-- **Replication Consumer FSM**: Replication client
-- **Backend Transaction FSM**: Transaction management
-
-### 🏗️ **Architecture Benefits Realized**
-
-The implemented FSMs demonstrate the architecture's key benefits:
-- **Type Safety**: Compile-time correctness through Rust's trait system
-- **Testability**: Comprehensive mock implementations and >90% test coverage
-- **Concurrency**: Independent FSM instances for parallel operations
-- **Extensibility**: Trait abstractions enable different implementations
-- **Error Handling**: Robust error propagation and recovery mechanisms
-- **Performance**: Efficient state management and resource utilization
-
-This architecture provides a solid foundation for implementing a production-ready LDAP server with enterprise features like replication, extended operations, and high concurrency.
+- FSM runtime simple and anonymous bind are wired. SASL FSM modules exist, but
+  the FSM server dispatch currently returns SASL as unsupported.
+- `access_control.rules_file` is parsed but not loaded by the shipped startup
+  path.
+- `performance.indexing_enabled` and `performance.cache_size` are wired into
+  startup; other performance fields are parsed for forward compatibility.
+- Restore applies incrementals with default LMDB index configuration; keep the
+  runtime config aligned and allow startup index backfill for custom indexes.
+- General multi-master conflict resolution is not implemented.

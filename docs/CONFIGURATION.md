@@ -1,0 +1,431 @@
+# OpenDR Configuration Reference
+
+OpenDR loads TOML with `ServerConfig::from_file` and then applies environment
+overrides with the `OPENDR` prefix and `__` separator.
+
+Example:
+
+```bash
+OPENDR_SERVER__LDAP_PORT=1389 \
+OPENDR_REPLICATION__MODE=provider \
+opendr --config /etc/opendr/server.toml --log-config /etc/opendr/log4rs.yml
+```
+
+Do not put ports in `server.bind_address`; the runtime forms listener addresses
+from `bind_address` plus `ldap_port` or `ldaps_port`.
+
+## Server
+
+```toml
+[server]
+bind_address = "127.0.0.1"
+ldap_port = 1389
+ldaps_port = 1636
+hostname = "localhost"
+runtime = "fsm"
+replica_id = 1
+base_dn = "dc=example,dc=com"
+root_user_dn = "cn=admin"
+root_password = "secret"
+organization_name = "Example Organization"
+read_buffer_size = 4096
+operation_timeout_secs = 300
+cleanup_interval_secs = 60
+max_concurrent_operations = 100
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `bind_address` | `127.0.0.1` | Host/address only |
+| `ldap_port` | `1389` | Must be non-zero |
+| `ldaps_port` | `1636` | Must differ from LDAP port |
+| `hostname` | `localhost` | Written by setup and available in config |
+| `runtime` | `fsm` | `fsm` or `legacy` |
+| `replica_id` | `1` | Must be non-zero and unique per replicated node |
+| `base_dn` | `dc=example,dc=com` | Base naming context |
+| `root_user_dn` | `cn=admin` | RDN or DN prefix used with `base_dn` during initialization |
+| `root_password` | `secret` | Inline secret; prefer `_env` or `_file` |
+| `root_password_env` | unset | Environment variable containing the root secret |
+| `root_password_file` | unset | File containing the root secret |
+| `organization_name` | `Example Organization` | Used during base initialization |
+| `read_buffer_size` | `4096` | Socket read buffer in bytes |
+| `operation_timeout_secs` | `300` | Per-operation timeout |
+| `cleanup_interval_secs` | `60` | Runtime cleanup interval |
+| `max_concurrent_operations` | `100` | Per-connection operation cap |
+
+Secret rule: set exactly one of `root_password`, `root_password_env`, or
+`root_password_file`. When using LMDB and a password file, store the full
+`{SSHA512}...` hash produced by `opendr-setup hash-password`.
+
+## Backend
+
+```toml
+[backend]
+backend_type = "lmdb"
+data_directory = "./data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 126
+import_sample_data = false
+indexed_attributes = ["cn", "uid", "mail", "objectClass"]
+
+[[backend.indexes]]
+attribute = "cn"
+types = ["substring"]
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `backend_type` | `lmdb` | `lmdb` or `memory` |
+| `data_directory` | `./data` | LMDB data directory |
+| `lmdb_max_size` | `10737418240` | LMDB map size in bytes |
+| `lmdb_max_readers` | `126` | LMDB reader slots |
+| `import_sample_data` | `false` | Parsed; setup writes sample LDIF, server startup does not auto-import it |
+| `indexed_attributes` | `["cn", "uid", "mail", "objectClass"]` | Each gets equality and presence indexes |
+| `[[backend.indexes]].attribute` | none | Attribute for typed index config |
+| `[[backend.indexes]].types` | none | `equality`, `presence`, `substring`, `ordering` or aliases |
+
+Typed index aliases:
+
+| Long | Short |
+| --- | --- |
+| `equality` | `eq` |
+| `presence` | `pres` |
+| `substring` | `sub` |
+| `ordering` | `ord` |
+
+Disable runtime indexing with:
+
+```toml
+[performance]
+indexing_enabled = false
+```
+
+## TLS
+
+```toml
+[tls]
+enabled = false
+cert_file = "certs/server.crt"
+key_file = "certs/server.key"
+ca_file = "certs/ca.crt"
+require_client_cert = false
+min_tls_version = "1.2"
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `false` | Starts LDAPS and enables StartTLS support |
+| `cert_file` | `certs/server.crt` | Must exist when TLS is enabled |
+| `key_file` | `certs/server.key` | Must exist when TLS is enabled |
+| `ca_file` | unset | Required when client cert verification is enabled |
+| `require_client_cert` | `false` | Enables mutual TLS |
+| `min_tls_version` | `1.2` | `1.2` or `1.3` |
+
+## Resources
+
+```toml
+[resources]
+max_connections = 1000
+max_connections_per_ip = 10
+max_operations_per_connection = 100
+max_memory_per_connection = 10485760
+max_total_memory = 1073741824
+connection_idle_timeout_secs = 600
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `max_connections` | `1000` | Must be greater than zero |
+| `max_connections_per_ip` | `10` | Must not exceed `max_connections` |
+| `max_operations_per_connection` | `100` | Per-connection operation cap |
+| `max_memory_per_connection` | `10485760` | Bytes |
+| `max_total_memory` | `1073741824` | Bytes |
+| `connection_idle_timeout_secs` | `600` | Idle cleanup threshold |
+
+## Rate Limit
+
+```toml
+[rate_limit]
+enabled = true
+global_requests_per_second = 1000
+per_client_requests_per_second = 100
+burst_size = 50
+window_duration_secs = 1
+adaptive_enabled = true
+adaptive_threshold = 0.8
+adaptive_multiplier = 0.5
+auto_ban_threshold = 100
+auto_ban_duration_secs = 300
+blacklist = []
+whitelist = []
+
+[rate_limit.operation_limits]
+bind = 10
+search = 50
+modify = 20
+add = 20
+delete = 10
+modifydn = 10
+compare = 30
+extended = 20
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `true` | Turns the runtime rate limiter on or off |
+| `global_requests_per_second` | `1000` | Process-wide request budget |
+| `per_client_requests_per_second` | `100` | Per-client request budget |
+| `burst_size` | `50` | Short burst allowance above the steady rate; keep the default in `legacy` runtime |
+| `window_duration_secs` | `1` | Sliding-window duration in seconds |
+| `adaptive_enabled` | `true` | Enables adaptive rate reduction |
+| `adaptive_threshold` | `0.8` | Utilization threshold from `0.0` to `1.0` |
+| `adaptive_multiplier` | `0.5` | Multiplier from `0.0` to `1.0` used when adaptive limiting is active |
+| `auto_ban_threshold` | `100` | Number of violations before an address is automatically banned |
+| `auto_ban_duration_secs` | `300` | Automatic ban duration in seconds |
+| `blacklist` | `[]` | IP addresses that should always be rejected |
+| `whitelist` | `[]` | IP addresses exempted from rate limiting |
+| `operation_limits.bind` | `10` | Per-operation rate limit for bind |
+| `operation_limits.search` | `50` | Per-operation rate limit for search |
+| `operation_limits.modify` | `20` | Per-operation rate limit for modify |
+| `operation_limits.add` | `20` | Per-operation rate limit for add |
+| `operation_limits.delete` | `10` | Per-operation rate limit for delete |
+| `operation_limits.modifydn` | `10` | Per-operation rate limit for ModifyDN |
+| `operation_limits.compare` | `30` | Per-operation rate limit for compare |
+| `operation_limits.extended` | `20` | Per-operation rate limit for extended operations |
+
+`adaptive_threshold` and `adaptive_multiplier` must be between `0.0` and `1.0`.
+`blacklist` and `whitelist` entries must parse as IP addresses.
+
+Legacy runtime note: the shipped binary rejects non-default `burst_size` in
+`legacy` runtime mode.
+
+## Replication
+
+```toml
+[replication]
+enabled = false
+mode = "provider"
+provider_url = "ldap://provider.example.com:1389"
+bind_dn = "cn=replication,dc=example,dc=com"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
+changelog_capacity = 10000
+changelog_enabled = true
+max_batch_size = 100
+sync_interval_secs = 60
+max_retry_attempts = 3
+retry_delay_secs = 5
+enable_change_listening = true
+enable_streaming = true
+heartbeat_interval_secs = 30
+max_concurrent_consumers = 10
+consumer_timeout_secs = 300
+provider_timeout_secs = 30
+state_persistence_timeout_secs = 10
+change_buffer_size = 1000
+state_storage_path = "./data/replication_state"
+stream_port = 0
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `false` | Enables provider, consumer, or both roles |
+| `mode` | `provider` | `provider`, `consumer`, or `both`; alias `role` |
+| `provider_url` | unset | Required for `consumer` and `both` |
+| `bind_dn` | unset | Consumer bind DN; aliases `provider_bind_dn`, `replication_bind_dn` |
+| `bind_password` | unset | Inline secret; aliases accepted |
+| `bind_password_env` | unset | Environment secret source; aliases accepted |
+| `bind_password_file` | unset | File secret source; aliases accepted |
+| `changelog_capacity` | `10000` | Alias `changelog_max_entries` |
+| `changelog_enabled` | `true` | Provider-side changelog |
+| `max_batch_size` | `100` | Entries per replication batch |
+| `sync_interval_secs` | `60` | Compatibility field; not the live listener cadence |
+| `max_retry_attempts` | `3` | Consumer reconnect attempts |
+| `retry_delay_secs` | `5` | Consumer retry delay |
+| `enable_change_listening` | `true` | Required for `consumer` and `both`; alias `listen_for_changes` |
+| `enable_streaming` | `true` | Provider live streaming support |
+| `heartbeat_interval_secs` | `30` | Listener heartbeat |
+| `max_concurrent_consumers` | `10` | Provider-side active consumer cap |
+| `consumer_timeout_secs` | `300` | Provider-side session timeout |
+| `provider_timeout_secs` | `30` | Consumer-side request timeout |
+| `state_persistence_timeout_secs` | `10` | Consumer state persistence timeout |
+| `change_buffer_size` | `1000` | Live change buffer size |
+| `state_storage_path` | `./data/replication_state` | Provider changelog and consumer cookie directory |
+| `stream_port` | `0` | Reserved/derived; aliases `replication_stream_port`, `change_listener_port` |
+
+For consumer and both modes, use exactly one of `bind_password`,
+`bind_password_env`, or `bind_password_file` when a replication bind password is
+configured.
+
+## Monitoring
+
+```toml
+[monitoring]
+enabled = true
+metrics_address = "127.0.0.1"
+metrics_port = 9090
+metrics_path = "/metrics"
+health_path = "/health"
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `true` | Starts or disables the monitoring HTTP endpoint |
+| `metrics_address` | `127.0.0.1` | Address for the monitoring HTTP server |
+| `metrics_port` | `9090` | Port for the monitoring HTTP server |
+| `metrics_path` | `/metrics` | Prometheus text metrics path |
+| `health_path` | `/health` | JSON health response path |
+
+The monitoring runtime serves Prometheus text and JSON health over HTTP GET.
+
+## Audit
+
+```toml
+[audit]
+enabled = true
+log_file = "./logs/audit.log"
+format = "json"
+level = "info"
+log_authentication = true
+log_authorization = true
+log_modifications = true
+log_connections = true
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `true` | Turns audit logging on or off |
+| `log_file` | `./logs/audit.log` | Audit output path |
+| `format` | `json` | `json`, `syslog`, or `text` |
+| `level` | `info` | Minimum audit level |
+| `log_authentication` | `true` | Logs bind and authentication events |
+| `log_authorization` | `true` | Logs authorization decisions |
+| `log_modifications` | `true` | Logs add, modify, delete, and ModifyDN-style changes |
+| `log_connections` | `true` | Logs connection lifecycle events |
+
+Valid formats are `json`, `syslog`, and `text`.
+
+Valid levels are `debug`, `info`, `warning`, `error`, and `critical`.
+
+## Access Control
+
+```toml
+[access_control]
+enabled = true
+default_policy = "deny"
+rules_file = "/etc/opendr/aci.toml"
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `true` | Enables ACI engine construction |
+| `default_policy` | `deny` | `allow` or `deny` |
+| `rules_file` | unset | Parsed but not loaded by the shipped startup path yet |
+
+## Performance
+
+```toml
+[performance]
+worker_threads = 0
+schema_validation = true
+indexing_enabled = true
+cache_size = 1000
+query_optimization = true
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `worker_threads` | `0` | Parsed for forward compatibility; `0` means automatic sizing |
+| `schema_validation` | `true` | Parsed for forward compatibility; schema behavior is wired through startup and schema modules |
+| `indexing_enabled` | `true` | Actively used; disables configured runtime indexes when `false` |
+| `cache_size` | `1000` | Actively used for runtime cache sizing |
+| `query_optimization` | `true` | Parsed for forward compatibility |
+
+## Minimal LMDB Server
+
+```toml
+[server]
+bind_address = "127.0.0.1"
+ldap_port = 1389
+runtime = "fsm"
+replica_id = 1
+base_dn = "dc=example,dc=com"
+root_user_dn = "cn=manager"
+root_password_file = "/run/secrets/opendr-root-password-hash"
+organization_name = "Example Org"
+
+[backend]
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 256
+
+[monitoring]
+enabled = true
+metrics_address = "127.0.0.1"
+metrics_port = 9090
+```
+
+## Provider
+
+```toml
+[server]
+bind_address = "0.0.0.0"
+ldap_port = 1389
+runtime = "fsm"
+replica_id = 1
+base_dn = "dc=example,dc=com"
+root_user_dn = "cn=manager"
+root_password_file = "/run/secrets/opendr-provider-root-password-hash"
+organization_name = "Example Provider"
+
+[backend]
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/provider/data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 256
+
+[replication]
+enabled = true
+mode = "provider"
+changelog_enabled = true
+changelog_capacity = 100000
+max_batch_size = 100
+enable_streaming = true
+heartbeat_interval_secs = 60
+state_storage_path = "/var/lib/opendr/provider/replication_state"
+```
+
+## Consumer
+
+```toml
+[server]
+bind_address = "0.0.0.0"
+ldap_port = 2389
+runtime = "fsm"
+replica_id = 2
+base_dn = "dc=example,dc=com"
+root_user_dn = "cn=manager"
+root_password_file = "/run/secrets/opendr-consumer-root-password-hash"
+organization_name = "Example Consumer"
+
+[backend]
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/consumer/data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 256
+
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:1389"
+bind_dn = "cn=replication,dc=example,dc=com"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
+max_retry_attempts = 5
+retry_delay_secs = 10
+enable_change_listening = true
+heartbeat_interval_secs = 60
+provider_timeout_secs = 30
+state_persistence_timeout_secs = 10
+change_buffer_size = 1000
+state_storage_path = "/var/lib/opendr/consumer/replication_state"
+```

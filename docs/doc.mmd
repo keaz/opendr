@@ -1,62 +1,58 @@
-graph TB
-    subgraph "Client Layer"
-        C[LDAP Client]
+flowchart TB
+    subgraph Entrypoint["src/main.rs"]
+        Config["ServerConfig"]
+        Runtime{"server.runtime"}
     end
 
-    subgraph "Transport Layer"
-        CF[ConnectionFsm<br/>TCP/TLS Management]
-        BF[BerDecoderFsm<br/>Message Parsing]
+    subgraph Listeners["Listener runtimes"]
+        FSM["src/fsm_server.rs"]
+        Legacy["src/server.rs"]
     end
 
-    subgraph "Authentication Layer"
-        AF[AuthFsm<br/>Simple Bind]
-        SF[SaslFsm<br/>SASL Mechanisms]
+    subgraph Connection["FSM connection path"]
+        Conn["ConnectionFsmImpl"]
+        Ber["BerDecoderFsmImpl"]
+        Auth["AuthenticationFsm"]
+        Ops["Operation registry"]
+        Search["SearchFsmImpl"]
+        Write["WriteFsmImpl"]
+        Compare["CompareFsmImpl"]
+        Extended["ExtendedOpFsmImpl"]
     end
 
-    subgraph "Operation Layer"
-        SeF[SearchFsm<br/>Search Operations]
-        WF[WriteFsm<br/>Add/Modify/Delete]
-        CoF[CompareFsm<br/>Compare Operations]
-        EF[ExtendedOpFsm<br/>Extended Operations]
-        RF[ReferralFsm<br/>Referral Handling]
+    subgraph Services["Shared services"]
+        Backend["DirectoryBackend"]
+        Lmdb["LMDB backend"]
+        Schema["Schema validator"]
+        Tls["rustls TLS handler"]
+        Metrics["Metrics and audit"]
     end
 
-    subgraph "Replication Layer"
-        RPF[ReplicationProviderFsm<br/>RFC 4533 Provider]
-        RCF[ReplicationConsumerFsm<br/>RFC 4533 Consumer]
+    subgraph Replication["Replication service"]
+        Wrapper["ChangelogBackendWrapper"]
+        Provider["Provider LDAP Sync search stream"]
+        Consumer["Consumer runtime task"]
+        State["provider_changelog.json and replication_cookie.txt"]
     end
 
-    subgraph "Storage Layer"
-        BTF[BackendTxnFsm<br/>Transaction Management]
-        DB[DirectoryBackend<br/>Data Storage]
-        MB[MockBackend<br/>In-Memory Implementation]
-    end
-
-    C --> CF
-    CF --> BF
-    BF --> AF
-    BF --> SF
-    BF --> SeF
-    BF --> WF
-    BF --> CoF
-    BF --> EF
-    BF --> RF
-    SeF --> BTF
-    WF --> BTF
-    CoF --> BTF
-    BTF --> DB
-    DB --> MB
-    SeF --> RPF
-    SeF --> RCF
-
-    classDef transport fill:#e1f5fe
-    classDef auth fill:#f3e5f5
-    classDef operation fill:#e8f5e8
-    classDef replication fill:#fff3e0
-    classDef storage fill:#fce4ec
-
-    class CF,BF transport
-    class AF,SF auth
-    class SeF,WF,CoF,EF,RF operation
-    class RPF,RCF replication
-    class BTF,DB,MB storage
+    Config --> Runtime
+    Runtime -->|"fsm"| FSM
+    Runtime -->|"legacy"| Legacy
+    FSM --> Conn --> Ber --> Auth
+    Ber --> Ops
+    Ops --> Search
+    Ops --> Write
+    Ops --> Compare
+    Ops --> Extended
+    FSM --> Backend
+    Legacy --> Backend
+    Backend --> Lmdb
+    Write --> Schema
+    Conn --> Tls
+    FSM --> Metrics
+    Legacy --> Metrics
+    Backend --> Wrapper
+    Wrapper --> Provider
+    Consumer --> Provider
+    Wrapper --> State
+    Consumer --> State

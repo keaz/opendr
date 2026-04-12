@@ -40,9 +40,9 @@ min_tls_version = "1.2"
 max_connections = 1000
 max_connections_per_ip = 50
 max_operations_per_connection = 200
-max_memory_per_connection_mb = 10
-max_total_memory_mb = 2048
-idle_timeout_secs = 600
+max_memory_per_connection = 10485760
+max_total_memory = 2147483648
+connection_idle_timeout_secs = 600
 
 [rate_limit]
 enabled = true

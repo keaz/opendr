@@ -30,7 +30,7 @@ The Auth FSM manages four primary states:
 3. **SimpleBound** - Successfully authenticated with Simple Bind
 4. **AuthenticationFailed** - Authentication failed or blocked
 
-![Auth FSM State Diagram](auth_fsm_states.mermaid)
+The state diagram is rendered below.
 
 ```mermaid
 stateDiagram-v2

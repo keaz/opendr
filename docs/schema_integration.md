@@ -322,4 +322,4 @@ Potential improvements:
 
 - [Write FSM Documentation](write_fsm.md)
 - [Architecture Overview](architecture-overview.md)
-- [Backend Integration](../BACKEND_INTEGRATION.md)
+- [Developer Operations Guide](./DEVELOPER_GUIDE.md)

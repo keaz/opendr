@@ -49,9 +49,6 @@ A high-performance, production-ready LDAP v3 server implementation in Rust. The 
 ### Prerequisites
 
 ```bash
-# Rust 1.70+
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
 # LDAP client tools (for testing)
 # Ubuntu/Debian
 sudo apt-get install ldap-utils
@@ -63,29 +60,34 @@ brew install openldap
 sudo yum install openldap-clients
 ```
 
-### Build
+### Set Up OpenDR
 
 ```bash
-git clone https://github.com/yourusername/opendr.git
-cd opendr
-cargo build --release
+mkdir -p ./config ./logs
+opendr-setup --config-dir ./config interactive
 ```
 
-### Basic Server
+The setup wizard writes `config/server.toml`, setup state, LDIF scaffolding,
+and the configured data directories. Provide a log4rs YAML file at
+`config/log4rs.yml`, or point `--log-config` at the packaged logging config.
+
+### Run OpenDR
 
 ```bash
-# Start from a working directory that contains config/server.toml and config/log4rs.yml
-./target/release/opendr
+opendr --config ./config/server.toml --log-config ./config/log4rs.yml
 ```
 
 ### Test Operations
 
 ```bash
 # Search
-ldapsearch -x -H ldap://localhost:389 -b "dc=example,dc=com" "(objectClass=*)"
+ldapsearch -x -H ldap://127.0.0.1:1389 \
+  -D "cn=admin,dc=example,dc=com" -w "$OPENDR_ADMIN_PASSWORD" \
+  -b "dc=example,dc=com" "(objectClass=*)"
 
 # Add entry
-ldapadd -x -H ldap://localhost:389 -D "cn=admin,dc=example,dc=com" -w password <<EOF
+ldapadd -x -H ldap://127.0.0.1:1389 \
+  -D "cn=admin,dc=example,dc=com" -w "$OPENDR_ADMIN_PASSWORD" <<EOF
 dn: cn=John Doe,dc=example,dc=com
 objectClass: person
 cn: John Doe
@@ -93,7 +95,8 @@ sn: Doe
 EOF
 
 # Modify entry
-ldapmodify -x -H ldap://localhost:389 -D "cn=admin,dc=example,dc=com" -w password <<EOF
+ldapmodify -x -H ldap://127.0.0.1:1389 \
+  -D "cn=admin,dc=example,dc=com" -w "$OPENDR_ADMIN_PASSWORD" <<EOF
 dn: cn=John Doe,dc=example,dc=com
 changetype: modify
 add: description
@@ -101,8 +104,27 @@ description: Test user
 EOF
 
 # Delete entry
-ldapdelete -x -H ldap://localhost:389 -D "cn=admin,dc=example,dc=com" -w password \
+ldapdelete -x -H ldap://127.0.0.1:1389 \
+    -D "cn=admin,dc=example,dc=com" -w "$OPENDR_ADMIN_PASSWORD" \
     "cn=John Doe,dc=example,dc=com"
+```
+
+### Build From Source
+
+Use this path only when developing OpenDR or testing a local branch.
+
+```bash
+# Rust 1.70+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+git clone https://github.com/keaz/opendr.git
+cd opendr
+cargo build --release
+
+./target/release/opendr-setup --config-dir ./config interactive
+./target/release/opendr \
+  --config ./config/server.toml \
+  --log-config ./config/log4rs.yml
 ```
 
 ## Replication Quick Start
@@ -267,23 +289,23 @@ Listener mode is active when the consumer logs `Replication consumer entered lis
 ## Documentation
 
 ### Core Documentation
-- [Architecture Overview](docs/architecture-overview.md) - System design and FSM architecture
-- [Configuration Guide](docs/CONFIGURATION.md) - Complete configuration reference
-- [Performance Optimization](docs/PERFORMANCE_OPTIMIZATION.md) - Tuning guide
+- [Documentation Website](https://keaz.github.io/opendr/) - GitHub Pages developer documentation
+- [Documentation Site Source](site/) - React and Vite source for the GitHub Pages site
+- [Developer Operations Guide](docs/DEVELOPER_GUIDE.md) - Setup, runtime, TLS, replication, indexing, backup, and troubleshooting
+- [Architecture Overview](docs/architecture-overview.md) - Current runtime and component architecture
+- [Configuration Guide](docs/CONFIGURATION.md) - Complete runtime configuration reference
 
 ### Replication
 - [Replication Guide](docs/REPLICATION_GUIDE.md) - Listener-based replication setup and verification
 - [Consumer FSM](docs/replication_consumer_fsm.md) - Consumer replication state machine details
 
 ### Operations
-- [Monitoring](docs/MONITORING.md) - Metrics and health checks
+- [Troubleshooting](docs/TROUBLESHOOTING.md) - Startup, bind, search, TLS, replication, backup, and monitoring diagnostics
 - [Backup and Restore](docs/BACKUP_RESTORE.md) - Online LMDB backup and offline restore runbook
-- [Setup Guide](SETUP_GUIDE.md) - Deployment and configuration
+- [GitHub Pages Deployment](docs/GITHUB_PAGES.md) - Publishing the Vite docs site with GitHub Actions
 
 ### Development
 - [FSM Architecture](docs/README.md) - Finite state machine design
-- [Backend Integration](BACKEND_INTEGRATION.md) - Storage backend details
-- [Task Tracker](TASK.md) - Development roadmap and progress
 
 ## Configuration
 
@@ -318,7 +340,7 @@ changelog_capacity = 100000
 
 [monitoring]
 enabled = true
-prometheus_port = 9090
+metrics_port = 9090
 
 [rate_limit]
 enabled = true
@@ -330,8 +352,6 @@ per_client_requests_per_second = 100
 - [Provider Configuration](config/examples/replication/provider.toml)
 - [Consumer Configuration](config/examples/replication/consumer.toml)
 - [Multi-Master Configuration](config/examples/replication/multi-master.toml)
-- [Development Configuration](config/server.development.toml)
-- [Production Configuration](config/server.production.toml)
 
 ### Environment Variables
 
@@ -358,10 +378,8 @@ OPENDR_REPLICATION__MODE=provider \
 
 ```toml
 [performance]
-worker_threads = 8           # Match CPU cores
-io_threads = 4               # For async I/O
-entry_cache_size_mb = 512    # Increase for large directories
-schema_cache_size_mb = 100
+indexing_enabled = true
+cache_size = 50000           # Entry/auth credential cache capacity
 
 [backend]
 lmdb_max_size = 21474836480  # 20GB for large directories
@@ -374,7 +392,8 @@ retry_delay_secs = 5
 state_storage_path = "/var/lib/opendr/consumer/state"
 ```
 
-See [Performance Optimization Guide](docs/PERFORMANCE_OPTIMIZATION.md) for details.
+See the [Developer Operations Guide](docs/DEVELOPER_GUIDE.md) and
+[Configuration Guide](docs/CONFIGURATION.md) for runtime tuning details.
 
 ## Monitoring
 
@@ -473,8 +492,8 @@ enabled = true
 [resources]
 max_connections = 1000
 max_connections_per_ip = 10
-max_memory_per_connection_mb = 10
-idle_timeout_secs = 300
+max_memory_per_connection = 10485760
+connection_idle_timeout_secs = 300
 ```
 
 ## Testing
@@ -550,15 +569,11 @@ Contributions are welcome! Please:
 5. Push to branch (`git push origin feature/amazing-feature`)
 6. Open a Pull Request
 
-## License
-
-[MIT License](LICENSE) or [Apache 2.0 License](LICENSE-APACHE) - your choice.
-
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/opendr/issues)
-- **Documentation**: [docs/](docs/)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/opendr/discussions)
+- **Issues**: [GitHub Issues](https://github.com/keaz/opendr/issues)
+- **Documentation**: [https://keaz.github.io/opendr/](https://keaz.github.io/opendr/)
+- **Discussions**: [GitHub Discussions](https://github.com/keaz/opendr/discussions)
 
 ## Acknowledgments
 
