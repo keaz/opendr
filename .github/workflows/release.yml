@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_BINS: "ldap_ops_client ldap_perf_client opendr opendr-backup opendr-restore opendr-setup"
+
+jobs:
+  perf-gate:
+    name: Docker performance gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install benchmark system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lsof netcat-openbsd ripgrep
+
+      - name: Show Docker version
+        run: docker version
+
+      - name: Run full latency profile
+        run: |
+          ./scripts/perf_docker_matrix.sh \
+            --profile-set full \
+            --products opendr \
+            --opendr-runtime fsm \
+            --benchmark-timeout 240 \
+            --output-dir target/perf/release/full
+
+      - name: Run simple-bind concurrency profile
+        run: |
+          ./scripts/perf_docker_matrix.sh \
+            --profile-set concurrency \
+            --products opendr \
+            --opendr-runtime fsm \
+            --benchmark-timeout 240 \
+            --concurrent-bind-clients 1,4,8,10,12,16,32,64,128 \
+            --concurrent-bind-iterations 20 \
+            --concurrent-bind-warmup-iterations 1 \
+            --concurrent-bind-operation-timeout-ms 5000 \
+            --output-dir target/perf/release/concurrency
+
+      - name: Run index profile
+        run: |
+          ./scripts/perf_docker_matrix.sh \
+            --profile-set index \
+            --products opendr \
+            --opendr-runtime fsm \
+            --benchmark-timeout 240 \
+            --concurrent-index-search-clients 1,4,8,16,32 \
+            --concurrent-index-search-iterations 20 \
+            --concurrent-index-search-warmup-iterations 1 \
+            --concurrent-index-search-operation-timeout-ms 5000 \
+            --perf-client-image opendr:docker-perf-client \
+            --output-dir target/perf/release/index
+
+      - name: Run SASL PLAIN concurrency profile
+        run: |
+          ./scripts/perf_docker_matrix.sh \
+            --profile-set sasl \
+            --products opendr \
+            --opendr-runtime fsm \
+            --benchmark-timeout 240 \
+            --concurrent-bind-clients 1,4,8,16,32,64,128 \
+            --concurrent-bind-iterations 20 \
+            --concurrent-bind-warmup-iterations 1 \
+            --concurrent-bind-operation-timeout-ms 5000 \
+            --sasl-plain-authcid-format rdn-value \
+            --skip-sasl-plain-admin-benchmark \
+            --perf-client-image opendr:docker-perf-client \
+            --output-dir target/perf/release/sasl
+
+      - name: Validate against documented baseline
+        run: |
+          python3 scripts/validate_docker_perf_baseline.py \
+            --baseline-doc docs/DOCKER_PERF_COMPARISON.md \
+            --summary-csv target/perf/release/full/comparison-summary.csv \
+            --summary-csv target/perf/release/concurrency/comparison-summary.csv \
+            --summary-csv target/perf/release/index/comparison-summary.csv \
+            --summary-csv target/perf/release/sasl/comparison-summary.csv \
+            --threshold-percent 10 \
+            --report-out target/perf/release/baseline-validation.md
+
+      - name: Package performance results
+        if: always()
+        run: |
+          mkdir -p target/perf
+          if [[ ! -d target/perf/release ]]; then
+            mkdir -p target/perf/release
+            printf 'Performance results were not produced before the job failed.\n' > target/perf/release/README.txt
+          fi
+          tar -czf target/perf/opendr-release-perf-results.tar.gz -C target/perf release
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opendr-release-perf-results
+          path: target/perf/opendr-release-perf-results.tar.gz
+          if-no-files-found: warn
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: perf-gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            exe_ext: ""
+          - label: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+            rust_targets: x86_64-apple-darwin,aarch64-apple-darwin
+            archive_ext: tar.gz
+            exe_ext: ""
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+            archive_ext: zip
+            exe_ext: ".exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          read -r -a bins <<< "${RELEASE_BINS}"
+          package_dir="dist/opendr-${{ matrix.label }}"
+          mkdir -p "${package_dir}"
+
+          if [[ "${{ matrix.target }}" == "universal-apple-darwin" ]]; then
+            for target in x86_64-apple-darwin aarch64-apple-darwin; do
+              cargo build --release --locked --target "${target}" --bins
+            done
+
+            for bin in "${bins[@]}"; do
+              lipo -create \
+                "target/x86_64-apple-darwin/release/${bin}" \
+                "target/aarch64-apple-darwin/release/${bin}" \
+                -output "${package_dir}/${bin}"
+              chmod +x "${package_dir}/${bin}"
+            done
+          else
+            cargo build --release --locked --target "${{ matrix.target }}" --bins
+            for bin in "${bins[@]}"; do
+              cp "target/${{ matrix.target }}/release/${bin}${{ matrix.exe_ext }}" \
+                "${package_dir}/${bin}${{ matrix.exe_ext }}"
+            done
+          fi
+
+          cp README.md "${package_dir}/README.md"
+
+      - name: Archive release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="opendr-${{ matrix.label }}.${{ matrix.archive_ext }}"
+          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            powershell -NoLogo -NoProfile -Command \
+              "Compress-Archive -Path 'dist/opendr-${{ matrix.label }}/*' -DestinationPath 'dist/${archive}' -Force"
+          else
+            tar -czf "dist/${archive}" -C dist "opendr-${{ matrix.label }}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opendr-${{ matrix.label }}
+          path: dist/opendr-${{ matrix.label }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  release:
+    name: Upload GitHub release assets
+    needs:
+      - perf-gate
+      - build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: find release-assets -maxdepth 2 -type f -print | sort
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/**/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}

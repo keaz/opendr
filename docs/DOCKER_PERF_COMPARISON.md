@@ -14,6 +14,14 @@ This document records the current Dockerized OpenDR and OpenDJ benchmark results
 
 ## Reproduction
 
+Release CD runs the OpenDR Docker perf regression gate with the full,
+simple-bind concurrency, index, and SASL PLAIN concurrency profiles. The gate
+uses `scripts/validate_docker_perf_baseline.py` to compare the generated
+`comparison-summary.csv` files against the OpenDR baseline values in this
+document and fails when a lower-is-better latency/failure metric regresses by
+more than 10%, or a higher-is-better throughput/capacity metric drops by more
+than 10%.
+
 Full latency run:
 
 ```bash
