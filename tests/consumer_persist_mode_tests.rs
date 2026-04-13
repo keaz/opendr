@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use opendr::consumer_persist_mode::{
-    create_persist_mode_event, is_persist_mode_compatible_state, should_use_persist_mode,
     PersistConnectionState, PersistModeConfig, PersistModeManager, PersistModeStats,
+    create_persist_mode_event, is_persist_mode_compatible_state, should_use_persist_mode,
 };
 use opendr::fsm::ReplicationConsumerState;
 use opendr::replication_consumer_fsm::{

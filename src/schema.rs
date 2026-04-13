@@ -361,10 +361,11 @@ impl LdapSchema {
 
         // Validate single-value constraints
         for (attr_name, values) in attributes {
-            if let Some(attr_type) = self.get_attribute_type(attr_name) {
-                if attr_type.single_value && values.len() > 1 {
-                    return Err(SchemaError::SingleValueViolation(attr_name.clone()));
-                }
+            if let Some(attr_type) = self.get_attribute_type(attr_name)
+                && attr_type.single_value
+                && values.len() > 1
+            {
+                return Err(SchemaError::SingleValueViolation(attr_name.clone()));
             }
         }
 

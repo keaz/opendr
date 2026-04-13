@@ -872,10 +872,12 @@ async fn test_batch_processor_replays_password_and_rename_semantics() {
         .await
         .unwrap();
 
-    assert!(consumer_backend
-        .authenticate(original_dn, b"initial-secret")
-        .await
-        .unwrap());
+    assert!(
+        consumer_backend
+            .authenticate(original_dn, b"initial-secret")
+            .await
+            .unwrap()
+    );
 
     provider
         .modify_entry(
@@ -906,14 +908,18 @@ async fn test_batch_processor_replays_password_and_rename_semantics() {
         .await
         .unwrap();
 
-    assert!(!consumer_backend
-        .authenticate(original_dn, b"initial-secret")
-        .await
-        .unwrap());
-    assert!(consumer_backend
-        .authenticate(original_dn, b"rotated-secret")
-        .await
-        .unwrap());
+    assert!(
+        !consumer_backend
+            .authenticate(original_dn, b"initial-secret")
+            .await
+            .unwrap()
+    );
+    assert!(
+        consumer_backend
+            .authenticate(original_dn, b"rotated-secret")
+            .await
+            .unwrap()
+    );
 
     provider
         .rename_entry(original_dn, "cn=replicated-renamed", true, None)
@@ -930,20 +936,26 @@ async fn test_batch_processor_replays_password_and_rename_semantics() {
         .await
         .unwrap();
 
-    assert!(consumer_backend
-        .get_entry(original_dn)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(consumer_backend
-        .get_entry(renamed_dn)
-        .await
-        .unwrap()
-        .is_some());
-    assert!(consumer_backend
-        .authenticate(renamed_dn, b"rotated-secret")
-        .await
-        .unwrap());
+    assert!(
+        consumer_backend
+            .get_entry(original_dn)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        consumer_backend
+            .get_entry(renamed_dn)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        consumer_backend
+            .authenticate(renamed_dn, b"rotated-secret")
+            .await
+            .unwrap()
+    );
 
     provider.delete_entry(renamed_dn).await.unwrap();
 
@@ -957,15 +969,19 @@ async fn test_batch_processor_replays_password_and_rename_semantics() {
         .await
         .unwrap();
 
-    assert!(consumer_backend
-        .get_entry(renamed_dn)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(!consumer_backend
-        .authenticate(renamed_dn, b"rotated-secret")
-        .await
-        .unwrap());
+    assert!(
+        consumer_backend
+            .get_entry(renamed_dn)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !consumer_backend
+            .authenticate(renamed_dn, b"rotated-secret")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

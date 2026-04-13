@@ -236,10 +236,12 @@ mod tests {
             as_map.get("contextCSN").unwrap(),
             &vec!["1696680896789012#001#000001#000000".to_string()]
         );
-        assert!(as_map
-            .get("supportedExtension")
-            .unwrap()
-            .contains(&START_TLS_OID.to_string()));
+        assert!(
+            as_map
+                .get("supportedExtension")
+                .unwrap()
+                .contains(&START_TLS_OID.to_string())
+        );
     }
 
     #[tokio::test]

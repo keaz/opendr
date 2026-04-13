@@ -3,7 +3,9 @@
 //! This benchmark suite measures the performance of LDAP schema validation,
 //! including object class validation, attribute collection, and constraint checking.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use opendr::schema::{AttributeType, LdapSchema, ObjectClass, ObjectClassKind};
 use std::collections::HashMap;
 

@@ -206,7 +206,7 @@ pub trait DirectoryBackend: Send + Sync {
     async fn get_entry(&self, dn: &str) -> Result<Option<DirectoryEntry>, BackendError>;
 
     async fn add_entry(&self, entry: DirectoryEntry, password: Vec<u8>)
-        -> Result<(), BackendError>;
+    -> Result<(), BackendError>;
 
     async fn add_entry_with_actor(
         &self,

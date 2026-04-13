@@ -248,13 +248,12 @@ pub fn create_incremental_backup(
     validate_changelog_window(&parent_csn, latest_changelog_csn.as_ref(), &changelog)?;
     if let (Some(source_context), Some(latest_changelog_csn)) =
         (source_context.as_ref(), latest_changelog_csn.as_ref())
+        && source_context > latest_changelog_csn
     {
-        if source_context > latest_changelog_csn {
-            return Err(BackupError::InvalidBackup(format!(
-                "persisted changelog is behind backend contextCSN: backend={}, changelog={}",
-                source_context, latest_changelog_csn
-            )));
-        }
+        return Err(BackupError::InvalidBackup(format!(
+            "persisted changelog is behind backend contextCSN: backend={}, changelog={}",
+            source_context, latest_changelog_csn
+        )));
     }
 
     let mut incremental_entries: Vec<BackupChangeEntry> = changelog

@@ -3,7 +3,9 @@
 //! This benchmark suite compares the performance of different backend
 //! implementations, with a focus on read operations.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
 use std::collections::HashMap;

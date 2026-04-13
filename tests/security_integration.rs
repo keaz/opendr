@@ -12,9 +12,9 @@ use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::connection_fsm::{ConnectionFsmImpl, TlsHandler};
 use opendr::extended_op_fsm::{ExtendedOpBackend, ExtendedOpMetrics, ExtendedOpParser};
 use opendr::extended_ops::{
-    encode_cancel_request_value, encode_password_modify_request_value, oids,
     ExtendedOpMetricsCollector, OperationCanceller, PasswordModifier, PasswordModifyRequest,
-    StandardExtendedOpBackend, StandardExtendedOpParser,
+    StandardExtendedOpBackend, StandardExtendedOpParser, encode_cancel_request_value,
+    encode_password_modify_request_value, oids,
 };
 use opendr::fsm::{ConnectionEvent, ConnectionState, SaslEvent, SaslFsm, StateMachine};
 use opendr::sasl_fsm::{CredentialVerifier, SaslFsmImpl, SaslMechanismHandler};

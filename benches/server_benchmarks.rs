@@ -3,7 +3,9 @@
 //! This benchmark suite measures end-to-end performance of LDAP operations
 //! through the full server request/response pipeline.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::schema::LdapSchema;
 use std::collections::HashMap;

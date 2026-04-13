@@ -13,8 +13,8 @@ use opendr::server;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -502,9 +502,11 @@ async fn test_max_persistent_consumers_limit() {
         .await;
 
     assert!(result.is_err(), "Should fail when at limit");
-    assert!(result
-        .unwrap_err()
-        .contains("Maximum persistent consumer limit"));
+    assert!(
+        result
+            .unwrap_err()
+            .contains("Maximum persistent consumer limit")
+    );
 
     println!("✅ Max consumer limit enforced correctly");
 

@@ -16,7 +16,7 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{Instant, sleep, timeout};
 
 /// Helper function to create a test configuration for consumer mode
 fn create_consumer_config() -> ServerConfig {
@@ -408,8 +408,8 @@ async fn test_consumer_custom_listening_config_propagates() {
 }
 
 #[tokio::test]
-async fn test_consumer_service_listening_mode_applies_initial_refresh_and_live_update_in_one_session(
-) {
+async fn test_consumer_service_listening_mode_applies_initial_refresh_and_live_update_in_one_session()
+ {
     let (provider_backend, provider_shutdown, provider_task, provider_url) =
         start_provider_server().await;
     let state_dir = TempDir::new().unwrap();

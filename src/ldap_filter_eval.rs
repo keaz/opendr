@@ -4,8 +4,8 @@ use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 use crate::search_fsm::SearchEntry;
 use lber::common::TagClass;
 use lber::structures::Tag;
-use ldap3::parse_filter;
 use ldap_parser::filter::{Filter, Substring};
+use ldap3::parse_filter;
 use std::collections::HashMap;
 
 const AND_FILTER: u64 = 0;
@@ -243,7 +243,7 @@ impl CompiledLdapFilter {
             Filter::Not(filter) => Ok(Self::Not(Box::new(Self::from_search_filter(filter)?))),
             Filter::EqualityMatch(ava) => Ok(Self::Equality {
                 attribute: ava.attribute_desc.0.to_ascii_lowercase(),
-                value: bytes_to_string(ava.assertion_value),
+                value: bytes_to_string(&ava.assertion_value),
             }),
             Filter::Substrings(substring) => Ok(Self::Substrings {
                 attribute: substring.filter_type.0.to_ascii_lowercase(),
@@ -255,18 +255,18 @@ impl CompiledLdapFilter {
             }),
             Filter::GreaterOrEqual(ava) => Ok(Self::GreaterOrEqual {
                 attribute: ava.attribute_desc.0.to_ascii_lowercase(),
-                value: bytes_to_string(ava.assertion_value),
+                value: bytes_to_string(&ava.assertion_value),
             }),
             Filter::LessOrEqual(ava) => Ok(Self::LessOrEqual {
                 attribute: ava.attribute_desc.0.to_ascii_lowercase(),
-                value: bytes_to_string(ava.assertion_value),
+                value: bytes_to_string(&ava.assertion_value),
             }),
             Filter::Present(attribute) => Ok(Self::Present {
                 attribute: attribute.0.to_ascii_lowercase(),
             }),
             Filter::ApproxMatch(ava) => Ok(Self::ApproxMatch {
                 attribute: ava.attribute_desc.0.to_ascii_lowercase(),
-                value: bytes_to_string(ava.assertion_value),
+                value: bytes_to_string(&ava.assertion_value),
             }),
             Filter::ExtensibleMatch(assertion) => Ok(Self::Extensible {
                 attribute: assertion
@@ -801,9 +801,11 @@ mod tests {
         let compiled = compile_filter("(objectClass=person)").unwrap();
         let prepared = prepare_change(&change, true).unwrap();
 
-        assert!(prepared
-            .matches("dc=example,dc=com", Some(&compiled))
-            .unwrap());
+        assert!(
+            prepared
+                .matches("dc=example,dc=com", Some(&compiled))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -813,9 +815,11 @@ mod tests {
         let compiled = compile_filter("(cn=Stale)").unwrap();
         let prepared = prepare_change(&change, true).unwrap();
 
-        assert!(prepared
-            .matches("dc=example,dc=com", Some(&compiled))
-            .unwrap());
+        assert!(
+            prepared
+                .matches("dc=example,dc=com", Some(&compiled))
+                .unwrap()
+        );
         assert!(!prepared.matches("dc=other,dc=com", None).unwrap());
     }
 
@@ -835,14 +839,18 @@ mod tests {
         );
         let prepared = prepare_change(&change, false).unwrap();
 
-        assert!(prepared
-            .matches("ou=people,dc=example,dc=com", None)
-            .unwrap());
-        assert!(prepared
-            .matches(
-                "dc=example,dc=com",
-                Some(&compile_filter("(cn=alice)").unwrap())
-            )
-            .is_err());
+        assert!(
+            prepared
+                .matches("ou=people,dc=example,dc=com", None)
+                .unwrap()
+        );
+        assert!(
+            prepared
+                .matches(
+                    "dc=example,dc=com",
+                    Some(&compile_filter("(cn=alice)").unwrap())
+                )
+                .is_err()
+        );
     }
 }

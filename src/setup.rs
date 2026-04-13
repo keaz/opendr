@@ -884,12 +884,12 @@ impl SetupHandler {
                     .await?;
                 consumer_config.state_storage_path = PathBuf::from(state_path);
 
-                if config.replication.role == ReplicationRole::Both {
-                    if let Some(provider_config) = config.replication.provider.as_mut() {
-                        provider_config.max_batch_size = consumer_config.max_batch_size;
-                        provider_config.heartbeat_interval_secs =
-                            consumer_config.heartbeat_interval_secs;
-                    }
+                if config.replication.role == ReplicationRole::Both
+                    && let Some(provider_config) = config.replication.provider.as_mut()
+                {
+                    provider_config.max_batch_size = consumer_config.max_batch_size;
+                    provider_config.heartbeat_interval_secs =
+                        consumer_config.heartbeat_interval_secs;
                 }
 
                 config.replication.consumer = Some(consumer_config);
@@ -948,50 +948,50 @@ impl SetupHandler {
         if config.replication.enabled {
             println!("\n  Replication:    Enabled");
             println!("  Role:           {:?}", config.replication.role);
-            if config.replication.role.requires_provider() {
-                if let Some(ref provider) = config.replication.provider {
-                    println!(
-                        "  Changelog:      {}",
-                        if provider.changelog_enabled {
-                            "Enabled"
-                        } else {
-                            "Disabled"
-                        }
-                    );
+            if config.replication.role.requires_provider()
+                && let Some(ref provider) = config.replication.provider
+            {
+                println!(
+                    "  Changelog:      {}",
                     if provider.changelog_enabled {
-                        println!("  Max Entries:    {}", provider.changelog_max_entries);
+                        "Enabled"
+                    } else {
+                        "Disabled"
                     }
-                    println!("  Batch Size:     {}", provider.max_batch_size);
-                    println!(
-                        "  Streaming:      {}",
-                        if provider.enable_streaming {
-                            "Enabled"
-                        } else {
-                            "Disabled"
-                        }
-                    );
+                );
+                if provider.changelog_enabled {
+                    println!("  Max Entries:    {}", provider.changelog_max_entries);
                 }
+                println!("  Batch Size:     {}", provider.max_batch_size);
+                println!(
+                    "  Streaming:      {}",
+                    if provider.enable_streaming {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    }
+                );
             }
-            if config.replication.role.requires_consumer() {
-                if let Some(ref consumer) = config.replication.consumer {
-                    println!("  Provider URL:   {}", consumer.provider_url);
-                    if consumer.provider_bind_dn.is_some() {
-                        println!("  Auth:           Enabled");
-                    }
-                    println!(
-                        "  Password Source: {}",
-                        replication_password_source_summary(consumer)
-                    );
-                    println!(
-                        "  Listener Mode:  Enabled (legacy refresh interval: {} seconds)",
-                        consumer.sync_interval_secs
-                    );
-                    println!("  Retry Attempts: {}", consumer.max_retry_attempts);
-                    println!(
-                        "  State Path:     {}",
-                        consumer.state_storage_path.display()
-                    );
+            if config.replication.role.requires_consumer()
+                && let Some(ref consumer) = config.replication.consumer
+            {
+                println!("  Provider URL:   {}", consumer.provider_url);
+                if consumer.provider_bind_dn.is_some() {
+                    println!("  Auth:           Enabled");
                 }
+                println!(
+                    "  Password Source: {}",
+                    replication_password_source_summary(consumer)
+                );
+                println!(
+                    "  Listener Mode:  Enabled (legacy refresh interval: {} seconds)",
+                    consumer.sync_interval_secs
+                );
+                println!("  Retry Attempts: {}", consumer.max_retry_attempts);
+                println!(
+                    "  State Path:     {}",
+                    consumer.state_storage_path.display()
+                );
             }
         } else {
             println!("\n  Replication:    Disabled");
@@ -1460,10 +1460,10 @@ description: Standard users group
 
     /// Hash password using Salted SHA512 (like OpenDJ)
     fn hash_password(&self, password: &str) -> String {
-        use rand::Rng;
+        use rand::RngExt;
 
         // Generate 16-byte salt
-        let salt: [u8; 16] = rand::thread_rng().gen();
+        let salt: [u8; 16] = rand::rng().random();
 
         // Hash password + salt
         let mut hasher = Sha512::new();

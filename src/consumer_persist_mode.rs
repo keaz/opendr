@@ -85,7 +85,7 @@ use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::interval;
 
 // ================================================================================================
@@ -557,7 +557,7 @@ pub trait ConsumerPersistModeExtension {
     /// * `Ok(usize)` - Number of entries processed
     /// * `Err(ConsumerError)` - Failed to handle change
     async fn handle_persist_mode_change(&mut self, change: Vec<u8>)
-        -> Result<usize, ConsumerError>;
+    -> Result<usize, ConsumerError>;
 
     /// Exit persist mode
     ///

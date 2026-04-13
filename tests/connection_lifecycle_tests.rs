@@ -5,8 +5,8 @@
 //! Full integration tests with persist mode manager are in separate files.
 
 use opendr::connection_lifecycle::{
-    can_reconnect, is_connection_active, is_terminal_state, ConnectionLifecycleState,
-    LifecycleConfig, LifecycleStats,
+    ConnectionLifecycleState, LifecycleConfig, LifecycleStats, can_reconnect, is_connection_active,
+    is_terminal_state,
 };
 use std::time::{Duration, Instant};
 

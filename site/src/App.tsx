@@ -136,7 +136,7 @@ max_concurrent_operations = 100`,
 backend_type = "lmdb"
 data_directory = "./data"
 lmdb_max_size = 10737418240
-lmdb_max_readers = 126
+lmdb_max_readers = 256
 import_sample_data = false
 indexed_attributes = ["cn", "uid", "mail", "objectClass"]
 
@@ -228,11 +228,11 @@ stream_port = 0`,
     title: "`[resources]`",
     intro: "Runtime safety limits enforced around connections, operations, memory, and idle sessions.",
     snippet: `[resources]
-max_connections = 1000
-max_connections_per_ip = 10
-max_operations_per_connection = 100
+max_connections = 512
+max_connections_per_ip = 256
+max_operations_per_connection = 200
 max_memory_per_connection = 10485760
-max_total_memory = 1073741824
+max_total_memory = 2147483648
 connection_idle_timeout_secs = 600`,
     options: [
       ["max_connections", "Total concurrent connection cap. Must be greater than zero."],
@@ -415,50 +415,49 @@ const troubleshootingRows = [
 const fsmVsOpenDjRuntime = {
   labels: ["Light", "Moderate", "Heavy", "Stress"],
   series: [
-    { label: "OpenDR FSM", values: [297.105, 426.724, 674.149, 1562.885], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [812.928, 1133.903, 1755.398, 4232.527], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [403.261, 558.925, 955.953, 2272.271], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [1026.66, 1359.839, 2019.819, 4982.452], color: "#f2b26d" },
   ],
 };
 
 const fsmVsOpenDjSubtreeSearch = {
   labels: ["Light", "Moderate", "Heavy", "Stress"],
   series: [
-    { label: "OpenDR FSM", values: [0.813, 3.271, 6.244, 15.5], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [3.838, 14.073, 25.052, 47.034], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [1.138, 4.474, 7.508, 15.799], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [6.05, 22.3, 38.378, 84.331], color: "#f2b26d" },
   ],
 };
 
 const fsmVsOpenDjMemory = {
   labels: ["Light", "Moderate", "Heavy", "Stress"],
   series: [
-    { label: "OpenDR FSM", values: [2.87, 4.17, 5.67, 6.69], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [805.9, 805.4, 829.4, 835.3], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [4.06, 6.89, 10.62, 11.48], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [955.9, 813.3, 804.9, 849], color: "#f2b26d" },
   ],
 };
 
 const concurrentBindThroughput: BarChartDatum[] = [
-  { label: "OpenDR FSM tuned", value: 30915.94, color: "#7ce8c8" },
-  { label: "OpenDJ", value: 10805.43, color: "#f2b26d" },
+  { label: "OpenDR FSM", value: 55397.02, color: "#7ce8c8" },
+  { label: "OpenDJ", value: 6525.77, color: "#f2b26d" },
 ];
 
 const saslPlainBindLatency = {
   labels: ["Light", "Moderate", "Heavy", "Stress"],
   series: [
-    { label: "OpenDR FSM", values: [0.059, 0.059, 0.063, 0.062], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [0.383, 0.425, 0.331, 0.474], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [0.061, 0.064, 0.062, 0.063], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [0.409, 0.5, 0.353, 0.404], color: "#f2b26d" },
   ],
 };
 
 const saslPlainBindThroughput: BarChartDatum[] = [
-  { label: "OpenDR FSM", value: 99330.02, color: "#7ce8c8" },
-  { label: "OpenDJ", value: 16091.05, color: "#f2b26d" },
+  { label: "OpenDR FSM", value: 195708.6, color: "#7ce8c8" },
+  { label: "OpenDJ", value: 10222.17, color: "#f2b26d" },
 ];
 
 const indexSearchLatency = {
   labels: ["uid eq", "mail present", "desc substring", "sn >=", "sn <="],
   series: [
-    { label: "OpenDR FSM", values: [0.265, 8.177, 3.894, 5.207, 4.893], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [0.412, 21.166, 4.358, 10.687, 10.654], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [0.108, 7.067, 3.9, 4.018, 3.977], color: "#7ce8c8" },
   ],
 };
 
@@ -861,34 +860,26 @@ cargo build --release`}</code></pre>
               <h3>Run the performance matrix</h3>
               <div className="command-list">
                 <section>
-                  <h3>FSM runtime current run</h3>
+                  <h3>Full latency run</h3>
                   <pre><code>{`./scripts/perf_docker_matrix.sh \\
   --profile-set full \\
-  --products opendr \\
+  --products opendr,opendj \\
   --opendr-runtime fsm \\
-  --perf-client-image opendr:docker-perf-client \\
-  --output-dir target/perf/docker-matrix-fsm-auth-cache-final-full-20260411`}</code></pre>
+  --benchmark-timeout 240 \\
+  --output-dir target/perf/docker-matrix-edition2024-full-tuned-hostclient-20260413`}</code></pre>
                 </section>
                 <section>
-                  <h3>OpenDJ comparison run</h3>
-                  <pre><code>{`./scripts/perf_docker_matrix.sh \\
-  --profile-set full \\
-  --products opendj \\
-  --perf-client-image opendr:docker-perf-client \\
-  --output-dir target/perf/docker-matrix-opendj-current-full-20260411`}</code></pre>
-                </section>
-                <section>
-                  <h3>Concurrent bind capacity run</h3>
+                  <h3>Simple bind concurrency run</h3>
                   <pre><code>{`./scripts/perf_docker_matrix.sh \\
   --profile-set concurrency \\
-  --products opendr \\
+  --products opendr,opendj \\
   --opendr-runtime fsm \\
   --benchmark-timeout 240 \\
   --concurrent-bind-clients 1,4,8,10,12,16,32,64,128 \\
   --concurrent-bind-iterations 20 \\
   --concurrent-bind-warmup-iterations 1 \\
   --concurrent-bind-operation-timeout-ms 5000 \\
-  --output-dir target/perf/docker-matrix-concurrent-bind-fsm-opendr-config-128-20260411`}</code></pre>
+  --output-dir target/perf/docker-matrix-edition2024-concurrent-bind-tuned-hostclient-20260413`}</code></pre>
                 </section>
                 <section>
                   <h3>SASL PLAIN comparison run</h3>
@@ -904,7 +895,7 @@ cargo build --release`}</code></pre>
   --sasl-plain-authcid-format rdn-value \\
   --skip-sasl-plain-admin-benchmark \\
   --perf-client-image opendr:docker-perf-client \\
-  --output-dir target/perf/docker-matrix-sasl-plain-concurrency-20260412`}</code></pre>
+  --output-dir target/perf/docker-matrix-edition2024-sasl-concurrency-20260413`}</code></pre>
                 </section>
                 <section>
                   <h3>Index-type comparison run</h3>
@@ -917,7 +908,22 @@ cargo build --release`}</code></pre>
   --concurrent-index-search-iterations 20 \\
   --concurrent-index-search-warmup-iterations 1 \\
   --concurrent-index-search-operation-timeout-ms 5000 \\
-  --output-dir target/perf/docker-matrix-index-types-final-20260412`}</code></pre>
+  --perf-client-image opendr:docker-perf-client \\
+  --output-dir target/perf/docker-matrix-edition2024-index-20260413`}</code></pre>
+                </section>
+                <section>
+                  <h3>OpenDJ index timeout confirmation</h3>
+                  <pre><code>{`./scripts/perf_docker_matrix.sh \\
+  --profile-set index \\
+  --products opendj \\
+  --opendr-runtime fsm \\
+  --benchmark-timeout 600 \\
+  --concurrent-index-search-clients 1,4,8,16,32 \\
+  --concurrent-index-search-iterations 20 \\
+  --concurrent-index-search-warmup-iterations 1 \\
+  --concurrent-index-search-operation-timeout-ms 5000 \\
+  --perf-client-image opendr:docker-perf-client \\
+  --output-dir target/perf/docker-matrix-edition2024-index-opendj-600-20260413`}</code></pre>
                 </section>
               </div>
 
@@ -976,27 +982,27 @@ cargo build --release`}</code></pre>
                 />
                 <SimpleBarChart
                   title="Peak successful bind throughput"
-                  description="Higher is better. Tuned OpenDR FSM versus OpenDJ in the 128-client concurrent-bind profile."
+                  description="Higher is better. Dedicated tuned host-client auth-concurrency profile; both products reached 128 clients at 0% failure."
                   data={concurrentBindThroughput}
                   unit="ops/s"
                   onExpand={() => setExpandedChart({
                     kind: "simple",
                     title: "Peak successful bind throughput",
-                    description: "Higher is better. Tuned OpenDR FSM versus OpenDJ in the 128-client concurrent-bind profile.",
+                    description: "Higher is better. Dedicated tuned host-client auth-concurrency profile; both products reached 128 clients at 0% failure.",
                     data: concurrentBindThroughput,
                     unit: "ops/s",
                   })}
                 />
                 <GroupedBarChart
                   title="SASL PLAIN bind mean"
-                  description="Lower is better. Fixture-user SASL PLAIN bind latency from the Docker full profile."
+                  description="Lower is better. Fixture-user SASL PLAIN bind latency from the serial SASL artifact."
                   labels={saslPlainBindLatency.labels}
                   series={saslPlainBindLatency.series}
                   unit="ms"
                   onExpand={() => setExpandedChart({
                     kind: "grouped",
                     title: "SASL PLAIN bind mean",
-                    description: "Lower is better. Fixture-user SASL PLAIN bind latency from the Docker full profile.",
+                    description: "Lower is better. Fixture-user SASL PLAIN bind latency from the serial SASL artifact.",
                     labels: saslPlainBindLatency.labels,
                     series: saslPlainBindLatency.series,
                     unit: "ms",
@@ -1017,14 +1023,14 @@ cargo build --release`}</code></pre>
                 />
                 <GroupedBarChart
                   title="Indexed search latency"
-                  description="Lower is better. Mean latency for equality, presence, substring, and ordering probes."
+                  description="Lower is better. Mean OpenDR latency for equality, presence, substring, and ordering probes; OpenDJ timed out before a comparable result."
                   labels={indexSearchLatency.labels}
                   series={indexSearchLatency.series}
                   unit="ms"
                   onExpand={() => setExpandedChart({
                     kind: "grouped",
                     title: "Indexed search latency",
-                    description: "Lower is better. Mean latency for equality, presence, substring, and ordering probes.",
+                    description: "Lower is better. Mean OpenDR latency for equality, presence, substring, and ordering probes; OpenDJ timed out before a comparable result.",
                     labels: indexSearchLatency.labels,
                     series: indexSearchLatency.series,
                     unit: "ms",

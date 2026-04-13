@@ -1,5 +1,5 @@
 use ldap3::{LdapConnAsync, Scope, SearchEntry};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::distr::{Alphanumeric, SampleString};
 use std::collections::HashSet;
 use std::error::Error;
 
@@ -74,14 +74,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Test 3: Add 1000 random test users
     println!("5. Adding 1000 random test users...");
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut added_count = 0;
     let mut skipped_count = 0;
 
     for i in 0..1000 {
         // Generate random user data
-        let first_name: String = (0..8).map(|_| rng.sample(Alphanumeric) as char).collect();
-        let last_name: String = (0..10).map(|_| rng.sample(Alphanumeric) as char).collect();
+        let first_name = Alphanumeric.sample_string(&mut rng, 8);
+        let last_name = Alphanumeric.sample_string(&mut rng, 10);
         let uid: String = format!("user{:04}", i);
         let cn = format!("{} {}", first_name, last_name);
         let email = format!("{}@example.com", uid);

@@ -925,10 +925,8 @@ impl LmdbBackend {
             .operational_attributes
             .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
 
-        if delete_old {
-            if let Some((attr, _)) = actual_dn.split_once('=') {
-                new_entry.attributes.remove(&attr.trim().to_lowercase());
-            }
+        if delete_old && let Some((attr, _)) = actual_dn.split_once('=') {
+            new_entry.attributes.remove(&attr.trim().to_lowercase());
         }
 
         if let Some((attr, val)) = new_rdn.split_once('=') {
@@ -1090,7 +1088,7 @@ impl LmdbBackend {
                 return Err(BackendError::Storage(format!(
                     "DN index lookup failed: {}",
                     e
-                )))
+                )));
             }
         };
 
@@ -1241,10 +1239,10 @@ impl LmdbBackend {
     /// Create SSHA512 password hash
     /// Format: {SSHA512}base64(SHA512(password + salt) + salt)
     fn create_ssha512(password: &[u8]) -> String {
-        use rand::Rng;
+        use rand::RngExt;
 
         // Generate random 16-byte salt
-        let salt: [u8; 16] = rand::thread_rng().gen();
+        let salt: [u8; 16] = rand::rng().random();
 
         // Hash password with salt
         let mut hasher = Sha512::new();
@@ -1483,7 +1481,7 @@ impl LmdbBackend {
                         return Err(BackendError::Storage(format!(
                             "Failed to read attribute index config metadata: {}",
                             e
-                        )))
+                        )));
                     }
                 };
 
@@ -1511,7 +1509,7 @@ impl LmdbBackend {
                             return Err(BackendError::Storage(format!(
                                 "Failed to read attribute index metadata for {}: {}",
                                 attr, e
-                            )))
+                            )));
                         }
                     }
                 }
@@ -1663,7 +1661,7 @@ impl LmdbBackend {
                 return Err(BackendError::Storage(format!(
                     "Failed to seek attribute index cursor: {}",
                     e
-                )))
+                )));
             }
         };
 
@@ -1714,19 +1712,19 @@ impl LmdbBackend {
             let attr_lower = attr_name.to_lowercase();
 
             // Check if this attribute is indexed
-            if let Some(index_db) = indexes.get(&attr_lower) {
-                if let Some(index_types) = self.index_config.index_types_for(&attr_lower) {
-                    for (_, index_key) in
-                        Self::attribute_index_keys(*index_db, dn, values, &index_types)
-                    {
-                        txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
-                            .map_err(|e| {
-                                BackendError::Storage(format!(
-                                    "Failed to update index for {}: {}",
-                                    attr_name, e
-                                ))
-                            })?;
-                    }
+            if let Some(index_db) = indexes.get(&attr_lower)
+                && let Some(index_types) = self.index_config.index_types_for(&attr_lower)
+            {
+                for (_, index_key) in
+                    Self::attribute_index_keys(*index_db, dn, values, &index_types)
+                {
+                    txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
+                        .map_err(|e| {
+                            BackendError::Storage(format!(
+                                "Failed to update index for {}: {}",
+                                attr_name, e
+                            ))
+                        })?;
                 }
             }
         }
@@ -1752,20 +1750,20 @@ impl LmdbBackend {
             let attr_lower = attr_name.to_lowercase();
 
             // Check if this attribute is indexed
-            if let Some(index_db) = indexes.get(&attr_lower) {
-                if let Some(index_types) = self.index_config.index_types_for(&attr_lower) {
-                    for (_, index_key) in
-                        Self::attribute_index_keys(*index_db, dn, values, &index_types)
-                    {
-                        txn.del(*index_db, &index_key.as_bytes(), None)
-                            .or_else(|e| match e {
-                                lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
-                                _ => Err(BackendError::Storage(format!(
-                                    "Failed to remove index for {}: {}",
-                                    attr_name, e
-                                ))),
-                            })?;
-                    }
+            if let Some(index_db) = indexes.get(&attr_lower)
+                && let Some(index_types) = self.index_config.index_types_for(&attr_lower)
+            {
+                for (_, index_key) in
+                    Self::attribute_index_keys(*index_db, dn, values, &index_types)
+                {
+                    txn.del(*index_db, &index_key.as_bytes(), None)
+                        .or_else(|e| match e {
+                            lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
+                            _ => Err(BackendError::Storage(format!(
+                                "Failed to remove index for {}: {}",
+                                attr_name, e
+                            ))),
+                        })?;
                 }
             }
         }
@@ -1919,7 +1917,7 @@ impl LmdbBackend {
                 return Err(BackendError::Storage(format!(
                     "Failed to seek ordering index cursor: {}",
                     e
-                )))
+                )));
             }
         };
 
@@ -2437,14 +2435,18 @@ mod tests {
 
         backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
 
-        assert!(backend
-            .authenticate("cn=test,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
-        assert!(!backend
-            .authenticate("cn=test,dc=example,dc=org", b"wrong")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=test,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .authenticate("cn=test,dc=example,dc=org", b"wrong")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2466,19 +2468,23 @@ mod tests {
         backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
 
         assert_eq!(backend.auth_cache_stats().len, 0);
-        assert!(backend
-            .authenticate("cn=cached,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
         let after_first_bind = backend.auth_cache_stats();
         assert_eq!(after_first_bind.hits, 0);
         assert_eq!(after_first_bind.misses, 1);
         assert_eq!(after_first_bind.len, 1);
 
-        assert!(backend
-            .authenticate("CN=CACHED,DC=EXAMPLE,DC=ORG", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("CN=CACHED,DC=EXAMPLE,DC=ORG", b"secret")
+                .await
+                .unwrap()
+        );
         let after_second_bind = backend.auth_cache_stats();
         assert_eq!(after_second_bind.hits, 1);
         assert_eq!(after_second_bind.misses, 1);
@@ -2505,10 +2511,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(backend
-            .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+                .await
+                .unwrap()
+        );
         backend
             .modify_entry(
                 "cn=cached,dc=example,dc=org",
@@ -2521,14 +2529,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!backend
-            .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
-            .await
-            .unwrap());
-        assert!(backend
-            .authenticate("cn=cached,dc=example,dc=org", b"new-secret")
-            .await
-            .unwrap());
+        assert!(
+            !backend
+                .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"new-secret")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2549,10 +2561,12 @@ mod tests {
         let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
         backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
 
-        assert!(backend
-            .authenticate("cn=cached,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
         backend
             .modify_entry(
                 "cn=cached,dc=example,dc=org",
@@ -2565,10 +2579,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(backend
-            .authenticate("cn=cached,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
         let stats = backend.auth_cache_stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
@@ -2592,10 +2608,12 @@ mod tests {
         attributes.insert("cn".to_string(), vec!["cached".to_string()]);
         let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
         backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
-        assert!(backend
-            .authenticate("cn=cached,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
 
         backend
             .delete_entry("cn=cached,dc=example,dc=org")
@@ -2603,10 +2621,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(backend.auth_cache_stats().len, 0);
-        assert!(!backend
-            .authenticate("cn=cached,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            !backend
+                .authenticate("cn=cached,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2626,24 +2646,30 @@ mod tests {
         attributes.insert("cn".to_string(), vec!["old".to_string()]);
         let entry = DirectoryEntry::new("cn=old,dc=example,dc=org", attributes);
         backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
-        assert!(backend
-            .authenticate("cn=old,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=old,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
 
         backend
             .rename_entry("cn=old,dc=example,dc=org", "cn=new", true, None)
             .await
             .unwrap();
 
-        assert!(!backend
-            .authenticate("cn=old,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
-        assert!(backend
-            .authenticate("cn=new,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            !backend
+                .authenticate("cn=old,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .authenticate("cn=new,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2666,10 +2692,12 @@ mod tests {
             .add_entry(entry, b"old-secret".to_vec())
             .await
             .unwrap();
-        assert!(backend
-            .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+                .await
+                .unwrap()
+        );
 
         let new_hash = LmdbBackend::create_ssha512(b"new-secret");
         backend
@@ -2677,14 +2705,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!backend
-            .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
-            .await
-            .unwrap());
-        assert!(backend
-            .authenticate("cn=cached,dc=example,dc=org", b"new-secret")
-            .await
-            .unwrap());
+        assert!(
+            !backend
+                .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"new-secret")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3046,14 +3078,18 @@ mod tests {
         .unwrap();
 
         assert!(backend.is_indexed("employeeNumber"));
-        assert!(backend
-            .search_by_index("employeeNumber", "12345")
-            .unwrap()
-            .is_empty());
-        assert!(backend
-            .search_present_by_index("employeeNumber")
-            .unwrap()
-            .is_empty());
+        assert!(
+            backend
+                .search_by_index("employeeNumber", "12345")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .search_present_by_index("employeeNumber")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3187,10 +3223,12 @@ mod tests {
             DirectoryEntry::new("uid=multi,dc=example,dc=org", multi_value_attributes);
         backend.add_entry(multi_value, vec![]).await.unwrap();
 
-        assert!(backend
-            .search_by_index("description", "alpha marker")
-            .unwrap()
-            .is_empty());
+        assert!(
+            backend
+                .search_by_index("description", "alpha marker")
+                .unwrap()
+                .is_empty()
+        );
 
         let results = backend
             .search_entries_with_hint(

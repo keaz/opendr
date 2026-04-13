@@ -325,7 +325,7 @@ impl BerDecoderFsmImpl {
                 BerDecoderState::Error => {
                     return Err(BerDecoderError::Generic {
                         message: "FSM is in error state".to_string(),
-                    })
+                    });
                 }
             }
         }
@@ -757,19 +757,19 @@ mod tests {
     #[async_trait]
     impl BerValidator for MockBerValidator {
         async fn validate_tag(&self, tag: u8) -> Result<(), String> {
-            if let Some(fail_tag) = self.should_fail_tag {
-                if tag == fail_tag {
-                    return Err(format!("Tag validation failed for {}", tag));
-                }
+            if let Some(fail_tag) = self.should_fail_tag
+                && tag == fail_tag
+            {
+                return Err(format!("Tag validation failed for {}", tag));
             }
             Ok(())
         }
 
         async fn validate_length(&self, length: usize) -> Result<(), String> {
-            if let Some(fail_length) = self.should_fail_length {
-                if length == fail_length {
-                    return Err(format!("Length validation failed for {}", length));
-                }
+            if let Some(fail_length) = self.should_fail_length
+                && length == fail_length
+            {
+                return Err(format!("Length validation failed for {}", length));
             }
             Ok(())
         }

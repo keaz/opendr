@@ -639,11 +639,11 @@ impl RateLimiter {
         let mut unbanned_count = 0;
 
         for client in clients.values_mut() {
-            if let Some(expiry) = client.ban_expiry {
-                if Instant::now() >= expiry {
-                    client.unban();
-                    unbanned_count += 1;
-                }
+            if let Some(expiry) = client.ban_expiry
+                && Instant::now() >= expiry
+            {
+                client.unban();
+                unbanned_count += 1;
             }
         }
 

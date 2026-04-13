@@ -13,7 +13,7 @@ use ldap_parser::ldap::{
 };
 use ldap_parser::parse_ldap_messages;
 use log::{error, info, warn};
-use rand::distributions::{Alphanumeric, DistString};
+use rand::distr::{Alphanumeric, SampleString};
 use rasn::error::EncodeError;
 use rasn_ldap::{LdapMessage as RasnLdapMessage, ProtocolOp as RasnProtocolOp, ResultCode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -36,11 +36,11 @@ use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
 use crate::ldap_controls::{ControlRegistry, ControlValidationError, LdapControl, RequestControls};
 use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
-    encode_bind_response, encode_custom_extended_response, encode_custom_search_result_done,
-    encode_extended_response_with_controls, encode_intermediate_response,
-    encode_result_response_with_controls, encode_result_response_with_referrals,
-    encode_search_entry_with_controls, encode_search_reference_with_controls, CustomResultCode,
-    ResponseOp,
+    CustomResultCode, ResponseOp, encode_bind_response, encode_custom_extended_response,
+    encode_custom_search_result_done, encode_extended_response_with_controls,
+    encode_intermediate_response, encode_result_response_with_controls,
+    encode_result_response_with_referrals, encode_search_entry_with_controls,
+    encode_search_reference_with_controls,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::real_time_propagation::is_dn_in_scope;
@@ -49,16 +49,16 @@ use crate::referral_fsm::ReferralResolver;
 use crate::replication::RenameChange;
 use crate::schema::LdapSchema;
 use crate::search_controls::{
-    decode_paged_results_control, decode_server_side_sort_request_control,
-    encode_paged_results_control, encode_server_side_sort_response_control, PagedResultsControl,
-    ServerSideSortResultCode, SortKey, PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID,
-    SERVER_SIDE_SORT_RESPONSE_OID,
+    PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
+    SERVER_SIDE_SORT_RESPONSE_OID, ServerSideSortResultCode, SortKey, decode_paged_results_control,
+    decode_server_side_sort_request_control, encode_paged_results_control,
+    encode_server_side_sort_response_control,
 };
 use crate::sync_controls::{
+    SYNC_DONE_OID, SYNC_INFO_OID, SYNC_REQUEST_OID, SYNC_STATE_OID, SyncDoneControl, SyncInfoValue,
+    SyncRefreshMode, SyncRequestControl, SyncStateControl, SyncStateType,
     decode_sync_request_control, encode_sync_done_control, encode_sync_info_value,
-    encode_sync_state_control, SyncDoneControl, SyncInfoValue, SyncRefreshMode, SyncRequestControl,
-    SyncStateControl, SyncStateType, SYNC_DONE_OID, SYNC_INFO_OID, SYNC_REQUEST_OID,
-    SYNC_STATE_OID,
+    encode_sync_state_control,
 };
 use crate::tls::RustlsTlsHandler;
 use uuid::Uuid;
@@ -307,13 +307,13 @@ impl ConnectionOperationRegistry {
 
     fn finish(&mut self, message_id: u32, outcome: FinishedOperationState) {
         self.active.remove(&message_id);
-        if let Some(cookie) = self.active_paged_searches.remove(&message_id) {
-            if matches!(
+        if let Some(cookie) = self.active_paged_searches.remove(&message_id)
+            && matches!(
                 outcome,
                 FinishedOperationState::Canceled | FinishedOperationState::Abandoned
-            ) {
-                self.paged_searches.remove(&cookie);
-            }
+            )
+        {
+            self.paged_searches.remove(&cookie);
         }
         self.finished.insert(message_id, outcome);
     }
@@ -326,7 +326,7 @@ impl ConnectionOperationRegistry {
     pub(crate) fn remember_paged_search(&mut self, cursor: PagedSearchCursor) -> Vec<u8> {
         loop {
             let cookie = Alphanumeric
-                .sample_string(&mut rand::thread_rng(), 24)
+                .sample_string(&mut rand::rng(), 24)
                 .into_bytes();
             if self.paged_searches.contains_key(&cookie) {
                 continue;
@@ -743,9 +743,9 @@ async fn run_plain_listener(
                     metrics.record_connection_accepted();
                 }
 
-                if let Some(security) = security.as_ref() {
-                    if let Some(audit) = security.audit_logger.as_ref() {
-                        if security.audit_config.log_connections {
+                if let Some(security) = security.as_ref()
+                    && let Some(audit) = security.audit_logger.as_ref()
+                        && security.audit_config.log_connections {
                             audit
                                 .log_connection_accepted(
                                     &addr.ip().to_string(),
@@ -753,8 +753,6 @@ async fn run_plain_listener(
                                 )
                                 .await;
                         }
-                    }
-                }
 
                 tokio::spawn(async move {
                     let request_context = RequestContext {
@@ -778,9 +776,9 @@ async fn run_plain_listener(
                     if let Some(metrics) = metrics.as_ref() {
                         metrics.record_connection_closed();
                     }
-                    if let Some(security) = request_context.security.as_ref() {
-                        if let Some(audit) = security.audit_logger.as_ref() {
-                            if security.audit_config.log_connections {
+                    if let Some(security) = request_context.security.as_ref()
+                        && let Some(audit) = security.audit_logger.as_ref()
+                            && security.audit_config.log_connections {
                                 audit
                                     .log_connection_closed(
                                         &addr.ip().to_string(),
@@ -788,8 +786,6 @@ async fn run_plain_listener(
                                     )
                                     .await;
                             }
-                        }
-                    }
                     info!("Connection {:?} (conn_id={}) closed", addr, conn_id);
                 });
             }
@@ -906,9 +902,9 @@ pub async fn run_tls_with_metrics_and_config_and_security(
                     metrics.record_connection_accepted();
                 }
 
-                if let Some(security) = security.as_ref() {
-                    if let Some(audit) = security.audit_logger.as_ref() {
-                        if security.audit_config.log_connections {
+                if let Some(security) = security.as_ref()
+                    && let Some(audit) = security.audit_logger.as_ref()
+                        && security.audit_config.log_connections {
                             audit
                                 .log_connection_accepted(
                                     &addr.ip().to_string(),
@@ -916,8 +912,6 @@ pub async fn run_tls_with_metrics_and_config_and_security(
                                 )
                                 .await;
                         }
-                    }
-                }
 
                 tokio::spawn(async move {
                     let request_context = RequestContext {
@@ -941,9 +935,9 @@ pub async fn run_tls_with_metrics_and_config_and_security(
                     if let Some(metrics) = metrics.as_ref() {
                         metrics.record_connection_closed();
                     }
-                    if let Some(security) = request_context.security.as_ref() {
-                        if let Some(audit) = security.audit_logger.as_ref() {
-                            if security.audit_config.log_connections {
+                    if let Some(security) = request_context.security.as_ref()
+                        && let Some(audit) = security.audit_logger.as_ref()
+                            && security.audit_config.log_connections {
                                 audit
                                     .log_connection_closed(
                                         &addr.ip().to_string(),
@@ -951,8 +945,6 @@ pub async fn run_tls_with_metrics_and_config_and_security(
                                     )
                                     .await;
                             }
-                        }
-                    }
                     info!("LDAPS connection {:?} (conn_id={}) closed", addr, conn_id);
                 });
             }
@@ -1048,13 +1040,13 @@ async fn handle_client_with_metrics_and_tls(
                     match decode_messages(&mut decoder, read_buffer[..n].to_vec()).await {
                         Ok(messages) => messages,
                         Err(err) => {
-                            if let Some(controls) = controls.as_ref() {
-                                if accounted_read_bytes {
-                                    controls
-                                        .pool
-                                        .update_memory_usage(controls.conn_id, -(n as isize))
-                                        .await;
-                                }
+                            if let Some(controls) = controls.as_ref()
+                                && accounted_read_bytes
+                            {
+                                controls
+                                    .pool
+                                    .update_memory_usage(controls.conn_id, -(n as isize))
+                                    .await;
                             }
                             error!("Failed to decode BER message: {}", err);
                             if let Err(write_err) = send_bind_response(
@@ -1071,13 +1063,13 @@ async fn handle_client_with_metrics_and_tls(
                         }
                     };
 
-                if let Some(controls) = controls.as_ref() {
-                    if accounted_read_bytes {
-                        controls
-                            .pool
-                            .update_memory_usage(controls.conn_id, -(n as isize))
-                            .await;
-                    }
+                if let Some(controls) = controls.as_ref()
+                    && accounted_read_bytes
+                {
+                    controls
+                        .pool
+                        .update_memory_usage(controls.conn_id, -(n as isize))
+                        .await;
                 }
 
                 for message_bytes in decoded_messages {
@@ -1107,45 +1099,42 @@ async fn handle_client_with_metrics_and_tls(
                         let operation_type = operation_type_for_protocol(&message.protocol_op);
                         let response_kind = rejection_response_for_protocol(&message.protocol_op);
                         let started_at = Instant::now();
-                        if let Some(metrics) = metrics.as_ref() {
-                            if let Some(operation_type) = operation_type {
-                                metrics.record_operation_start(operation_type, "");
-                            }
+                        if let Some(metrics) = metrics.as_ref()
+                            && let Some(operation_type) = operation_type
+                        {
+                            metrics.record_operation_start(operation_type, "");
                         }
 
                         if let Some(controls) = controls.as_ref() {
                             if let Some(operation_name) =
                                 rate_limited_operation_name_for_protocol(&message.protocol_op)
+                                && let Some(rate_limiter) = controls.rate_limiter.as_ref()
+                                && !rate_limiter
+                                    .check_rate_limit(controls.client_ip, operation_name)
+                                    .await
                             {
-                                if let Some(rate_limiter) = controls.rate_limiter.as_ref() {
-                                    if !rate_limiter
-                                        .check_rate_limit(controls.client_ip, operation_name)
-                                        .await
-                                    {
-                                        let result = send_rejection_response(
-                                            &mut socket,
-                                            message.message_id.0,
-                                            response_kind,
-                                            ResultCode::Busy,
-                                            "Rate limit exceeded - please slow down",
-                                        )
-                                        .await;
-                                        if let Some(metrics) = metrics.as_ref() {
-                                            if let Some(operation_type) = operation_type {
-                                                metrics.record_operation_complete(
-                                                    operation_type,
-                                                    started_at.elapsed(),
-                                                    false,
-                                                );
-                                            }
-                                        }
-                                        if let Err(err) = result {
-                                            error!("Failed to send rate-limit response: {}", err);
-                                            return;
-                                        }
-                                        continue;
-                                    }
+                                let result = send_rejection_response(
+                                    &mut socket,
+                                    message.message_id.0,
+                                    response_kind,
+                                    ResultCode::Busy,
+                                    "Rate limit exceeded - please slow down",
+                                )
+                                .await;
+                                if let Some(metrics) = metrics.as_ref()
+                                    && let Some(operation_type) = operation_type
+                                {
+                                    metrics.record_operation_complete(
+                                        operation_type,
+                                        started_at.elapsed(),
+                                        false,
+                                    );
                                 }
+                                if let Err(err) = result {
+                                    error!("Failed to send rate-limit response: {}", err);
+                                    return;
+                                }
+                                continue;
                             }
 
                             if !controls.pool.start_operation(controls.conn_id).await {
@@ -1157,14 +1146,14 @@ async fn handle_client_with_metrics_and_tls(
                                     "Server is busy - operation limit exceeded",
                                 )
                                 .await;
-                                if let Some(metrics) = metrics.as_ref() {
-                                    if let Some(operation_type) = operation_type {
-                                        metrics.record_operation_complete(
-                                            operation_type,
-                                            started_at.elapsed(),
-                                            false,
-                                        );
-                                    }
+                                if let Some(metrics) = metrics.as_ref()
+                                    && let Some(operation_type) = operation_type
+                                {
+                                    metrics.record_operation_complete(
+                                        operation_type,
+                                        started_at.elapsed(),
+                                        false,
+                                    );
                                 }
                                 if let Err(err) = result {
                                     error!("Failed to send busy response: {}", err);
@@ -1191,14 +1180,14 @@ async fn handle_client_with_metrics_and_tls(
                             controls.pool.end_operation(controls.conn_id).await;
                         }
 
-                        if let Some(metrics) = metrics.as_ref() {
-                            if let Some(operation_type) = operation_type {
-                                metrics.record_operation_complete(
-                                    operation_type,
-                                    started_at.elapsed(),
-                                    result.is_ok(),
-                                );
-                            }
+                        if let Some(metrics) = metrics.as_ref()
+                            && let Some(operation_type) = operation_type
+                        {
+                            metrics.record_operation_complete(
+                                operation_type,
+                                started_at.elapsed(),
+                                result.is_ok(),
+                            );
                         }
 
                         if let Err(err) = result {
@@ -2390,21 +2379,21 @@ pub(crate) async fn log_sasl_bind(
 
 pub(crate) async fn log_anonymous_bind(request_context: &RequestContext) {
     let session = ConnectionSession::default();
-    if let Some(security) = request_context.security.as_ref() {
-        if security.audit_config.log_authentication {
-            log_generic_audit_event(
-                request_context,
-                &session,
-                AuditLevel::Info,
-                AuditEventType::Authentication,
-                "anonymous_bind",
-                true,
-                None,
-                None,
-                Vec::new(),
-            )
-            .await;
-        }
+    if let Some(security) = request_context.security.as_ref()
+        && security.audit_config.log_authentication
+    {
+        log_generic_audit_event(
+            request_context,
+            &session,
+            AuditLevel::Info,
+            AuditEventType::Authentication,
+            "anonymous_bind",
+            true,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
     }
 }
 
@@ -3354,19 +3343,19 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         increment_control_counter(request_context, "ldap_sort_requests_total", 1);
     }
 
-    if let Some(requested_sort) = requested_sort.as_ref() {
-        if let Err(err) = validate_server_side_sort_request(requested_sort) {
-            reject_server_side_sort_request(
-                socket,
-                message_id,
-                &base_dn,
-                session,
-                request_context,
-                &err,
-            )
-            .await?;
-            return Ok(());
-        }
+    if let Some(requested_sort) = requested_sort.as_ref()
+        && let Err(err) = validate_server_side_sort_request(requested_sort)
+    {
+        reject_server_side_sort_request(
+            socket,
+            message_id,
+            &base_dn,
+            session,
+            request_context,
+            &err,
+        )
+        .await?;
+        return Ok(());
     }
 
     let requested_sync = match parse_sync_request_control(request_controls) {
@@ -3417,23 +3406,16 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         increment_control_counter(request_context, "ldap_manage_dsa_it_requests_total", 1);
     }
 
-    if let Some(control) = paged_results.as_ref() {
-        if control.size == 0 && control.cookie.is_empty() {
-            let err = PagedSearchRequestError::ProtocolError(
-                "paged results page size must be greater than zero on the initial request"
-                    .to_string(),
-            );
-            reject_paged_search_request(
-                socket,
-                message_id,
-                &base_dn,
-                session,
-                request_context,
-                &err,
-            )
+    if let Some(control) = paged_results.as_ref()
+        && control.size == 0
+        && control.cookie.is_empty()
+    {
+        let err = PagedSearchRequestError::ProtocolError(
+            "paged results page size must be greater than zero on the initial request".to_string(),
+        );
+        reject_paged_search_request(socket, message_id, &base_dn, session, request_context, &err)
             .await?;
-            return Ok(());
-        }
+        return Ok(());
     }
 
     let is_virtual_base =
@@ -3548,61 +3530,57 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         None
     };
 
-    if !manage_dsa_it && request.scope == ldap_parser::ldap::SearchScope::BaseObject {
-        if let Some(base_entry) = base_object_entry.as_ref() {
-            if entry_is_referral(base_entry) {
-                match referral_urls_for_entry(base_entry) {
-                    Ok(referrals) => {
-                        increment_control_counter(
-                            request_context,
-                            "ldap_referral_results_total",
-                            1,
-                        );
-                        log_generic_audit_event(
-                            request_context,
-                            session,
-                            AuditLevel::Info,
-                            AuditEventType::Authorization,
-                            "search_referral",
-                            true,
-                            Some(effective_base_dn.as_str()),
-                            Some("base search resolved to referral"),
-                            vec![("referral_count".to_string(), referrals.len().to_string())],
-                        )
-                        .await;
-                        send_result_with_referrals(
-                            socket,
-                            message_id,
-                            ResponseOp::SearchDone,
-                            ResultCode::Referral,
-                            &effective_base_dn,
-                            "search base is a referral",
-                            &referrals,
-                            &[],
-                        )
-                        .await?;
-                        operation_registry.finish(message_id, FinishedOperationState::Completed);
-                        return Ok(());
-                    }
-                    Err(diagnostic) => {
-                        increment_control_counter(
-                            request_context,
-                            "ldap_referral_processing_failures_total",
-                            1,
-                        );
-                        send_result(
-                            socket,
-                            message_id,
-                            ResponseOp::SearchDone,
-                            ResultCode::OperationsError,
-                            &effective_base_dn,
-                            diagnostic,
-                        )
-                        .await?;
-                        operation_registry.finish(message_id, FinishedOperationState::Completed);
-                        return Ok(());
-                    }
-                }
+    if !manage_dsa_it
+        && request.scope == ldap_parser::ldap::SearchScope::BaseObject
+        && let Some(base_entry) = base_object_entry.as_ref()
+        && entry_is_referral(base_entry)
+    {
+        match referral_urls_for_entry(base_entry) {
+            Ok(referrals) => {
+                increment_control_counter(request_context, "ldap_referral_results_total", 1);
+                log_generic_audit_event(
+                    request_context,
+                    session,
+                    AuditLevel::Info,
+                    AuditEventType::Authorization,
+                    "search_referral",
+                    true,
+                    Some(effective_base_dn.as_str()),
+                    Some("base search resolved to referral"),
+                    vec![("referral_count".to_string(), referrals.len().to_string())],
+                )
+                .await;
+                send_result_with_referrals(
+                    socket,
+                    message_id,
+                    ResponseOp::SearchDone,
+                    ResultCode::Referral,
+                    &effective_base_dn,
+                    "search base is a referral",
+                    &referrals,
+                    &[],
+                )
+                .await?;
+                operation_registry.finish(message_id, FinishedOperationState::Completed);
+                return Ok(());
+            }
+            Err(diagnostic) => {
+                increment_control_counter(
+                    request_context,
+                    "ldap_referral_processing_failures_total",
+                    1,
+                );
+                send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::SearchDone,
+                    ResultCode::OperationsError,
+                    &effective_base_dn,
+                    diagnostic,
+                )
+                .await?;
+                operation_registry.finish(message_id, FinishedOperationState::Completed);
+                return Ok(());
             }
         }
     }
@@ -4086,11 +4064,11 @@ async fn collect_search_result_set(
     let mut returned_dns = HashSet::new();
 
     for entry in entries {
-        if let Some(deadline) = search_deadline {
-            if Instant::now() >= deadline {
-                time_limit_hit = true;
-                break;
-            }
+        if let Some(deadline) = search_deadline
+            && Instant::now() >= deadline
+        {
+            time_limit_hit = true;
+            break;
         }
 
         let entry = resolve_search_candidate_entry(backend, &entry, deref_aliases)
@@ -4138,12 +4116,11 @@ async fn collect_search_result_set(
         collected.push(entry);
     }
 
-    if !time_limit_hit {
-        if let Some(deadline) = search_deadline {
-            if Instant::now() >= deadline {
-                time_limit_hit = true;
-            }
-        }
+    if !time_limit_hit
+        && let Some(deadline) = search_deadline
+        && Instant::now() >= deadline
+    {
+        time_limit_hit = true;
     }
 
     Ok(SearchResultSet {
@@ -4170,15 +4147,15 @@ async fn collect_base_object_search_result_set(
         "collect_search_result_set base-object fast path base={effective_base_dn}"
     ));
 
-    if let Some(deadline) = search_deadline {
-        if Instant::now() >= deadline {
-            return Ok(SearchResultSet {
-                entries: Vec::new(),
-                references: Vec::new(),
-                size_limit_hit: false,
-                time_limit_hit: true,
-            });
-        }
+    if let Some(deadline) = search_deadline
+        && Instant::now() >= deadline
+    {
+        return Ok(SearchResultSet {
+            entries: Vec::new(),
+            references: Vec::new(),
+            size_limit_hit: false,
+            time_limit_hit: true,
+        });
     }
 
     let entry = match base_object_entry {
@@ -4203,15 +4180,15 @@ async fn collect_base_object_search_result_set(
         });
     };
 
-    if let Some(deadline) = search_deadline {
-        if Instant::now() >= deadline {
-            return Ok(SearchResultSet {
-                entries: Vec::new(),
-                references: Vec::new(),
-                size_limit_hit: false,
-                time_limit_hit: true,
-            });
-        }
+    if let Some(deadline) = search_deadline
+        && Instant::now() >= deadline
+    {
+        return Ok(SearchResultSet {
+            entries: Vec::new(),
+            references: Vec::new(),
+            size_limit_hit: false,
+            time_limit_hit: true,
+        });
     }
 
     let entry = resolve_search_candidate_entry(backend, &entry, deref_aliases)
@@ -4294,14 +4271,14 @@ async fn emit_search_entries(
     if search_deadline.is_some() {
         let mut returned = 0usize;
         for entry in entries {
-            if let Some(deadline) = search_deadline {
-                if Instant::now() >= deadline {
-                    trace_search(format_args!(
-                        "emit_search_entries deadline hit after {} entries",
-                        returned
-                    ));
-                    return Ok((returned, true));
-                }
+            if let Some(deadline) = search_deadline
+                && Instant::now() >= deadline
+            {
+                trace_search(format_args!(
+                    "emit_search_entries deadline hit after {} entries",
+                    returned
+                ));
+                return Ok((returned, true));
             }
 
             let attributes = select_attributes(entry, attribute_selection);
@@ -4323,14 +4300,14 @@ async fn emit_search_entries(
                 ));
             }
 
-            if let Some(deadline) = search_deadline {
-                if Instant::now() >= deadline {
-                    trace_search(format_args!(
-                        "emit_search_entries deadline hit after send {} entries",
-                        returned
-                    ));
-                    return Ok((returned, true));
-                }
+            if let Some(deadline) = search_deadline
+                && Instant::now() >= deadline
+            {
+                trace_search(format_args!(
+                    "emit_search_entries deadline hit after send {} entries",
+                    returned
+                ));
+                return Ok((returned, true));
             }
         }
 
@@ -4632,20 +4609,20 @@ fn validate_sync_cookie(
         )));
     };
 
-    if let Some(oldest) = changelog.get_oldest_csn() {
-        if csn < oldest {
-            return Err(SyncRequestError::InvalidCookie(format!(
-                "stale sync cookie {cookie}"
-            )));
-        }
+    if let Some(oldest) = changelog.get_oldest_csn()
+        && csn < oldest
+    {
+        return Err(SyncRequestError::InvalidCookie(format!(
+            "stale sync cookie {cookie}"
+        )));
     }
 
-    if let Some(latest) = changelog.get_context_csn() {
-        if csn > latest {
-            return Err(SyncRequestError::InvalidCookie(format!(
-                "invalid sync cookie {cookie}"
-            )));
-        }
+    if let Some(latest) = changelog.get_context_csn()
+        && csn > latest
+    {
+        return Err(SyncRequestError::InvalidCookie(format!(
+            "invalid sync cookie {cookie}"
+        )));
     }
 
     Ok(Some(csn))
@@ -4928,14 +4905,15 @@ pub(crate) async fn handle_sync_search_request(
     let mut control_buffer = vec![0_u8; 4096];
 
     let mut receiver = if sync_request.request.mode == SyncRefreshMode::RefreshAndPersist {
-        if let Some(receiver) = backend.subscribe_to_replication_changes() {
-            Some(receiver)
-        } else {
-            session
-                .send_unavailable("replication stream not available")
-                .await?;
-            operation_registry.finish(message_id, FinishedOperationState::Completed);
-            return Ok(());
+        match backend.subscribe_to_replication_changes() {
+            Some(receiver) => Some(receiver),
+            _ => {
+                session
+                    .send_unavailable("replication stream not available")
+                    .await?;
+                operation_registry.finish(message_id, FinishedOperationState::Completed);
+                return Ok(());
+            }
         }
     } else {
         None
@@ -6101,7 +6079,7 @@ pub(crate) async fn handle_compare_request_with_context(
 ) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let attribute = request.ava.attribute_desc.0.as_ref().trim().to_owned();
-    let assertion = bytes_to_string(request.ava.assertion_value);
+    let assertion = bytes_to_string(&request.ava.assertion_value);
 
     if !authorize_operation(
         socket,
@@ -6696,7 +6674,7 @@ async fn handle_extended_request_with_session_and_registry(
             Some(new_password) => (new_password, false),
             None => (
                 Alphanumeric
-                    .sample_string(&mut rand::thread_rng(), 24)
+                    .sample_string(&mut rand::rng(), 24)
                     .into_bytes(),
                 true,
             ),
@@ -6877,20 +6855,19 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
         let op_attrs = &entry.operational_attributes;
 
         // entryCSN
-        if include_all_operational || requested.iter().any(|a| a.eq_ignore_ascii_case("entrycsn")) {
-            if let Some(entry_csn) = op_attrs.entry_csn.as_ref() {
-                selected.push(("entryCSN".to_string(), vec![entry_csn.to_ldap_string()]));
-            }
+        if (include_all_operational || requested.iter().any(|a| a.eq_ignore_ascii_case("entrycsn")))
+            && let Some(entry_csn) = op_attrs.entry_csn.as_ref()
+        {
+            selected.push(("entryCSN".to_string(), vec![entry_csn.to_ldap_string()]));
         }
 
-        if include_all_operational
+        if (include_all_operational
             || requested
                 .iter()
-                .any(|a| a.eq_ignore_ascii_case("entryuuid"))
+                .any(|a| a.eq_ignore_ascii_case("entryuuid")))
+            && let Some(entry_uuid) = op_attrs.entry_uuid.as_ref()
         {
-            if let Some(entry_uuid) = op_attrs.entry_uuid.as_ref() {
-                selected.push(("entryUUID".to_string(), vec![entry_uuid.clone()]));
-            }
+            selected.push(("entryUUID".to_string(), vec![entry_uuid.clone()]));
         }
 
         // createTimestamp
@@ -6997,10 +6974,10 @@ pub(crate) fn build_entry_from_add_request(
             .map(|value| bytes_to_string(value.0.as_ref()))
             .collect();
 
-        if name == "userpassword" {
-            if let Some(first) = values.first() {
-                password = first.as_bytes().to_vec();
-            }
+        if name == "userpassword"
+            && let Some(first) = values.first()
+        {
+            password = first.as_bytes().to_vec();
         }
 
         let entry_values = attribute_map.entry(name).or_default();
@@ -7029,16 +7006,16 @@ mod tests {
     use crate::replication_service::ReplicationService;
     use crate::schema::LdapSchema;
     use crate::search_controls::{
-        decode_paged_results_control, decode_server_side_sort_response_control,
-        encode_paged_results_control, encode_server_side_sort_request_control, PagedResultsControl,
-        ServerSideSortResponseControl, ServerSideSortResultCode, SortKey, PAGED_RESULTS_OID,
-        SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
+        PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
+        SERVER_SIDE_SORT_RESPONSE_OID, ServerSideSortResponseControl, ServerSideSortResultCode,
+        SortKey, decode_paged_results_control, decode_server_side_sort_response_control,
+        encode_paged_results_control, encode_server_side_sort_request_control,
     };
     use crate::sync_controls::{
+        SYNC_DONE_OID, SYNC_INFO_OID, SYNC_REQUEST_OID, SYNC_STATE_OID, SyncDoneControl,
+        SyncInfoValue, SyncRefreshMode, SyncRequestControl, SyncStateControl, SyncStateType,
         decode_sync_done_control, decode_sync_info_value, decode_sync_state_control,
-        encode_sync_request_control, SyncDoneControl, SyncInfoValue, SyncRefreshMode,
-        SyncRequestControl, SyncStateControl, SyncStateType, SYNC_DONE_OID, SYNC_INFO_OID,
-        SYNC_REQUEST_OID, SYNC_STATE_OID,
+        encode_sync_request_control,
     };
     use ldap_parser::filter::{
         Attribute as FilterAttribute, AttributeValue, AttributeValueAssertion, Filter,
@@ -7064,7 +7041,7 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::time::{timeout, Duration, Sleep};
+    use tokio::time::{Duration, Sleep, timeout};
 
     async fn connected_stream_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7549,7 +7526,7 @@ mod tests {
 
         let equality_filter = Filter::EqualityMatch(AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         });
         assert!(entry_matches_filter(&entry, &equality_filter));
 
@@ -7564,7 +7541,7 @@ mod tests {
     fn extract_search_hint_prefers_indexable_terms() {
         let equality_filter = Filter::EqualityMatch(AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("uid".to_string())),
-            assertion_value: b"alice",
+            assertion_value: Cow::Borrowed(b"alice"),
         });
         assert_eq!(
             extract_search_hint(&equality_filter),
@@ -7769,7 +7746,7 @@ mod tests {
             entry: LdapDN(Cow::Owned("cn=target,dc=example,dc=org".to_string())),
             ava: AttributeValueAssertion {
                 attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-                assertion_value: b"target",
+                assertion_value: Cow::Borrowed(b"target"),
             },
         };
 
@@ -8641,9 +8618,11 @@ mod tests {
             }
         }
         assert_eq!(seen_dns.len(), 1);
-        assert!(operation_registry
-            .paged_search(first_cookie.cookie.as_slice())
-            .is_none());
+        assert!(
+            operation_registry
+                .paged_search(first_cookie.cookie.as_slice())
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -8713,9 +8692,11 @@ mod tests {
         .unwrap();
         let response = read_response(&mut client_stream).await;
         let (_, messages) = parse_ldap_messages(&response).unwrap();
-        assert!(paged_results_response(messages.last().unwrap())
-            .cookie
-            .is_empty());
+        assert!(
+            paged_results_response(messages.last().unwrap())
+                .cookie
+                .is_empty()
+        );
 
         let request_controls = paged_results_request_controls(2, &first_cookie.cookie);
         handle_search_request_with_context_and_registry(
@@ -9359,7 +9340,7 @@ mod tests {
             types_only: false,
             filter: Filter::EqualityMatch(AttributeValueAssertion {
                 attribute_desc: LdapString(Cow::Owned("sn".to_string())),
-                assertion_value: b"Target".as_ref(),
+                assertion_value: Cow::Borrowed(b"Target".as_ref()),
             }),
             attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
         };
@@ -9496,17 +9477,21 @@ mod tests {
             attributes.get("cn").unwrap(),
             &vec!["Subschema".to_string()]
         );
-        assert!(attributes
-            .get("attributeTypes")
-            .unwrap()
-            .iter()
-            .any(|value| value.contains("2.5.4.3") && value.contains("commonName")));
-        assert!(attributes
-            .get("objectClasses")
-            .unwrap()
-            .iter()
-            .any(|value| value.contains("2.16.840.1.113730.3.2.2")
-                && value.contains("inetOrgPerson")));
+        assert!(
+            attributes
+                .get("attributeTypes")
+                .unwrap()
+                .iter()
+                .any(|value| value.contains("2.5.4.3") && value.contains("commonName"))
+        );
+        assert!(
+            attributes
+                .get("objectClasses")
+                .unwrap()
+                .iter()
+                .any(|value| value.contains("2.16.840.1.113730.3.2.2")
+                    && value.contains("inetOrgPerson"))
+        );
     }
 
     #[tokio::test]
@@ -10162,9 +10147,11 @@ mod tests {
 
         let response = read_response(&mut client_stream).await;
         let (_, messages) = parse_ldap_messages(&response).unwrap();
-        assert!(messages
-            .iter()
-            .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultReference(_))));
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultReference(_)))
+        );
         let reference = messages
             .iter()
             .find_map(|message| match &message.protocol_op {
@@ -10221,17 +10208,21 @@ mod tests {
                     attributes.get("ref").unwrap(),
                     &vec!["ldap://remote.example.org/dc=remote,dc=org".to_string()]
                 );
-                assert!(attributes
-                    .get("objectclass")
-                    .unwrap()
-                    .iter()
-                    .any(|value| value.eq_ignore_ascii_case("referral")));
+                assert!(
+                    attributes
+                        .get("objectclass")
+                        .unwrap()
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case("referral"))
+                );
             }
             other => panic!("unexpected response: {:?}", other),
         }
-        assert!(!messages
-            .iter()
-            .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultReference(_))));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultReference(_)))
+        );
         assert!(matches!(
             &messages[1].protocol_op,
             ProtocolOp::SearchResultDone(done) if done.result_code == ParserResultCode::Success

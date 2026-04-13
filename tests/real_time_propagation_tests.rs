@@ -6,13 +6,13 @@
 use opendr::backend::DirectoryEntry;
 use opendr::change_observer::{ChangeCallback, ChangeObserver, ChangeObserverImpl};
 use opendr::push_manager::{PushManager, PushManagerConfig};
-use opendr::real_time_propagation::{is_dn_in_scope, PropagationConfig, RealTimePropagationEngine};
+use opendr::real_time_propagation::{PropagationConfig, RealTimePropagationEngine, is_dn_in_scope};
 use opendr::replication_provider_fsm::{ChangeType, ChangelogEntry};
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 

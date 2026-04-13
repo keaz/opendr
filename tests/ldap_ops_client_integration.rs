@@ -59,7 +59,7 @@ fn reserve_port() -> u16 {
 fn generate_test_certificate() -> (String, String) {
     let certified = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_pem = certified.cert.pem();
-    let key_pem = certified.key_pair.serialize_pem();
+    let key_pem = certified.signing_key.serialize_pem();
     (cert_pem, key_pem)
 }
 

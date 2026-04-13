@@ -31,7 +31,7 @@
 use log::{info, warn};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{Notify, RwLock, broadcast};
 use tokio::time::timeout;
 
 /// Shutdown configuration
@@ -310,7 +310,7 @@ impl ShutdownSignal {
     pub async fn wait(self) {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
 
             let mut sigterm =
                 signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");

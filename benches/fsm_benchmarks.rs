@@ -3,7 +3,9 @@
 //! This benchmark suite measures the performance of FSM creation
 //! and memory allocations.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use opendr::auth_fsm::AuthFsmImpl;
 use opendr::ber_decoder_fsm::BerDecoderFsmImpl;
 use opendr::connection_fsm::{ConnectionFsmImpl, NoOpTlsHandler};

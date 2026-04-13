@@ -35,7 +35,7 @@ use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, SearchCandidateHint,
 };
 use crate::change_observer::ChangeObserver;
-use crate::replication::{encode_rename_change_with_actor, ChangelogTracker};
+use crate::replication::{ChangelogTracker, encode_rename_change_with_actor};
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 use crate::replication_service::ReplicationProviderLifecycle;
 

@@ -14,8 +14,8 @@ use opendr::change_observer::{ChangeCallback, ChangeObserver, ChangeObserverImpl
 use opendr::replication::ChangelogTracker;
 use opendr::replication_provider_fsm::{ChangeType, ChangelogEntry};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 /// Test callback that counts notifications and records change details

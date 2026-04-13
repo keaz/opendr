@@ -12,8 +12,8 @@ use opendr::config::ServerConfig;
 use opendr::fsm_server;
 use opendr::metrics::MetricsCollector;
 use opendr::monitoring_runtime::{
-    console_admin_dn, spawn_monitoring_server_with_context, ComponentStatus,
-    MonitoringRuntimeContext, RuntimeHealthRegistry,
+    ComponentStatus, MonitoringRuntimeContext, RuntimeHealthRegistry, console_admin_dn,
+    spawn_monitoring_server_with_context,
 };
 use opendr::replication_service::ReplicationService;
 use opendr::server;
@@ -476,58 +476,59 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let ldaps_server_task = if let Some(tls_handler) = tls_handler.clone() {
-        let ldaps_backend = backend.clone();
-        let ldaps_metrics = monitoring_metrics.clone();
-        let ldaps_runtime_config = legacy_server_config.clone();
-        let ldaps_fsm_runtime_config = fsm_server_config.clone();
-        let ldaps_fsm_runtime_context = fsm_server::FsmServerRuntimeContext {
-            legacy_runtime_config: legacy_server_config.clone(),
-            metrics: monitoring_metrics.clone(),
-            security: legacy_security_config.clone(),
-            tls_handler: Some(tls_handler.clone()),
-        };
-        let ldaps_security = legacy_security_config.clone();
-        let ldaps_runtime = config.server.runtime.clone();
-        let ldaps_shutdown = shutdown.clone();
-        println!("Starting LDAPS server on {}", ldaps_bind_addr);
-        Some(tokio::spawn(async move {
-            let result = match ldaps_runtime.as_str() {
-                "legacy" => {
-                    server::run_tls_with_metrics_and_config_and_security(
-                        &ldaps_bind_addr,
-                        ldaps_backend,
-                        ldaps_shutdown_rx,
-                        ldaps_metrics,
-                        ldaps_runtime_config,
-                        tls_handler,
-                        ldaps_security,
-                    )
-                    .await
-                }
-                "fsm" => {
-                    fsm_server::run_tls_with_shutdown_and_context(
-                        &ldaps_bind_addr,
-                        ldaps_backend,
-                        ldaps_fsm_runtime_config,
-                        ldaps_fsm_runtime_context,
-                        Some(ldaps_shutdown),
-                    )
-                    .await
-                }
-                unsupported => Err(std::io::Error::other(format!(
-                    "server.runtime = {:?} is not supported by the shipped opendr binary",
-                    unsupported
-                ))
-                .into()),
+    let ldaps_server_task = match tls_handler.clone() {
+        Some(tls_handler) => {
+            let ldaps_backend = backend.clone();
+            let ldaps_metrics = monitoring_metrics.clone();
+            let ldaps_runtime_config = legacy_server_config.clone();
+            let ldaps_fsm_runtime_config = fsm_server_config.clone();
+            let ldaps_fsm_runtime_context = fsm_server::FsmServerRuntimeContext {
+                legacy_runtime_config: legacy_server_config.clone(),
+                metrics: monitoring_metrics.clone(),
+                security: legacy_security_config.clone(),
+                tls_handler: Some(tls_handler.clone()),
             };
+            let ldaps_security = legacy_security_config.clone();
+            let ldaps_runtime = config.server.runtime.clone();
+            let ldaps_shutdown = shutdown.clone();
+            println!("Starting LDAPS server on {}", ldaps_bind_addr);
+            Some(tokio::spawn(async move {
+                let result = match ldaps_runtime.as_str() {
+                    "legacy" => {
+                        server::run_tls_with_metrics_and_config_and_security(
+                            &ldaps_bind_addr,
+                            ldaps_backend,
+                            ldaps_shutdown_rx,
+                            ldaps_metrics,
+                            ldaps_runtime_config,
+                            tls_handler,
+                            ldaps_security,
+                        )
+                        .await
+                    }
+                    "fsm" => {
+                        fsm_server::run_tls_with_shutdown_and_context(
+                            &ldaps_bind_addr,
+                            ldaps_backend,
+                            ldaps_fsm_runtime_config,
+                            ldaps_fsm_runtime_context,
+                            Some(ldaps_shutdown),
+                        )
+                        .await
+                    }
+                    unsupported => Err(std::io::Error::other(format!(
+                        "server.runtime = {:?} is not supported by the shipped opendr binary",
+                        unsupported
+                    ))
+                    .into()),
+                };
 
-            if let Err(e) = result {
-                eprintln!("LDAPS server error: {}", e);
-            }
-        }))
-    } else {
-        None
+                if let Err(e) = result {
+                    eprintln!("LDAPS server error: {}", e);
+                }
+            }))
+        }
+        _ => None,
     };
 
     // Wait for shutdown signal
@@ -615,13 +616,15 @@ async fn initialize_base_structure(
             ),
             (
                 "cn".to_string(),
-                vec![config
-                    .server
-                    .root_user_dn
-                    .split('=')
-                    .nth(1)
-                    .unwrap_or("manager")
-                    .to_string()],
+                vec![
+                    config
+                        .server
+                        .root_user_dn
+                        .split('=')
+                        .nth(1)
+                        .unwrap_or("manager")
+                        .to_string(),
+                ],
             ),
             ("sn".to_string(), vec!["Manager".to_string()]),
         ]),
@@ -720,13 +723,15 @@ async fn initialize_lmdb_base_structure(
             ),
             (
                 "cn".to_string(),
-                vec![config
-                    .server
-                    .root_user_dn
-                    .split('=')
-                    .nth(1)
-                    .unwrap_or("manager")
-                    .to_string()],
+                vec![
+                    config
+                        .server
+                        .root_user_dn
+                        .split('=')
+                        .nth(1)
+                        .unwrap_or("manager")
+                        .to_string(),
+                ],
             ),
             ("sn".to_string(), vec!["Manager".to_string()]),
         ]),
@@ -831,28 +836,38 @@ mod tests {
         assert!(root_entry.attributes.contains_key("cn"));
 
         // Verify organizational units were created
-        assert!(backend
-            .get_entry("ou=People,dc=example,dc=org")
-            .await
-            .is_ok());
-        assert!(backend
-            .get_entry("ou=Groups,dc=example,dc=org")
-            .await
-            .is_ok());
-        assert!(backend
-            .get_entry("ou=Applications,dc=example,dc=org")
-            .await
-            .is_ok());
+        assert!(
+            backend
+                .get_entry("ou=People,dc=example,dc=org")
+                .await
+                .is_ok()
+        );
+        assert!(
+            backend
+                .get_entry("ou=Groups,dc=example,dc=org")
+                .await
+                .is_ok()
+        );
+        assert!(
+            backend
+                .get_entry("ou=Applications,dc=example,dc=org")
+                .await
+                .is_ok()
+        );
 
         // Verify authentication works with root user
-        assert!(backend
-            .authenticate("cn=manager,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
-        assert!(!backend
-            .authenticate("cn=manager,dc=example,dc=org", b"wrong")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=manager,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .authenticate("cn=manager,dc=example,dc=org", b"wrong")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -890,28 +905,38 @@ mod tests {
         assert!(root_entry.attributes.contains_key("cn"));
 
         // Verify organizational units were created
-        assert!(backend
-            .get_entry("ou=People,dc=test,dc=local")
-            .await
-            .is_ok());
-        assert!(backend
-            .get_entry("ou=Groups,dc=test,dc=local")
-            .await
-            .is_ok());
-        assert!(backend
-            .get_entry("ou=Applications,dc=test,dc=local")
-            .await
-            .is_ok());
+        assert!(
+            backend
+                .get_entry("ou=People,dc=test,dc=local")
+                .await
+                .is_ok()
+        );
+        assert!(
+            backend
+                .get_entry("ou=Groups,dc=test,dc=local")
+                .await
+                .is_ok()
+        );
+        assert!(
+            backend
+                .get_entry("ou=Applications,dc=test,dc=local")
+                .await
+                .is_ok()
+        );
 
         // Verify authentication works with root user
-        assert!(backend
-            .authenticate("cn=admin,dc=test,dc=local", b"AdminPass123")
-            .await
-            .unwrap());
-        assert!(!backend
-            .authenticate("cn=admin,dc=test,dc=local", b"wrong")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=admin,dc=test,dc=local", b"AdminPass123")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .authenticate("cn=admin,dc=test,dc=local", b"wrong")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -933,14 +958,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(backend
-            .authenticate("cn=manager,dc=example,dc=org", b"file-backed-secret")
-            .await
-            .unwrap());
-        assert!(!backend
-            .authenticate("cn=manager,dc=example,dc=org", b"wrong")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .authenticate("cn=manager,dc=example,dc=org", b"file-backed-secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .authenticate("cn=manager,dc=example,dc=org", b"wrong")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -972,23 +1001,27 @@ subject = {{ user = "cn=reader,dc=example,dc=com" }}
             .unwrap();
         let aci_engine = security.access_control.as_ref().unwrap();
 
-        assert!(aci_engine
-            .check_permission(
-                Some("cn=reader,dc=example,dc=com"),
-                "uid=target,dc=example,dc=com",
-                Some("cn"),
-                opendr::aci::Permission::Read,
-            )
-            .await
-            .is_ok());
-        assert!(aci_engine
-            .check_permission(
-                Some("cn=reader,dc=example,dc=com"),
-                "uid=target,dc=example,dc=com",
-                Some("mail"),
-                opendr::aci::Permission::Read,
-            )
-            .await
-            .is_err());
+        assert!(
+            aci_engine
+                .check_permission(
+                    Some("cn=reader,dc=example,dc=com"),
+                    "uid=target,dc=example,dc=com",
+                    Some("cn"),
+                    opendr::aci::Permission::Read,
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            aci_engine
+                .check_permission(
+                    Some("cn=reader,dc=example,dc=com"),
+                    "uid=target,dc=example,dc=com",
+                    Some("mail"),
+                    opendr::aci::Permission::Read,
+                )
+                .await
+                .is_err()
+        );
     }
 }

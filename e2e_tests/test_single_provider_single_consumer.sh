@@ -152,7 +152,7 @@ deadline=$(($(date +%s) + REPL_TIMEOUT_SECS))
 deleted=false
 
 while [[ $(date +%s) -lt ${deadline} ]]; do
-  if ! search_entry "${LDAP_HOST}" "${CONSUMER_PORT}" "uid=user0005,ou=people,${BASE_DN}" "(objectClass=*)" dn >/dev/null 2>&1; then
+  if ! verify_entry_exists "${LDAP_HOST}" "${CONSUMER_PORT}" "uid=user0005,ou=people,${BASE_DN}"; then
     deleted=true
     break
   fi

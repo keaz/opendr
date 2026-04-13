@@ -47,8 +47,8 @@
 use async_trait::async_trait;
 use base64::Engine;
 use ldap3::controls::{
-    parse_syncinfo, Control, ControlType, EntryState, MakeCritical, RefreshMode as LdapRefreshMode,
-    SyncRequest as LdapSyncRequest, SyncState as LdapSyncState,
+    Control, ControlType, EntryState, MakeCritical, RefreshMode as LdapRefreshMode,
+    SyncRequest as LdapSyncRequest, SyncState as LdapSyncState, parse_syncinfo,
 };
 use ldap3::{LdapConnAsync, LdapConnSettings, ResultEntry, Scope, SearchEntry};
 use log::{error, info, warn};
@@ -58,7 +58,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::backend::{DirectoryBackend, Modification, ModifyOperation};
@@ -431,10 +431,10 @@ impl ChangelogTracker {
             return ChangelogCookieStatus::Valid(Some(csn));
         };
 
-        if let Some(oldest_csn) = self.get_oldest_csn() {
-            if csn < oldest_csn {
-                return ChangelogCookieStatus::Stale;
-            }
+        if let Some(oldest_csn) = self.get_oldest_csn()
+            && csn < oldest_csn
+        {
+            return ChangelogCookieStatus::Stale;
         }
 
         if csn > latest_csn {
@@ -721,13 +721,15 @@ pub fn changelog_entry_to_replication_attrs(entry: &ChangelogEntry) -> Vec<(Stri
         ),
         (
             REPLICATION_CHANGE_TYPE_ATTRIBUTE.to_string(),
-            vec![match entry.change_type {
-                ChangeType::Add => "add",
-                ChangeType::Modify => "modify",
-                ChangeType::Delete => "delete",
-                ChangeType::Rename => "rename",
-            }
-            .to_string()],
+            vec![
+                match entry.change_type {
+                    ChangeType::Add => "add",
+                    ChangeType::Modify => "modify",
+                    ChangeType::Delete => "delete",
+                    ChangeType::Rename => "rename",
+                }
+                .to_string(),
+            ],
         ),
         (
             REPLICATION_CHANGE_DATA_ATTRIBUTE.to_string(),
@@ -779,7 +781,7 @@ pub fn parse_replication_stream_entry(
         other => {
             return Err(ConsumerError::ListeningError {
                 message: format!("Unknown replication change type: {}", other),
-            })
+            });
         }
     };
 
@@ -1468,10 +1470,10 @@ impl ProviderConnection for ProviderConnectionImpl {
             self.ldap_connection.lock().await.take()
         };
 
-        if let Some(mut ldap) = ldap_opt {
-            if let Err(e) = ldap.unbind().await {
-                warn!("Error unbinding LDAP connection: {}", e);
-            }
+        if let Some(mut ldap) = ldap_opt
+            && let Err(e) = ldap.unbind().await
+        {
+            warn!("Error unbinding LDAP connection: {}", e);
         }
 
         self.connected.store(false, Ordering::SeqCst);
@@ -1521,7 +1523,7 @@ impl BatchProcessor for BatchProcessorImpl {
         let header_end = entry
             .iter()
             .enumerate()
-            .filter(|(_, &b)| b == b'|')
+            .filter(|&(_, &b)| b == b'|')
             .nth(3)
             .map(|(i, _)| i + 1)
             .ok_or_else(|| ConsumerError::ProcessingError {

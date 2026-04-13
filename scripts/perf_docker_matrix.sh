@@ -33,6 +33,10 @@ OPENDR_IMAGE="opendr:docker-perf"
 OPENDJ_IMAGE="openidentityplatform/opendj:5.0.4"
 PRODUCTS="opendr,opendj"
 OPENDR_RUNTIME="fsm"
+OPENDR_LMDB_MAX_READERS="${OPENDR_LMDB_MAX_READERS:-256}"
+OPENDR_MAX_CONNECTIONS="${OPENDR_MAX_CONNECTIONS:-512}"
+OPENDR_MAX_CONNECTIONS_PER_IP="${OPENDR_MAX_CONNECTIONS_PER_IP:-256}"
+OPENDR_MAX_OPERATIONS_PER_CONNECTION="${OPENDR_MAX_OPERATIONS_PER_CONNECTION:-200}"
 DEFAULT_OPENDR_INDEX_BENCHMARK_TOML=$'[[backend.indexes]]\nattribute = "description"\ntypes = ["substring"]\n\n[[backend.indexes]]\nattribute = "sn"\ntypes = ["ordering"]'
 OPENDR_BACKEND_INDEXES_TOML=""
 PERF_CLIENT_IMAGE=""
@@ -637,6 +641,10 @@ write_run_metadata() {
   "cpu_limit": "${CPU_LIMIT}",
   "memory_limit": "${MEMORY_LIMIT}",
   "opendr_runtime": "${OPENDR_RUNTIME}",
+  "opendr_lmdb_max_readers": ${OPENDR_LMDB_MAX_READERS},
+  "opendr_max_connections": ${OPENDR_MAX_CONNECTIONS},
+  "opendr_max_connections_per_ip": ${OPENDR_MAX_CONNECTIONS_PER_IP},
+  "opendr_max_operations_per_connection": ${OPENDR_MAX_OPERATIONS_PER_CONNECTION},
   "benchmark_client": "${benchmark_client}",
   "benchmark_client_host": "${benchmark_client_host}",
   "benchmark_client_network": "${benchmark_client_network}",
@@ -828,6 +836,10 @@ run_profile() {
         -e OPENDR_BASE_DN="${BASE_DN}" \
         -e OPENDR_ROOT_USER_DN="cn=admin" \
         -e OPENDR_ROOT_PASSWORD="${ROOT_PASSWORD}" \
+        -e OPENDR_LMDB_MAX_READERS="${OPENDR_LMDB_MAX_READERS}" \
+        -e OPENDR_MAX_CONNECTIONS="${OPENDR_MAX_CONNECTIONS}" \
+        -e OPENDR_MAX_CONNECTIONS_PER_IP="${OPENDR_MAX_CONNECTIONS_PER_IP}" \
+        -e OPENDR_MAX_OPERATIONS_PER_CONNECTION="${OPENDR_MAX_OPERATIONS_PER_CONNECTION}" \
         -e OPENDR_BACKEND_INDEXES_TOML="${OPENDR_BACKEND_INDEXES_TOML}" \
         "${image}" \
         >/dev/null

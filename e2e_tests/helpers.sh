@@ -157,8 +157,8 @@ build_server() {
   
   # Try to find existing binary
   # Split SERVER_BIN_HINTS into array (bash/zsh compatible)
-  local hints
-  IFS=' ' read -r -a hints <<< "${SERVER_BIN_HINTS}"
+  local -a hints
+  hints=(${=SERVER_BIN_HINTS})
   for hint in "${hints[@]}"; do
     if [[ -x "${hint}" ]]; then
       # Convert to absolute path
@@ -247,6 +247,12 @@ enabled = true
 mode = "provider"
 changelog_enabled = true
 EXTRA_PLACEHOLDER
+
+[monitoring]
+enabled = false
+
+[access_control]
+enabled = false
 EOF
 
   # Now do the replacements using awk to avoid shell interpretation issues
@@ -301,17 +307,23 @@ mode = "consumer"
 provider_url = "ldap://127.0.0.1:PROVIDER_PORT_PLACEHOLDER"
 sync_interval_secs = SYNC_INT_PLACEHOLDER
 EXTRA_PLACEHOLDER
+
+[monitoring]
+enabled = false
+
+[access_control]
+enabled = false
 EOF
 
   # Now do the replacements using awk to avoid shell interpretation issues
   awk -v port="${port}" -v base="${base}" -v rootrdn="${rootrdn}" -v rootpw="${rootpw}" -v dir="${dir}" -v provider_port="${provider_port}" -v sync_int="${sync_int}" -v extra="${extra}" '
   {
+    gsub(/PROVIDER_PORT_PLACEHOLDER/, provider_port)
     gsub(/PORT_PLACEHOLDER/, port)
     gsub(/BASE_DN_PLACEHOLDER/, base)
     gsub(/ROOT_RDN_PLACEHOLDER/, rootrdn)
     gsub(/ROOT_PW_PLACEHOLDER/, rootpw)
     gsub(/DIR_PLACEHOLDER/, dir)
-    gsub(/PROVIDER_PORT_PLACEHOLDER/, provider_port)
     gsub(/SYNC_INT_PLACEHOLDER/, sync_int)
     gsub(/EXTRA_PLACEHOLDER/, extra)
     print
@@ -634,9 +646,10 @@ cleanup_all() {
     log_warning "Test failed or encountered errors. Dumping server logs:"
     echo ""
     
-    for i in "${!SERVER_LOGS[@]}"; do
+    for ((i = 1; i <= ${#SERVER_LOGS[@]}; i++)); do
       local log="${SERVER_LOGS[$i]}"
-      local name="${SERVER_NAMES[$i]:-unknown}"
+      local name="${SERVER_NAMES[$i]}"
+      [[ -n "${name}" ]] || name="unknown"
       
       if [[ -f "${log}" ]]; then
         echo "${BOLD}${YELLOW}──── ${name} log (last 50 lines) ────${RESET}"
@@ -647,9 +660,10 @@ cleanup_all() {
   fi
   
   # Stop all servers
-  for i in "${!SERVER_PIDS[@]}"; do
+  for ((i = 1; i <= ${#SERVER_PIDS[@]}; i++)); do
     local pid="${SERVER_PIDS[$i]}"
-    local name="${SERVER_NAMES[$i]:-unknown}"
+    local name="${SERVER_NAMES[$i]}"
+    [[ -n "${name}" ]] || name="unknown"
     stop_server "${pid}" "${name}"
   done
   

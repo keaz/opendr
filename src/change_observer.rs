@@ -219,8 +219,8 @@ mod tests {
     use super::*;
     use crate::csn::Csn;
     use crate::replication_provider_fsm::ChangeType;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test callback that counts invocations
     struct CountingCallback {

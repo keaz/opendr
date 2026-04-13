@@ -2263,21 +2263,31 @@ mod tests {
         assert_eq!(completion, None);
 
         let calls = metrics_log.lock().unwrap();
-        assert!(calls
-            .iter()
-            .any(|call| call.contains("record_search_start")));
-        assert!(calls
-            .iter()
-            .any(|call| call == "record_candidates_found(2)"));
-        assert!(calls
-            .iter()
-            .any(|call| call == "record_entry_processed(cn=john,dc=example,dc=org, true)"));
-        assert!(calls
-            .iter()
-            .any(|call| call == "record_entry_processed(cn=jane,dc=example,dc=org, true)"));
-        assert!(calls
-            .iter()
-            .any(|call| { call.contains("record_search_complete(Success, 2,") }));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("record_search_start"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "record_candidates_found(2)")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "record_entry_processed(cn=john,dc=example,dc=org, true)")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "record_entry_processed(cn=jane,dc=example,dc=org, true)")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| { call.contains("record_search_complete(Success, 2,") })
+        );
     }
 
     #[tokio::test]

@@ -212,10 +212,10 @@ async fn bind_admin_with_retry(server: &mut TestServer) -> Ldap {
 
         if let Ok((conn, mut ldap)) = LdapConnAsync::new(&url).await {
             ldap3::drive!(conn);
-            if let Ok(result) = ldap.simple_bind(ADMIN_DN, ADMIN_PASSWORD).await {
-                if result.success().is_ok() {
-                    return ldap;
-                }
+            if let Ok(result) = ldap.simple_bind(ADMIN_DN, ADMIN_PASSWORD).await
+                && result.success().is_ok()
+            {
+                return ldap;
             }
             let _ = ldap.unbind().await;
         }

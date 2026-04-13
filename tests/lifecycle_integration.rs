@@ -4,7 +4,7 @@
 //! work correctly in realistic scenarios.
 
 use opendr::backend::MockBackend;
-use opendr::fsm_server::{run_with_shutdown, FsmServerConfig};
+use opendr::fsm_server::{FsmServerConfig, run_with_shutdown};
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator, ShutdownState};
 use std::sync::Arc;
 use std::time::Duration;

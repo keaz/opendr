@@ -321,7 +321,7 @@ pub trait ReferralResolver: Send + Sync {
     /// * `Ok(Vec<ResolvedEndpoint>)` - List of resolved DSA endpoints
     /// * `Err(String)` - Resolution error message
     async fn resolve_referral_urls(&self, urls: &[String])
-        -> Result<Vec<ResolvedEndpoint>, String>;
+    -> Result<Vec<ResolvedEndpoint>, String>;
 
     /// Validate a single referral URL format
     ///
@@ -894,10 +894,10 @@ impl ReferralFsmImpl {
         session.response_data = Some(response.clone());
         self.state = ReferralState::ProcessingResponse;
 
-        if let Some(metrics) = &self.metrics {
-            if let Some(duration) = session.request_duration() {
-                metrics.record_response_received(target, response.len(), duration);
-            }
+        if let Some(metrics) = &self.metrics
+            && let Some(duration) = session.request_duration()
+        {
+            metrics.record_response_received(target, response.len(), duration);
         }
 
         Ok(None)
@@ -1189,17 +1189,17 @@ impl ReferralFsmImpl {
         // Record request sent time
         session.request_sent_time = Some(Instant::now());
 
-        if let Some(ref metrics) = self.metrics {
-            if let Some(target) = &session.current_target {
-                match previous_state {
-                    ReferralState::ChainRequest { hop_count, .. } => {
-                        metrics.record_chain_request(target, hop_count);
-                    }
-                    ReferralState::ProxyRequest { .. } => {
-                        metrics.record_proxy_request(target);
-                    }
-                    _ => {}
+        if let Some(ref metrics) = self.metrics
+            && let Some(target) = &session.current_target
+        {
+            match previous_state {
+                ReferralState::ChainRequest { hop_count, .. } => {
+                    metrics.record_chain_request(target, hop_count);
                 }
+                ReferralState::ProxyRequest { .. } => {
+                    metrics.record_proxy_request(target);
+                }
+                _ => {}
             }
         }
 
@@ -1241,12 +1241,11 @@ impl ReferralFsmImpl {
         self.state = ReferralState::ProcessingResponse;
 
         // Record metrics
-        if let Some(ref metrics) = self.metrics {
-            if let (Some(target), Some(duration)) =
+        if let Some(ref metrics) = self.metrics
+            && let (Some(target), Some(duration)) =
                 (&session.current_target, session.request_duration())
-            {
-                metrics.record_response_received(target, response.len(), duration);
-            }
+        {
+            metrics.record_response_received(target, response.len(), duration);
         }
 
         Ok(None)
@@ -2475,12 +2474,14 @@ mod tests {
         assert!(log
             .iter()
             .any(|entry| entry.contains("record_chain_request: target=test-server.example.com")));
-        assert!(!log
-            .iter()
-            .any(|entry| entry.contains("record_proxy_request")));
-        assert!(log
-            .iter()
-            .any(|entry| entry.contains("record_response_received")));
+        assert!(
+            !log.iter()
+                .any(|entry| entry.contains("record_proxy_request"))
+        );
+        assert!(
+            log.iter()
+                .any(|entry| entry.contains("record_response_received"))
+        );
 
         let (total, successful, failed, avg_hops) = fsm.get_stats();
         assert_eq!(total, 1);
@@ -2617,12 +2618,16 @@ mod tests {
         let resolver = MockReferralResolver::new();
 
         // Test URL validation
-        assert!(resolver
-            .validate_referral_url("ldap://test.com/dc=test,dc=org")
-            .is_ok());
-        assert!(resolver
-            .validate_referral_url("ldaps://test.com/dc=test,dc=org")
-            .is_ok());
+        assert!(
+            resolver
+                .validate_referral_url("ldap://test.com/dc=test,dc=org")
+                .is_ok()
+        );
+        assert!(
+            resolver
+                .validate_referral_url("ldaps://test.com/dc=test,dc=org")
+                .is_ok()
+        );
         assert!(resolver.validate_referral_url("invalid-url").is_err());
 
         // Test resolution
@@ -2634,12 +2639,14 @@ mod tests {
         // Test call log
         let log = resolver.call_log();
         assert!(!log.is_empty());
-        assert!(log
-            .iter()
-            .any(|entry| entry.contains("validate_referral_url")));
-        assert!(log
-            .iter()
-            .any(|entry| entry.contains("resolve_referral_urls")));
+        assert!(
+            log.iter()
+                .any(|entry| entry.contains("validate_referral_url"))
+        );
+        assert!(
+            log.iter()
+                .any(|entry| entry.contains("resolve_referral_urls"))
+        );
     }
 
     #[tokio::test]

@@ -4,9 +4,9 @@ use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend, Operational
 use opendr::fsm::{SearchEvent, StateMachine};
 use opendr::metrics::{MetricsCollector, OperationType};
 use opendr::search_adapters::{
-    build_production_search_fsm, build_production_search_fsm_with_message_id,
     ProductionEntryFormatter, ProductionFilterMatcher, ProductionSearchBackendAdapter,
-    ProductionSearchMetrics,
+    ProductionSearchMetrics, build_production_search_fsm,
+    build_production_search_fsm_with_message_id,
 };
 use opendr::search_fsm::{
     EntryFormatter, FilterMatcher, SearchBackend, SearchEntry, SearchMetrics,
@@ -77,14 +77,18 @@ async fn production_filter_matcher_uses_real_filter_evaluation() {
         .await
         .unwrap();
 
-    assert!(matcher
-        .matches_filter(&entry, "(&(objectClass=person)(cn=Alice))")
-        .await
-        .unwrap());
-    assert!(!matcher
-        .matches_filter(&entry, "(&(objectClass=person)(cn=Bob))")
-        .await
-        .unwrap());
+    assert!(
+        matcher
+            .matches_filter(&entry, "(&(objectClass=person)(cn=Alice))")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !matcher
+            .matches_filter(&entry, "(&(objectClass=person)(cn=Bob))")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -107,18 +111,24 @@ async fn production_entry_formatter_projects_and_encodes_entries() {
                 response.object_name.0.as_ref(),
                 "cn=alice,dc=example,dc=org"
             );
-            assert!(response
-                .attributes
-                .iter()
-                .any(|attr| attr.attr_type.0.as_ref() == "cn"));
-            assert!(response
-                .attributes
-                .iter()
-                .any(|attr| attr.attr_type.0.as_ref() == "entrycsn"));
-            assert!(!response
-                .attributes
-                .iter()
-                .any(|attr| attr.attr_type.0.as_ref() == "mail"));
+            assert!(
+                response
+                    .attributes
+                    .iter()
+                    .any(|attr| attr.attr_type.0.as_ref() == "cn")
+            );
+            assert!(
+                response
+                    .attributes
+                    .iter()
+                    .any(|attr| attr.attr_type.0.as_ref() == "entrycsn")
+            );
+            assert!(
+                !response
+                    .attributes
+                    .iter()
+                    .any(|attr| attr.attr_type.0.as_ref() == "mail")
+            );
         }
         other => panic!("unexpected protocol op: {:?}", other),
     }

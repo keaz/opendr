@@ -73,14 +73,18 @@ async fn test_lmdb_backend_initialization() {
     assert_eq!(admin_entry.dn, "cn=admin,dc=test,dc=com");
 
     // Verify authentication works
-    assert!(backend
-        .authenticate("cn=admin,dc=test,dc=com", b"admin123")
-        .await
-        .unwrap());
-    assert!(!backend
-        .authenticate("cn=admin,dc=test,dc=com", b"wrong")
-        .await
-        .unwrap());
+    assert!(
+        backend
+            .authenticate("cn=admin,dc=test,dc=com", b"admin123")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !backend
+            .authenticate("cn=admin,dc=test,dc=com", b"wrong")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -269,16 +273,20 @@ async fn test_lmdb_backend_password_authentication() {
     let backend = create_test_backend(&temp_dir).await;
 
     // Test successful authentication
-    assert!(backend
-        .authenticate("cn=admin,dc=test,dc=com", b"admin123")
-        .await
-        .unwrap());
+    assert!(
+        backend
+            .authenticate("cn=admin,dc=test,dc=com", b"admin123")
+            .await
+            .unwrap()
+    );
 
     // Test failed authentication with wrong password
-    assert!(!backend
-        .authenticate("cn=admin,dc=test,dc=com", b"wrongpass")
-        .await
-        .unwrap());
+    assert!(
+        !backend
+            .authenticate("cn=admin,dc=test,dc=com", b"wrongpass")
+            .await
+            .unwrap()
+    );
 
     // Test failed authentication with non-existent user
     let result = backend
@@ -390,8 +398,10 @@ async fn test_setup_config_with_lmdb_backend() {
     assert_eq!(base.attributes["o"][0], "Config Test Org");
 
     // Verify root user authentication
-    assert!(backend
-        .authenticate(&root_dn, config.root_password.as_bytes())
-        .await
-        .unwrap());
+    assert!(
+        backend
+            .authenticate(&root_dn, config.root_password.as_bytes())
+            .await
+            .unwrap()
+    );
 }

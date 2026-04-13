@@ -59,7 +59,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use crate::change_observer::{ChangeCallback, ChangeObserver};
-use crate::ldap_filter_eval::{compile_filter, prepare_change, CompiledLdapFilter, PreparedChange};
+use crate::ldap_filter_eval::{CompiledLdapFilter, PreparedChange, compile_filter, prepare_change};
 use crate::persistent_connection::{DirectoryEntry, PersistentConsumer, SyncState};
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 
@@ -463,15 +463,14 @@ impl ChangeCallback for PushManagerCallback {
 
             // Use spawn instead of spawn_blocking since we'll manage the locks properly
             let task = tokio::spawn(async move {
-                let result = push_change_to_consumer_wrapper(
+                push_change_to_consumer_wrapper(
                     &consumer_id,
                     &consumer,
                     &change,
                     push_manager,
                     &config,
                 )
-                .await;
-                result
+                .await
             });
 
             tasks.push(task);

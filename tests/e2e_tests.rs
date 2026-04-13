@@ -300,18 +300,22 @@ async fn test_rename_entry() {
         .expect("Failed to rename");
 
     // Verify old DN doesn't exist
-    assert!(backend
-        .get_entry("cn=OldName,dc=example,dc=com")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        backend
+            .get_entry("cn=OldName,dc=example,dc=com")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Verify new DN exists
-    assert!(backend
-        .get_entry("cn=NewName,dc=example,dc=com")
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        backend
+            .get_entry("cn=NewName,dc=example,dc=com")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// Test 10: Compare operations

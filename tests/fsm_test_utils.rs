@@ -21,7 +21,7 @@ use std::time::Duration;
 /// Assert that an FSM transitions from one state to another when given an event
 #[macro_export]
 macro_rules! assert_state_transition {
-    ($fsm:expr, $from_state:pat, $event:expr, $to_state:pat) => {
+    ($fsm:expr_2021, $from_state:pat, $event:expr_2021, $to_state:pat) => {
         assert!(
             matches!($fsm.current_state(), $from_state),
             "FSM not in expected initial state"
@@ -39,7 +39,7 @@ macro_rules! assert_state_transition {
 /// Assert that an FSM remains in the same state after an event
 #[macro_export]
 macro_rules! assert_state_unchanged {
-    ($fsm:expr, $expected_state:pat, $event:expr) => {
+    ($fsm:expr_2021, $expected_state:pat, $event:expr_2021) => {
         assert!(
             matches!($fsm.current_state(), $expected_state),
             "FSM not in expected state before event"
@@ -57,7 +57,7 @@ macro_rules! assert_state_unchanged {
 /// Assert that an event causes an FSM to enter an error state
 #[macro_export]
 macro_rules! assert_error_state {
-    ($fsm:expr, $event:expr) => {
+    ($fsm:expr_2021, $event:expr_2021) => {
         let result = $fsm.handle_event($event).await;
         assert!(
             result.is_err() || $fsm.is_error(),
@@ -69,7 +69,7 @@ macro_rules! assert_error_state {
 /// Assert that an FSM is in a terminal state
 #[macro_export]
 macro_rules! assert_terminal_state {
-    ($fsm:expr) => {
+    ($fsm:expr_2021) => {
         assert!($fsm.is_terminal(), "FSM is not in a terminal state");
     };
 }

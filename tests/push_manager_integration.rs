@@ -7,8 +7,8 @@ use opendr::change_observer::{ChangeCallback, ChangeObserver, ChangeObserverImpl
 use opendr::csn::Csn;
 use opendr::push_manager::{PushManager, PushManagerConfig};
 use opendr::replication_provider_fsm::{ChangeType, ChangelogEntry};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 

@@ -15,7 +15,7 @@ use ldap_parser::filter::{Filter, Substring};
 use ldap_parser::ldap::{LdapMessage, ProtocolOp};
 use ldap_parser::parse_ldap_messages;
 use log::{debug, error, info, warn};
-use rand::distributions::{Alphanumeric, DistString};
+use rand::distr::{Alphanumeric, SampleString};
 use rasn_ldap::ResultCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -47,8 +47,8 @@ use crate::metrics::{
     FsmType, MetricsCollector, OperationType as MetricsOperationType, ResourceEventType,
 };
 use crate::parser::{
-    encode_custom_extended_response, encode_extended_response,
-    encode_result_response_with_referrals, encode_search_reference_with_controls, ResponseOp,
+    ResponseOp, encode_custom_extended_response, encode_extended_response,
+    encode_result_response_with_referrals, encode_search_reference_with_controls,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::schema::LdapSchema;
@@ -57,26 +57,25 @@ use crate::search_adapters::{
     ProductionEntryFormatter, ProductionFilterMatcher, ProductionSearchMetrics,
 };
 use crate::search_controls::{
-    decode_paged_results_control, decode_server_side_sort_request_control,
-    encode_paged_results_control, encode_server_side_sort_response_control, PagedResultsControl,
-    ServerSideSortResultCode, SortKey, PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID,
-    SERVER_SIDE_SORT_RESPONSE_OID,
+    PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
+    SERVER_SIDE_SORT_RESPONSE_OID, ServerSideSortResultCode, SortKey, decode_paged_results_control,
+    decode_server_side_sort_request_control, encode_paged_results_control,
+    encode_server_side_sort_response_control,
 };
 use crate::search_fsm::{
     EntryFormatter, SearchBackend, SearchEntry, SearchFsmConfig, SearchFsmError, SearchFsmImpl,
 };
 use crate::server::{
-    authorize_attribute_permissions, authorize_operation, build_entry_from_add_request,
-    compute_new_dn, entry_is_referral as directory_entry_is_referral, extract_search_hint,
-    filter_search_entries_for_read_access, handle_sync_search_request, increment_control_counter,
-    log_add_audit_event, log_anonymous_bind, log_compare_audit, log_delete_audit_event,
-    log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
+    CancelRequestOutcome, ConnectionOperationRegistry, ConnectionSession, LegacySecurityConfig,
+    LegacyServerConfig, PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError,
+    SyncRequestError, authorize_attribute_permissions, authorize_operation,
+    build_entry_from_add_request, compute_new_dn, entry_is_referral as directory_entry_is_referral,
+    extract_search_hint, filter_search_entries_for_read_access, handle_sync_search_request,
+    increment_control_counter, log_add_audit_event, log_anonymous_bind, log_compare_audit,
+    log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
     log_password_modify_audit_event, log_sasl_bind, log_simple_bind_failure,
     log_simple_bind_success, parse_sync_request_control, referral_urls_for_entry,
     reject_sync_request, resolve_search_base_dn, resolve_search_candidate_entry,
-    CancelRequestOutcome, ConnectionOperationRegistry, ConnectionSession, LegacySecurityConfig,
-    LegacyServerConfig, PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError,
-    SyncRequestError,
 };
 use crate::shutdown::ShutdownCoordinator;
 use crate::sync_controls::SYNC_REQUEST_OID;
@@ -674,10 +673,10 @@ async fn handle_connection_with_transport(
                     for message in parsed_messages {
                         let operation_type = metrics_operation_for_protocol(&message.protocol_op);
                         let started_at = Instant::now();
-                        if let Some(metrics) = runtime_context.metrics.as_ref() {
-                            if let Some(operation_type) = operation_type {
-                                metrics.record_operation_start(operation_type, "");
-                            }
+                        if let Some(metrics) = runtime_context.metrics.as_ref()
+                            && let Some(operation_type) = operation_type
+                        {
+                            metrics.record_operation_start(operation_type, "");
                         }
 
                         let result = process_ldap_message(
@@ -694,14 +693,14 @@ async fn handle_connection_with_transport(
                         )
                         .await;
 
-                        if let Some(metrics) = runtime_context.metrics.as_ref() {
-                            if let Some(operation_type) = operation_type {
-                                metrics.record_operation_complete(
-                                    operation_type,
-                                    started_at.elapsed(),
-                                    result.is_ok(),
-                                );
-                            }
+                        if let Some(metrics) = runtime_context.metrics.as_ref()
+                            && let Some(operation_type) = operation_type
+                        {
+                            metrics.record_operation_complete(
+                                operation_type,
+                                started_at.elapsed(),
+                                result.is_ok(),
+                            );
                         }
 
                         if let Err(err) = result {
@@ -1194,24 +1193,25 @@ async fn handle_search_request_with_fsm_runtime(
             .map_err(|err| err.to_string())?;
         return Ok(());
     }
-    if let Some(control) = paged_results.as_ref() {
-        if control.size == 0 && control.cookie.is_empty() {
-            let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
-            let session = legacy_session_from_fsm(fsm_set);
-            reject_native_paged_search_request(
-                fsm_set,
-                request,
-                request_context,
-                &session,
-                &base_dn,
-                NativePagedSearchError::ProtocolError(
-                    "paged results page size must be greater than zero on the initial request"
-                        .to_string(),
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
+    if let Some(control) = paged_results.as_ref()
+        && control.size == 0
+        && control.cookie.is_empty()
+    {
+        let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+        let session = legacy_session_from_fsm(fsm_set);
+        reject_native_paged_search_request(
+            fsm_set,
+            request,
+            request_context,
+            &session,
+            &base_dn,
+            NativePagedSearchError::ProtocolError(
+                "paged results page size must be greater than zero on the initial request"
+                    .to_string(),
+            ),
+        )
+        .await?;
+        return Ok(());
     }
 
     let session = legacy_session_from_fsm(fsm_set);
@@ -2876,7 +2876,7 @@ fn render_search_filter_string(filter: &Filter<'_>) -> String {
         Filter::EqualityMatch(ava) => format!(
             "({}={})",
             ava.attribute_desc.0.as_ref(),
-            escape_filter_value(ava.assertion_value)
+            escape_filter_value(&ava.assertion_value)
         ),
         Filter::Substrings(substring) => format!(
             "({}={})",
@@ -2886,18 +2886,18 @@ fn render_search_filter_string(filter: &Filter<'_>) -> String {
         Filter::GreaterOrEqual(ava) => format!(
             "({}>={})",
             ava.attribute_desc.0.as_ref(),
-            escape_filter_value(ava.assertion_value)
+            escape_filter_value(&ava.assertion_value)
         ),
         Filter::LessOrEqual(ava) => format!(
             "({}<={})",
             ava.attribute_desc.0.as_ref(),
-            escape_filter_value(ava.assertion_value)
+            escape_filter_value(&ava.assertion_value)
         ),
         Filter::Present(attribute) => format!("({}=*)", attribute.0.as_ref()),
         Filter::ApproxMatch(ava) => format!(
             "({}~={})",
             ava.attribute_desc.0.as_ref(),
-            escape_filter_value(ava.assertion_value)
+            escape_filter_value(&ava.assertion_value)
         ),
         Filter::ExtensibleMatch(assertion) => {
             let mut head = String::new();
@@ -4178,7 +4178,7 @@ async fn handle_extended_request_with_fsm_runtime(
             Some(new_password) => (new_password, false),
             None => (
                 Alphanumeric
-                    .sample_string(&mut rand::thread_rng(), 24)
+                    .sample_string(&mut rand::rng(), 24)
                     .into_bytes(),
                 true,
             ),
@@ -4921,9 +4921,9 @@ mod tests {
     use crate::extended_ops::oids;
     use crate::replication_service::ReplicationService;
     use crate::sync_controls::{
-        decode_sync_done_control, decode_sync_state_control, encode_sync_request_control,
-        SyncRefreshMode, SyncRequestControl, SyncStateControl, SyncStateType, SYNC_DONE_OID,
-        SYNC_STATE_OID,
+        SYNC_DONE_OID, SYNC_STATE_OID, SyncRefreshMode, SyncRequestControl, SyncStateControl,
+        SyncStateType, decode_sync_done_control, decode_sync_state_control,
+        encode_sync_request_control,
     };
     use ldap_parser::ldap::{
         AuthenticationChoice, BindRequest, LdapDN, LdapString, ProtocolOp,
@@ -4945,8 +4945,8 @@ mod tests {
     };
     use std::borrow::Cow;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::timeout;
 
     async fn connected_stream_pair() -> (TcpStream, TcpStream) {
@@ -5455,10 +5455,11 @@ mod tests {
             assert!(len > 0, "connection closed before receiving response");
             buf.extend_from_slice(&chunk[..len]);
 
-            if let Ok((remaining, messages)) = parse_ldap_messages(&buf) {
-                if remaining.is_empty() && messages.len() >= expected_messages {
-                    return buf;
-                }
+            if let Ok((remaining, messages)) = parse_ldap_messages(&buf)
+                && remaining.is_empty()
+                && messages.len() >= expected_messages
+            {
+                return buf;
             }
         }
     }
@@ -5746,14 +5747,18 @@ mod tests {
         match &messages[0].protocol_op {
             ProtocolOp::SearchResultEntry(entry) => {
                 assert_eq!(entry.object_name.0.as_ref(), "cn=Subschema");
-                assert!(entry
-                    .attributes
-                    .iter()
-                    .any(|attribute| attribute.attr_type.0.as_ref() == "cn"));
-                assert!(entry
-                    .attributes
-                    .iter()
-                    .any(|attribute| attribute.attr_type.0.as_ref() == "objectClass"));
+                assert!(
+                    entry
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.attr_type.0.as_ref() == "cn")
+                );
+                assert!(
+                    entry
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.attr_type.0.as_ref() == "objectClass")
+                );
             }
             other => panic!("unexpected response: {:?}", other),
         }
@@ -5936,13 +5941,17 @@ mod tests {
                     .map(|attribute| attribute.attr_type.0.as_ref())
                     .collect();
                 assert!(attribute_names.contains(&"cn"));
-                assert!(attribute_names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case("objectClass")));
+                assert!(
+                    attribute_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case("objectClass"))
+                );
                 assert!(!attribute_names.contains(&"sn"));
-                assert!(!attribute_names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case("userPassword")));
+                assert!(
+                    !attribute_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case("userPassword"))
+                );
             }
             other => panic!("unexpected response: {:?}", other),
         }
@@ -6241,10 +6250,12 @@ mod tests {
             ProtocolOp::SearchResultEntry(entry) => {
                 assert_eq!(entry.object_name.0.as_ref(), "cn=alice,dc=example,dc=org");
                 assert_eq!(entry.attributes.len(), 2);
-                assert!(entry
-                    .attributes
-                    .iter()
-                    .all(|attr| attr.attr_vals.is_empty()));
+                assert!(
+                    entry
+                        .attributes
+                        .iter()
+                        .all(|attr| attr.attr_vals.is_empty())
+                );
             }
             other => panic!("unexpected response: {:?}", other),
         }
@@ -6578,10 +6589,12 @@ mod tests {
                     entry.object_name.0.as_ref(),
                     "cn=referral,dc=example,dc=org"
                 );
-                assert!(entry
-                    .attributes
-                    .iter()
-                    .any(|attribute| attribute.attr_type.0.as_ref() == "ref"));
+                assert!(
+                    entry
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.attr_type.0.as_ref() == "ref")
+                );
             }
             other => panic!("unexpected response: {:?}", other),
         }
@@ -6703,9 +6716,11 @@ mod tests {
         let (_, messages) = parse_ldap_messages(&response).unwrap();
 
         assert_eq!(messages.len(), 3);
-        assert!(messages
-            .iter()
-            .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_))));
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.protocol_op, ProtocolOp::SearchResultEntry(_)))
+        );
         let reference = messages
             .iter()
             .find_map(|message| match &message.protocol_op {
@@ -7007,15 +7022,19 @@ mod tests {
             other => panic!("unexpected response: {:?}", other),
         }
 
-        assert!(backend
-            .get_entry("cn=add-me,dc=example,dc=org")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(backend
-            .authenticate("cn=add-me,dc=example,dc=org", b"new-secret")
-            .await
-            .unwrap());
+        assert!(
+            backend
+                .get_entry("cn=add-me,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .authenticate("cn=add-me,dc=example,dc=org", b"new-secret")
+                .await
+                .unwrap()
+        );
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();
@@ -7467,11 +7486,13 @@ mod tests {
             other => panic!("unexpected response: {:?}", other),
         }
 
-        assert!(backend
-            .get_entry("cn=delete-me,dc=example,dc=org")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            backend
+                .get_entry("cn=delete-me,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();
@@ -7671,16 +7692,20 @@ mod tests {
             other => panic!("unexpected response: {:?}", other),
         }
 
-        assert!(backend
-            .get_entry("cn=rename-me,dc=example,dc=org")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(backend
-            .get_entry("cn=renamed-user,dc=example,dc=org")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            backend
+                .get_entry("cn=rename-me,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_entry("cn=renamed-user,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();
@@ -7791,16 +7816,20 @@ mod tests {
             other => panic!("unexpected response: {:?}", other),
         }
 
-        assert!(backend
-            .get_entry("cn=rename-source,dc=example,dc=org")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(backend
-            .get_entry("cn=rename-target,dc=example,dc=org")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            backend
+                .get_entry("cn=rename-source,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .get_entry("cn=rename-target,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();

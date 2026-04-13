@@ -182,11 +182,11 @@ async fn run(cli: Cli) -> Result<(), String> {
 
         Commands::HashPassword { password } => {
             use base64::Engine;
-            use rand::Rng;
+            use rand::RngExt;
             use sha2::{Digest, Sha512};
 
             // Generate 16-byte salt
-            let salt: [u8; 16] = rand::thread_rng().gen();
+            let salt: [u8; 16] = rand::rng().random();
 
             // Hash password + salt
             let mut hasher = Sha512::new();

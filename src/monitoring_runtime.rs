@@ -8,7 +8,7 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -1032,10 +1032,12 @@ mod tests {
             response.components["replication_provider"].status,
             ComponentStatus::Disabled
         );
-        assert!(response
-            .details
-            .iter()
-            .any(|detail| detail.contains("memory backend initialized")));
+        assert!(
+            response
+                .details
+                .iter()
+                .any(|detail| detail.contains("memory backend initialized"))
+        );
     }
 
     #[tokio::test]

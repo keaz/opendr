@@ -216,7 +216,7 @@ mod tests {
                 types_only: false,
                 filter: Filter::EqualityMatch(AttributeValueAssertion {
                     attribute_desc: LdapString(Cow::Borrowed("objectClass")),
-                    assertion_value: b"*",
+                    assertion_value: Cow::Borrowed(b"*"),
                 }),
                 attributes: Vec::new(),
             }),
@@ -255,8 +255,10 @@ mod tests {
             rejection.result_code,
             ResultCode::UnavailableCriticalExtension
         );
-        assert!(rejection
-            .diagnostic_message
-            .contains("unsupported critical control 1.2.3"));
+        assert!(
+            rejection
+                .diagnostic_message
+                .contains("unsupported critical control 1.2.3")
+        );
     }
 }

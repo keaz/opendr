@@ -8,11 +8,11 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use ldap_parser::ldap::{ProtocolOp as ParserProtocolOp, ResultCode as ParserResultCode};
+use ldap_parser::parse_ldap_messages;
 use ldap3::exop::{PasswordModify, WhoAmI, WhoAmIResp};
 use ldap3::result::LdapError;
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Mod, Scope, SearchEntry};
-use ldap_parser::ldap::{ProtocolOp as ParserProtocolOp, ResultCode as ParserResultCode};
-use ldap_parser::parse_ldap_messages;
 use rasn::der;
 use rasn_ldap::{
     AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
@@ -28,8 +28,8 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use url::Url;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -944,7 +944,7 @@ impl LdapTarget {
             scheme => {
                 return Err(other_error(format!(
                     "unsupported LDAP URL scheme for SASL benchmark: {scheme}"
-                )))
+                )));
             }
         };
         let host = url
@@ -2241,7 +2241,9 @@ fn print_human_summary(report: &BenchmarkReport) {
     println!();
     println!("## Benchmarks");
     println!();
-    println!("| Operation | Concurrency | Attempts | Successes | Failures | Failure % | Mean ms | P50 ms | P95 ms | P99 ms | Max ms | Attempt ops/s | Success ops/s |");
+    println!(
+        "| Operation | Concurrency | Attempts | Successes | Failures | Failure % | Mean ms | P50 ms | P95 ms | P99 ms | Max ms | Attempt ops/s | Success ops/s |"
+    );
     println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for benchmark in &report.benchmarks {
         println!(

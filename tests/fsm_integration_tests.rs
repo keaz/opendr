@@ -154,16 +154,20 @@ async fn test_backend_operations_with_mock() {
     backend.add_entry(entry2, vec![]).await.unwrap();
 
     // Verify entries exist
-    assert!(backend
-        .get_entry("dc=example,dc=com")
-        .await
-        .unwrap()
-        .is_some());
-    assert!(backend
-        .get_entry("cn=user,dc=example,dc=com")
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        backend
+            .get_entry("dc=example,dc=com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .get_entry("cn=user,dc=example,dc=com")
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     // Test search
     let results = backend
@@ -198,11 +202,13 @@ async fn test_backend_operations_with_mock() {
         .delete_entry("cn=user,dc=example,dc=com")
         .await
         .unwrap();
-    assert!(backend
-        .get_entry("cn=user,dc=example,dc=com")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        backend
+            .get_entry("cn=user,dc=example,dc=com")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -236,11 +242,13 @@ async fn test_backend_operations_with_lmdb() {
 
     // Verify entries exist
     assert!(backend.get_entry("dc=test,dc=com").await.unwrap().is_some());
-    assert!(backend
-        .get_entry("cn=testuser,dc=test,dc=com")
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        backend
+            .get_entry("cn=testuser,dc=test,dc=com")
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     // Test search
     let results = backend
@@ -275,11 +283,13 @@ async fn test_backend_operations_with_lmdb() {
         .delete_entry("cn=testuser,dc=test,dc=com")
         .await
         .unwrap();
-    assert!(backend
-        .get_entry("cn=testuser,dc=test,dc=com")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        backend
+            .get_entry("cn=testuser,dc=test,dc=com")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -345,21 +355,27 @@ async fn test_concurrent_backend_operations() {
     assert!(result3.unwrap().is_ok());
 
     // Verify all entries exist
-    assert!(backend
-        .get_entry("cn=user1,dc=concurrent,dc=com")
-        .await
-        .unwrap()
-        .is_some());
-    assert!(backend
-        .get_entry("cn=user2,dc=concurrent,dc=com")
-        .await
-        .unwrap()
-        .is_some());
-    assert!(backend
-        .get_entry("cn=user3,dc=concurrent,dc=com")
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        backend
+            .get_entry("cn=user1,dc=concurrent,dc=com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .get_entry("cn=user2,dc=concurrent,dc=com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .get_entry("cn=user3,dc=concurrent,dc=com")
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     // Verify total count
     let results = backend

@@ -110,10 +110,12 @@ async fn test_write_backend_adapter() {
         .await
         .unwrap();
     assert!(exists, "Committed add should exist");
-    assert!(backend
-        .authenticate("cn=newuser,dc=example,dc=org", b"password")
-        .await
-        .unwrap());
+    assert!(
+        backend
+            .authenticate("cn=newuser,dc=example,dc=org", b"password")
+            .await
+            .unwrap()
+    );
 
     // Test modify_entry
     let txn_id = adapter.begin_transaction().await.unwrap();

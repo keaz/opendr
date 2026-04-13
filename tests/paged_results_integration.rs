@@ -5,7 +5,7 @@ use ldap_parser::ldap::{ProtocolOp, ResultCode as ParserResultCode};
 use ldap_parser::parse_ldap_messages;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::search_controls::{
-    decode_paged_results_control, encode_paged_results_control, PAGED_RESULTS_OID,
+    PAGED_RESULTS_OID, decode_paged_results_control, encode_paged_results_control,
 };
 use opendr::server::{self, LegacyServerConfig, ServerError};
 use rasn::der;

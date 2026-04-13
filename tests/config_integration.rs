@@ -123,10 +123,12 @@ ldaps_port = 1389
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("ports must be different"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("ports must be different")
+    );
 }
 
 #[test]
@@ -154,10 +156,12 @@ base_dn = ""
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Base DN cannot be empty"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Base DN cannot be empty")
+    );
 }
 
 #[test]
@@ -171,10 +175,12 @@ backend_type = "postgresql"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid backend type"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid backend type")
+    );
 }
 
 #[test]
@@ -188,10 +194,12 @@ adaptive_threshold = 1.5
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("adaptive_threshold"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("adaptive_threshold")
+    );
 }
 
 #[test]
@@ -205,10 +213,12 @@ blacklist = ["not-an-ip-address", "192.168.1.1"]
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid blacklist IP"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid blacklist IP")
+    );
 }
 
 #[test]
@@ -237,10 +247,12 @@ mode = "invalid"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid replication mode"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid replication mode")
+    );
 }
 
 #[test]
@@ -399,10 +411,12 @@ enable_change_listening = false
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("poll-based replication has been removed"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("poll-based replication has been removed")
+    );
 }
 
 #[test]
@@ -435,10 +449,12 @@ max_retry_attempts = 0
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("max_retry_attempts must be > 0"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("max_retry_attempts must be > 0")
+    );
 }
 
 #[test]
@@ -452,10 +468,12 @@ format = "xml"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid audit format"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid audit format")
+    );
 }
 
 #[test]
@@ -469,10 +487,12 @@ level = "verbose"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid audit level"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid audit level")
+    );
 }
 
 #[test]
@@ -486,10 +506,12 @@ default_policy = "maybe"
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid access policy"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid access policy")
+    );
 }
 
 #[test]
@@ -665,14 +687,18 @@ indexed_attributes = ["cn", "uid", "mail", "sn", "givenName", "objectClass", "ou
 
     let config = ServerConfig::from_toml_str(toml).unwrap();
     assert_eq!(config.backend.indexed_attributes.len(), 7);
-    assert!(config
-        .backend
-        .indexed_attributes
-        .contains(&"sn".to_string()));
-    assert!(config
-        .backend
-        .indexed_attributes
-        .contains(&"givenName".to_string()));
+    assert!(
+        config
+            .backend
+            .indexed_attributes
+            .contains(&"sn".to_string())
+    );
+    assert!(
+        config
+            .backend
+            .indexed_attributes
+            .contains(&"givenName".to_string())
+    );
 }
 
 #[test]
@@ -725,10 +751,12 @@ types = ["bogus"]
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("unsupported backend index type for cn: bogus"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported backend index type for cn: bogus")
+    );
 }
 
 #[test]
@@ -743,10 +771,12 @@ max_connections_per_ip = 200
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("max_connections_per_ip cannot exceed max_connections"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("max_connections_per_ip cannot exceed max_connections")
+    );
 }
 
 #[test]
@@ -760,8 +790,10 @@ max_connections = 0
     let result = config.validate();
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("max_connections must be > 0"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("max_connections must be > 0")
+    );
 }

@@ -119,10 +119,11 @@ impl SchemaValidator for LdapSchemaValidator {
             // Check single-value constraints for Add and Replace
             match modification {
                 Modification::Add { name, values } | Modification::Replace { name, values } => {
-                    if let Some(attr_type) = self.schema.get_attribute_type(name) {
-                        if attr_type.single_value && values.len() > 1 {
-                            return Err(format!("Single-value violation for attribute: {}", name));
-                        }
+                    if let Some(attr_type) = self.schema.get_attribute_type(name)
+                        && attr_type.single_value
+                        && values.len() > 1
+                    {
+                        return Err(format!("Single-value violation for attribute: {}", name));
                     }
                 }
                 _ => {}
@@ -180,14 +181,18 @@ mail: john@example.com
         let attributes = LdapSchemaValidator::parse_ldif_to_attributes(ldif).unwrap();
 
         assert_eq!(attributes.get("objectClass").unwrap().len(), 2);
-        assert!(attributes
-            .get("objectClass")
-            .unwrap()
-            .contains(&"top".to_string()));
-        assert!(attributes
-            .get("objectClass")
-            .unwrap()
-            .contains(&"person".to_string()));
+        assert!(
+            attributes
+                .get("objectClass")
+                .unwrap()
+                .contains(&"top".to_string())
+        );
+        assert!(
+            attributes
+                .get("objectClass")
+                .unwrap()
+                .contains(&"person".to_string())
+        );
         assert_eq!(attributes.get("cn").unwrap()[0], "John Doe");
         assert_eq!(attributes.get("sn").unwrap()[0], "Doe");
         assert_eq!(attributes.get("mail").unwrap()[0], "john@example.com");
@@ -262,10 +267,12 @@ mail: john@example.com
             },
         ];
 
-        assert!(validator
-            .validate_modifications("cn=John Doe,dc=example,dc=com", &modifications)
-            .await
-            .is_ok());
+        assert!(
+            validator
+                .validate_modifications("cn=John Doe,dc=example,dc=com", &modifications)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -289,10 +296,12 @@ mail: john@example.com
     async fn test_validate_dn_modification() {
         let validator = LdapSchemaValidator::new();
 
-        assert!(validator
-            .validate_dn_modification("cn=John Doe,dc=example,dc=com", "cn=Jane Doe", None)
-            .await
-            .is_ok());
+        assert!(
+            validator
+                .validate_dn_modification("cn=John Doe,dc=example,dc=com", "cn=Jane Doe", None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

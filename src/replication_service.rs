@@ -42,8 +42,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tokio::sync::Notify;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -453,7 +453,7 @@ impl ReplicationService {
                 return Err(format!(
                     "Invalid replication mode: {}",
                     config.replication.mode
-                ))
+                ));
             }
         };
 
@@ -573,8 +573,7 @@ impl ReplicationService {
 
         info!(
             "Starting replication provider service with inbound stream sessions (streaming={}, heartbeat={}s)",
-            provider_config.enable_streaming,
-            provider_config.heartbeat_interval_secs
+            provider_config.enable_streaming, provider_config.heartbeat_interval_secs
         );
 
         // Get shutdown receiver
@@ -653,8 +652,7 @@ impl ReplicationService {
             .ok_or_else(|| "Consumer config not available".to_string())?;
 
         if Self::uses_local_provider_runtime(&consumer_config.provider_url) {
-            let message =
-                "listener-based replication requires ldap:// or ldaps:// provider_url; local:// and in-memory:// are not supported";
+            let message = "listener-based replication requires ldap:// or ldaps:// provider_url; local:// and in-memory:// are not supported";
             self.status.set_consumer_error(message);
             return Err(message.to_string());
         }
@@ -992,7 +990,7 @@ mod tests {
     use crate::backend::MockBackend;
     use crate::replication_provider_fsm::ChangeType;
     use std::io::Write;
-    use tempfile::{tempdir, NamedTempFile};
+    use tempfile::{NamedTempFile, tempdir};
 
     fn create_test_config() -> ServerConfig {
         let mut config = ServerConfig::default();

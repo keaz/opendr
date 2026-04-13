@@ -1987,25 +1987,24 @@ impl ReplicationProviderFsmImpl {
                 .await
                 .map_err(|message| ReplicationProviderError::StreamingError { message })?;
 
-            if needs_stream_start {
-                if let Err(e) = self
+            if needs_stream_start
+                && let Err(e) = self
                     .streaming_manager
                     .start_streaming(consumer_id, start_cookie.as_deref())
                     .await
-                {
-                    if let Some(session) = self.sessions.get_mut(consumer_id) {
-                        session.record_error();
-                        if session.error_count >= self.config.max_retry_attempts as usize {
-                            exhausted_consumers.push(consumer_id.clone());
-                        }
+            {
+                if let Some(session) = self.sessions.get_mut(consumer_id) {
+                    session.record_error();
+                    if session.error_count >= self.config.max_retry_attempts as usize {
+                        exhausted_consumers.push(consumer_id.clone());
                     }
-
-                    if let Some(ref metrics) = self.metrics {
-                        metrics.record_replication_error(consumer_id, "stream_start", &e);
-                    }
-
-                    continue;
                 }
+
+                if let Some(ref metrics) = self.metrics {
+                    metrics.record_replication_error(consumer_id, "stream_start", &e);
+                }
+
+                continue;
             }
 
             match self
@@ -2839,8 +2838,8 @@ pub mod tests {
     type SentEntryRecord = (String, ChangelogEntry);
     type SentEntryLog = Arc<Mutex<Vec<SentEntryRecord>>>;
 
-    fn create_test_fsm_with_recording_streaming_manager(
-    ) -> (ReplicationProviderFsmImpl, SentEntryLog) {
+    fn create_test_fsm_with_recording_streaming_manager()
+    -> (ReplicationProviderFsmImpl, SentEntryLog) {
         let changelog_provider = Box::new(MockChangelogProvider::new());
         let consumer_registry = Box::new(MockConsumerRegistry::new());
         let streaming_manager = MockStreamingManager::new();

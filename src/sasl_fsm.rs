@@ -462,13 +462,13 @@ impl SaslFsmImpl {
         }
 
         // Check data size limits
-        if let Some(data) = &initial_data {
-            if data.len() > self.config.max_data_size {
-                self.failed_auths += 1;
-                return Err(SaslFsmError::Generic {
-                    message: format!("Initial data too large: {} bytes", data.len()),
-                });
-            }
+        if let Some(data) = &initial_data
+            && data.len() > self.config.max_data_size
+        {
+            self.failed_auths += 1;
+            return Err(SaslFsmError::Generic {
+                message: format!("Initial data too large: {} bytes", data.len()),
+            });
         }
 
         // Start authentication
@@ -1321,11 +1321,15 @@ mod tests {
             .await;
 
         let calls = call_log.lock().unwrap();
-        assert!(calls
-            .iter()
-            .any(|call| call.contains("supports_mechanism(PLAIN)")));
-        assert!(calls
-            .iter()
-            .any(|call| call.contains("start_authentication(PLAIN")));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("supports_mechanism(PLAIN)"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("start_authentication(PLAIN"))
+        );
     }
 }

@@ -395,10 +395,12 @@ async fn test_typed_substring_index_configuration_and_candidates() {
     let bob = DirectoryEntry::new("uid=bob,ou=people,dc=example,dc=org", bob_attributes);
     backend.add_entry(bob, vec![]).await.unwrap();
 
-    assert!(backend
-        .search_by_index("description", "alpha marker")
-        .unwrap()
-        .is_empty());
+    assert!(
+        backend
+            .search_by_index("description", "alpha marker")
+            .unwrap()
+            .is_empty()
+    );
 
     let results = backend
         .search_entries_with_hint(
@@ -445,10 +447,12 @@ async fn test_typed_ordering_index_configuration_and_candidates() {
             .unwrap();
     }
 
-    assert!(backend
-        .search_by_index("serialNumber", "020")
-        .unwrap()
-        .is_empty());
+    assert!(
+        backend
+            .search_by_index("serialNumber", "020")
+            .unwrap()
+            .is_empty()
+    );
 
     let greater_or_equal = backend
         .search_entries_with_hint(

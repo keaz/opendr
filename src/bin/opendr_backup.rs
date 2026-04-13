@@ -3,8 +3,8 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use opendr::backup::{
-    create_full_backup, create_incremental_backup, read_manifest, verify_manifest_files,
-    BackupManifest,
+    BackupManifest, create_full_backup, create_incremental_backup, read_manifest,
+    verify_manifest_files,
 };
 use opendr::config::ServerConfig;
 

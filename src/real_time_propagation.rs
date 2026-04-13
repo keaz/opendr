@@ -74,8 +74,8 @@ use tokio::sync::RwLock;
 
 use crate::change_observer::{ChangeCallback, ChangeObserver};
 use crate::ldap_filter_eval::{
-    compile_filter, is_dn_in_scope as ldap_dn_in_scope, prepare_change, CompiledLdapFilter,
-    PreparedChange,
+    CompiledLdapFilter, PreparedChange, compile_filter, is_dn_in_scope as ldap_dn_in_scope,
+    prepare_change,
 };
 use crate::push_manager::PushManager;
 use crate::replication_provider_fsm::ChangelogEntry;

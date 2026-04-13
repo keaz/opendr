@@ -481,14 +481,18 @@ async fn test_lmdb_modify_userpassword_updates_authentication() {
         .await
         .unwrap();
 
-    assert!(!backend
-        .authenticate("cn=password-user,dc=example,dc=org", b"initial-secret")
-        .await
-        .unwrap());
-    assert!(backend
-        .authenticate("cn=password-user,dc=example,dc=org", b"rotated-secret")
-        .await
-        .unwrap());
+    assert!(
+        !backend
+            .authenticate("cn=password-user,dc=example,dc=org", b"initial-secret")
+            .await
+            .unwrap()
+    );
+    assert!(
+        backend
+            .authenticate("cn=password-user,dc=example,dc=org", b"rotated-secret")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -508,10 +512,12 @@ async fn test_lmdb_add_entry_preserves_prehashed_userpassword() {
         .await
         .unwrap();
 
-    assert!(backend
-        .authenticate("cn=hash-user,dc=example,dc=org", b"prehashed-secret")
-        .await
-        .unwrap());
+    assert!(
+        backend
+            .authenticate("cn=hash-user,dc=example,dc=org", b"prehashed-secret")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

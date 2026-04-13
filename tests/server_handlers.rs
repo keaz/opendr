@@ -280,7 +280,7 @@ async fn search_returns_entries_and_success() {
         types_only: false,
         filter: Filter::EqualityMatch(AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         }),
         attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
     };
@@ -389,7 +389,7 @@ async fn base_object_search_uses_get_entry_fast_path() {
         types_only: false,
         filter: Filter::EqualityMatch(AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         }),
         attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
     };
@@ -725,7 +725,7 @@ async fn compare_matching_attribute_returns_true() {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
         ava: AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         },
     };
 
@@ -760,7 +760,7 @@ async fn compare_non_matching_attribute_returns_false() {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
         ava: AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Bob",
+            assertion_value: Cow::Borrowed(b"Bob"),
         },
     };
 
@@ -795,7 +795,7 @@ async fn compare_backend_error_maps_to_no_such_object() {
         entry: LdapDN(Cow::Owned("cn=Missing,dc=example,dc=org".to_string())),
         ava: AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("cn".to_string())),
-            assertion_value: b"Alice",
+            assertion_value: Cow::Borrowed(b"Alice"),
         },
     };
 

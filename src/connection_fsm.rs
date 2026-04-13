@@ -474,34 +474,37 @@ impl ConnectionFsmImpl {
 
                 self.state = ConnectionState::StartTlsNegotiation;
 
-                if let Some(transport) = self.stream.take() {
-                    let plain_stream = match transport.into_plain() {
-                        Ok(stream) => stream,
-                        Err(transport) => {
-                            self.stream = Some(transport);
-                            self.state = ConnectionState::Error;
-                            return Err(ConnectionFsmError::TlsHandshakeFailed {
-                                reason: "connection already uses TLS".to_string(),
-                            });
-                        }
-                    };
+                match self.stream.take() {
+                    Some(transport) => {
+                        let plain_stream = match transport.into_plain() {
+                            Ok(stream) => stream,
+                            Err(transport) => {
+                                self.stream = Some(transport);
+                                self.state = ConnectionState::Error;
+                                return Err(ConnectionFsmError::TlsHandshakeFailed {
+                                    reason: "connection already uses TLS".to_string(),
+                                });
+                            }
+                        };
 
-                    match self.tls_handler.upgrade_transport(plain_stream).await {
-                        Ok(upgraded) => {
-                            self.stream = Some(upgraded);
-                            self.state = ConnectionState::Secure;
-                            self.is_secure = true;
-                            Ok(Some(self.connection_info()))
-                        }
-                        Err(reason) => {
-                            self.stream = Some(ConnectionTransport::Closed);
-                            self.state = ConnectionState::Error;
-                            Err(ConnectionFsmError::TlsHandshakeFailed { reason })
+                        match self.tls_handler.upgrade_transport(plain_stream).await {
+                            Ok(upgraded) => {
+                                self.stream = Some(upgraded);
+                                self.state = ConnectionState::Secure;
+                                self.is_secure = true;
+                                Ok(Some(self.connection_info()))
+                            }
+                            Err(reason) => {
+                                self.stream = Some(ConnectionTransport::Closed);
+                                self.state = ConnectionState::Error;
+                                Err(ConnectionFsmError::TlsHandshakeFailed { reason })
+                            }
                         }
                     }
-                } else {
-                    self.state = ConnectionState::Error;
-                    Err(ConnectionFsmError::NotConnected)
+                    _ => {
+                        self.state = ConnectionState::Error;
+                        Err(ConnectionFsmError::NotConnected)
+                    }
                 }
             }
             _ => Err(ConnectionFsmError::InvalidTransition {
@@ -600,12 +603,12 @@ impl ConnectionFsmImpl {
 
     /// Check if connection has timed out
     fn check_timeout(&self) -> Result<(), ConnectionFsmError> {
-        if let Some(start_time) = self.connect_start {
-            if start_time.elapsed() > self.connect_timeout {
-                return Err(ConnectionFsmError::Timeout {
-                    duration: self.connect_timeout,
-                });
-            }
+        if let Some(start_time) = self.connect_start
+            && start_time.elapsed() > self.connect_timeout
+        {
+            return Err(ConnectionFsmError::Timeout {
+                duration: self.connect_timeout,
+            });
         }
         Ok(())
     }

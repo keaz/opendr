@@ -413,12 +413,16 @@ mod tests {
     fn test_ldap_referral_resolver_validate() {
         let resolver = LdapReferralResolver::new();
 
-        assert!(resolver
-            .validate_referral_url("ldap://server.example.com/dc=example,dc=org")
-            .is_ok());
-        assert!(resolver
-            .validate_referral_url("ldaps://server.example.com/dc=example,dc=org")
-            .is_ok());
+        assert!(
+            resolver
+                .validate_referral_url("ldap://server.example.com/dc=example,dc=org")
+                .is_ok()
+        );
+        assert!(
+            resolver
+                .validate_referral_url("ldaps://server.example.com/dc=example,dc=org")
+                .is_ok()
+        );
         assert!(resolver.validate_referral_url("invalid-url").is_err());
     }
 

@@ -24,9 +24,9 @@ use opendr::replication_service::ReplicationService;
 use opendr::server;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use opendr::sync_controls::{
-    decode_sync_info_value, decode_sync_state_control, encode_sync_request_control, SyncInfoValue,
-    SyncRefreshMode, SyncRequestControl, SyncStateType, SYNC_INFO_OID, SYNC_REQUEST_OID,
-    SYNC_STATE_OID,
+    SYNC_INFO_OID, SYNC_REQUEST_OID, SYNC_STATE_OID, SyncInfoValue, SyncRefreshMode,
+    SyncRequestControl, SyncStateType, decode_sync_info_value, decode_sync_state_control,
+    encode_sync_request_control,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -126,7 +126,7 @@ fn create_replication_search_request() -> SearchRequest<'static> {
         types_only: false,
         filter: Filter::EqualityMatch(AttributeValueAssertion {
             attribute_desc: LdapString(Cow::Owned("objectClass".to_string())),
-            assertion_value: b"top",
+            assertion_value: Cow::Borrowed(b"top"),
         }),
         attributes: Vec::new(),
     }

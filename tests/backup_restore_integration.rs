@@ -6,8 +6,8 @@ use opendr::backend::{DirectoryBackend, DirectoryEntry};
 use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
 use opendr::backend_lmdb::LmdbBackend;
 use opendr::backup::{
-    create_full_backup, create_incremental_backup, restore_backup_chain, verify_manifest_files,
-    BackupType, CheckpointSource,
+    BackupType, CheckpointSource, create_full_backup, create_incremental_backup,
+    restore_backup_chain, verify_manifest_files,
 };
 use opendr::config::ServerConfig;
 use opendr::replication::ChangelogTracker;
@@ -51,10 +51,12 @@ async fn full_backup_restores_lmdb_data_directory() {
     let backup_dir = root.path().join("full-backup");
     let manifest = create_full_backup(&config, &backup_dir, false).unwrap();
     assert_eq!(manifest.backup_type, BackupType::Full);
-    assert!(manifest
-        .files
-        .iter()
-        .any(|file| file.path == "data/data.mdb"));
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|file| file.path == "data/data.mdb")
+    );
     verify_manifest_files(&backup_dir).unwrap();
 
     let restore_dir = root.path().join("restore-data");
@@ -135,14 +137,18 @@ async fn incremental_backup_restores_changelog_entries_after_full_backup() {
     .unwrap();
 
     let restored = LmdbBackend::new(&restore_dir, 64, 1).unwrap();
-    assert!(restored
-        .get_entry("cn=before,dc=example,dc=org")
-        .await
-        .unwrap()
-        .is_some());
-    assert!(restored
-        .get_entry("cn=after,dc=example,dc=org")
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        restored
+            .get_entry("cn=before,dc=example,dc=org")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        restored
+            .get_entry("cn=after,dc=example,dc=org")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

@@ -9,8 +9,8 @@ use opendr::aci::AciEngine;
 use opendr::audit::{AuditLevel, AuditLogger};
 use opendr::backend::{DirectoryBackend, MockBackend};
 use opendr::extended_ops::{
-    decode_password_modify_response_value, encode_password_modify_request_value, oids,
-    PasswordModifyRequest,
+    PasswordModifyRequest, decode_password_modify_response_value,
+    encode_password_modify_request_value, oids,
 };
 use opendr::server::{
     self, LegacyAuditConfig, LegacySecurityConfig, LegacyServerConfig, ServerError,
@@ -77,7 +77,7 @@ fn reserve_port() -> u16 {
 fn generate_test_certificate() -> (String, String) {
     let certified = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_pem = certified.cert.pem();
-    let key_pem = certified.key_pair.serialize_pem();
+    let key_pem = certified.signing_key.serialize_pem();
     (cert_pem, key_pem)
 }
 
@@ -930,11 +930,13 @@ async fn restrictive_aci_denies_compare_in_live_runtime_and_audits_denial() {
                 compare_result.result_code,
                 ParserResultCode::InsufficientAccessRights
             );
-            assert!(compare_result
-                .diagnostic_message
-                .0
-                .as_ref()
-                .contains("Access denied"));
+            assert!(
+                compare_result
+                    .diagnostic_message
+                    .0
+                    .as_ref()
+                    .contains("Access denied")
+            );
         }
         other => panic!("unexpected compare response: {:?}", other),
     }

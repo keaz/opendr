@@ -1784,8 +1784,8 @@ pub mod tests {
             } else {
                 // Return a mock CSN for testing
                 use crate::csn::CsnGenerator;
-                let gen = CsnGenerator::new(1);
-                Ok(Some(gen.generate()))
+                let r#gen = CsnGenerator::new(1);
+                Ok(Some(r#gen.generate()))
             }
         }
     }
@@ -2161,7 +2161,7 @@ pub mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(2)); // MockProviderConnection returns 2 entries
-                                              // After processing entries, FSM transitions to Listening state
+        // After processing entries, FSM transitions to Listening state
         assert!(matches!(
             fsm.current_state(),
             ReplicationConsumerState::Listening

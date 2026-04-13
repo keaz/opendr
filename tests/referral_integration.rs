@@ -995,13 +995,16 @@ async fn test_metrics_distinguish_chain_and_proxy_execution() {
         .unwrap();
 
     let log = metric_log.lock().unwrap().clone();
-    assert!(log
-        .iter()
-        .any(|entry| entry.contains("record_proxy_request: target=server.example.com")));
-    assert!(!log
-        .iter()
-        .any(|entry| entry.contains("record_chain_request: target=server.example.com")));
-    assert!(log
-        .iter()
-        .any(|entry| entry.contains("record_response_received: target=server.example.com")));
+    assert!(
+        log.iter()
+            .any(|entry| entry.contains("record_proxy_request: target=server.example.com"))
+    );
+    assert!(
+        !log.iter()
+            .any(|entry| entry.contains("record_chain_request: target=server.example.com"))
+    );
+    assert!(
+        log.iter()
+            .any(|entry| entry.contains("record_response_received: target=server.example.com"))
+    );
 }

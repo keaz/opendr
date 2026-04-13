@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.86-bookworm AS chef
+FROM rust:1.94-bookworm AS chef
 
 RUN cargo install cargo-chef --version 0.1.71
 

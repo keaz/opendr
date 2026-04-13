@@ -1386,13 +1386,13 @@ impl ServerConfig {
                     "Client certificate verification requires a CA file".to_string(),
                 ));
             }
-            if let Some(ca_file) = &self.tls.ca_file {
-                if !ca_file.exists() {
-                    return Err(ConfigError::ValidationError(format!(
-                        "TLS CA file not found: {:?}",
-                        ca_file
-                    )));
-                }
+            if let Some(ca_file) = &self.tls.ca_file
+                && !ca_file.exists()
+            {
+                return Err(ConfigError::ValidationError(format!(
+                    "TLS CA file not found: {:?}",
+                    ca_file
+                )));
             }
             if !["1.2", "1.3"].contains(&self.tls.min_tls_version.as_str()) {
                 return Err(ConfigError::ValidationError(format!(

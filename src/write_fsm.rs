@@ -1370,14 +1370,14 @@ impl WriteFsmImpl {
                 return Err(error);
             }
 
-            if let Some(session) = &self.session {
-                if let Some(ref metrics) = self.metrics {
-                    let duration = session
-                        .schema_check_start
-                        .map(|start| start.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    metrics.record_schema_check_complete(session.operation_type(), duration);
-                }
+            if let Some(session) = &self.session
+                && let Some(ref metrics) = self.metrics
+            {
+                let duration = session
+                    .schema_check_start
+                    .map(|start| start.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                metrics.record_schema_check_complete(session.operation_type(), duration);
             }
         }
 
@@ -1540,16 +1540,15 @@ impl WriteFsmImpl {
             Ok(())
         };
 
-        if self.config.enable_aci_checks {
-            if let Some(session) = &self.session {
-                if let Some(ref metrics) = self.metrics {
-                    let duration = session
-                        .aci_check_start
-                        .map(|start| start.elapsed())
-                        .unwrap_or(Duration::ZERO);
-                    metrics.record_aci_check_complete(session.operation_type(), duration);
-                }
-            }
+        if self.config.enable_aci_checks
+            && let Some(session) = &self.session
+            && let Some(ref metrics) = self.metrics
+        {
+            let duration = session
+                .aci_check_start
+                .map(|start| start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            metrics.record_aci_check_complete(session.operation_type(), duration);
         }
 
         if let Err(error) = aci_result {
@@ -2408,9 +2407,11 @@ mod tests {
         assert!(calls.iter().any(|call| call == "begin_transaction"));
         assert!(calls.iter().any(|call| call
             == "rollback_transaction(txn-1, Write backend error: Mock backend add failure)"));
-        assert!(!calls
-            .iter()
-            .any(|call| call.starts_with("commit_transaction")));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("commit_transaction"))
+        );
 
         let (total_writes, successful_writes, failed_writes) = fsm.stats();
         assert_eq!(total_writes, 1);
@@ -2620,18 +2621,26 @@ mod tests {
 
         let calls = metrics_log.lock().unwrap();
         assert!(calls.iter().any(|call| call.contains("record_write_start")));
-        assert!(calls
-            .iter()
-            .any(|call| call == "record_validation_complete(add)"));
-        assert!(calls
-            .iter()
-            .any(|call| call == "record_schema_check_complete(add)"));
-        assert!(calls
-            .iter()
-            .any(|call| call == "record_aci_check_complete(add)"));
-        assert!(calls
-            .iter()
-            .any(|call| call == "record_transaction_started(txn-1)"));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "record_validation_complete(add)")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "record_schema_check_complete(add)")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "record_aci_check_complete(add)")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "record_transaction_started(txn-1)")
+        );
         assert!(calls.iter().any(|call| {
             call.contains("record_write_complete(Add { dn: \"cn=test,dc=example,dc=org\"")
                 && call.contains("Success")

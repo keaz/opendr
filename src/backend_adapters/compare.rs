@@ -214,18 +214,24 @@ mod tests {
         entry.add_attribute("cn".to_string(), vec![b"alice".to_vec(), b"bob".to_vec()]);
 
         let comparator = ProductionAttributeComparator::new();
-        assert!(comparator
-            .compare_attribute(&entry, "cn", b"alice")
-            .await
-            .unwrap());
-        assert!(!comparator
-            .compare_attribute(&entry, "cn", b"ALICE")
-            .await
-            .unwrap());
-        assert!(!comparator
-            .compare_attribute(&entry, "mail", b"alice@example.org")
-            .await
-            .unwrap());
+        assert!(
+            comparator
+                .compare_attribute(&entry, "cn", b"alice")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !comparator
+                .compare_attribute(&entry, "cn", b"ALICE")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !comparator
+                .compare_attribute(&entry, "mail", b"alice@example.org")
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

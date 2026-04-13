@@ -534,9 +534,9 @@ impl ConnectionLifecycleManager {
 
                     // Add jitter if enabled
                     if config.enable_jitter {
-                        use rand::Rng;
-                        let mut rng = rand::thread_rng();
-                        let jitter_percent = rng.gen_range(0.0..config.max_jitter_percent);
+                        use rand::RngExt;
+                        let mut rng = rand::rng();
+                        let jitter_percent = rng.random_range(0.0..config.max_jitter_percent);
                         let jitter = Duration::from_secs_f64(delay.as_secs_f64() * jitter_percent);
                         delay += jitter;
                     }

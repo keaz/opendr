@@ -714,10 +714,10 @@ impl CompareFsmImpl {
             session.result = Some(result);
         }
 
-        if self.config.enable_metrics {
-            if let Some(metrics) = &self.metrics {
-                metrics.record_comparison_complete(&attribute, result, comparison_start.elapsed());
-            }
+        if self.config.enable_metrics
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_comparison_complete(&attribute, result, comparison_start.elapsed());
         }
 
         self.state = CompareState::Emitting { result };
@@ -861,10 +861,10 @@ impl CompareFsmImpl {
         let session = CompareSession::new(params.clone(), user_dn);
 
         // Record metrics
-        if self.config.enable_metrics {
-            if let Some(ref metrics) = self.metrics {
-                metrics.record_compare_start(&params, session.user_dn.as_deref());
-            }
+        if self.config.enable_metrics
+            && let Some(ref metrics) = self.metrics
+        {
+            metrics.record_compare_start(&params, session.user_dn.as_deref());
         }
 
         self.session = Some(session);
@@ -914,10 +914,10 @@ impl CompareFsmImpl {
             session.entry_read_time = Some(Instant::now());
         }
 
-        if self.config.enable_metrics {
-            if let Some(metrics) = &self.metrics {
-                metrics.record_entry_read(&dn, entry_result.is_some(), read_duration);
-            }
+        if self.config.enable_metrics
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.record_entry_read(&dn, entry_result.is_some(), read_duration);
         }
 
         match entry_result {
@@ -956,16 +956,11 @@ impl CompareFsmImpl {
             session.result = Some(result);
 
             // Record comparison metrics
-            if self.config.enable_metrics {
-                if let Some(ref metrics) = self.metrics {
-                    if let Some(duration) = session.comparison_duration() {
-                        metrics.record_comparison_complete(
-                            &session.params.attribute,
-                            result,
-                            duration,
-                        );
-                    }
-                }
+            if self.config.enable_metrics
+                && let Some(ref metrics) = self.metrics
+                && let Some(duration) = session.comparison_duration()
+            {
+                metrics.record_comparison_complete(&session.params.attribute, result, duration);
             }
 
             self.state = CompareState::Emitting { result };
@@ -998,10 +993,10 @@ impl CompareFsmImpl {
             self.total_duration += session.total_duration();
 
             // Record final metrics
-            if self.config.enable_metrics {
-                if let Some(ref metrics) = self.metrics {
-                    metrics.record_compare_complete(result, session.total_duration());
-                }
+            if self.config.enable_metrics
+                && let Some(ref metrics) = self.metrics
+            {
+                metrics.record_compare_complete(result, session.total_duration());
             }
 
             Ok(None)
@@ -1023,10 +1018,10 @@ impl CompareFsmImpl {
     ) -> Result<Option<Vec<u8>>, CompareFsmError> {
         if let Some(session) = &self.session {
             // Record error metrics
-            if self.config.enable_metrics {
-                if let Some(ref metrics) = self.metrics {
-                    metrics.record_compare_error("Generic", session.total_duration());
-                }
+            if self.config.enable_metrics
+                && let Some(ref metrics) = self.metrics
+            {
+                metrics.record_compare_error("Generic", session.total_duration());
             }
         }
 
@@ -1495,11 +1490,13 @@ mod tests {
             &CompareState::Emitting { result: true }
         );
         assert_eq!(fsm.result(), Some(true));
-        assert!(comparator_log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|call| call.contains("compare_attribute")));
+        assert!(
+            comparator_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.contains("compare_attribute"))
+        );
     }
 
     #[tokio::test]
@@ -1778,9 +1775,11 @@ mod tests {
 
         // Check metrics were called
         let calls = metrics_log.lock().unwrap();
-        assert!(calls
-            .iter()
-            .any(|call| call.contains("record_compare_start")));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("record_compare_start"))
+        );
     }
 
     #[tokio::test]
@@ -1827,11 +1826,13 @@ mod tests {
             .await;
 
         assert!(allowed.is_ok());
-        assert!(access_log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|call| call.contains("Some(\"cn=admin,dc=example,dc=org\")")));
+        assert!(
+            access_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.contains("Some(\"cn=admin,dc=example,dc=org\")"))
+        );
 
         let backend = Box::new(MockCompareBackend::new());
         let comparator = Box::new(MockAttributeComparator::new());

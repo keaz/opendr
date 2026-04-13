@@ -532,9 +532,11 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Unknown or closed transaction"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Unknown or closed transaction")
+        );
     }
 
     #[tokio::test]

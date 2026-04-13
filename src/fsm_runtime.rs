@@ -37,7 +37,7 @@ use crate::connection_fsm::{ConnectionFsmImpl, ConnectionTransport, TlsHandler};
 use crate::extended_op_fsm::ExtendedOpFsmImpl;
 use crate::fsm::{AuthState, ConnectionFsm, SaslFsm, StateMachine};
 use crate::fsm_operation_registry::{FsmOperationRegistry, OperationInfo};
-use crate::fsm_request::{build_request_context, FsmRequestContext, FsmRequestRejection};
+use crate::fsm_request::{FsmRequestContext, FsmRequestRejection, build_request_context};
 use crate::sasl_fsm::SaslFsmImpl;
 use crate::search_fsm::SearchFsmImpl;
 use crate::write_fsm::{SchemaValidator, WriteFsmImpl};
@@ -545,11 +545,13 @@ mod tests {
         let fsm_set = ConnectionFsmSet::new(stream, backend, None);
 
         // Verify backend access
-        assert!(fsm_set
-            .backend()
-            .authenticate("cn=admin,dc=example,dc=org", b"secret")
-            .await
-            .unwrap());
+        assert!(
+            fsm_set
+                .backend()
+                .authenticate("cn=admin,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
 
         // Verify connection and decoder FSMs are accessible
         assert!(!fsm_set.connection().is_terminal());

@@ -6,13 +6,13 @@
 use crate::connection_fsm::{ConnectionTransport, TlsHandler};
 use async_trait::async_trait;
 use rustls::server::WebPkiClientVerifier;
-use rustls::{version, RootCertStore, ServerConfig, SupportedProtocolVersion};
+use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion, version};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio_rustls::{server::TlsStream, TlsAcceptor};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 /// TLS configuration for LDAP server
 #[derive(Clone)]

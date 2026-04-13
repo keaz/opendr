@@ -13,7 +13,7 @@ use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, sleep, timeout};
 
 fn create_test_entry(dn: &str, cn: &str) -> DirectoryEntry {
     let mut attributes = HashMap::new();

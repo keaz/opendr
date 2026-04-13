@@ -1000,9 +1000,11 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("Maximum persistent consumer limit"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Maximum persistent consumer limit")
+        );
 
         coordinator.stop().await.unwrap();
     }

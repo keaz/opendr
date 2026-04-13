@@ -16,7 +16,7 @@ use opendr::audit::{
 };
 use std::fs;
 use tempfile::NamedTempFile;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 // ================================================================================================
 // Test: Audit Event Creation and Formatting

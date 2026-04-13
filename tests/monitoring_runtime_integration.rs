@@ -7,8 +7,8 @@ use opendr::backend::MockBackend;
 use opendr::config::MonitoringSettings;
 use opendr::metrics::MetricsCollector;
 use opendr::monitoring_runtime::{
-    spawn_monitoring_server, spawn_monitoring_server_with_context, ComponentStatus,
-    MonitoringRuntimeContext, RuntimeHealthRegistry,
+    ComponentStatus, MonitoringRuntimeContext, RuntimeHealthRegistry, spawn_monitoring_server,
+    spawn_monitoring_server_with_context,
 };
 use opendr::server;
 use rasn::der;
