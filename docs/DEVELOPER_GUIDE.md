@@ -243,9 +243,10 @@ Important rules:
 
 Runtime fields that are parsed but currently limited:
 
-- `performance.worker_threads`, `performance.schema_validation`, and
-  `performance.query_optimization` are parsed. Current startup wiring actively
-  uses `performance.indexing_enabled` and `performance.cache_size`.
+- `performance.worker_threads` and `performance.query_optimization` are parsed.
+  Current startup wiring actively uses `performance.indexing_enabled`,
+  `performance.cache_size`, and the `[schema]` section for schema loading and
+  validation.
 - `backend.import_sample_data` is parsed; setup writes sample LDIF, but server
   startup does not import sample LDIF automatically.
 
@@ -310,14 +311,21 @@ Controls:
 
 Schema validation:
 
+- The registry loads configured built-in schema and RFC-style LDIF files from
+  `[schema].schema_dir`.
 - The core schema includes common LDAP classes such as `top`, `person`,
   `organizationalPerson`, `inetOrgPerson`, `organization`, and
   `organizationalUnit`.
 - Adds require `objectClass`, required attributes, a valid structural class, and
-  no single-value violations.
-- Modification validation checks known attributes and single-value constraints.
-- Syntax validation and strict rejection of all attributes outside object class
-  MAY/MUST sets are not fully implemented.
+  no single-value or syntax violations.
+- Modify and ModifyDN validate the resulting entry or RDN against the active
+  registry.
+- Attributes outside object class MAY/MUST sets are rejected.
+- If `[schema].allow_online_updates = true`, authenticated and authorized Modify
+  operations against `cn=Subschema` update the shared registry and persist
+  accepted online definitions to `schema_dir/99-online.ldif`.
+- Online schema deletes and replaces are rejected when they would break schema
+  dependencies or invalidate existing entries.
 
 Access control:
 
@@ -351,7 +359,7 @@ LMDB databases include:
 - `idx_<attribute>`: per-attribute indexes
 
 Legacy `indexed_attributes` entries get equality and presence indexes. Typed
-indexes add OpenDJ-style categories:
+indexes add explicit LDAP search categories:
 
 ```toml
 [[backend.indexes]]
@@ -359,7 +367,7 @@ attribute = "cn"
 types = ["substring"]
 
 [[backend.indexes]]
-attribute = "entryCSN"
+attribute = "exampleScore"
 types = ["ordering"]
 ```
 
@@ -368,14 +376,20 @@ Supported typed names are `equality`/`eq`, `presence`/`pres`,
 
 Index behavior:
 
-- Index values are lowercased.
-- Equality indexes use exact lowercased attribute values.
+- Schema validation decides whether equality, substring, or ordering
+  comparisons are legal for an attribute.
+- Equality indexes store values normalized by the attribute equality matching
+  rule.
 - Presence indexes use a sentinel.
-- Substring indexes use 3-character windows and fall back to full scan when the
-  query cannot produce a 3-character token.
-- Ordering indexes use lexicographic lowercased string order.
+- Substring indexes store 3-character windows from the substring matching-rule
+  normalized value and fall back to full scan when the query cannot produce a
+  3-character token.
+- Ordering indexes store ordering keys produced by the attribute ordering
+  matching rule, for example integer ordering keys sort numerically rather than
+  lexicographically.
 - Indexes are maintained on add, modify, and delete.
-- Startup backfills index DBs when the configured index metadata changes.
+- Startup backfills index DBs when configured index types or their resolved
+  matching-rule OIDs change.
 - `performance.indexing_enabled = false` disables configured runtime indexes.
 
 ## Replication
@@ -644,7 +658,9 @@ cargo test --test replication_integration
 cargo test --test replication_consumer_integration
 cargo test --test replication_provider_integration
 cargo test --test replication_e2e
+./e2e_tests/test_schema_management.sh
 ```
 
-The shell e2e area currently implements a single provider/single consumer flow;
-some broader scenarios in the e2e summary remain pending.
+The shell e2e area includes replication coverage and schema-management coverage
+through real LDAP client commands. Some broader scenarios in the e2e summary
+remain pending.

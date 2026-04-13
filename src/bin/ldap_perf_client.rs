@@ -37,6 +37,8 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const STARTTLS_OID: &str = "1.3.6.1.4.1.1466.20037";
 const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
 const WHOAMI_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
+const BENCHMARK_INDEX_AUXILIARY_CLASS: &str = "benchmarkIndexedObject";
+const BENCHMARK_ORDER_ATTRIBUTE: &str = "benchmarkOrder";
 
 #[derive(Debug, Parser)]
 #[command(name = "ldap-perf-client")]
@@ -299,6 +301,7 @@ async fn run(args: Args) -> AppResult<()> {
         args.preloaded_users,
         &args.user_password,
         &args.name_prefix,
+        run_index_benchmarks,
     )
     .await?;
     progress("fixture.count.after_setup");
@@ -1764,7 +1767,7 @@ async fn run_concurrent_index_search_benchmark(
 
 fn index_search_specs(args: &Args, dns: &ScenarioDns) -> Vec<IndexSearchSpec> {
     let midpoint = args.preloaded_users / 2;
-    let midpoint_sn = format!("BenchmarkUser{midpoint:06}");
+    let midpoint_order = midpoint.to_string();
 
     vec![
         IndexSearchSpec {
@@ -1789,16 +1792,16 @@ fn index_search_specs(args: &Args, dns: &ScenarioDns) -> Vec<IndexSearchSpec> {
             expected_dn: Some(dns.control_user_dn.clone()),
         },
         IndexSearchSpec {
-            operation: "index_ordering_sn_ge",
+            operation: "index_ordering_benchmark_order_ge",
             base_dn: dns.users_ou_dn.clone(),
-            filter: format!("(sn>={midpoint_sn})"),
+            filter: format!("({BENCHMARK_ORDER_ATTRIBUTE}>={midpoint_order})"),
             expected_count: args.preloaded_users - midpoint,
             expected_dn: None,
         },
         IndexSearchSpec {
-            operation: "index_ordering_sn_le",
+            operation: "index_ordering_benchmark_order_le",
             base_dn: dns.users_ou_dn.clone(),
-            filter: format!("(sn<={midpoint_sn})"),
+            filter: format!("({BENCHMARK_ORDER_ATTRIBUTE}<={midpoint_order})"),
             expected_count: midpoint + 1,
             expected_dn: None,
         },
@@ -1811,7 +1814,14 @@ async fn verify_index_search(ldap: &mut Ldap, spec: &IndexSearchSpec) -> AppResu
         &spec.base_dn,
         Scope::Subtree,
         &spec.filter,
-        vec!["uid", "cn", "sn", "mail", "description"],
+        vec![
+            "uid",
+            "cn",
+            "sn",
+            "mail",
+            "description",
+            BENCHMARK_ORDER_ATTRIBUTE,
+        ],
     )
     .await?;
     ensure(
@@ -1992,39 +2002,44 @@ async fn preload_users(
     count: usize,
     password: &str,
     name_prefix: &str,
+    include_index_attributes: bool,
 ) -> AppResult<()> {
     for index in 0..count {
         let uid = format!("{name_prefix}-user-{index:06}");
         let dn = format!("uid={uid},{}", dns.users_ou_dn);
-        ldap.add(
-            &dn,
-            vec![
-                (
-                    "objectClass".to_string(),
-                    string_set(["top", "person", "organizationalPerson", "inetOrgPerson"]),
-                ),
-                ("uid".to_string(), string_set([uid.clone()])),
-                (
-                    "cn".to_string(),
-                    string_set([format!("Benchmark User {index}")]),
-                ),
-                (
-                    "sn".to_string(),
-                    string_set([format!("BenchmarkUser{index:06}")]),
-                ),
-                (
-                    "description".to_string(),
-                    string_set([format!("Benchmark fixture user {index:06}")]),
-                ),
-                (
-                    "mail".to_string(),
-                    string_set([format!("{uid}@example.com")]),
-                ),
-                ("userPassword".to_string(), string_set([password])),
-            ],
-        )
-        .await?
-        .success()?;
+        let mut object_classes =
+            string_set(["top", "person", "organizationalPerson", "inetOrgPerson"]);
+        if include_index_attributes {
+            object_classes.insert(BENCHMARK_INDEX_AUXILIARY_CLASS.to_string());
+        }
+        let mut attributes = vec![
+            ("objectClass".to_string(), object_classes),
+            ("uid".to_string(), string_set([uid.clone()])),
+            (
+                "cn".to_string(),
+                string_set([format!("Benchmark User {index}")]),
+            ),
+            (
+                "sn".to_string(),
+                string_set([format!("BenchmarkUser{index:06}")]),
+            ),
+            (
+                "description".to_string(),
+                string_set([format!("Benchmark fixture user {index:06}")]),
+            ),
+            (
+                "mail".to_string(),
+                string_set([format!("{uid}@example.com")]),
+            ),
+            ("userPassword".to_string(), string_set([password])),
+        ];
+        if include_index_attributes {
+            attributes.push((
+                BENCHMARK_ORDER_ATTRIBUTE.to_string(),
+                string_set([index.to_string()]),
+            ));
+        }
+        ldap.add(&dn, attributes).await?.success()?;
     }
 
     ensure(

@@ -41,7 +41,7 @@ pub fn parse_attribute_request(requested_attrs: &[String]) -> (bool, bool, Vec<S
     let mut has_user_attrs = false;
 
     for attr in requested_attrs {
-        let attr_lower = attr.to_lowercase();
+        let attr_lower = attr.to_ascii_lowercase();
 
         match attr_lower.as_str() {
             "*" => include_user = true,
@@ -93,7 +93,7 @@ pub fn filter_operational_attributes(
         // Return only specifically requested operational attributes
         all_operational
             .into_iter()
-            .filter(|(key, _)| specific_operational.contains(&key.to_lowercase()))
+            .filter(|(key, _)| specific_operational.contains(&key.to_ascii_lowercase()))
             .collect()
     }
 }
@@ -123,12 +123,15 @@ pub fn filter_user_attributes(
     }
 
     // Return only specifically requested user attributes
-    let requested_lower: Vec<String> = requested_attrs.iter().map(|a| a.to_lowercase()).collect();
+    let requested_lower: Vec<String> = requested_attrs
+        .iter()
+        .map(|a| a.to_ascii_lowercase())
+        .collect();
 
     user_attrs
         .iter()
         .filter(|(key, _)| {
-            let key_lower = key.to_lowercase();
+            let key_lower = key.to_ascii_lowercase();
             // Include if requested and not operational
             requested_lower.contains(&key_lower)
                 && !OperationalAttributes::is_operational(&key_lower)

@@ -8,7 +8,9 @@ use crate::compare_fsm::{
     AttributeComparator, CompareAccessControl, CompareBackend, CompareEntry, CompareMetrics,
 };
 use crate::fsm::CompareParams;
+use crate::ldap_filter_eval::compare_attribute_with_schema;
 use crate::metrics::{FsmType, MetricsCollector};
+use crate::schema::LdapSchema;
 
 /// Adapter that implements `CompareBackend` using a `DirectoryBackend`.
 pub struct CompareBackendAdapter {
@@ -24,11 +26,19 @@ impl CompareBackendAdapter {
 /// Production comparator that mirrors the backend's current compare semantics:
 /// attribute names are case-insensitive, while values are matched exactly.
 #[derive(Debug, Default)]
-pub struct ProductionAttributeComparator;
+pub struct ProductionAttributeComparator {
+    schema: Option<LdapSchema>,
+}
 
 impl ProductionAttributeComparator {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_schema(schema: LdapSchema) -> Self {
+        Self {
+            schema: Some(schema),
+        }
     }
 }
 
@@ -40,6 +50,31 @@ impl AttributeComparator for ProductionAttributeComparator {
         attr_name: &str,
         value: &[u8],
     ) -> Result<bool, String> {
+        if let Some(schema) = self.schema.as_ref() {
+            let attributes = entry
+                .attributes
+                .iter()
+                .map(|(attribute, values)| {
+                    (
+                        attribute.clone(),
+                        values
+                            .iter()
+                            .map(|value| String::from_utf8_lossy(value).to_string())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let assertion = String::from_utf8_lossy(value).to_string();
+            return compare_attribute_with_schema(
+                schema,
+                &entry.dn,
+                &attributes,
+                attr_name,
+                &assertion,
+            )
+            .map_err(|err| err.to_string());
+        }
+
         Ok(entry
             .get_attribute(attr_name)
             .map(|values| values.iter().any(|candidate| candidate.as_slice() == value))

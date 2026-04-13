@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs;
+use std::io::Write;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -22,9 +25,10 @@ use tokio_rustls::server::TlsStream;
 
 use crate::aci::{AciEngine, Permission};
 use crate::audit::{AuditEvent, AuditEventType, AuditLevel, AuditLogger};
+#[cfg(test)]
+use crate::backend::SearchCandidateHint;
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
-    SearchCandidateHint,
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
@@ -34,6 +38,10 @@ use crate::extended_ops::{
 };
 use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
 use crate::ldap_controls::{ControlRegistry, ControlValidationError, LdapControl, RequestControls};
+use crate::ldap_filter_eval::{
+    FilterSchemaError, PreparedLdapFilter, compare_attribute_with_schema,
+    matches_search_filter_with_schema, prepare_search_filter_with_schema, validate_search_filter,
+};
 use crate::metrics::{MetricsCollector, OperationType};
 use crate::parser::{
     CustomResultCode, ResponseOp, encode_bind_response, encode_custom_extended_response,
@@ -47,7 +55,7 @@ use crate::real_time_propagation::is_dn_in_scope;
 use crate::referral::LdapReferralResolver;
 use crate::referral_fsm::ReferralResolver;
 use crate::replication::RenameChange;
-use crate::schema::LdapSchema;
+use crate::schema::{LdapSchema, SchemaError, canonical_schema_attr_name, schema_definition_key};
 use crate::search_controls::{
     PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
     SERVER_SIDE_SORT_RESPONSE_OID, ServerSideSortResultCode, SortKey, decode_paged_results_control,
@@ -122,6 +130,17 @@ const CANCEL_OID: &str = oids::CANCEL;
 const PASSWORD_MODIFY_OID: &str = oids::PASSWORD_MODIFY;
 const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
 const SUBSCHEMA_DN: &str = "cn=Subschema";
+const ONLINE_SCHEMA_FILE: &str = "99-online.ldif";
+
+pub type SharedLdapSchema = Arc<RwLock<LdapSchema>>;
+
+pub fn shared_schema(schema: LdapSchema) -> SharedLdapSchema {
+    Arc::new(RwLock::new(schema))
+}
+
+pub(crate) fn schema_snapshot(schema: &SharedLdapSchema) -> LdapSchema {
+    schema.read().expect("LDAP schema lock poisoned").clone()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionOperationKind {
@@ -360,6 +379,8 @@ pub struct LegacyServerConfig {
     pub rate_limiting_enabled: bool,
     pub naming_contexts: Vec<String>,
     pub subschema_dn: String,
+    pub schema_dir: PathBuf,
+    pub allow_online_schema_updates: bool,
 }
 
 impl Default for LegacyServerConfig {
@@ -370,6 +391,8 @@ impl Default for LegacyServerConfig {
             rate_limiting_enabled: true,
             naming_contexts: Vec::new(),
             subschema_dn: SUBSCHEMA_DN.to_string(),
+            schema_dir: PathBuf::from("config/schema"),
+            allow_online_schema_updates: false,
         }
     }
 }
@@ -389,6 +412,8 @@ impl LegacyServerConfig {
             rate_limiting_enabled: config.rate_limit.enabled,
             naming_contexts: vec![config.server.base_dn.clone()],
             subschema_dn: SUBSCHEMA_DN.to_string(),
+            schema_dir: config.schema.schema_dir.clone(),
+            allow_online_schema_updates: config.schema.allow_online_updates,
         }
     }
 }
@@ -657,6 +682,54 @@ pub async fn run_with_metrics_and_config_with_tls_and_security(
     tls_handler: Option<Arc<RustlsTlsHandler>>,
     security: Option<Arc<LegacySecurityConfig>>,
 ) -> Result<(), ServerError> {
+    run_with_metrics_and_config_with_tls_and_security_and_shared_schema(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        runtime_config,
+        tls_handler,
+        security,
+        shared_schema(LdapSchema::with_core_schema()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_metrics_and_config_with_tls_and_security_and_schema(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+    tls_handler: Option<Arc<RustlsTlsHandler>>,
+    security: Option<Arc<LegacySecurityConfig>>,
+    schema: Arc<LdapSchema>,
+) -> Result<(), ServerError> {
+    run_with_metrics_and_config_with_tls_and_security_and_shared_schema(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        runtime_config,
+        tls_handler,
+        security,
+        shared_schema((*schema).clone()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_metrics_and_config_with_tls_and_security_and_shared_schema(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+    tls_handler: Option<Arc<RustlsTlsHandler>>,
+    security: Option<Arc<LegacySecurityConfig>>,
+    schema: SharedLdapSchema,
+) -> Result<(), ServerError> {
     run_plain_listener(
         addr,
         backend,
@@ -665,10 +738,12 @@ pub async fn run_with_metrics_and_config_with_tls_and_security(
         runtime_config,
         tls_handler,
         security,
+        schema,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_plain_listener(
     addr: &str,
     backend: Arc<dyn DirectoryBackend>,
@@ -677,12 +752,11 @@ async fn run_plain_listener(
     runtime_config: LegacyServerConfig,
     tls_handler: Option<Arc<RustlsTlsHandler>>,
     security: Option<Arc<LegacySecurityConfig>>,
+    schema: SharedLdapSchema,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAP server listening on {}", addr);
 
-    // Create schema validator with core schema
-    let schema = Arc::new(LdapSchema::with_core_schema());
     let pool = Arc::new(ConnectionPool::new(runtime_config.resource_limits.clone()));
     let rate_limiter = if runtime_config.rate_limiting_enabled {
         Some(Arc::new(RateLimiter::new(
@@ -823,16 +897,63 @@ pub async fn run_tls_with_metrics_and_config(
 pub async fn run_tls_with_metrics_and_config_and_security(
     addr: &str,
     backend: Arc<dyn DirectoryBackend>,
-    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     metrics: Option<Arc<MetricsCollector>>,
     runtime_config: LegacyServerConfig,
     tls_handler: Arc<RustlsTlsHandler>,
     security: Option<Arc<LegacySecurityConfig>>,
 ) -> Result<(), ServerError> {
+    run_tls_with_metrics_and_config_and_security_and_shared_schema(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        runtime_config,
+        tls_handler,
+        security,
+        shared_schema(LdapSchema::with_core_schema()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tls_with_metrics_and_config_and_security_and_schema(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+    tls_handler: Arc<RustlsTlsHandler>,
+    security: Option<Arc<LegacySecurityConfig>>,
+    schema: Arc<LdapSchema>,
+) -> Result<(), ServerError> {
+    run_tls_with_metrics_and_config_and_security_and_shared_schema(
+        addr,
+        backend,
+        shutdown_rx,
+        metrics,
+        runtime_config,
+        tls_handler,
+        security,
+        shared_schema((*schema).clone()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tls_with_metrics_and_config_and_security_and_shared_schema(
+    addr: &str,
+    backend: Arc<dyn DirectoryBackend>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    metrics: Option<Arc<MetricsCollector>>,
+    runtime_config: LegacyServerConfig,
+    tls_handler: Arc<RustlsTlsHandler>,
+    security: Option<Arc<LegacySecurityConfig>>,
+    schema: SharedLdapSchema,
+) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
     info!("LDAPS server listening on {}", addr);
 
-    let schema = Arc::new(LdapSchema::with_core_schema());
     let pool = Arc::new(ConnectionPool::new(runtime_config.resource_limits.clone()));
     let rate_limiter = if runtime_config.rate_limiting_enabled {
         Some(Arc::new(RateLimiter::new(
@@ -967,7 +1088,7 @@ pub async fn handle_client(
     handle_client_with_metrics_and_tls(
         ConnectionStream::plain(socket),
         backend,
-        schema,
+        shared_schema((*schema).clone()),
         LegacyServerConfig::default(),
         None,
         None,
@@ -981,7 +1102,7 @@ pub async fn handle_client(
 async fn handle_client_with_metrics_and_tls(
     mut socket: ConnectionStream,
     backend: Arc<dyn DirectoryBackend>,
-    schema: Arc<LdapSchema>,
+    schema: SharedLdapSchema,
     runtime_config: LegacyServerConfig,
     tls_handler: Option<Arc<RustlsTlsHandler>>,
     metrics: Option<Arc<MetricsCollector>>,
@@ -1166,7 +1287,7 @@ async fn handle_client_with_metrics_and_tls(
                         let result = process_message_with_session(
                             &mut socket,
                             backend.as_ref(),
-                            schema.as_ref(),
+                            &schema,
                             &runtime_config,
                             &mut session,
                             &mut operation_registry,
@@ -1426,10 +1547,11 @@ pub async fn process_message(
     let mut session = ConnectionSession::default();
     let mut operation_registry = ConnectionOperationRegistry::default();
     let runtime_config = LegacyServerConfig::default();
+    let shared_schema = shared_schema(schema.clone());
     process_message_with_session(
         socket,
         backend,
-        schema,
+        &shared_schema,
         &runtime_config,
         &mut session,
         &mut operation_registry,
@@ -1444,7 +1566,7 @@ pub async fn process_message(
 async fn process_message_with_session(
     socket: &mut ConnectionStream,
     backend: &dyn DirectoryBackend,
-    schema: &LdapSchema,
+    schema: &SharedLdapSchema,
     runtime_config: &LegacyServerConfig,
     session: &mut ConnectionSession,
     operation_registry: &mut ConnectionOperationRegistry,
@@ -1484,10 +1606,11 @@ async fn process_message_with_session(
             .await?;
         }
         ProtocolOp::SearchRequest(search_request) => {
+            let schema_snapshot = schema_snapshot(schema);
             handle_search_request_with_context_and_registry(
                 socket,
                 backend,
-                schema,
+                &schema_snapshot,
                 runtime_config,
                 message_id,
                 search_request,
@@ -1513,16 +1636,32 @@ async fn process_message_with_session(
             {
                 return Ok(());
             }
-            handle_modify_request_with_context(
-                socket,
-                backend,
-                message_id,
-                modify_request,
-                session,
-                request_context,
-                &request_controls,
-            )
-            .await?;
+            if dn.eq_ignore_ascii_case(&runtime_config.subschema_dn) {
+                handle_online_schema_modify_request_with_context(
+                    socket,
+                    backend,
+                    schema,
+                    runtime_config,
+                    message_id,
+                    modify_request,
+                    session,
+                    request_context,
+                )
+                .await?;
+            } else {
+                let schema_snapshot = schema_snapshot(schema);
+                handle_modify_request_with_context(
+                    socket,
+                    backend,
+                    &schema_snapshot,
+                    message_id,
+                    modify_request,
+                    session,
+                    request_context,
+                    &request_controls,
+                )
+                .await?;
+            }
         }
         ProtocolOp::AddRequest(add_request) => {
             let dn = add_request.entry.0.as_ref().trim().to_owned();
@@ -1531,10 +1670,11 @@ async fn process_message_with_session(
             {
                 return Ok(());
             }
+            let schema_snapshot = schema_snapshot(schema);
             handle_add_request_with_context(
                 socket,
                 backend,
-                schema,
+                &schema_snapshot,
                 message_id,
                 add_request,
                 session,
@@ -1580,9 +1720,11 @@ async fn process_message_with_session(
             {
                 return Ok(());
             }
+            let schema_snapshot = schema_snapshot(schema);
             handle_moddn_request_with_context(
                 socket,
                 backend,
+                &schema_snapshot,
                 message_id,
                 rename_request,
                 session,
@@ -1592,9 +1734,11 @@ async fn process_message_with_session(
             .await?;
         }
         ProtocolOp::CompareRequest(compare_request) => {
+            let schema_snapshot = schema_snapshot(schema);
             handle_compare_request_with_context(
                 socket,
                 backend,
+                &schema_snapshot,
                 message_id,
                 compare_request,
                 session,
@@ -1835,6 +1979,16 @@ struct SearchExecutionError {
     target_dn: String,
     alias_dereference_failure: bool,
     referral_processing_failure: bool,
+}
+
+fn search_filter_execution_error(err: FilterSchemaError, target_dn: &str) -> SearchExecutionError {
+    SearchExecutionError {
+        result_code: map_filter_schema_error(&err),
+        diagnostic: err.to_string(),
+        target_dn: target_dn.to_string(),
+        alias_dereference_failure: false,
+        referral_processing_failure: false,
+    }
 }
 
 #[derive(Debug)]
@@ -2275,6 +2429,18 @@ fn is_root_dn(session: &ConnectionSession, request_context: &RequestContext) -> 
         .unwrap_or(false)
 }
 
+pub(crate) fn can_skip_search_post_filter(
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> bool {
+    request_context
+        .security
+        .as_ref()
+        .and_then(|security| security.access_control.as_ref())
+        .is_none()
+        || is_root_dn(session, request_context)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn log_generic_audit_event(
     request_context: &RequestContext,
@@ -2581,24 +2747,43 @@ pub(crate) async fn filter_search_entries_for_read_access(
     readable_entries
 }
 
+struct SaslPlainCredentialsRef<'a> {
+    authzid: &'a str,
+    authcid: &'a str,
+    password: &'a [u8],
+}
+
 fn parse_sasl_plain_credentials(
     credentials: Option<&[u8]>,
-) -> Result<(String, String, Vec<u8>), &'static str> {
+) -> Result<SaslPlainCredentialsRef<'_>, &'static str> {
     let Some(credentials) = credentials else {
         return Err("SASL PLAIN requires credentials");
     };
 
-    let parts: Vec<&[u8]> = credentials.split(|&byte| byte == 0).collect();
-    if parts.len() != 3 {
+    let mut parts = credentials.split(|&byte| byte == 0);
+    let Some(authzid_bytes) = parts.next() else {
+        return Err("invalid SASL PLAIN credential format");
+    };
+    let Some(authcid_bytes) = parts.next() else {
+        return Err("invalid SASL PLAIN credential format");
+    };
+    let Some(password) = parts.next() else {
+        return Err("invalid SASL PLAIN credential format");
+    };
+    if parts.next().is_some() {
         return Err("invalid SASL PLAIN credential format");
     }
 
     let authzid =
-        String::from_utf8(parts[0].to_vec()).map_err(|_| "invalid SASL authzid encoding")?;
+        std::str::from_utf8(authzid_bytes).map_err(|_| "invalid SASL authzid encoding")?;
     let authcid =
-        String::from_utf8(parts[1].to_vec()).map_err(|_| "invalid SASL authcid encoding")?;
+        std::str::from_utf8(authcid_bytes).map_err(|_| "invalid SASL authcid encoding")?;
 
-    Ok((authzid, authcid, parts[2].to_vec()))
+    Ok(SaslPlainCredentialsRef {
+        authzid,
+        authcid,
+        password,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2712,27 +2897,26 @@ async fn handle_bind_request_with_session_and_context(
                 return Ok(());
             }
 
-            let (authzid, authcid, password) =
-                match parse_sasl_plain_credentials(credentials.credentials.as_deref()) {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        session.clear();
-                        log_sasl_bind(
-                            request_context,
-                            request.name.0.as_ref().trim(),
-                            "PLAIN",
-                            false,
-                            Some(err),
-                        )
-                        .await;
-                        send_bind_response(socket, message_id, ResultCode::InvalidCredentials, err)
-                            .await?;
-                        return Ok(());
-                    }
-                };
+            let parsed = match parse_sasl_plain_credentials(credentials.credentials.as_deref()) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    session.clear();
+                    log_sasl_bind(
+                        request_context,
+                        request.name.0.as_ref().trim(),
+                        "PLAIN",
+                        false,
+                        Some(err),
+                    )
+                    .await;
+                    send_bind_response(socket, message_id, ResultCode::InvalidCredentials, err)
+                        .await?;
+                    return Ok(());
+                }
+            };
 
             let bind_dn = if request.name.0.as_ref().trim().is_empty() {
-                authcid.clone()
+                parsed.authcid.to_owned()
             } else {
                 request.name.0.as_ref().trim().to_owned()
             };
@@ -2757,7 +2941,7 @@ async fn handle_bind_request_with_session_and_context(
                 return Ok(());
             }
 
-            if !authzid.is_empty() && !authzid.eq_ignore_ascii_case(&bind_dn) {
+            if !parsed.authzid.is_empty() && !parsed.authzid.eq_ignore_ascii_case(&bind_dn) {
                 session.clear();
                 log_sasl_bind(
                     request_context,
@@ -2777,7 +2961,7 @@ async fn handle_bind_request_with_session_and_context(
                 return Ok(());
             }
 
-            match backend.authenticate(&bind_dn, &password).await {
+            match backend.authenticate(&bind_dn, parsed.password).await {
                 Ok(true) => {
                     session.bind(bind_dn.clone());
                     log_sasl_bind(request_context, &bind_dn, "PLAIN", true, None).await;
@@ -3177,6 +3361,15 @@ fn map_backend_error(err: &BackendError) -> ResultCode {
     }
 }
 
+fn map_filter_schema_error(err: &FilterSchemaError) -> ResultCode {
+    match err {
+        FilterSchemaError::UndefinedAttribute(_) => ResultCode::UndefinedAttributeType,
+        FilterSchemaError::InappropriateMatching(_) => ResultCode::InappropriateMatching,
+        FilterSchemaError::InvalidAttributeSyntax(_) => ResultCode::InvalidAttributeSyntax,
+        FilterSchemaError::InvalidFilter(_) => ResultCode::ProtocolError,
+    }
+}
+
 fn diagnostic_for_error(err: &BackendError) -> &'static str {
     match err {
         BackendError::AlreadyExists => "entry already exists",
@@ -3468,6 +3661,21 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         return Ok(());
     }
 
+    if let Err(err) = validate_search_filter(schema, &request.filter) {
+        let diagnostic = err.to_string();
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::SearchDone,
+            map_filter_schema_error(&err),
+            &base_dn,
+            &diagnostic,
+        )
+        .await?;
+        operation_registry.finish(message_id, FinishedOperationState::Completed);
+        return Ok(());
+    }
+
     if !authorize_operation(
         socket,
         Some(backend),
@@ -3589,6 +3797,7 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         return handle_sync_search_request(
             socket,
             backend,
+            schema,
             message_id,
             &request,
             &effective_base_dn,
@@ -3750,6 +3959,7 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
 
     let mut search_result_set = match collect_search_result_set(
         backend,
+        schema,
         &effective_base_dn,
         base_object_entry,
         &request,
@@ -4013,6 +4223,7 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
 #[allow(clippy::too_many_arguments)]
 async fn collect_search_result_set(
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     effective_base_dn: &str,
     base_object_entry: Option<DirectoryEntry>,
     request: &SearchRequest<'_>,
@@ -4022,9 +4233,21 @@ async fn collect_search_result_set(
     request_context: &RequestContext,
     search_deadline: Option<Instant>,
 ) -> Result<SearchResultSet, SearchExecutionError> {
+    let prepared_filter =
+        prepare_search_filter_with_schema(schema, &request.filter).map_err(|err| {
+            SearchExecutionError {
+                result_code: map_filter_schema_error(&err),
+                diagnostic: err.to_string(),
+                target_dn: effective_base_dn.to_string(),
+                alias_dereference_failure: false,
+                referral_processing_failure: false,
+            }
+        })?;
+
     if request.scope == ldap_parser::ldap::SearchScope::BaseObject {
         return collect_base_object_search_result_set(
             backend,
+            &prepared_filter,
             effective_base_dn,
             base_object_entry,
             request,
@@ -4037,13 +4260,14 @@ async fn collect_search_result_set(
         .await;
     }
 
-    let search_hint = extract_search_hint(&request.filter);
+    let search_hint = prepared_filter.search_candidate_hint();
+    let exact_index_hint = prepared_filter.exact_index_coverage_hint();
     trace_search(format_args!(
         "collect_search_result_set start base={effective_base_dn} scope={} hint={:?}",
         request.scope.0, search_hint
     ));
-    let entries = backend
-        .search_entries_with_hint(effective_base_dn, request.scope, search_hint)
+    let search_report = backend
+        .search_entries_with_hint_report(effective_base_dn, request.scope, search_hint.clone())
         .await
         .map_err(|err| SearchExecutionError {
             result_code: map_backend_error(&err),
@@ -4052,6 +4276,11 @@ async fn collect_search_result_set(
             alias_dereference_failure: false,
             referral_processing_failure: false,
         })?;
+    let index_covers_filter = search_report.hint_covers_filter
+        && exact_index_hint.as_ref() == search_hint.as_ref()
+        && !should_deref_search_candidates(deref_aliases)
+        && can_skip_search_post_filter(session, request_context);
+    let entries = search_report.entries;
     trace_search(format_args!(
         "collect_search_result_set loaded {} candidate entries for base={effective_base_dn}",
         entries.len()
@@ -4100,7 +4329,11 @@ async fn collect_search_result_set(
             continue;
         };
 
-        if !entry_matches_filter(&entry, &request.filter) {
+        if !index_covers_filter
+            && !prepared_filter
+                .matches_entry(&entry)
+                .map_err(|err| search_filter_execution_error(err, &entry.dn))?
+        {
             continue;
         }
 
@@ -4134,9 +4367,10 @@ async fn collect_search_result_set(
 #[allow(clippy::too_many_arguments)]
 async fn collect_base_object_search_result_set(
     backend: &dyn DirectoryBackend,
+    prepared_filter: &PreparedLdapFilter,
     effective_base_dn: &str,
     base_object_entry: Option<DirectoryEntry>,
-    request: &SearchRequest<'_>,
+    _request: &SearchRequest<'_>,
     deref_aliases: ldap_parser::ldap::DerefAliases,
     manage_dsa_it: bool,
     session: &ConnectionSession,
@@ -4229,7 +4463,10 @@ async fn collect_base_object_search_result_set(
         });
     };
 
-    if !entry_matches_filter(&entry, &request.filter) {
+    if !prepared_filter
+        .matches_entry(&entry)
+        .map_err(|err| search_filter_execution_error(err, &entry.dn))?
+    {
         return Ok(SearchResultSet {
             entries: Vec::new(),
             references: Vec::new(),
@@ -4373,6 +4610,7 @@ async fn emit_search_references(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn extract_search_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
     crate::ldap_filter_eval::extract_search_candidate_hint(filter)
 }
@@ -4648,8 +4886,10 @@ fn serialized_entry_from_change(
     serde_json::from_slice::<DirectoryEntry>(&change.change_data).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_sync_search_entry_from_change(
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     change: &crate::replication_provider_fsm::ChangelogEntry,
     base_dn: &str,
     request: &SearchRequest<'_>,
@@ -4672,7 +4912,9 @@ async fn build_sync_search_entry_from_change(
             else {
                 return Ok(None);
             };
-            if !entry_matches_filter(&entry, &request.filter) {
+            if !entry_matches_filter_with_schema(&entry, &request.filter, schema)
+                .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?
+            {
                 return Ok(None);
             }
             let state = if matches!(
@@ -4701,7 +4943,10 @@ async fn build_sync_search_entry_from_change(
             else {
                 return Ok(None);
             };
-            if !entry.attributes.is_empty() && !entry_matches_filter(&entry, &request.filter) {
+            if !entry.attributes.is_empty()
+                && !entry_matches_filter_with_schema(&entry, &request.filter, schema)
+                    .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?
+            {
                 return Ok(None);
             }
             Ok(Some(SyncSearchEntry {
@@ -4745,7 +4990,9 @@ async fn build_sync_search_entry_from_change(
             else {
                 return Ok(None);
             };
-            if !entry_matches_filter(&entry, &request.filter) {
+            if !entry_matches_filter_with_schema(&entry, &request.filter, schema)
+                .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?
+            {
                 return Ok(None);
             }
             Ok(Some(SyncSearchEntry {
@@ -4847,6 +5094,7 @@ pub(crate) async fn reject_sync_request(
 pub(crate) async fn handle_sync_search_request(
     socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     message_id: u32,
     request: &SearchRequest<'_>,
     base_dn: &str,
@@ -4922,6 +5170,7 @@ pub(crate) async fn handle_sync_search_request(
     if cookie_csn.is_none() {
         let result_set = collect_search_result_set(
             backend,
+            schema,
             base_dn,
             None,
             request,
@@ -4981,6 +5230,7 @@ pub(crate) async fn handle_sync_search_request(
             }
             if let Some(sync_entry) = build_sync_search_entry_from_change(
                 backend,
+                schema,
                 &change,
                 base_dn,
                 request,
@@ -5129,6 +5379,7 @@ pub(crate) async fn handle_sync_search_request(
                 }
                 let sync_entry = match build_sync_search_entry_from_change(
                     backend,
+                    schema,
                     &entry,
                     base_dn,
                     request,
@@ -5621,9 +5872,11 @@ pub async fn handle_modify_request(
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
     let request_controls = RequestControls::default();
+    let schema = LdapSchema::default();
     handle_modify_request_with_context(
         socket,
         backend,
+        &schema,
         message_id,
         request,
         &session,
@@ -5633,9 +5886,361 @@ pub async fn handle_modify_request(
     .await
 }
 
+#[derive(Debug)]
+pub(crate) enum OnlineSchemaUpdateError {
+    Disabled,
+    Unauthorized,
+    UnsupportedAttribute(String),
+    Schema(SchemaError),
+    Unsafe(String),
+    Backend(String),
+    Io(String),
+}
+
+impl fmt::Display for OnlineSchemaUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OnlineSchemaUpdateError::Disabled => write!(f, "online schema updates are disabled"),
+            OnlineSchemaUpdateError::Unauthorized => {
+                write!(f, "authentication required for online schema updates")
+            }
+            OnlineSchemaUpdateError::UnsupportedAttribute(attribute) => {
+                write!(
+                    f,
+                    "unsupported schema attribute for online update: {}",
+                    attribute
+                )
+            }
+            OnlineSchemaUpdateError::Schema(err) => write!(f, "{}", err),
+            OnlineSchemaUpdateError::Unsafe(message) => write!(f, "{}", message),
+            OnlineSchemaUpdateError::Backend(message) => write!(f, "{}", message),
+            OnlineSchemaUpdateError::Io(message) => write!(f, "{}", message),
+        }
+    }
+}
+
+impl From<SchemaError> for OnlineSchemaUpdateError {
+    fn from(err: SchemaError) -> Self {
+        OnlineSchemaUpdateError::Schema(err)
+    }
+}
+
+pub(crate) fn online_schema_update_result(err: &OnlineSchemaUpdateError) -> (ResultCode, String) {
+    match err {
+        OnlineSchemaUpdateError::Disabled => (ResultCode::UnwillingToPerform, err.to_string()),
+        OnlineSchemaUpdateError::Unauthorized => {
+            (ResultCode::InsufficientAccessRights, err.to_string())
+        }
+        OnlineSchemaUpdateError::UnsupportedAttribute(_) => {
+            (ResultCode::ObjectClassViolation, err.to_string())
+        }
+        OnlineSchemaUpdateError::Schema(_) | OnlineSchemaUpdateError::Unsafe(_) => {
+            (ResultCode::ObjectClassViolation, err.to_string())
+        }
+        OnlineSchemaUpdateError::Backend(_) | OnlineSchemaUpdateError::Io(_) => {
+            (ResultCode::Unavailable, err.to_string())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_online_schema_modify_request_with_context(
+    socket: &mut (impl AsyncWrite + Unpin),
+    backend: &dyn DirectoryBackend,
+    schema: &SharedLdapSchema,
+    runtime_config: &LegacyServerConfig,
+    message_id: u32,
+    request: ModifyRequest<'_>,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
+) -> Result<(), ServerError> {
+    let dn = request.object.0.as_ref().trim().to_owned();
+    let modifications = convert_ldap_changes_to_modifications(&request.changes);
+    let modified_attributes = modifications
+        .iter()
+        .map(|modification| modification.attribute.clone())
+        .collect::<Vec<_>>();
+
+    if !authorize_operation(
+        socket,
+        Some(backend),
+        message_id,
+        ResponseOp::Modify,
+        session,
+        request_context,
+        Permission::Modify,
+        "modify",
+        &dn,
+        None,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    if !authorize_attribute_permissions(
+        socket,
+        backend,
+        message_id,
+        ResponseOp::Modify,
+        session,
+        request_context,
+        Permission::Modify,
+        "modify",
+        &dn,
+        &modified_attributes,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    match apply_online_schema_modify(backend, schema, runtime_config, session, modifications).await
+    {
+        Ok(()) => {
+            log_modify_audit_event(
+                request_context,
+                session,
+                &dn,
+                true,
+                &modified_attributes,
+                None,
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::Success,
+                &dn,
+                "",
+            )
+            .await?;
+        }
+        Err(err) => {
+            let (result_code, diagnostic) = online_schema_update_result(&err);
+            error!("Online schema update failed for {}: {}", dn, diagnostic);
+            log_modify_audit_event(
+                request_context,
+                session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(&diagnostic),
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                result_code,
+                &dn,
+                &diagnostic,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn apply_online_schema_modify(
+    backend: &dyn DirectoryBackend,
+    schema: &SharedLdapSchema,
+    runtime_config: &LegacyServerConfig,
+    session: &ConnectionSession,
+    modifications: Vec<Modification>,
+) -> Result<(), OnlineSchemaUpdateError> {
+    if !runtime_config.allow_online_schema_updates {
+        return Err(OnlineSchemaUpdateError::Disabled);
+    }
+    if !session.is_authenticated() {
+        return Err(OnlineSchemaUpdateError::Unauthorized);
+    }
+
+    let schema_file = online_schema_file_path(runtime_config);
+    let online_store = read_online_schema_store(&schema_file)?;
+    let mut proposed_store = online_store.clone();
+    let mut proposed_schema = schema_snapshot(schema);
+
+    for modification in &modifications {
+        let Some(canonical_name) = canonical_schema_attr_name(&modification.attribute) else {
+            return Err(OnlineSchemaUpdateError::UnsupportedAttribute(
+                modification.attribute.clone(),
+            ));
+        };
+        match modification.operation {
+            ModifyOperation::Add => {
+                for value in &modification.values {
+                    proposed_schema.apply_schema_attr_value(canonical_name, value)?;
+                    proposed_store
+                        .entry(canonical_name.to_string())
+                        .or_default()
+                        .push(value.clone());
+                }
+            }
+            ModifyOperation::Delete => {
+                if modification.values.is_empty() {
+                    let removed_values =
+                        proposed_store.remove(canonical_name).ok_or_else(|| {
+                            OnlineSchemaUpdateError::Unsafe(format!(
+                                "{} has no online-managed schema definitions to delete",
+                                canonical_name
+                            ))
+                        })?;
+                    for removed_value in removed_values {
+                        proposed_schema.remove_schema_attr_value(canonical_name, &removed_value)?;
+                    }
+                } else {
+                    for value in &modification.values {
+                        let removed_value =
+                            remove_online_store_value(&mut proposed_store, canonical_name, value)?;
+                        proposed_schema.remove_schema_attr_value(canonical_name, &removed_value)?;
+                    }
+                }
+            }
+            ModifyOperation::Replace => {
+                if let Some(removed_values) = proposed_store.remove(canonical_name) {
+                    for removed_value in removed_values {
+                        proposed_schema.remove_schema_attr_value(canonical_name, &removed_value)?;
+                    }
+                }
+                if !modification.values.is_empty() {
+                    for value in &modification.values {
+                        proposed_schema.apply_schema_attr_value(canonical_name, value)?;
+                    }
+                    proposed_store.insert(canonical_name.to_string(), modification.values.clone());
+                }
+            }
+        }
+    }
+
+    proposed_schema.validate_schema_dependencies()?;
+    validate_existing_entries_against_schema(backend, runtime_config, &proposed_schema).await?;
+    write_online_schema_store(&schema_file, &proposed_store)?;
+
+    *schema.write().expect("LDAP schema lock poisoned") = proposed_schema;
+    Ok(())
+}
+
+fn online_schema_file_path(runtime_config: &LegacyServerConfig) -> PathBuf {
+    runtime_config.schema_dir.join(ONLINE_SCHEMA_FILE)
+}
+
+fn read_online_schema_store(
+    path: &PathBuf,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, OnlineSchemaUpdateError> {
+    if !path.exists() {
+        return Ok(Default::default());
+    }
+    let contents = fs::read_to_string(path)
+        .map_err(|err| OnlineSchemaUpdateError::Io(format!("{}: {}", path.display(), err)))?;
+    LdapSchema::parse_schema_ldif_values(&contents).map_err(OnlineSchemaUpdateError::Schema)
+}
+
+fn remove_online_store_value(
+    store: &mut std::collections::BTreeMap<String, Vec<String>>,
+    canonical_name: &str,
+    value: &str,
+) -> Result<String, OnlineSchemaUpdateError> {
+    let target_key = schema_definition_key(canonical_name, value)?;
+    let values = store.get_mut(canonical_name).ok_or_else(|| {
+        OnlineSchemaUpdateError::Unsafe(format!(
+            "{} definition is not managed by the online schema store",
+            target_key
+        ))
+    })?;
+    let Some(position) = values.iter().position(|candidate| {
+        schema_definition_key(canonical_name, candidate).is_ok_and(|key| key == target_key)
+    }) else {
+        return Err(OnlineSchemaUpdateError::Unsafe(format!(
+            "{} definition is not managed by the online schema store",
+            target_key
+        )));
+    };
+    let removed = values.remove(position);
+    if values.is_empty() {
+        store.remove(canonical_name);
+    }
+    Ok(removed)
+}
+
+fn write_online_schema_store(
+    path: &PathBuf,
+    store: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<(), OnlineSchemaUpdateError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| OnlineSchemaUpdateError::Io(format!("{}: {}", parent.display(), err)))?;
+    }
+    let temp_path = path.with_extension("ldif.tmp");
+    let mut file = fs::File::create(&temp_path)
+        .map_err(|err| OnlineSchemaUpdateError::Io(format!("{}: {}", temp_path.display(), err)))?;
+    file.write_all(render_online_schema_store(store).as_bytes())
+        .map_err(|err| OnlineSchemaUpdateError::Io(format!("{}: {}", temp_path.display(), err)))?;
+    file.sync_all()
+        .map_err(|err| OnlineSchemaUpdateError::Io(format!("{}: {}", temp_path.display(), err)))?;
+    drop(file);
+    fs::rename(&temp_path, path).map_err(|err| {
+        OnlineSchemaUpdateError::Io(format!(
+            "rename {} to {}: {}",
+            temp_path.display(),
+            path.display(),
+            err
+        ))
+    })
+}
+
+fn render_online_schema_store(store: &std::collections::BTreeMap<String, Vec<String>>) -> String {
+    let mut output = String::from(
+        "dn: cn=Subschema\nobjectClass: top\nobjectClass: subentry\nobjectClass: subschema\ncn: Subschema\n",
+    );
+    for (name, values) in store {
+        for value in values {
+            output.push_str(name);
+            output.push_str(": ");
+            output.push_str(value);
+            output.push('\n');
+        }
+    }
+    output
+}
+
+async fn validate_existing_entries_against_schema(
+    backend: &dyn DirectoryBackend,
+    runtime_config: &LegacyServerConfig,
+    schema: &LdapSchema,
+) -> Result<(), OnlineSchemaUpdateError> {
+    let naming_contexts = if runtime_config.naming_contexts.is_empty() {
+        vec![String::new()]
+    } else {
+        runtime_config.naming_contexts.clone()
+    };
+    for naming_context in naming_contexts {
+        let entries = backend
+            .search_entries(
+                &naming_context,
+                ldap_parser::ldap::SearchScope::WholeSubtree,
+            )
+            .await
+            .map_err(|err| OnlineSchemaUpdateError::Backend(err.to_string()))?;
+        for entry in entries {
+            schema.validate_entry(&entry.attributes).map_err(|err| {
+                OnlineSchemaUpdateError::Unsafe(format!(
+                    "schema update would invalidate existing entry {}: {}",
+                    entry.dn, err
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_modify_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     message_id: u32,
     request: ModifyRequest<'_>,
     session: &ConnectionSession,
@@ -5680,6 +6285,73 @@ pub(crate) async fn handle_modify_request_with_context(
     )
     .await?
     {
+        return Ok(());
+    }
+
+    let existing_entry = match backend.get_entry(&dn).await {
+        Ok(Some(existing_entry)) => existing_entry,
+        Ok(None) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::NoSuchObject,
+                &dn,
+                "no such object",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(err) => {
+            error!("Modify lookup failed for {}: {}", dn, err);
+            log_modify_audit_event(
+                request_context,
+                session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(diagnostic_for_error(&err)),
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                map_backend_error(&err),
+                &dn,
+                diagnostic_for_error(&err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let mut candidate_attributes = existing_entry.attributes.clone();
+    apply_modifications_to_attributes(&mut candidate_attributes, &modifications);
+    if let Err(schema_error) =
+        schema.validate_modified_entry(&existing_entry.attributes, &candidate_attributes)
+    {
+        error!(
+            "Schema validation failed for modify {}: {}",
+            dn, schema_error
+        );
+        log_modify_audit_event(
+            request_context,
+            session,
+            &dn,
+            false,
+            &modified_attributes,
+            Some(&format!("Schema validation failed: {}", schema_error)),
+        )
+        .await;
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::Modify,
+            ResultCode::ObjectClassViolation,
+            &dn,
+            &format!("Schema validation failed: {}", schema_error),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -5952,9 +6624,11 @@ pub async fn handle_moddn_request(
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
     let request_controls = RequestControls::default();
+    let schema = LdapSchema::default();
     handle_moddn_request_with_context(
         socket,
         backend,
+        &schema,
         message_id,
         request,
         &session,
@@ -5964,9 +6638,11 @@ pub async fn handle_moddn_request(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_moddn_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     message_id: u32,
     request: ModDnRequest<'_>,
     session: &ConnectionSession,
@@ -5999,6 +6675,70 @@ pub(crate) async fn handle_moddn_request_with_context(
     }
 
     let new_dn = compute_new_dn(&dn, &new_rdn, new_superior.as_deref());
+
+    let existing_entry = match backend.get_entry(&dn).await {
+        Ok(Some(existing_entry)) => existing_entry,
+        Ok(None) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::ModifyDn,
+                ResultCode::NoSuchObject,
+                &dn,
+                "no such object",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(err) => {
+            error!("ModifyDN lookup failed for {}: {}", dn, err);
+            log_moddn_audit_event(
+                request_context,
+                session,
+                &dn,
+                &new_dn,
+                false,
+                Some(diagnostic_for_error(&err)),
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::ModifyDn,
+                map_backend_error(&err),
+                &dn,
+                diagnostic_for_error(&err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(schema_error) = schema.validate_rdn_for_entry(&existing_entry.attributes, &new_rdn) {
+        error!(
+            "Schema validation failed for modifydn {}: {}",
+            dn, schema_error
+        );
+        log_moddn_audit_event(
+            request_context,
+            session,
+            &dn,
+            &new_dn,
+            false,
+            Some(&format!("Schema validation failed: {}", schema_error)),
+        )
+        .await;
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::ModifyDn,
+            ResultCode::ObjectClassViolation,
+            &dn,
+            &format!("Schema validation failed: {}", schema_error),
+        )
+        .await?;
+        return Ok(());
+    }
 
     match backend
         .rename_entry_with_actor(
@@ -6056,9 +6796,11 @@ pub async fn handle_compare_request(
 ) -> Result<(), ServerError> {
     let session = ConnectionSession::default();
     let request_controls = RequestControls::default();
+    let schema = LdapSchema::default();
     handle_compare_request_with_context(
         socket,
         backend,
+        &schema,
         message_id,
         request,
         &session,
@@ -6068,9 +6810,11 @@ pub async fn handle_compare_request(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_compare_request_with_context(
     socket: &mut (impl AsyncWrite + Unpin),
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     message_id: u32,
     request: CompareRequest<'_>,
     session: &ConnectionSession,
@@ -6098,7 +6842,16 @@ pub(crate) async fn handle_compare_request_with_context(
         return Ok(());
     }
 
-    match backend.compare_attribute(&dn, &attribute, &assertion).await {
+    let compare_result = match backend.get_entry(&dn).await {
+        Ok(Some(entry)) => {
+            compare_attribute_with_schema(schema, &dn, &entry.attributes, &attribute, &assertion)
+                .map_err(CompareRequestError::Filter)
+        }
+        Ok(None) => Err(CompareRequestError::Backend(BackendError::NotFound)),
+        Err(err) => Err(CompareRequestError::Backend(err)),
+    };
+
+    match compare_result {
         Ok(true) => {
             log_compare_audit(
                 request_context,
@@ -6141,7 +6894,7 @@ pub(crate) async fn handle_compare_request_with_context(
             )
             .await?;
         }
-        Err(err) => {
+        Err(CompareRequestError::Backend(err)) => {
             error!("Compare operation failed for {}: {}", dn, err);
             log_compare_audit(
                 request_context,
@@ -6163,9 +6916,40 @@ pub(crate) async fn handle_compare_request_with_context(
             )
             .await?;
         }
+        Err(CompareRequestError::Filter(err)) => {
+            let diagnostic = err.to_string();
+            error!(
+                "Compare schema validation failed for {}: {}",
+                dn, diagnostic
+            );
+            log_compare_audit(
+                request_context,
+                session,
+                &dn,
+                &attribute,
+                false,
+                "error",
+                Some(&diagnostic),
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Compare,
+                map_filter_schema_error(&err),
+                &dn,
+                &diagnostic,
+            )
+            .await?;
+        }
     }
 
     Ok(())
+}
+
+enum CompareRequestError {
+    Backend(BackendError),
+    Filter(FilterSchemaError),
 }
 
 async fn handle_abandon_request(
@@ -6926,13 +7710,22 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
     selected
 }
 
+#[cfg(test)]
 fn entry_matches_filter(entry: &DirectoryEntry, filter: &Filter<'_>) -> bool {
     crate::ldap_filter_eval::matches_search_filter(entry, filter)
 }
 
-fn convert_modifications(changes: Vec<Change<'_>>) -> Vec<Modification> {
+fn entry_matches_filter_with_schema(
+    entry: &DirectoryEntry,
+    filter: &Filter<'_>,
+    schema: &LdapSchema,
+) -> Result<bool, FilterSchemaError> {
+    matches_search_filter_with_schema(entry, filter, schema)
+}
+
+pub(crate) fn convert_ldap_changes_to_modifications(changes: &[Change<'_>]) -> Vec<Modification> {
     changes
-        .into_iter()
+        .iter()
         .map(|change| {
             let operation = match change.operation.0 {
                 0 => ModifyOperation::Add,
@@ -6957,6 +7750,46 @@ fn convert_modifications(changes: Vec<Change<'_>>) -> Vec<Modification> {
             }
         })
         .collect()
+}
+
+fn convert_modifications(changes: Vec<Change<'_>>) -> Vec<Modification> {
+    convert_ldap_changes_to_modifications(&changes)
+}
+
+fn apply_modifications_to_attributes(
+    attributes: &mut HashMap<String, Vec<String>>,
+    modifications: &[Modification],
+) {
+    for modification in modifications {
+        let attribute = modification.attribute.to_lowercase();
+        match modification.operation {
+            ModifyOperation::Add => {
+                let values = attributes.entry(attribute).or_default();
+                for value in &modification.values {
+                    if !values.contains(value) {
+                        values.push(value.clone());
+                    }
+                }
+            }
+            ModifyOperation::Delete => {
+                if modification.values.is_empty() {
+                    attributes.remove(&attribute);
+                } else if let Some(values) = attributes.get_mut(&attribute) {
+                    values.retain(|value| !modification.values.contains(value));
+                    if values.is_empty() {
+                        attributes.remove(&attribute);
+                    }
+                }
+            }
+            ModifyOperation::Replace => {
+                if modification.values.is_empty() {
+                    attributes.remove(&attribute);
+                } else {
+                    attributes.insert(attribute, modification.values.clone());
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn build_entry_from_add_request(
@@ -7751,9 +8584,11 @@ mod tests {
         };
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let schema = LdapSchema::default();
         handle_compare_request_with_context(
             &mut server_stream,
             &backend,
+            &schema,
             4,
             request,
             &session,
@@ -8121,9 +8956,11 @@ mod tests {
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
         let request_controls = RequestControls::default();
+        let schema = LdapSchema::default();
         handle_modify_request_with_context(
             &mut server_stream,
             &backend,
+            &schema,
             9,
             request,
             &session,
@@ -8160,6 +8997,184 @@ mod tests {
         );
     }
 
+    const ONLINE_TEST_ATTRIBUTE: &str = "( 1.3.6.1.4.1.55555.1.1 NAME 'openDRTestCode' DESC 'OpenDR online schema test attribute' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )";
+    const ONLINE_TEST_OBJECT_CLASS: &str = "( 1.3.6.1.4.1.55555.2.1 NAME 'openDRTestObject' DESC 'OpenDR online schema test object class' SUP top STRUCTURAL MUST cn MAY openDRTestCode )";
+
+    fn bound_schema_session() -> ConnectionSession {
+        let mut session = ConnectionSession::default();
+        session.bind("cn=admin,dc=example,dc=org".to_string());
+        session
+    }
+
+    fn online_schema_runtime_config(schema_dir: &std::path::Path) -> LegacyServerConfig {
+        LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            schema_dir: schema_dir.to_path_buf(),
+            allow_online_schema_updates: true,
+            ..LegacyServerConfig::default()
+        }
+    }
+
+    fn online_schema_add_modifications() -> Vec<Modification> {
+        vec![
+            Modification {
+                operation: ModifyOperation::Add,
+                attribute: "attributeTypes".to_string(),
+                values: vec![ONLINE_TEST_ATTRIBUTE.to_string()],
+            },
+            Modification {
+                operation: ModifyOperation::Add,
+                attribute: "objectClasses".to_string(),
+                values: vec![ONLINE_TEST_OBJECT_CLASS.to_string()],
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn online_schema_modify_adds_definition_and_persists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_config = online_schema_runtime_config(temp_dir.path());
+        let backend = MockBackend::new();
+        let schema = shared_schema(LdapSchema::with_core_schema());
+        let session = bound_schema_session();
+
+        apply_online_schema_modify(
+            &backend,
+            &schema,
+            &runtime_config,
+            &session,
+            online_schema_add_modifications(),
+        )
+        .await
+        .unwrap();
+
+        let schema_snapshot = schema_snapshot(&schema);
+        assert!(
+            schema_snapshot
+                .get_attribute_type("openDRTestCode")
+                .is_some()
+        );
+        assert!(
+            schema_snapshot
+                .get_object_class("openDRTestObject")
+                .is_some()
+        );
+        schema_snapshot
+            .validate_entry(&HashMap::from([
+                (
+                    "objectclass".to_string(),
+                    vec!["top".to_string(), "openDRTestObject".to_string()],
+                ),
+                ("cn".to_string(), vec!["custom entry".to_string()]),
+                ("openDRTestCode".to_string(), vec!["alpha".to_string()]),
+            ]))
+            .unwrap();
+
+        let online_schema_path = temp_dir.path().join(ONLINE_SCHEMA_FILE);
+        let persisted = std::fs::read_to_string(&online_schema_path).unwrap();
+        assert!(persisted.contains("attributeTypes:"));
+        assert!(persisted.contains("openDRTestObject"));
+
+        let mut reloaded_schema = LdapSchema::with_core_schema();
+        reloaded_schema.load_schema_dir(temp_dir.path()).unwrap();
+        assert!(
+            reloaded_schema
+                .get_attribute_type("openDRTestCode")
+                .is_some()
+        );
+        assert!(
+            reloaded_schema
+                .get_object_class("openDRTestObject")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn online_schema_modify_rejects_disabled_updates() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_config = LegacyServerConfig {
+            schema_dir: temp_dir.path().to_path_buf(),
+            allow_online_schema_updates: false,
+            ..LegacyServerConfig::default()
+        };
+        let backend = MockBackend::new();
+        let schema = shared_schema(LdapSchema::with_core_schema());
+        let session = bound_schema_session();
+
+        let error = apply_online_schema_modify(
+            &backend,
+            &schema,
+            &runtime_config,
+            &session,
+            online_schema_add_modifications(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, OnlineSchemaUpdateError::Disabled));
+        assert!(!temp_dir.path().join(ONLINE_SCHEMA_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn online_schema_modify_rejects_deleting_object_class_used_by_existing_entry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_config = online_schema_runtime_config(temp_dir.path());
+        let backend = MockBackend::new();
+        let schema = shared_schema(LdapSchema::with_core_schema());
+        let session = bound_schema_session();
+
+        apply_online_schema_modify(
+            &backend,
+            &schema,
+            &runtime_config,
+            &session,
+            online_schema_add_modifications(),
+        )
+        .await
+        .unwrap();
+
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=custom entry,dc=example,dc=org",
+                    HashMap::from([
+                        (
+                            "objectclass".to_string(),
+                            vec!["top".to_string(), "openDRTestObject".to_string()],
+                        ),
+                        ("cn".to_string(), vec!["custom entry".to_string()]),
+                        ("opendrtestcode".to_string(), vec!["alpha".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let error = apply_online_schema_modify(
+            &backend,
+            &schema,
+            &runtime_config,
+            &session,
+            vec![Modification {
+                operation: ModifyOperation::Delete,
+                attribute: "objectClasses".to_string(),
+                values: vec![ONLINE_TEST_OBJECT_CLASS.to_string()],
+            }],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, OnlineSchemaUpdateError::Unsafe(_)));
+        assert!(
+            schema_snapshot(&schema)
+                .get_object_class("openDRTestObject")
+                .is_some()
+        );
+        let persisted = std::fs::read_to_string(temp_dir.path().join(ONLINE_SCHEMA_FILE)).unwrap();
+        assert!(persisted.contains("openDRTestObject"));
+    }
+
     #[tokio::test]
     async fn authenticated_moddn_uses_bound_dn_for_operational_attrs() {
         let backend = MockBackend::new();
@@ -8190,9 +9205,11 @@ mod tests {
 
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
         let request_controls = RequestControls::default();
+        let schema = LdapSchema::default();
         handle_moddn_request_with_context(
             &mut server_stream,
             &backend,
+            &schema,
             10,
             request,
             &session,

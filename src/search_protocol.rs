@@ -65,22 +65,44 @@ pub fn build_subschema_attributes(schema: &LdapSchema) -> Vec<(String, Vec<Strin
         ("cn".to_string(), vec!["Subschema".to_string()]),
     ];
 
-    let attribute_types = schema
-        .attribute_types_unique_sorted()
-        .into_iter()
-        .map(|attribute| attribute.to_schema_description())
-        .collect::<Vec<_>>();
+    let attribute_types = schema.attribute_type_descriptions_unique_sorted();
     if !attribute_types.is_empty() {
         attributes.push(("attributeTypes".to_string(), attribute_types));
     }
 
-    let object_classes = schema
-        .object_classes_unique_sorted()
-        .into_iter()
-        .map(|object_class| object_class.to_schema_description())
-        .collect::<Vec<_>>();
+    let object_classes = schema.object_class_descriptions_unique_sorted();
     if !object_classes.is_empty() {
         attributes.push(("objectClasses".to_string(), object_classes));
+    }
+
+    let ldap_syntaxes = schema.ldap_syntax_descriptions_unique_sorted();
+    if !ldap_syntaxes.is_empty() {
+        attributes.push(("ldapSyntaxes".to_string(), ldap_syntaxes));
+    }
+
+    let matching_rules = schema.matching_rule_descriptions_unique_sorted();
+    if !matching_rules.is_empty() {
+        attributes.push(("matchingRules".to_string(), matching_rules));
+    }
+
+    let matching_rule_use = schema.matching_rule_use_descriptions_unique_sorted();
+    if !matching_rule_use.is_empty() {
+        attributes.push(("matchingRuleUse".to_string(), matching_rule_use));
+    }
+
+    let dit_content_rules = schema.dit_content_rule_descriptions_unique_sorted();
+    if !dit_content_rules.is_empty() {
+        attributes.push(("dITContentRules".to_string(), dit_content_rules));
+    }
+
+    let name_forms = schema.name_form_descriptions_unique_sorted();
+    if !name_forms.is_empty() {
+        attributes.push(("nameForms".to_string(), name_forms));
+    }
+
+    let dit_structure_rules = schema.dit_structure_rule_descriptions_unique_sorted();
+    if !dit_structure_rules.is_empty() {
+        attributes.push(("dITStructureRules".to_string(), dit_structure_rules));
     }
 
     attributes

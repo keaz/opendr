@@ -142,7 +142,11 @@ indexed_attributes = ["cn", "uid", "mail", "objectClass"]
 
 [[backend.indexes]]
 attribute = "cn"
-types = ["substring"]`,
+types = ["substring"]
+
+[[backend.indexes]]
+attribute = "exampleScore"
+types = ["equality", "ordering"]`,
     options: [
       ["backend_type", "Use lmdb for persistent runtime data. memory is useful for tests and temporary experiments."],
       ["data_directory", "Directory that stores LMDB files for persistent backends."],
@@ -151,7 +155,7 @@ types = ["substring"]`,
       ["import_sample_data", "Parsed by runtime; setup can write sample.ldif, but server startup does not import it automatically."],
       ["indexed_attributes", "Legacy shortcut: each listed attribute receives equality and presence indexes."],
       ["indexes.attribute", "Attribute name for typed index configuration."],
-      ["indexes.types", "Index types for the attribute: equality, presence, substring, or ordering. Short aliases eq, pres, sub, and ord are accepted."],
+      ["indexes.types", "Index types for the attribute: equality, presence, substring, or ordering. Short aliases eq, pres, sub, and ord are accepted. Equality, substring, and ordering indexes are validated against the loaded schema matching rules."],
     ],
   },
   {
@@ -362,10 +366,27 @@ cache_size = 1000
 query_optimization = true`,
     options: [
       ["worker_threads", "Parsed for forward compatibility. A value of 0 means automatic sizing."],
-      ["schema_validation", "Parsed for forward compatibility; schema behavior is currently wired through server startup and schema modules."],
+      ["schema_validation", "Parsed for compatibility; active schema behavior is configured in `[schema]`."],
       ["indexing_enabled", "Controls whether configured runtime indexes are maintained."],
       ["cache_size", "Entry/auth cache sizing used by current startup wiring."],
       ["query_optimization", "Parsed for forward compatibility."],
+    ],
+  },
+  {
+    title: "`[schema]`",
+    intro: "Schema registry loading, validation, and subschema publication.",
+    snippet: `[schema]
+enabled = true
+schema_dir = "config/schema"
+load_builtin = ["core"]
+strict_validation = true
+allow_online_updates = false`,
+    options: [
+      ["enabled", "Loads the built-in and external LDAP schema registry at startup."],
+      ["schema_dir", "Directory for RFC-style LDIF schema files with `.ldif`, `.schema`, or `.conf` extensions."],
+      ["load_builtin", "Built-in schema bundle names loaded before external files."],
+      ["strict_validation", "Treats malformed schema files as startup errors."],
+      ["allow_online_updates", "Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into the configured schema directory."],
     ],
   },
 ];
@@ -394,11 +415,36 @@ permissions = ["read"]
 target = { subtree = "dc=example,dc=com", attributes = ["userPassword"] }
 subject = { all_authenticated = true }`;
 
+const schemaDefinitionExample = `dn: cn=schema
+matchingRules: ( 1.3.6.1.4.1.55555.20.7 NAME 'exampleEmployeeNumberMatch' DESC 'Example employee number equality' SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 )
+matchingRuleUse: ( 1.3.6.1.4.1.55555.20.7 NAME 'exampleEmployeeNumberMatchUse' APPLIES exampleEmployeeNumber )
+attributeTypes: ( 1.3.6.1.4.1.55555.20.1 NAME 'exampleEmployeeNumber' DESC 'Example employee number' EQUALITY exampleEmployeeNumberMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.20.2 NAME 'exampleAccessCode' DESC 'Example access code' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.20.3 NAME 'exampleStartTime' DESC 'Example start timestamp' EQUALITY generalizedTimeMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.20.6 NAME 'exampleScore' DESC 'Example integer score' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.20.8 NAME 'exampleExactCode' DESC 'Example case exact code' EQUALITY caseExactMatch SUBSTR caseExactSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+objectClasses: ( 1.3.6.1.4.1.55555.20.100 NAME 'exampleEmployee' DESC 'Example employee entry' SUP inetOrgPerson STRUCTURAL MUST ( exampleEmployeeNumber $ exampleAccessCode ) MAY ( exampleStartTime $ exampleScore $ exampleExactCode ) )
+nameForms: ( 1.3.6.1.4.1.55555.20.101 NAME 'exampleEmployeeNameForm' OC exampleEmployee MUST cn )
+dITStructureRules: ( 555201 NAME 'exampleEmployeeStructureRule' FORM exampleEmployeeNameForm )`;
+
+const schemaRecordExample = `dn: cn=Schema Example One,ou=people,dc=example,dc=org
+objectClass: top
+objectClass: exampleEmployee
+cn: Schema Example One
+sn: One
+uid: schemaexample1
+mail: schemaexample1@example.org
+exampleEmployeeNumber: 1001
+exampleAccessCode: blue
+exampleStartTime: 20260413010101Z
+exampleScore: 010
+exampleExactCode: CaseToken`;
+
 const operationsRows = [
   ["LDAP operations", "Simple bind, anonymous bind, search, add, modify, delete, ModifyDN, compare, abandon, and unbind."],
   ["Extended operations", "StartTLS, Password Modify, WhoAmI, and Cancel are wired in the FSM server path."],
   ["Controls", "Paged results, server-side sort, ManageDsaIT, and LDAP Sync controls are supported."],
-  ["Schema", "Core schema validates required attributes, structural classes, unknown attributes, and single-value constraints."],
+  ["Schema", "Built-in, external LDIF, and authorized online schema definitions publish through `cn=Subschema` and validate add, modify, and ModifyDN writes."],
   ["ACI", "Startup loads TOML ACI rules, then applies operation-level and attribute-level checks for search and write paths."],
   ["Monitoring", "Prometheus metrics, JSON health, and the read-only management console are served from the configured monitoring listener."],
 ];
@@ -1124,6 +1170,22 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
                   </p>
                   <pre><code>{aciRulesExample}</code></pre>
                 </section>
+                <section className="config-section">
+                  <h3><code>config/schema/10-example-employee.ldif</code></h3>
+                  <p>
+                    Schema files use <code>dn: cn=schema</code> and RFC-style
+                    subschema attributes. Place attribute definitions before
+                    object classes, and validate the file before restart.
+                  </p>
+                  <pre><code>{schemaDefinitionExample}</code></pre>
+                  <pre><code>{`opendr --config config/server.toml schema validate
+opendr --config config/server.toml schema explain exampleEmployeeNumber`}</code></pre>
+                  <p>
+                    After startup, LDAP clients can write entries that use the
+                    custom object class and attributes.
+                  </p>
+                  <pre><code>{schemaRecordExample}</code></pre>
+                </section>
               </div>
 
               <a className="text-link" href={docsHref("CONFIGURATION.md")}>Read the complete configuration reference</a>
@@ -1191,7 +1253,8 @@ enable_change_listening = true`}</code></pre>
               <h2 id="indexing-title">Indexing</h2>
               <p>
                 LMDB indexes are configured by attribute and index type. Startup
-                checks index metadata and backfills when configured indexes change.
+                validates index types against schema matching rules and backfills
+                when configured index metadata or resolved matching-rule OIDs change.
               </p>
 
               <pre><code>{`[backend]
@@ -1202,14 +1265,15 @@ attribute = "cn"
 types = ["substring"]
 
 [[backend.indexes]]
-attribute = "entryCSN"
+attribute = "exampleScore"
 types = ["ordering"]`}</code></pre>
 
               <ul>
                 <li>Legacy attributes receive equality and presence indexes.</li>
                 <li>Typed indexes support equality, presence, substring, and ordering.</li>
-                <li>Substring indexes use 3-character tokens.</li>
-                <li>Ordering indexes use lowercased lexicographic string order.</li>
+                <li>Equality keys use the attribute equality matching rule.</li>
+                <li>Substring indexes use 3-character tokens from the substring matching rule.</li>
+                <li>Ordering indexes use ordering-rule keys, including numeric order for integer attributes.</li>
               </ul>
             </section>
 

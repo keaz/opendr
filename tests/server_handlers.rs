@@ -117,6 +117,20 @@ async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
     response
 }
 
+fn person_entry(dn: &str) -> DirectoryEntry {
+    DirectoryEntry::new(
+        dn,
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            ("cn".to_string(), vec!["Alice".to_string()]),
+            ("sn".to_string(), vec!["Smith".to_string()]),
+        ]),
+    )
+}
+
 fn person_add_attributes(include_password: bool) -> Vec<FilterAttribute<'static>> {
     let mut attributes = vec![
         FilterAttribute {
@@ -266,7 +280,7 @@ async fn search_returns_entries_and_success() {
                 && *hint
                     == Some(SearchCandidateHint::Equality {
                         attribute: "cn".to_string(),
-                        value: "Alice".to_string(),
+                        value: "alice".to_string(),
                     })
         })
         .return_once(move |_, _, _| Ok(vec![entry_clone.clone()]));
@@ -426,6 +440,10 @@ async fn base_object_search_uses_get_entry_fast_path() {
 async fn modify_success_returns_success_response() {
     let mut backend = MockDirectory::new();
     backend
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
+        .return_once(|_| Ok(Some(person_entry("cn=Alice,dc=example,dc=org"))));
+    backend
         .expect_modify_entry_with_actor()
         .withf(|dn, modifications, actor_dn| {
             dn == "cn=Alice,dc=example,dc=org"
@@ -472,6 +490,10 @@ async fn modify_success_returns_success_response() {
 #[tokio::test]
 async fn modify_backend_error_returns_mapping() {
     let mut backend = MockDirectory::new();
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Missing,dc=example,dc=org")
+        .return_once(|_| Ok(Some(person_entry("cn=Missing,dc=example,dc=org"))));
     backend
         .expect_modify_entry_with_actor()
         .returning(|_, _, _| Err(BackendError::NotFound));
@@ -642,6 +664,10 @@ async fn delete_missing_entry_returns_error() {
 async fn moddn_successful_rename_returns_success() {
     let mut backend = MockDirectory::new();
     backend
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
+        .return_once(|_| Ok(Some(person_entry("cn=Alice,dc=example,dc=org"))));
+    backend
         .expect_rename_entry_with_actor()
         .withf(|dn, new_rdn, delete_old, superior, actor_dn| {
             dn == "cn=Alice,dc=example,dc=org"
@@ -680,6 +706,10 @@ async fn moddn_successful_rename_returns_success() {
 async fn moddn_conflict_returns_error() {
     let mut backend = MockDirectory::new();
     backend
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
+        .return_once(|_| Ok(Some(person_entry("cn=Alice,dc=example,dc=org"))));
+    backend
         .expect_rename_entry_with_actor()
         .returning(|_, _, _, _, _| Err(BackendError::AlreadyExists));
 
@@ -714,12 +744,11 @@ async fn moddn_conflict_returns_error() {
 #[tokio::test]
 async fn compare_matching_attribute_returns_true() {
     let mut backend = MockDirectory::new();
+    let entry = person_entry("cn=Alice,dc=example,dc=org");
     backend
-        .expect_compare_attribute()
-        .withf(|dn, attribute, value| {
-            dn == "cn=Alice,dc=example,dc=org" && attribute == "cn" && value == "Alice"
-        })
-        .return_once(|_, _, _| Ok(true));
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
+        .return_once(move |_| Ok(Some(entry)));
 
     let request = CompareRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
@@ -752,9 +781,11 @@ async fn compare_matching_attribute_returns_true() {
 #[tokio::test]
 async fn compare_non_matching_attribute_returns_false() {
     let mut backend = MockDirectory::new();
+    let entry = person_entry("cn=Alice,dc=example,dc=org");
     backend
-        .expect_compare_attribute()
-        .return_once(|_, _, _| Ok(false));
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
+        .return_once(move |_| Ok(Some(entry)));
 
     let request = CompareRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
@@ -788,8 +819,9 @@ async fn compare_non_matching_attribute_returns_false() {
 async fn compare_backend_error_maps_to_no_such_object() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_compare_attribute()
-        .returning(|_, _, _| Err(BackendError::NotFound));
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Missing,dc=example,dc=org")
+        .returning(|_| Err(BackendError::NotFound));
 
     let request = CompareRequest {
         entry: LdapDN(Cow::Owned("cn=Missing,dc=example,dc=org".to_string())),

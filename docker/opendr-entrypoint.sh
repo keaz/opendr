@@ -26,6 +26,7 @@ mkdir -p "${CONFIG_DIR}" "${CERT_DIR}" "${DATA_DIR}"
 : "${OPENDR_MAX_TOTAL_MEMORY:=2147483648}"
 : "${OPENDR_CONNECTION_IDLE_TIMEOUT_SECS:=600}"
 : "${OPENDR_BACKEND_INDEXES_TOML:=}"
+: "${OPENDR_SCHEMA_LDIF:=}"
 
 if [[ ! -f "${CERT_DIR}/server.crt" || ! -f "${CERT_DIR}/server.key" ]]; then
   openssl req \
@@ -91,6 +92,11 @@ EOF
 
 if [[ -n "${OPENDR_BACKEND_INDEXES_TOML}" ]]; then
   printf '\n%s\n' "${OPENDR_BACKEND_INDEXES_TOML}" >> "${CONFIG_DIR}/server.toml"
+fi
+
+if [[ -n "${OPENDR_SCHEMA_LDIF}" ]]; then
+  mkdir -p "${CONFIG_DIR}/schema"
+  printf '%s\n' "${OPENDR_SCHEMA_LDIF}" > "${CONFIG_DIR}/schema/99-env-schema.ldif"
 fi
 
 cat > "${CONFIG_DIR}/log4rs.yml" <<'EOF'

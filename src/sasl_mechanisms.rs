@@ -18,6 +18,12 @@ pub struct MultiMechanismHandler {
     supported_mechanisms: Vec<String>,
 }
 
+pub(crate) struct PlainCredentialsRef<'a> {
+    pub(crate) authzid: &'a str,
+    pub(crate) authcid: &'a str,
+    pub(crate) password: &'a [u8],
+}
+
 impl MultiMechanismHandler {
     /// Create a new multi-mechanism handler
     ///
@@ -49,21 +55,48 @@ impl MultiMechanismHandler {
     /// Parse PLAIN mechanism credentials
     ///
     /// Format: [authzid]\0authcid\0passwd
+    #[cfg(test)]
     pub(crate) fn parse_plain_credentials(
         data: &[u8],
     ) -> Result<(String, String, Vec<u8>), String> {
-        let parts: Vec<&[u8]> = data.split(|&b| b == 0).collect();
+        let credentials = Self::parse_plain_credentials_ref(data)?;
+        Ok((
+            credentials.authzid.to_string(),
+            credentials.authcid.to_string(),
+            credentials.password.to_vec(),
+        ))
+    }
 
-        if parts.len() != 3 {
+    /// Parse PLAIN mechanism credentials as borrowed values.
+    ///
+    /// Format: [authzid]\0authcid\0passwd
+    pub(crate) fn parse_plain_credentials_ref(
+        data: &[u8],
+    ) -> Result<PlainCredentialsRef<'_>, String> {
+        let mut parts = data.split(|&b| b == 0);
+        let authzid_bytes = parts
+            .next()
+            .ok_or_else(|| "Invalid PLAIN credentials format".to_string())?;
+        let authcid_bytes = parts
+            .next()
+            .ok_or_else(|| "Invalid PLAIN credentials format".to_string())?;
+        let password = parts
+            .next()
+            .ok_or_else(|| "Invalid PLAIN credentials format".to_string())?;
+        if parts.next().is_some() {
             return Err("Invalid PLAIN credentials format".to_string());
         }
 
-        let authzid = String::from_utf8(parts[0].to_vec())
+        let authzid = std::str::from_utf8(authzid_bytes)
             .map_err(|e| format!("Invalid authzid encoding: {}", e))?;
-        let authcid = String::from_utf8(parts[1].to_vec())
+        let authcid = std::str::from_utf8(authcid_bytes)
             .map_err(|e| format!("Invalid authcid encoding: {}", e))?;
 
-        Ok((authzid, authcid, parts[2].to_vec()))
+        Ok(PlainCredentialsRef {
+            authzid,
+            authcid,
+            password,
+        })
     }
 
     /// Handle PLAIN mechanism authentication
@@ -73,8 +106,8 @@ impl MultiMechanismHandler {
     ) -> Result<SaslChallengeResult, String> {
         let data = initial_data.ok_or("PLAIN requires initial data")?;
 
-        let (_authzid, authcid, passwd) = Self::parse_plain_credentials(data)?;
-        if authcid.is_empty() {
+        let credentials = Self::parse_plain_credentials_ref(data)?;
+        if credentials.authcid.is_empty() {
             return Ok(SaslChallengeResult::Failure(
                 "Empty SASL identity".to_string(),
             ));
@@ -82,7 +115,7 @@ impl MultiMechanismHandler {
 
         if !self
             .credential_verifier
-            .is_mechanism_allowed(&authcid, "PLAIN")
+            .is_mechanism_allowed(credentials.authcid, "PLAIN")
             .await?
         {
             return Ok(SaslChallengeResult::Failure(
@@ -93,7 +126,7 @@ impl MultiMechanismHandler {
         // Verify credentials through the credential verifier
         let is_valid = self
             .credential_verifier
-            .verify_credentials("PLAIN", &authcid, &passwd)
+            .verify_credentials("PLAIN", credentials.authcid, credentials.password)
             .await?;
 
         if !is_valid {
@@ -105,7 +138,7 @@ impl MultiMechanismHandler {
         // Get user DN
         let dn = self
             .credential_verifier
-            .get_user_dn(&authcid)
+            .get_user_dn(credentials.authcid)
             .await?
             .ok_or_else(|| "User not found".to_string())?;
 
@@ -116,7 +149,9 @@ impl MultiMechanismHandler {
 #[async_trait]
 impl SaslMechanismHandler for MultiMechanismHandler {
     async fn supports_mechanism(&self, mechanism: &str) -> bool {
-        self.supported_mechanisms.contains(&mechanism.to_string())
+        self.supported_mechanisms
+            .iter()
+            .any(|supported| supported == mechanism)
     }
 
     async fn start_authentication(

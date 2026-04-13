@@ -243,8 +243,14 @@ def extract_baseline_checks(doc: Path) -> list[BaselineCheck]:
             "index_substring_description_mean_ms",
             "index description substring mean",
         ),
-        "Ordering `sn >=`": ("index_ordering_sn_ge_mean_ms", "index sn >= ordering mean"),
-        "Ordering `sn <=`": ("index_ordering_sn_le_mean_ms", "index sn <= ordering mean"),
+        "Ordering `benchmarkOrder >=`": (
+            "index_ordering_benchmark_order_ge_mean_ms",
+            "index benchmarkOrder >= ordering mean",
+        ),
+        "Ordering `benchmarkOrder <=`": (
+            "index_ordering_benchmark_order_le_mean_ms",
+            "index benchmarkOrder <= ordering mean",
+        ),
     }
 
     for table in tables:

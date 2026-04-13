@@ -7,7 +7,7 @@
 //! and operation execution.
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use tokio::time::sleep;
 
 use crate::aci::Permission;
 use crate::audit::{AuditEventType, AuditLevel};
-use crate::backend::DirectoryBackend;
+use crate::backend::{DirectoryBackend, DirectoryEntry, OperationalAttributes};
 use crate::backend_adapters::{
     AllowAllCompareAccessControl, AllowAllWriteAciChecker, CompareBackendAdapter,
     PassthroughSchemaValidator, ProductionAttributeComparator, ProductionCompareMetrics,
@@ -43,12 +43,16 @@ use crate::fsm::{
 use crate::fsm_request::{FsmRequestContext, FsmRequestRejection, FsmResponseKind};
 use crate::fsm_runtime::{AuthenticationFsm, ConnectionFsmSet};
 use crate::ldap_controls::LdapControl;
+use crate::ldap_filter_eval::{
+    FilterSchemaError, PreparedLdapFilter, prepare_search_filter_with_schema,
+};
 use crate::metrics::{
     FsmType, MetricsCollector, OperationType as MetricsOperationType, ResourceEventType,
 };
 use crate::parser::{
     ResponseOp, encode_custom_extended_response, encode_extended_response,
-    encode_result_response_with_referrals, encode_search_reference_with_controls,
+    encode_result_response_with_referrals, encode_search_entry_parts_with_controls,
+    encode_search_reference_with_controls,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::schema::LdapSchema;
@@ -68,14 +72,16 @@ use crate::search_fsm::{
 use crate::server::{
     CancelRequestOutcome, ConnectionOperationRegistry, ConnectionSession, LegacySecurityConfig,
     LegacyServerConfig, PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError,
-    SyncRequestError, authorize_attribute_permissions, authorize_operation,
-    build_entry_from_add_request, compute_new_dn, entry_is_referral as directory_entry_is_referral,
-    extract_search_hint, filter_search_entries_for_read_access, handle_sync_search_request,
-    increment_control_counter, log_add_audit_event, log_anonymous_bind, log_compare_audit,
-    log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
-    log_password_modify_audit_event, log_sasl_bind, log_simple_bind_failure,
-    log_simple_bind_success, parse_sync_request_control, referral_urls_for_entry,
-    reject_sync_request, resolve_search_base_dn, resolve_search_candidate_entry,
+    SharedLdapSchema, SyncRequestError, apply_online_schema_modify,
+    authorize_attribute_permissions, authorize_operation, build_entry_from_add_request,
+    can_skip_search_post_filter, compute_new_dn, convert_ldap_changes_to_modifications,
+    entry_is_referral as directory_entry_is_referral, filter_search_entries_for_read_access,
+    handle_sync_search_request, increment_control_counter, log_add_audit_event, log_anonymous_bind,
+    log_compare_audit, log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event,
+    log_modify_audit_event, log_password_modify_audit_event, log_sasl_bind,
+    log_simple_bind_failure, log_simple_bind_success, online_schema_update_result,
+    parse_sync_request_control, referral_urls_for_entry, reject_sync_request,
+    resolve_search_base_dn, resolve_search_candidate_entry, schema_snapshot, shared_schema,
 };
 use crate::shutdown::ShutdownCoordinator;
 use crate::sync_controls::SYNC_REQUEST_OID;
@@ -155,6 +161,7 @@ pub async fn run(
         backend,
         config,
         FsmServerRuntimeContext::default(),
+        shared_schema(LdapSchema::with_core_schema()),
         None,
     )
     .await
@@ -172,6 +179,7 @@ pub async fn run_with_shutdown(
         backend,
         config,
         FsmServerRuntimeContext::default(),
+        shared_schema(LdapSchema::with_core_schema()),
         shutdown,
     )
     .await
@@ -183,6 +191,7 @@ pub async fn run_with_shutdown_and_context(
     backend: Arc<dyn DirectoryBackend>,
     config: FsmServerConfig,
     runtime_context: FsmServerRuntimeContext,
+    schema: SharedLdapSchema,
     shutdown: Option<Arc<ShutdownCoordinator>>,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
@@ -249,6 +258,7 @@ pub async fn run_with_shutdown_and_context(
                 let backend = backend.clone();
                 let config = config.clone();
                 let runtime_context = runtime_context.clone();
+                let schema = schema.clone();
                 let pool_clone = pool.clone();
                 let shutdown_clone = shutdown.clone();
                 let rate_limiter_clone = rate_limiter.clone();
@@ -259,6 +269,7 @@ pub async fn run_with_shutdown_and_context(
                         backend,
                         config,
                         runtime_context.clone(),
+                        schema,
                         pool_clone.clone(),
                         conn_id,
                         Some(client_addr.ip()),
@@ -266,7 +277,11 @@ pub async fn run_with_shutdown_and_context(
                     )
                     .await
                     {
-                        error!("Connection error for {:?}: {}", client_addr, err);
+                        log_connection_failure(
+                            "Connection error",
+                            client_addr,
+                            &err.to_string(),
+                        );
                         record_connection_failed(&runtime_context);
                     }
 
@@ -302,6 +317,7 @@ pub async fn run_tls_with_shutdown_and_context(
     backend: Arc<dyn DirectoryBackend>,
     config: FsmServerConfig,
     runtime_context: FsmServerRuntimeContext,
+    schema: SharedLdapSchema,
     shutdown: Option<Arc<ShutdownCoordinator>>,
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr).await?;
@@ -361,36 +377,46 @@ pub async fn run_tls_with_shutdown_and_context(
                     }
                 };
 
-                let transport = match tls_handler.accept_transport(socket).await {
-                    Ok(transport) => transport,
-                    Err(err) => {
-                        warn!("LDAPS handshake failed for {:?}: {}", client_addr, err);
-                        record_connection_failed(&runtime_context);
-                        pool.release_connection(conn_id).await;
-                        if let Some(ref shutdown_coord) = shutdown {
-                            shutdown_coord.unregister_connection().await;
-                        }
-                        continue;
-                    }
-                };
-
-                info!("Accepted FSM LDAPS connection from {:?} (conn_id={})", client_addr, conn_id);
-                record_connection_accepted(&runtime_context, true);
-                audit_connection_accepted(&runtime_context, client_addr.ip(), conn_id).await;
-
                 let backend = backend.clone();
                 let config = config.clone();
                 let runtime_context = runtime_context.clone();
+                let schema = schema.clone();
                 let pool_clone = pool.clone();
                 let shutdown_clone = shutdown.clone();
                 let rate_limiter_clone = rate_limiter.clone();
+                let tls_handler = tls_handler.clone();
 
                 tokio::spawn(async move {
+                    let transport = match tls_handler.accept_transport(socket).await {
+                        Ok(transport) => transport,
+                        Err(err) => {
+                            log_connection_failure(
+                                "LDAPS handshake failed",
+                                client_addr,
+                                &err,
+                            );
+                            record_connection_failed(&runtime_context);
+                            pool_clone.release_connection(conn_id).await;
+                            if let Some(ref shutdown_coord) = shutdown_clone {
+                                shutdown_coord.unregister_connection().await;
+                            }
+                            return;
+                        }
+                    };
+
+                    info!(
+                        "Accepted FSM LDAPS connection from {:?} (conn_id={})",
+                        client_addr, conn_id
+                    );
+                    record_connection_accepted(&runtime_context, true);
+                    audit_connection_accepted(&runtime_context, client_addr.ip(), conn_id).await;
+
                     if let Err(err) = handle_connection_with_transport(
                         transport,
                         backend,
                         config,
                         runtime_context.clone(),
+                        schema,
                         pool_clone.clone(),
                         conn_id,
                         Some(client_addr.ip()),
@@ -398,7 +424,11 @@ pub async fn run_tls_with_shutdown_and_context(
                     )
                     .await
                     {
-                        error!("LDAPS connection error for {:?}: {}", client_addr, err);
+                        log_connection_failure(
+                            "LDAPS connection error",
+                            client_addr,
+                            &err.to_string(),
+                        );
                         record_connection_failed(&runtime_context);
                     }
 
@@ -579,6 +609,7 @@ async fn handle_connection(
         backend,
         config,
         FsmServerRuntimeContext::default(),
+        shared_schema(LdapSchema::with_core_schema()),
         pool,
         conn_id,
         client_ip,
@@ -593,6 +624,7 @@ async fn handle_connection_with_transport(
     backend: Arc<dyn DirectoryBackend>,
     config: FsmServerConfig,
     runtime_context: FsmServerRuntimeContext,
+    schema: SharedLdapSchema,
     pool: Arc<ConnectionPool>,
     conn_id: u64,
     client_ip: Option<IpAddr>,
@@ -603,7 +635,6 @@ async fn handle_connection_with_transport(
         backend.clone(),
         runtime_context.boxed_tls_handler(),
     );
-    let schema = LdapSchema::with_core_schema();
     let request_context = runtime_context.request_context(client_ip, conn_id);
     let mut legacy_operation_registry = ConnectionOperationRegistry::default();
     let mut read_buffer = vec![0u8; config.read_buffer_size];
@@ -740,7 +771,7 @@ async fn process_ldap_message(
     message: LdapMessage<'_>,
     runtime_context: &FsmServerRuntimeContext,
     pool: &Arc<ConnectionPool>,
-    schema: &LdapSchema,
+    schema: &SharedLdapSchema,
     request_context: &RequestContext,
     legacy_operation_registry: &mut ConnectionOperationRegistry,
     conn_id: u64,
@@ -803,11 +834,12 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
+            let schema_snapshot = connection_schema_snapshot(fsm_set, schema, runtime_context);
             let result = handle_search_request_with_fsm_runtime(
                 fsm_set,
                 &request,
                 search_req,
-                schema,
+                schema_snapshot.as_ref(),
                 request_context,
                 runtime_context,
                 legacy_operation_registry,
@@ -837,14 +869,31 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
-            let result = handle_modify_request_with_fsm_runtime(
-                fsm_set,
-                &request,
-                modify_req,
-                request_context,
-                runtime_context,
-            )
-            .await;
+            let dn = modify_req.object.0.as_ref().trim().to_owned();
+            let result = if dn
+                .eq_ignore_ascii_case(&runtime_context.legacy_runtime_config.subschema_dn)
+            {
+                handle_online_schema_modify_with_fsm_runtime(
+                    fsm_set,
+                    &request,
+                    modify_req,
+                    schema,
+                    request_context,
+                    runtime_context,
+                )
+                .await
+            } else {
+                let schema_snapshot = connection_schema_snapshot(fsm_set, schema, runtime_context);
+                handle_modify_request_with_fsm_runtime(
+                    fsm_set,
+                    &request,
+                    modify_req,
+                    schema_snapshot.as_ref(),
+                    request_context,
+                    runtime_context,
+                )
+                .await
+            };
             pool.end_operation(conn_id).await;
             result?;
         }
@@ -869,11 +918,12 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
+            let schema_snapshot = connection_schema_snapshot(fsm_set, schema, runtime_context);
             let result = handle_add_request_with_fsm_runtime(
                 fsm_set,
                 &request,
                 add_req,
-                schema,
+                schema_snapshot.as_ref(),
                 request_context,
                 runtime_context,
             )
@@ -934,10 +984,12 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
+            let schema_snapshot = connection_schema_snapshot(fsm_set, schema, runtime_context);
             let result = handle_moddn_request_with_fsm_runtime(
                 fsm_set,
                 &request,
                 rename_req,
+                schema_snapshot.as_ref(),
                 request_context,
                 runtime_context,
             )
@@ -953,10 +1005,12 @@ async fn process_ldap_message(
                 return Ok(());
             }
 
+            let schema_snapshot = connection_schema_snapshot(fsm_set, schema, runtime_context);
             let result = handle_compare_request_with_fsm_runtime(
                 fsm_set,
                 &request,
                 compare_req,
+                schema_snapshot.as_ref(),
                 request_context,
                 runtime_context,
             )
@@ -1005,6 +1059,48 @@ fn legacy_session_from_fsm(fsm_set: &ConnectionFsmSet) -> ConnectionSession {
         session.bind(bound_dn.to_string());
     }
     session
+}
+
+fn connection_schema_snapshot(
+    fsm_set: &mut ConnectionFsmSet,
+    schema: &SharedLdapSchema,
+    runtime_context: &FsmServerRuntimeContext,
+) -> Arc<LdapSchema> {
+    if runtime_context
+        .legacy_runtime_config
+        .allow_online_schema_updates
+    {
+        return Arc::new(schema_snapshot(schema));
+    }
+
+    if let Some(snapshot) = fsm_set.immutable_schema_snapshot() {
+        return snapshot;
+    }
+
+    let snapshot = Arc::new(schema_snapshot(schema));
+    fsm_set.remember_immutable_schema_snapshot(snapshot.clone());
+    snapshot
+}
+
+fn prepare_or_cache_search_filter(
+    fsm_set: &mut ConnectionFsmSet,
+    schema: &LdapSchema,
+    rendered_filter: &str,
+    filter: &Filter<'_>,
+    allow_online_schema_updates: bool,
+) -> Result<PreparedLdapFilter, FilterSchemaError> {
+    if !allow_online_schema_updates
+        && let Some(prepared_filter) = fsm_set.prepared_search_filter(rendered_filter)
+    {
+        return Ok(prepared_filter);
+    }
+
+    let prepared_filter = prepare_search_filter_with_schema(schema, filter)?;
+    if !allow_online_schema_updates {
+        fsm_set
+            .remember_prepared_search_filter(rendered_filter.to_string(), prepared_filter.clone());
+    }
+    Ok(prepared_filter)
 }
 
 struct PreloadedSearchBackend {
@@ -1223,6 +1319,31 @@ async fn handle_search_request_with_fsm_runtime(
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
 
+    let filter = render_search_filter_string(&search_req.filter);
+    let prepared_filter = match prepare_or_cache_search_filter(
+        fsm_set,
+        schema,
+        &filter,
+        &search_req.filter,
+        runtime_context
+            .legacy_runtime_config
+            .allow_online_schema_updates,
+    ) {
+        Ok(prepared_filter) => prepared_filter,
+        Err(err) => {
+            let diagnostic = err.to_string();
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                map_filter_schema_error_code(&err),
+                &diagnostic,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
     let authorized = {
         let stream = fsm_set
             .connection_mut()
@@ -1362,6 +1483,7 @@ async fn handle_search_request_with_fsm_runtime(
         handle_sync_search_request(
             stream,
             backend.as_ref(),
+            schema,
             request.message_id as u32,
             &search_req,
             &effective_base_dn,
@@ -1408,16 +1530,17 @@ async fn handle_search_request_with_fsm_runtime(
     }
 
     let search_started_at = Instant::now();
-    let search_hint = extract_search_hint(&search_req.filter);
+    let search_hint = prepared_filter.search_candidate_hint();
+    let exact_index_hint = prepared_filter.exact_index_coverage_hint();
     trace_fsm_search(format_args!(
         "plain_search load candidates base={effective_base_dn} scope={} hint={search_hint:?}",
         search_req.scope.0
     ));
-    let mut preloaded_entries = match backend
-        .search_entries_with_hint(&effective_base_dn, search_req.scope, search_hint)
+    let search_report = match backend
+        .search_entries_with_hint_report(&effective_base_dn, search_req.scope, search_hint.clone())
         .await
     {
-        Ok(entries) => entries,
+        Ok(search_report) => search_report,
         Err(err) => {
             send_request_result_response(
                 fsm_set,
@@ -1430,6 +1553,11 @@ async fn handle_search_request_with_fsm_runtime(
             return Ok(());
         }
     };
+    let mut index_covers_filter = search_report.hint_covers_filter
+        && exact_index_hint.as_ref() == search_hint.as_ref()
+        && !matches!(search_req.deref_aliases.0, 1 | 3)
+        && can_skip_search_post_filter(&session, request_context);
+    let mut preloaded_entries = search_report.entries;
 
     match resolve_plain_search_alias_candidates(
         backend.as_ref(),
@@ -1469,6 +1597,9 @@ async fn handle_search_request_with_fsm_runtime(
             .await?;
             return Ok(());
         }
+    }
+    if matches!(search_req.deref_aliases.0, 1 | 3) {
+        index_covers_filter = false;
     }
 
     let mut search_references = Vec::new();
@@ -1538,13 +1669,15 @@ async fn handle_search_request_with_fsm_runtime(
         }
     }
 
-    preloaded_entries = filter_search_entries_for_read_access(
-        backend.as_ref(),
-        &session,
-        request_context,
-        preloaded_entries,
-    )
-    .await;
+    if !can_skip_search_post_filter(&session, request_context) {
+        preloaded_entries = filter_search_entries_for_read_access(
+            backend.as_ref(),
+            &session,
+            request_context,
+            preloaded_entries,
+        )
+        .await;
+    }
     if let Some(requested_sort) = requested_sort.as_ref() {
         sort_native_search_entries(&mut preloaded_entries, requested_sort);
     }
@@ -1565,7 +1698,6 @@ async fn handle_search_request_with_fsm_runtime(
         }
     };
 
-    let filter = render_search_filter_string(&search_req.filter);
     if let Some(control) = paged_results.as_ref() {
         handle_native_paged_search_initial(
             fsm_set,
@@ -1580,8 +1712,27 @@ async fn handle_search_request_with_fsm_runtime(
             requested_sort.as_ref(),
             preloaded_entries,
             search_references,
-            &filter,
+            &prepared_filter,
+            index_covers_filter,
             effective_time_limit,
+            search_req.size_limit,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if index_covers_filter && requested_sort.is_none() {
+        emit_index_covered_plain_search(
+            fsm_set,
+            request,
+            request_context,
+            runtime_context.metrics.as_deref(),
+            preloaded_entries,
+            &search_references,
+            &attribute_selection,
+            search_req.types_only,
+            search_started_at,
+            search_req.time_limit,
             search_req.size_limit,
         )
         .await?;
@@ -1590,6 +1741,8 @@ async fn handle_search_request_with_fsm_runtime(
 
     let mut search_fsm = build_preloaded_search_fsm(
         preloaded_entries,
+        schema,
+        Some((filter.clone(), prepared_filter, index_covers_filter)),
         runtime_context.metrics.clone(),
         request.message_id as u32,
         search_req.types_only,
@@ -2216,7 +2369,8 @@ async fn handle_native_paged_search_initial(
     requested_sort: Option<&NativeServerSideSort>,
     entries: Vec<crate::backend::DirectoryEntry>,
     references: Vec<Vec<String>>,
-    filter: &str,
+    prepared_filter: &PreparedLdapFilter,
+    index_covers_filter: bool,
     effective_time_limit: u32,
     size_limit: u32,
 ) -> Result<(), String> {
@@ -2225,7 +2379,13 @@ async fn handle_native_paged_search_initial(
         mut entries,
         size_limit_hit,
         time_limit_hit,
-    } = match collect_native_paged_search_entries(entries, filter, size_limit, search_deadline) {
+    } = match collect_native_paged_search_entries(
+        entries,
+        prepared_filter,
+        index_covers_filter,
+        size_limit,
+        search_deadline,
+    ) {
         Ok(collection) => collection,
         Err(diagnostic) => {
             send_request_result_response_with_controls(
@@ -2331,7 +2491,8 @@ struct NativePagedSearchCollection {
 
 fn collect_native_paged_search_entries(
     entries: Vec<crate::backend::DirectoryEntry>,
-    filter: &str,
+    prepared_filter: &PreparedLdapFilter,
+    index_covers_filter: bool,
     size_limit: u32,
     search_deadline: Option<Instant>,
 ) -> Result<NativePagedSearchCollection, String> {
@@ -2346,7 +2507,12 @@ fn collect_native_paged_search_entries(
             break;
         }
 
-        if !crate::ldap_filter_eval::matches_filter_string(&entry, filter)? {
+        let search_entry = directory_entry_to_search_entry(&entry);
+        if !index_covers_filter
+            && !prepared_filter
+                .matches_search_entry(&search_entry)
+                .map_err(|err| err.to_string())?
+        {
             continue;
         }
 
@@ -2534,6 +2700,193 @@ async fn emit_plain_search_references(
         references.len() as u64,
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_index_covered_plain_search(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    metrics: Option<&MetricsCollector>,
+    entries: Vec<DirectoryEntry>,
+    references: &[Vec<String>],
+    requested_attributes: &[String],
+    types_only: bool,
+    started_at: Instant,
+    time_limit: u32,
+    size_limit: u32,
+) -> Result<(), String> {
+    let projection = DirectoryAttributeProjection::new(requested_attributes);
+    let effective_size_limit = (size_limit != 0).then_some(size_limit as usize);
+    let mut pending_entry_bytes = Vec::with_capacity(FSM_SEARCH_ENTRY_WRITE_BATCH_BYTES);
+    let mut emitted_entries = 0usize;
+
+    record_direct_search_start(metrics, entries.len());
+
+    for entry in entries {
+        if search_time_limit_exceeded(started_at, time_limit) {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+            record_direct_search_complete(metrics, emitted_entries, started_at, false);
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::TimeLimitExceeded,
+                "time limit exceeded",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if effective_size_limit.is_some_and(|limit| emitted_entries >= limit) {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+            record_direct_search_complete(metrics, emitted_entries, started_at, false);
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::SizeLimitExceeded,
+                "size limit exceeded",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let selected_attributes = project_directory_entry_attributes(&entry, &projection);
+        let encoded_entry = encode_search_entry_parts_with_controls(
+            request.message_id as u32,
+            &entry.dn,
+            &selected_attributes,
+            types_only,
+            &[],
+        )
+        .map_err(|err| format!("failed to encode search entry: {err:?}"))?;
+        pending_entry_bytes.extend(encoded_entry);
+        emitted_entries += 1;
+
+        if pending_entry_bytes.len() >= FSM_SEARCH_ENTRY_WRITE_BATCH_BYTES {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+        }
+    }
+
+    flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+    emit_plain_search_references(fsm_set, request, request_context, references).await?;
+    let response_controls = native_search_done_controls(None, ResultCode::Success)?;
+    record_direct_search_complete(metrics, emitted_entries, started_at, true);
+    send_request_result_response_with_controls(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        ResultCode::Success,
+        "",
+        "",
+        &response_controls,
+    )
+    .await
+}
+
+fn search_time_limit_exceeded(started_at: Instant, time_limit: u32) -> bool {
+    time_limit != 0 && started_at.elapsed() > Duration::from_secs(time_limit as u64)
+}
+
+fn record_direct_search_start(metrics: Option<&MetricsCollector>, candidates: usize) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    metrics.record_operation_start(MetricsOperationType::Search, "");
+    metrics.record_fsm_state(FsmType::Search, "searching");
+    metrics.increment_counter("ldap_search_candidates_found", candidates as u64);
+    metrics.increment_counter("ldap_search_entries_seen", candidates as u64);
+    metrics.increment_counter("ldap_search_entries_matched", candidates as u64);
+}
+
+fn record_direct_search_complete(
+    metrics: Option<&MetricsCollector>,
+    entries_sent: usize,
+    started_at: Instant,
+    success: bool,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    metrics.record_operation_complete(MetricsOperationType::Search, started_at.elapsed(), success);
+    metrics.set_gauge("ldap_search_entries_sent", entries_sent as u64);
+    metrics.record_fsm_state(
+        FsmType::Search,
+        if success {
+            "completed"
+        } else {
+            "completed_with_error"
+        },
+    );
+}
+
+#[derive(Debug, Clone, Default)]
+struct DirectoryAttributeProjection {
+    requested_lower: Vec<String>,
+    include_user: bool,
+    include_all_user: bool,
+    include_all_operational: bool,
+    specific_operational: Vec<String>,
+}
+
+impl DirectoryAttributeProjection {
+    fn new(requested_attributes: &[String]) -> Self {
+        let (include_user, include_all_operational, specific_operational) =
+            crate::operational_attrs::parse_attribute_request(requested_attributes);
+        let requested_lower = requested_attributes
+            .iter()
+            .map(|attribute| attribute.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let include_all_user = requested_attributes.is_empty()
+            || requested_lower.iter().any(|attribute| attribute == "*");
+
+        Self {
+            requested_lower,
+            include_user,
+            include_all_user,
+            include_all_operational,
+            specific_operational,
+        }
+    }
+}
+
+fn project_directory_entry_attributes(
+    entry: &DirectoryEntry,
+    projection: &DirectoryAttributeProjection,
+) -> Vec<(String, Vec<String>)> {
+    let mut selected = Vec::with_capacity(entry.attributes.len());
+
+    if projection.include_user {
+        for (name, values) in &entry.attributes {
+            if OperationalAttributes::is_operational(name) {
+                continue;
+            }
+            if projection.include_all_user
+                || projection
+                    .requested_lower
+                    .iter()
+                    .any(|requested| requested.eq_ignore_ascii_case(name))
+            {
+                selected.push((name.clone(), values.clone()));
+            }
+        }
+    }
+
+    if projection.include_all_operational || !projection.specific_operational.is_empty() {
+        for (name, values) in entry.operational_attributes.to_attributes() {
+            if projection.include_all_operational
+                || projection
+                    .specific_operational
+                    .iter()
+                    .any(|requested| requested.eq_ignore_ascii_case(&name))
+            {
+                selected.push((name, values));
+            }
+        }
+    }
+
+    selected
 }
 
 async fn try_handle_virtual_search_request_with_fsm_runtime(
@@ -2773,6 +3126,8 @@ fn native_search_control_oids_supported(
 
 fn build_preloaded_search_fsm(
     entries: Vec<crate::backend::DirectoryEntry>,
+    schema: &LdapSchema,
+    prepared_filter: Option<(String, PreparedLdapFilter, bool)>,
     metrics: Option<Arc<MetricsCollector>>,
     message_id: u32,
     types_only: bool,
@@ -2788,7 +3143,23 @@ fn build_preloaded_search_fsm(
     };
 
     let backend = Box::new(PreloadedSearchBackend::new(entries));
-    let filter_matcher = Box::new(ProductionFilterMatcher::new());
+    let filter_matcher = Box::new(match prepared_filter {
+        Some((filter, prepared_filter, true)) => {
+            ProductionFilterMatcher::with_index_covered_prepared_filter(
+                schema.clone(),
+                filter,
+                prepared_filter,
+            )
+        }
+        Some((filter, prepared_filter, false)) => {
+            ProductionFilterMatcher::with_schema_and_prepared_filter(
+                schema.clone(),
+                filter,
+                prepared_filter,
+            )
+        }
+        None => ProductionFilterMatcher::with_schema(schema.clone()),
+    });
     let entry_formatter = Box::new(ProductionEntryFormatter::with_request(
         message_id, types_only,
     ));
@@ -3052,10 +3423,128 @@ async fn handle_delete_request_with_fsm_runtime(
     .await
 }
 
+async fn handle_online_schema_modify_with_fsm_runtime(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    modify_req: ldap_parser::ldap::ModifyRequest<'_>,
+    schema: &SharedLdapSchema,
+    request_context: &RequestContext,
+    runtime_context: &FsmServerRuntimeContext,
+) -> Result<(), String> {
+    let session = legacy_session_from_fsm(fsm_set);
+    let backend = fsm_set.backend().clone();
+    let dn = modify_req.object.0.as_ref().trim().to_owned();
+    let modifications = convert_ldap_changes_to_modifications(&modify_req.changes);
+    let modified_attributes = modifications
+        .iter()
+        .map(|modification| modification.attribute.clone())
+        .collect::<Vec<_>>();
+
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_operation(
+            stream,
+            Some(backend.as_ref()),
+            request.message_id as u32,
+            ResponseOp::Modify,
+            &session,
+            request_context,
+            Permission::Modify,
+            "modify",
+            &dn,
+            None,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    let authorized = {
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        authorize_attribute_permissions(
+            stream,
+            backend.as_ref(),
+            request.message_id as u32,
+            ResponseOp::Modify,
+            &session,
+            request_context,
+            Permission::Modify,
+            "modify",
+            &dn,
+            &modified_attributes,
+        )
+        .await
+        .map_err(|err| err.to_string())?
+    };
+    if !authorized {
+        return Ok(());
+    }
+
+    match apply_online_schema_modify(
+        backend.as_ref(),
+        schema,
+        &runtime_context.legacy_runtime_config,
+        &session,
+        modifications,
+    )
+    .await
+    {
+        Ok(()) => {
+            log_modify_audit_event(
+                request_context,
+                &session,
+                &dn,
+                true,
+                &modified_attributes,
+                None,
+            )
+            .await;
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::Success,
+                "",
+            )
+            .await
+        }
+        Err(err) => {
+            let (result_code, diagnostic) = online_schema_update_result(&err);
+            error!("Online schema update failed for {}: {}", dn, diagnostic);
+            log_modify_audit_event(
+                request_context,
+                &session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(&diagnostic),
+            )
+            .await;
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                result_code,
+                &diagnostic,
+            )
+            .await
+        }
+    }
+}
+
 async fn handle_modify_request_with_fsm_runtime(
     fsm_set: &mut ConnectionFsmSet,
     request: &FsmRequestContext,
     modify_req: ldap_parser::ldap::ModifyRequest<'_>,
+    schema: &LdapSchema,
     request_context: &RequestContext,
     runtime_context: &FsmServerRuntimeContext,
 ) -> Result<(), String> {
@@ -3114,6 +3603,97 @@ async fn handle_modify_request_with_fsm_runtime(
         .map_err(|err| err.to_string())?
     };
     if !authorized {
+        return Ok(());
+    }
+
+    for attribute in &modified_attributes {
+        if schema.get_attribute_type(attribute).is_none() {
+            let diagnostic =
+                format!("Schema validation failed: Attribute type not found: {attribute}");
+            error!("Schema validation failed for modify {}: {}", dn, diagnostic);
+            log_modify_audit_event(
+                request_context,
+                &session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(&diagnostic),
+            )
+            .await;
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ObjectClassViolation,
+                &diagnostic,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    let existing_entry = match backend.get_entry(&dn).await {
+        Ok(Some(existing_entry)) => existing_entry,
+        Ok(None) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::NoSuchObject,
+                "no such object",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(err) => {
+            error!("Modify lookup failed for {}: {}", dn, err);
+            log_modify_audit_event(
+                request_context,
+                &session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(backend_diagnostic(&err)),
+            )
+            .await;
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                map_backend_error_code(&err),
+                backend_diagnostic(&err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let mut candidate_attributes = existing_entry.attributes.clone();
+    apply_ldap_changes_to_attributes(&mut candidate_attributes, &modify_req.changes);
+    if let Err(schema_error) =
+        schema.validate_modified_entry(&existing_entry.attributes, &candidate_attributes)
+    {
+        let diagnostic = format!("Schema validation failed: {}", schema_error);
+        error!(
+            "Schema validation failed for modify {}: {}",
+            dn, schema_error
+        );
+        log_modify_audit_event(
+            request_context,
+            &session,
+            &dn,
+            false,
+            &modified_attributes,
+            Some(&diagnostic),
+        )
+        .await;
+        send_request_result_response(
+            fsm_set,
+            request.message_id as u32,
+            request.response_kind,
+            ResultCode::ObjectClassViolation,
+            &diagnostic,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -3307,6 +3887,7 @@ async fn handle_moddn_request_with_fsm_runtime(
     fsm_set: &mut ConnectionFsmSet,
     request: &FsmRequestContext,
     rename_req: ldap_parser::ldap::ModDnRequest<'_>,
+    schema: &LdapSchema,
     request_context: &RequestContext,
     runtime_context: &FsmServerRuntimeContext,
 ) -> Result<(), String> {
@@ -3345,8 +3926,69 @@ async fn handle_moddn_request_with_fsm_runtime(
         return Ok(());
     }
 
+    let existing_entry = match backend.get_entry(&dn).await {
+        Ok(Some(existing_entry)) => existing_entry,
+        Ok(None) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::NoSuchObject,
+                "no such object",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(err) => {
+            error!("ModifyDN lookup failed for {}: {}", dn, err);
+            log_moddn_audit_event(
+                request_context,
+                &session,
+                &dn,
+                &new_dn,
+                false,
+                Some(backend_diagnostic(&err)),
+            )
+            .await;
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                map_backend_error_code(&err),
+                backend_diagnostic(&err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if let Err(schema_error) = schema.validate_rdn_for_entry(&existing_entry.attributes, &new_rdn) {
+        let diagnostic = format!("Schema validation failed: {}", schema_error);
+        error!(
+            "Schema validation failed for modifydn {}: {}",
+            dn, schema_error
+        );
+        log_moddn_audit_event(
+            request_context,
+            &session,
+            &dn,
+            &new_dn,
+            false,
+            Some(&diagnostic),
+        )
+        .await;
+        send_request_result_response(
+            fsm_set,
+            request.message_id as u32,
+            request.response_kind,
+            ResultCode::ObjectClassViolation,
+            &diagnostic,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let write_config = WriteFsmConfig {
-        strict_schema_validation: false,
+        strict_schema_validation: true,
         enable_aci_checks: false,
         enable_audit_logging: false,
         ..WriteFsmConfig::default()
@@ -3356,7 +3998,7 @@ async fn handle_moddn_request_with_fsm_runtime(
         Box::new(
             WriteBackendAdapter::new(backend).with_actor(session.bound_dn().map(str::to_string)),
         ),
-        Box::new(PassthroughSchemaValidator),
+        Box::new(LdapSchemaValidator::with_schema(schema.clone())),
         Box::new(AllowAllWriteAciChecker),
         write_config,
     );
@@ -3417,6 +4059,7 @@ async fn handle_compare_request_with_fsm_runtime(
     fsm_set: &mut ConnectionFsmSet,
     request: &FsmRequestContext,
     compare_req: ldap_parser::ldap::CompareRequest<'_>,
+    schema: &LdapSchema,
     request_context: &RequestContext,
     runtime_context: &FsmServerRuntimeContext,
 ) -> Result<(), String> {
@@ -3458,7 +4101,7 @@ async fn handle_compare_request_with_fsm_runtime(
 
     let mut compare_fsm = CompareFsmImpl::with_config(
         Box::new(CompareBackendAdapter::new(backend)),
-        Box::new(ProductionAttributeComparator::new()),
+        Box::new(ProductionAttributeComparator::with_schema(schema.clone())),
         Box::new(AllowAllCompareAccessControl),
         compare_config,
     );
@@ -3557,14 +4200,32 @@ fn compare_fsm_error_response(error: &CompareFsmError) -> (ResultCode, String) {
         CompareFsmError::AccessDenied { message } => {
             (ResultCode::InsufficientAccessRights, message.clone())
         }
-        CompareFsmError::BackendError { message }
-        | CompareFsmError::ComparisonError { message }
-        | CompareFsmError::Generic { message } => (ResultCode::Unavailable, message.clone()),
+        CompareFsmError::ComparisonError { message } => compare_schema_error_response(message)
+            .unwrap_or_else(|| (ResultCode::Unavailable, message.clone())),
+        CompareFsmError::BackendError { message } | CompareFsmError::Generic { message } => {
+            (ResultCode::Unavailable, message.clone())
+        }
         CompareFsmError::InvalidStateTransition { .. } | CompareFsmError::NoActiveCompare => {
             (ResultCode::OperationsError, error.to_string())
         }
         CompareFsmError::NoSuchAttribute { .. } => (ResultCode::CompareFalse, String::new()),
     }
+}
+
+fn compare_schema_error_response(message: &str) -> Option<(ResultCode, String)> {
+    if message.starts_with("undefined attribute type:") {
+        return Some((ResultCode::UndefinedAttributeType, message.to_string()));
+    }
+    if message.starts_with("inappropriate matching:") {
+        return Some((ResultCode::InappropriateMatching, message.to_string()));
+    }
+    if message.starts_with("invalid attribute syntax:") {
+        return Some((ResultCode::InvalidAttributeSyntax, message.to_string()));
+    }
+    if message.starts_with("invalid filter:") {
+        return Some((ResultCode::ProtocolError, message.to_string()));
+    }
+    None
 }
 
 fn write_fsm_error_response(error: &WriteFsmError) -> (ResultCode, String) {
@@ -3768,6 +4429,15 @@ fn map_backend_error_code(err: &crate::backend::BackendError) -> ResultCode {
     }
 }
 
+fn map_filter_schema_error_code(err: &FilterSchemaError) -> ResultCode {
+    match err {
+        FilterSchemaError::UndefinedAttribute(_) => ResultCode::UndefinedAttributeType,
+        FilterSchemaError::InappropriateMatching(_) => ResultCode::InappropriateMatching,
+        FilterSchemaError::InvalidAttributeSyntax(_) => ResultCode::InvalidAttributeSyntax,
+        FilterSchemaError::InvalidFilter(_) => ResultCode::ProtocolError,
+    }
+}
+
 fn backend_diagnostic(err: &crate::backend::BackendError) -> &'static str {
     match err {
         crate::backend::BackendError::AlreadyExists => "entry already exists",
@@ -3798,6 +4468,49 @@ fn encode_modify_changes_for_write_fsm(changes: &[ldap_parser::ldap::Change<'_>]
     }
 
     encoded.into_bytes()
+}
+
+fn apply_ldap_changes_to_attributes(
+    attributes: &mut HashMap<String, Vec<String>>,
+    changes: &[ldap_parser::ldap::Change<'_>],
+) {
+    for change in changes {
+        let attribute = change.modification.attr_type.0.to_ascii_lowercase();
+        let values = change
+            .modification
+            .attr_vals
+            .iter()
+            .map(|value| String::from_utf8_lossy(value.0.as_ref()).to_string())
+            .collect::<Vec<_>>();
+        match change.operation.0 {
+            0 => {
+                let existing_values = attributes.entry(attribute).or_default();
+                for value in values {
+                    if !existing_values.contains(&value) {
+                        existing_values.push(value);
+                    }
+                }
+            }
+            1 => {
+                if values.is_empty() {
+                    attributes.remove(&attribute);
+                } else if let Some(existing_values) = attributes.get_mut(&attribute) {
+                    existing_values.retain(|value| !values.contains(value));
+                    if existing_values.is_empty() {
+                        attributes.remove(&attribute);
+                    }
+                }
+            }
+            2 => {
+                if values.is_empty() {
+                    attributes.remove(&attribute);
+                } else {
+                    attributes.insert(attribute, values);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn encode_add_entry_for_write_fsm(entry: &crate::backend::DirectoryEntry) -> Vec<u8> {
@@ -4456,11 +5169,11 @@ async fn handle_sasl_bind_with_fsm(
         return Ok(());
     }
 
-    let (authzid, authcid, password) = match credentials
+    let parsed = match credentials
         .credentials
         .as_deref()
         .ok_or_else(|| "SASL PLAIN requires credentials".to_string())
-        .and_then(crate::sasl_mechanisms::MultiMechanismHandler::parse_plain_credentials)
+        .and_then(crate::sasl_mechanisms::MultiMechanismHandler::parse_plain_credentials_ref)
     {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -4481,7 +5194,7 @@ async fn handle_sasl_bind_with_fsm(
     };
 
     let bind_dn = if request_name.is_empty() {
-        authcid.clone()
+        parsed.authcid.to_owned()
     } else {
         request_name
     };
@@ -4508,7 +5221,7 @@ async fn handle_sasl_bind_with_fsm(
         return Ok(());
     }
 
-    if !authzid.is_empty() && !authzid.eq_ignore_ascii_case(&bind_dn) {
+    if !parsed.authzid.is_empty() && !parsed.authzid.eq_ignore_ascii_case(&bind_dn) {
         if let Some(metrics) = metrics {
             metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
         }
@@ -4532,7 +5245,7 @@ async fn handle_sasl_bind_with_fsm(
 
     let auth_event = AuthEvent::BindRequest {
         dn: bind_dn.clone(),
-        password,
+        password: parsed.password.to_vec(),
     };
 
     match fsm_set.auth_mut() {
@@ -4872,6 +5585,22 @@ fn record_resource_event(runtime_context: &FsmServerRuntimeContext, event: Resou
     }
 }
 
+fn log_connection_failure(context: &str, client_addr: SocketAddr, error: &str) {
+    if expected_peer_disconnect_error(error) {
+        debug!("{context} for {client_addr:?}: {error}");
+    } else {
+        error!("{context} for {client_addr:?}: {error}");
+    }
+}
+
+fn expected_peer_disconnect_error(error: &str) -> bool {
+    error.contains("Connection reset by peer")
+        || error.contains("tls handshake eof")
+        || error.contains("Broken pipe")
+        || error.contains("connection closed")
+        || error.contains("unexpected eof")
+}
+
 async fn audit_connection_accepted(
     runtime_context: &FsmServerRuntimeContext,
     client_ip: IpAddr,
@@ -5102,18 +5831,39 @@ mod tests {
     }
 
     fn sasl_plain_bind_request(bind_dn: &str, password: &[u8]) -> BindRequest<'static> {
+        sasl_plain_bind_request_with_authzid(bind_dn, "", bind_dn, password)
+    }
+
+    fn sasl_plain_bind_request_with_authzid(
+        request_dn: &str,
+        authzid: &str,
+        authcid: &str,
+        password: &[u8],
+    ) -> BindRequest<'static> {
         let mut credentials = Vec::new();
+        credentials.extend_from_slice(authzid.as_bytes());
         credentials.push(0);
-        credentials.extend_from_slice(bind_dn.as_bytes());
+        credentials.extend_from_slice(authcid.as_bytes());
         credentials.push(0);
         credentials.extend_from_slice(password);
 
         BindRequest {
             version: 3,
-            name: LdapDN(Cow::Owned(bind_dn.to_string())),
+            name: LdapDN(Cow::Owned(request_dn.to_string())),
             authentication: AuthenticationChoice::Sasl(SaslCredentials {
                 mechanism: LdapString(Cow::Owned("PLAIN".to_string())),
                 credentials: Some(Cow::Owned(credentials)),
+            }),
+        }
+    }
+
+    fn malformed_sasl_plain_bind_request(bind_dn: &str) -> BindRequest<'static> {
+        BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned(bind_dn.to_string())),
+            authentication: AuthenticationChoice::Sasl(SaslCredentials {
+                mechanism: LdapString(Cow::Owned("PLAIN".to_string())),
+                credentials: Some(Cow::Owned(b"\0missing-password-delimiter".to_vec())),
             }),
         }
     }
@@ -5493,6 +6243,7 @@ mod tests {
                 backend,
                 config,
                 runtime_context,
+                shared_schema(LdapSchema::with_core_schema()),
                 pool.clone(),
                 conn_id,
                 client_ip,
@@ -7230,6 +7981,75 @@ mod tests {
                 assert_eq!(
                     bind_response.result.result_code,
                     ParserResultCode::InvalidCredentials
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_bind_with_fsm_rejects_malformed_sasl_plain_credentials() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut fsm_set = ConnectionFsmSet::new(server_stream, backend, None);
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            37,
+            malformed_sasl_plain_bind_request("cn=admin,dc=example,dc=org"),
+            true,
+            &RequestContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(fsm_set.authenticated_dn(), None);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(
+                    bind_response.result.result_code,
+                    ParserResultCode::InvalidCredentials
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_bind_with_fsm_rejects_sasl_plain_proxy_authorization() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut fsm_set = ConnectionFsmSet::new(server_stream, backend, None);
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            38,
+            sasl_plain_bind_request_with_authzid(
+                "cn=admin,dc=example,dc=org",
+                "cn=other,dc=example,dc=org",
+                "cn=admin,dc=example,dc=org",
+                b"secret",
+            ),
+            true,
+            &RequestContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(fsm_set.authenticated_dn(), None);
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(
+                    bind_response.result.result_code,
+                    ParserResultCode::InappropriateAuthentication
                 );
             }
             other => panic!("unexpected response: {:?}", other),

@@ -71,6 +71,10 @@ indexed_attributes = ["cn", "uid", "mail", "objectClass"]
 [[backend.indexes]]
 attribute = "cn"
 types = ["substring"]
+
+[[backend.indexes]]
+attribute = "exampleScore"
+types = ["equality", "ordering"]
 ```
 
 | Key | Default | Notes |
@@ -83,6 +87,13 @@ types = ["substring"]
 | `indexed_attributes` | `["cn", "uid", "mail", "objectClass"]` | Each gets equality and presence indexes |
 | `[[backend.indexes]].attribute` | none | Attribute for typed index config |
 | `[[backend.indexes]].types` | none | `equality`, `presence`, `substring`, `ordering` or aliases |
+
+Typed indexes are validated against the loaded schema. Equality indexes require
+an equality matching rule, substring indexes require a substring matching rule,
+and ordering indexes require an ordering matching rule. LMDB stores index keys
+using the matching-rule normalized value for the configured index type. Startup
+backfills an index when the configured index types or resolved matching-rule OIDs
+change.
 
 Typed index aliases:
 
@@ -367,6 +378,43 @@ subject = { all_authenticated = true }
 Each rule target sets one of `dn`, `subtree`, or `attributes`, or combines
 `attributes` with `dn` or `subtree`. Each subject sets exactly one of `user`,
 `group`, `all_authenticated`, `all`, or `self_entry`.
+
+## Schema
+
+```toml
+[schema]
+enabled = true
+schema_dir = "config/schema"
+load_builtin = ["core"]
+strict_validation = true
+allow_online_updates = false
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `true` | Loads the built-in and external LDAP schema registry |
+| `schema_dir` | `config/schema` | Directory containing `.ldif`, `.schema`, or `.conf` schema definition files |
+| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files |
+| `strict_validation` | `true` | Treats malformed schema files as startup errors |
+| `allow_online_updates` | `false` | Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into `schema_dir/99-online.ldif` |
+
+Schema files use RFC-style subschema attributes:
+
+```ldif
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.20.1 NAME 'exampleEmployeeNumber' DESC 'Example employee number' EQUALITY integerMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.20.2 NAME 'exampleAccessCode' DESC 'Example access code' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.20.6 NAME 'exampleScore' DESC 'Example integer score' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.20.8 NAME 'exampleExactCode' DESC 'Example case exact code' EQUALITY caseExactMatch SUBSTR caseExactSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+objectClasses: ( 1.3.6.1.4.1.55555.20.100 NAME 'exampleEmployee' DESC 'Example employee entry' SUP inetOrgPerson STRUCTURAL MUST ( exampleEmployeeNumber $ exampleAccessCode ) MAY ( exampleScore $ exampleExactCode ) )
+```
+
+Validate schema changes before restart:
+
+```bash
+opendr --config config/server.toml schema validate
+opendr --config config/server.toml schema explain exampleEmployeeNumber
+```
 
 ## Performance
 

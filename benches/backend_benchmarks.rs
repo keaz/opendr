@@ -6,11 +6,14 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
-use opendr::backend_lmdb::LmdbBackend;
+use opendr::backend::{
+    DirectoryBackend, DirectoryEntry, MockBackend, SearchCandidateHint, SearchSubstringPart,
+};
+use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBackend};
+use opendr::schema::LdapSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 fn setup_mock_backend() -> Arc<MockBackend> {
     let backend = Arc::new(MockBackend::default());
@@ -63,6 +66,79 @@ fn setup_lmdb_backend() -> Arc<LmdbBackend> {
     });
 
     backend
+}
+
+fn setup_lmdb_indexed_backend() -> (TempDir, Arc<LmdbBackend>) {
+    let dir = tempdir().unwrap();
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(
+            "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.250.1 NAME 'benchmarkOrder' DESC 'Benchmark integer ordering key' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+objectClasses: ( 1.3.6.1.4.1.55555.250.2 NAME 'benchmarkIndexedObject' DESC 'Benchmark auxiliary object class for index probes' SUP top AUXILIARY MAY benchmarkOrder )
+",
+        )
+        .unwrap();
+    let backend = Arc::new(
+        LmdbBackend::new_with_schema_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: vec!["uid".to_string(), "mail".to_string()],
+                attribute_indexes: vec![
+                    AttributeIndexConfig {
+                        attribute: "description".to_string(),
+                        index_types: vec![IndexType::Substring],
+                    },
+                    AttributeIndexConfig {
+                        attribute: "benchmarkOrder".to_string(),
+                        index_types: vec![IndexType::Ordering],
+                    },
+                ],
+            },
+            &schema,
+        )
+        .unwrap(),
+    );
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        for i in 0..1000 {
+            let mut attributes = HashMap::new();
+            attributes.insert(
+                "objectclass".to_string(),
+                vec![
+                    "top".to_string(),
+                    "person".to_string(),
+                    "benchmarkIndexedObject".to_string(),
+                ],
+            );
+            attributes.insert("cn".to_string(), vec![format!("Fixture User {i:06}")]);
+            attributes.insert("sn".to_string(), vec![format!("User {i:06}")]);
+            attributes.insert("uid".to_string(), vec![format!("perfbench-user-{i:06}")]);
+            attributes.insert(
+                "mail".to_string(),
+                vec![format!("perfbench-user-{i:06}@example.org")],
+            );
+            attributes.insert(
+                "description".to_string(),
+                vec![format!("fixture user {i:06} indexed search benchmark")],
+            );
+            attributes.insert("benchmarkOrder".to_string(), vec![i.to_string()]);
+
+            let entry = DirectoryEntry::new(
+                format!("uid=perfbench-user-{i:06},ou=people,dc=example,dc=org"),
+                attributes,
+            );
+            backend
+                .add_entry(entry, format!("password{i}").as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+    });
+
+    (dir, backend)
 }
 
 fn bench_read_operations(c: &mut Criterion) {
@@ -176,10 +252,86 @@ fn bench_search_operations(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lmdb_indexed_search_hints(c: &mut Criterion) {
+    use ldap_parser::ldap::SearchScope;
+
+    let mut group = c.benchmark_group("lmdb_indexed_search_hints");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dir, backend) = setup_lmdb_indexed_backend();
+    let base_dn = "ou=people,dc=example,dc=org";
+    let scope = SearchScope(2);
+
+    let equality_hint = Some(SearchCandidateHint::Equality {
+        attribute: "uid".to_string(),
+        value: "perfbench-user-000500".to_string(),
+    });
+    group.bench_function("equality_uid", |b| {
+        b.iter(|| {
+            let backend = backend.clone();
+            let hint = equality_hint.clone();
+            rt.block_on(async move {
+                let _ = backend
+                    .search_entries_with_hint(black_box(base_dn), black_box(scope), hint)
+                    .await;
+            })
+        });
+    });
+
+    let presence_hint = Some(SearchCandidateHint::Present {
+        attribute: "mail".to_string(),
+    });
+    group.bench_function("presence_mail", |b| {
+        b.iter(|| {
+            let backend = backend.clone();
+            let hint = presence_hint.clone();
+            rt.block_on(async move {
+                let _ = backend
+                    .search_entries_with_hint(black_box(base_dn), black_box(scope), hint)
+                    .await;
+            })
+        });
+    });
+
+    let substring_hint = Some(SearchCandidateHint::Substring {
+        attribute: "description".to_string(),
+        parts: vec![SearchSubstringPart::Any("fixture user 000500".to_string())],
+    });
+    group.bench_function("substring_description", |b| {
+        b.iter(|| {
+            let backend = backend.clone();
+            let hint = substring_hint.clone();
+            rt.block_on(async move {
+                let _ = backend
+                    .search_entries_with_hint(black_box(base_dn), black_box(scope), hint)
+                    .await;
+            })
+        });
+    });
+
+    let ordering_hint = Some(SearchCandidateHint::GreaterOrEqual {
+        attribute: "benchmarkOrder".to_string(),
+        value: "500".to_string(),
+    });
+    group.bench_function("ordering_benchmark_order_ge", |b| {
+        b.iter(|| {
+            let backend = backend.clone();
+            let hint = ordering_hint.clone();
+            rt.block_on(async move {
+                let _ = backend
+                    .search_entries_with_hint(black_box(base_dn), black_box(scope), hint)
+                    .await;
+            })
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read_operations,
     bench_authentication,
-    bench_search_operations
+    bench_search_operations,
+    bench_lmdb_indexed_search_hints
 );
 criterion_main!(benches);

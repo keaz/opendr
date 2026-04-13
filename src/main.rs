@@ -3,7 +3,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use opendr::aci::AciEngine;
 use opendr::audit::{AuditConfig, AuditFormat, AuditLevel, AuditLogger};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
@@ -29,6 +29,38 @@ struct Args {
 
     #[arg(long, default_value = "config/log4rs.yml")]
     log_config: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Manage LDAP schema files and registry output.
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// Validate configured or supplied schema files.
+    Validate {
+        #[arg(long)]
+        schema_dir: Option<PathBuf>,
+    },
+    /// Print the effective schema in RFC subschema attribute format.
+    Dump {
+        #[arg(long)]
+        schema_dir: Option<PathBuf>,
+    },
+    /// Show one schema element by descriptor or OID.
+    Explain {
+        name_or_oid: String,
+        #[arg(long)]
+        schema_dir: Option<PathBuf>,
+    },
 }
 
 fn parse_audit_level(level: &str) -> Result<AuditLevel, Box<dyn Error>> {
@@ -110,6 +142,63 @@ fn main() -> Result<(), Box<dyn Error>> {
     tokio::runtime::Runtime::new()?.block_on(run(args))
 }
 
+fn run_cli_command(mut config: ServerConfig, command: Command) -> Result<(), Box<dyn Error>> {
+    match command {
+        Command::Schema { command } => {
+            let schema_dir = match &command {
+                SchemaCommand::Validate { schema_dir }
+                | SchemaCommand::Dump { schema_dir }
+                | SchemaCommand::Explain { schema_dir, .. } => schema_dir.clone(),
+            };
+            if let Some(schema_dir) = schema_dir {
+                config.schema.schema_dir = schema_dir;
+            }
+            config.validate()?;
+            let schema = config.load_schema()?;
+            config.validate_indexes_against_schema(&schema)?;
+
+            match command {
+                SchemaCommand::Validate { .. } => {
+                    println!("Schema is valid");
+                }
+                SchemaCommand::Dump { .. } => {
+                    for value in schema.attribute_type_descriptions_unique_sorted() {
+                        println!("attributeTypes: {}", value);
+                    }
+                    for value in schema.object_class_descriptions_unique_sorted() {
+                        println!("objectClasses: {}", value);
+                    }
+                    for value in schema.ldap_syntax_descriptions_unique_sorted() {
+                        println!("ldapSyntaxes: {}", value);
+                    }
+                    for value in schema.matching_rule_descriptions_unique_sorted() {
+                        println!("matchingRules: {}", value);
+                    }
+                    for value in schema.matching_rule_use_descriptions_unique_sorted() {
+                        println!("matchingRuleUse: {}", value);
+                    }
+                    for value in schema.dit_content_rule_descriptions_unique_sorted() {
+                        println!("dITContentRules: {}", value);
+                    }
+                    for value in schema.name_form_descriptions_unique_sorted() {
+                        println!("nameForms: {}", value);
+                    }
+                    for value in schema.dit_structure_rule_descriptions_unique_sorted() {
+                        println!("dITStructureRules: {}", value);
+                    }
+                }
+                SchemaCommand::Explain { name_or_oid, .. } => {
+                    let Some(description) = schema.explain(&name_or_oid) else {
+                        return Err(format!("schema element not found: {}", name_or_oid).into());
+                    };
+                    println!("{}", description);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     log4rs::init_file(&args.log_config, Default::default()).unwrap();
 
@@ -117,10 +206,18 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let config_path = args.config.to_string_lossy();
     let config = ServerConfig::from_file(&config_path)?;
 
+    if let Some(command) = args.command {
+        return run_cli_command(config, command);
+    }
+
     // Validate configuration
     config.validate()?;
     config.validate_for_shipped_binary()?;
     let root_password = config.resolved_root_password()?;
+    let schema = config.load_schema()?;
+    config.validate_indexes_against_schema(&schema)?;
+    let schema_for_indexes = schema.clone();
+    let schema = server::shared_schema(schema);
 
     // Create shutdown coordinator
     let shutdown_config = ShutdownConfig::default();
@@ -191,13 +288,14 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
                     "LMDB entry cache capacity: {}",
                     config.performance.cache_size
                 );
-                let mut backend = LmdbBackend::new_with_runtime_and_cache_config(
+                let mut backend = LmdbBackend::new_with_runtime_and_cache_config_with_schema(
                     &config.backend.data_directory,
                     max_size_mb,
                     replica_id,
                     index_config,
                     config.backend.lmdb_max_readers,
                     config.performance.cache_size,
+                    &schema_for_indexes,
                 )?;
                 backend.set_metrics(monitoring_metrics.clone());
 
@@ -440,10 +538,11 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let ldap_tls_handler = tls_handler.clone();
     let ldap_security = legacy_security_config.clone();
     let ldap_shutdown = shutdown.clone();
+    let ldap_schema = schema.clone();
     let ldap_server_task = tokio::spawn(async move {
         let result = match selected_runtime.as_str() {
             "legacy" => {
-                server::run_with_metrics_and_config_with_tls_and_security(
+                server::run_with_metrics_and_config_with_tls_and_security_and_shared_schema(
                     &bind_addr,
                     ldap_backend,
                     ldap_shutdown_rx,
@@ -451,6 +550,7 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
                     ldap_runtime_config,
                     ldap_tls_handler,
                     ldap_security,
+                    ldap_schema.clone(),
                 )
                 .await
             }
@@ -460,6 +560,7 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
                     ldap_backend,
                     ldap_fsm_runtime_config,
                     ldap_fsm_runtime_context,
+                    ldap_schema.clone(),
                     Some(ldap_shutdown),
                 )
                 .await
@@ -491,11 +592,12 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
             let ldaps_security = legacy_security_config.clone();
             let ldaps_runtime = config.server.runtime.clone();
             let ldaps_shutdown = shutdown.clone();
+            let ldaps_schema = schema.clone();
             println!("Starting LDAPS server on {}", ldaps_bind_addr);
             Some(tokio::spawn(async move {
                 let result = match ldaps_runtime.as_str() {
                     "legacy" => {
-                        server::run_tls_with_metrics_and_config_and_security(
+                        server::run_tls_with_metrics_and_config_and_security_and_shared_schema(
                             &ldaps_bind_addr,
                             ldaps_backend,
                             ldaps_shutdown_rx,
@@ -503,6 +605,7 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
                             ldaps_runtime_config,
                             tls_handler,
                             ldaps_security,
+                            ldaps_schema.clone(),
                         )
                         .await
                     }
@@ -512,6 +615,7 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
                             ldaps_backend,
                             ldaps_fsm_runtime_config,
                             ldaps_fsm_runtime_context,
+                            ldaps_schema.clone(),
                             Some(ldaps_shutdown),
                         )
                         .await

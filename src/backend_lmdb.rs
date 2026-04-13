@@ -23,7 +23,8 @@
 //! - Indexed attribute lookups
 //! - DN normalization for fast case-insensitive searches
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,10 +39,11 @@ use tokio::sync::RwLock;
 
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
-    SearchCandidateHint, SearchSubstringPart,
+    SearchCandidateHint, SearchEntriesWithHintReport, SearchSubstringPart,
 };
 use crate::csn::CsnGenerator;
 use crate::metrics::MetricsCollector;
+use crate::schema::{LdapSchema, ResolvedMatchingRule};
 
 const LMDB_SET_RANGE_OP: u32 = 17;
 const DEFAULT_ENTRY_CACHE_CAPACITY: usize = 1000;
@@ -49,6 +51,7 @@ const PRESENCE_INDEX_VALUE_SENTINEL: &str = "\0present";
 const SUBSTRING_INDEX_KEY_PREFIX: &str = "\0sub\0";
 const ORDERING_INDEX_KEY_PREFIX: &str = "\0ord\0";
 const SUBSTRING_INDEX_TOKEN_LEN: usize = 3;
+const SUBSTRING_QUERY_MAX_TOKENS: usize = 2;
 const ATTRIBUTE_INDEX_VERSION: &[u8] = b"1";
 const ATTRIBUTE_INDEX_CONFIG_METADATA_KEY: &str = "attribute_indexes_v1:configured";
 
@@ -439,7 +442,7 @@ impl IndexConfig {
         let mut indexes = BTreeMap::new();
 
         for attribute in &self.indexed_attributes {
-            let attribute = attribute.to_lowercase();
+            let attribute = ldap_attribute_key(attribute).into_owned();
             if attribute.is_empty() {
                 continue;
             }
@@ -449,7 +452,7 @@ impl IndexConfig {
         }
 
         for configured in &self.attribute_indexes {
-            let attribute = configured.attribute.to_lowercase();
+            let attribute = ldap_attribute_key(&configured.attribute).into_owned();
             if attribute.is_empty() {
                 continue;
             }
@@ -462,17 +465,259 @@ impl IndexConfig {
         indexes.retain(|_, index_types| !index_types.is_empty());
         indexes
     }
+}
 
-    fn index_types_for(&self, attribute: &str) -> Option<BTreeSet<IndexType>> {
-        self.effective_index_types()
-            .get(&attribute.to_lowercase())
-            .cloned()
+#[derive(Debug, Clone)]
+struct IndexPlan {
+    attributes: BTreeMap<String, AttributeIndexPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct AttributeIndexPlan {
+    attribute: String,
+    index_types: BTreeSet<IndexType>,
+    equality_rule: Option<ResolvedMatchingRule>,
+    substring_rule: Option<ResolvedMatchingRule>,
+    ordering_rule: Option<ResolvedMatchingRule>,
+}
+
+struct SubstringIndexCandidates {
+    attribute: String,
+    normalized_parts: Vec<SearchSubstringPart>,
+    dns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeIndexReadiness {
+    pub attribute: String,
+    pub index_types: Vec<IndexType>,
+    pub ready: bool,
+}
+
+impl IndexPlan {
+    fn from_config(
+        index_config: &IndexConfig,
+        schema: Option<&LdapSchema>,
+    ) -> Result<Self, BackendError> {
+        if schema.is_none() {
+            return Ok(Self::legacy_from_config(index_config));
+        }
+
+        let mut attributes = BTreeMap::new();
+
+        for (attribute, index_types) in index_config.effective_index_types() {
+            if let Some(schema) = schema
+                && schema.get_attribute_type(&attribute).is_none()
+            {
+                return Err(BackendError::Storage(format!(
+                    "invalid index plan for {}: attribute is not defined in schema",
+                    attribute
+                )));
+            }
+            let equality_rule = if index_types.contains(&IndexType::Equality) {
+                Some(Self::resolve_index_rule(
+                    schema,
+                    &attribute,
+                    IndexType::Equality,
+                )?)
+            } else {
+                None
+            };
+            let substring_rule = if index_types.contains(&IndexType::Substring) {
+                Some(Self::resolve_index_rule(
+                    schema,
+                    &attribute,
+                    IndexType::Substring,
+                )?)
+            } else {
+                None
+            };
+            let ordering_rule = if index_types.contains(&IndexType::Ordering) {
+                Some(Self::resolve_index_rule(
+                    schema,
+                    &attribute,
+                    IndexType::Ordering,
+                )?)
+            } else {
+                None
+            };
+
+            attributes.insert(
+                attribute.clone(),
+                AttributeIndexPlan {
+                    attribute,
+                    index_types,
+                    equality_rule,
+                    substring_rule,
+                    ordering_rule,
+                },
+            );
+        }
+
+        Ok(Self { attributes })
+    }
+
+    fn resolve_index_rule(
+        schema: Option<&LdapSchema>,
+        attribute: &str,
+        index_type: IndexType,
+    ) -> Result<ResolvedMatchingRule, BackendError> {
+        let Some(schema) = schema else {
+            return Err(BackendError::Storage(
+                "schema is required to resolve matching-rule index plans".to_string(),
+            ));
+        };
+
+        let rule = match index_type {
+            IndexType::Equality => schema.equality_rule_for_attribute(attribute),
+            IndexType::Substring => schema.substring_rule_for_attribute(attribute),
+            IndexType::Ordering => schema.ordering_rule_for_attribute(attribute),
+            IndexType::Presence => unreachable!("presence indexes do not use matching rules"),
+        }
+        .map_err(|err| {
+            BackendError::Storage(format!(
+                "invalid {} index plan for {}: {}",
+                index_type.label(),
+                attribute,
+                err
+            ))
+        })?;
+
+        if !rule.is_supported() {
+            return Err(BackendError::Storage(format!(
+                "unsupported matching rule {} for {} {} index",
+                rule.primary_name,
+                attribute,
+                index_type.label()
+            )));
+        }
+
+        Ok(rule)
+    }
+
+    fn legacy_from_config(index_config: &IndexConfig) -> Self {
+        Self {
+            attributes: index_config
+                .effective_index_types()
+                .into_iter()
+                .map(|(attribute, index_types)| {
+                    (
+                        attribute.clone(),
+                        AttributeIndexPlan {
+                            attribute,
+                            index_types,
+                            equality_rule: None,
+                            substring_rule: None,
+                            ordering_rule: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn attribute_names(&self) -> impl Iterator<Item = &String> {
+        self.attributes.keys()
+    }
+
+    fn attribute_plan(&self, attribute: &str) -> Option<&AttributeIndexPlan> {
+        let attribute = ldap_attribute_key(attribute);
+        self.attributes.get(attribute.as_ref())
+    }
+
+    fn attribute_plan_normalized(&self, attribute: &str) -> Option<&AttributeIndexPlan> {
+        self.attributes.get(attribute)
     }
 
     fn has_index_type(&self, attribute: &str, index_type: IndexType) -> bool {
-        self.effective_index_types()
-            .get(&attribute.to_lowercase())
-            .is_some_and(|index_types| index_types.contains(&index_type))
+        self.attribute_plan(attribute)
+            .is_some_and(|plan| plan.index_types.contains(&index_type))
+    }
+
+    fn config_value(&self) -> String {
+        self.attributes
+            .iter()
+            .map(|(attribute, plan)| {
+                let labels = plan
+                    .index_types
+                    .iter()
+                    .map(|index_type| match index_type {
+                        IndexType::Equality => format!(
+                            "{}={}",
+                            index_type.label(),
+                            plan.equality_rule
+                                .as_ref()
+                                .map(|rule| rule.oid.as_str())
+                                .unwrap_or("legacy")
+                        ),
+                        IndexType::Substring => format!(
+                            "{}={}",
+                            index_type.label(),
+                            plan.substring_rule
+                                .as_ref()
+                                .map(|rule| rule.oid.as_str())
+                                .unwrap_or("legacy")
+                        ),
+                        IndexType::Ordering => format!(
+                            "{}={}",
+                            index_type.label(),
+                            plan.ordering_rule
+                                .as_ref()
+                                .map(|rule| rule.oid.as_str())
+                                .unwrap_or("legacy")
+                        ),
+                        IndexType::Presence => index_type.label().to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{attribute}:{labels}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl AttributeIndexPlan {
+    fn normalize_equality_value(&self, value: &str) -> Result<String, BackendError> {
+        normalize_index_value(self.equality_rule.as_ref(), value)
+    }
+
+    fn normalize_substring_value(&self, value: &str) -> Result<String, BackendError> {
+        normalize_index_value(self.substring_rule.as_ref(), value)
+    }
+
+    fn normalize_ordering_value(&self, value: &str) -> Result<String, BackendError> {
+        if let Some(rule) = self.ordering_rule.as_ref() {
+            rule.ordering_key(value).map_err(|err| {
+                BackendError::Storage(format!(
+                    "invalid ordering index value for {}: {}",
+                    self.attribute, err
+                ))
+            })
+        } else {
+            Ok(value.to_lowercase())
+        }
+    }
+}
+
+fn normalize_index_value(
+    rule: Option<&ResolvedMatchingRule>,
+    value: &str,
+) -> Result<String, BackendError> {
+    if let Some(rule) = rule {
+        rule.normalize_value(value).map_err(|err| {
+            BackendError::Storage(format!("invalid matching-rule index value: {}", err))
+        })
+    } else {
+        Ok(value.to_lowercase())
+    }
+}
+
+fn ldap_attribute_key(attribute: &str) -> Cow<'_, str> {
+    if attribute.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(attribute.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(attribute)
     }
 }
 
@@ -490,8 +735,8 @@ pub struct LmdbBackend {
     metadata_db: Database,
     /// Attribute indexes: one database per indexed attribute
     attr_indexes: Arc<RwLock<HashMap<String, Database>>>,
-    /// Index configuration
-    index_config: IndexConfig,
+    /// Effective schema-aware index plan.
+    index_plan: IndexPlan,
     /// Lock for write operations (reads are lock-free in LMDB)
     write_lock: Arc<RwLock<()>>,
     /// Bounded cache for hot exact-DN reads.
@@ -545,6 +790,24 @@ impl LmdbBackend {
         Self::new_with_runtime_config(path, max_size_mb, replica_id, index_config, 126)
     }
 
+    pub fn new_with_schema_config<P: AsRef<Path>>(
+        path: P,
+        max_size_mb: usize,
+        replica_id: u16,
+        index_config: IndexConfig,
+        schema: &LdapSchema,
+    ) -> Result<Self, BackendError> {
+        Self::new_with_runtime_and_cache_config_with_schema(
+            path,
+            max_size_mb,
+            replica_id,
+            index_config,
+            126,
+            DEFAULT_ENTRY_CACHE_CAPACITY,
+            schema,
+        )
+    }
+
     pub fn new_with_runtime_config<P: AsRef<Path>>(
         path: P,
         max_size_mb: usize,
@@ -562,6 +825,27 @@ impl LmdbBackend {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_runtime_and_cache_config_with_schema<P: AsRef<Path>>(
+        path: P,
+        max_size_mb: usize,
+        replica_id: u16,
+        index_config: IndexConfig,
+        max_readers: u32,
+        entry_cache_capacity: usize,
+        schema: &LdapSchema,
+    ) -> Result<Self, BackendError> {
+        Self::new_with_runtime_and_cache_config_internal(
+            path,
+            max_size_mb,
+            replica_id,
+            index_config,
+            max_readers,
+            entry_cache_capacity,
+            Some(schema),
+        )
+    }
+
     pub fn new_with_runtime_and_cache_config<P: AsRef<Path>>(
         path: P,
         max_size_mb: usize,
@@ -570,7 +854,28 @@ impl LmdbBackend {
         max_readers: u32,
         entry_cache_capacity: usize,
     ) -> Result<Self, BackendError> {
+        Self::new_with_runtime_and_cache_config_internal(
+            path,
+            max_size_mb,
+            replica_id,
+            index_config,
+            max_readers,
+            entry_cache_capacity,
+            None,
+        )
+    }
+
+    fn new_with_runtime_and_cache_config_internal<P: AsRef<Path>>(
+        path: P,
+        max_size_mb: usize,
+        replica_id: u16,
+        index_config: IndexConfig,
+        max_readers: u32,
+        entry_cache_capacity: usize,
+        schema: Option<&LdapSchema>,
+    ) -> Result<Self, BackendError> {
         let db_path = path.as_ref().to_path_buf();
+        let index_plan = IndexPlan::from_config(&index_config, schema)?;
 
         // Create directory if it doesn't exist
         std::fs::create_dir_all(&db_path)
@@ -604,11 +909,9 @@ impl LmdbBackend {
             .create_db(Some("metadata"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create metadata db: {}", e)))?;
 
-        let effective_index_types = index_config.effective_index_types();
-
         // Create attribute index databases.
         let mut attr_indexes = HashMap::new();
-        for attr in effective_index_types.keys() {
+        for attr in index_plan.attribute_names() {
             let db_name = format!("idx_{}", attr);
             let db = env
                 .create_db(Some(&db_name), lmdb::DatabaseFlags::empty())
@@ -623,7 +926,7 @@ impl LmdbBackend {
             entries_db,
             metadata_db,
             &attr_indexes,
-            &effective_index_types,
+            &index_plan,
         )?;
 
         // Initialize CSN generator with replica ID
@@ -636,7 +939,7 @@ impl LmdbBackend {
             dn_index_db,
             metadata_db,
             attr_indexes: Arc::new(RwLock::new(attr_indexes)),
-            index_config,
+            index_plan,
             write_lock: Arc::new(RwLock::new(())),
             entry_cache: Arc::new(EntryCache::new(entry_cache_capacity)),
             auth_cache: Arc::new(AuthCredentialCache::new(entry_cache_capacity)),
@@ -757,11 +1060,21 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
         let mut entry: StoredEntry = bincode::deserialize(entry_bytes)
             .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
-        let old_attributes = entry.attributes.clone();
+        let indexed_modified_attributes = modifications
+            .iter()
+            .map(|modification| ldap_attribute_key(&modification.attribute).into_owned())
+            .filter(|attribute| {
+                self.index_plan
+                    .attribute_plan_normalized(attribute)
+                    .is_some()
+            })
+            .collect::<HashSet<_>>();
+        let old_attributes =
+            (!indexed_modified_attributes.is_empty()).then(|| entry.attributes.clone());
         let mut password_touched = false;
 
         for modification in modifications {
-            let attribute = modification.attribute.to_lowercase();
+            let attribute = ldap_attribute_key(&modification.attribute).into_owned();
             if attribute == "userpassword" {
                 password_touched = true;
             }
@@ -841,8 +1154,20 @@ impl LmdbBackend {
             }
         }
 
-        self.remove_attribute_indexes(&mut txn, &entry.dn, &old_attributes)?;
-        self.update_attribute_indexes(&mut txn, &entry.dn, &entry.attributes)?;
+        if let Some(old_attributes) = old_attributes.as_ref() {
+            self.remove_attribute_indexes_for_filter(
+                &mut txn,
+                &entry.dn,
+                old_attributes,
+                Some(&indexed_modified_attributes),
+            )?;
+            self.update_attribute_indexes_for_filter(
+                &mut txn,
+                &entry.dn,
+                &entry.attributes,
+                Some(&indexed_modified_attributes),
+            )?;
+        }
 
         let csn_string = csn.to_ldap_string();
         txn.put(
@@ -926,11 +1251,12 @@ impl LmdbBackend {
             .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
 
         if delete_old && let Some((attr, _)) = actual_dn.split_once('=') {
-            new_entry.attributes.remove(&attr.trim().to_lowercase());
+            let attr = ldap_attribute_key(attr.trim());
+            new_entry.attributes.remove(attr.as_ref());
         }
 
         if let Some((attr, val)) = new_rdn.split_once('=') {
-            let attr_lower = attr.trim().to_lowercase();
+            let attr_lower = ldap_attribute_key(attr.trim()).into_owned();
             let val_str = val.trim().to_string();
             new_entry
                 .attributes
@@ -1212,14 +1538,52 @@ impl LmdbBackend {
 
     /// Check if DN is in search scope
     fn entry_in_scope(dn: &str, base_dn: &str, scope: SearchScope) -> bool {
-        let mut dn_components = dn.split(',').rev().map(str::trim).filter(|c| !c.is_empty());
+        if scope == SearchScope(2) {
+            return Self::entry_in_subtree_scope(dn, base_dn);
+        }
 
-        for base_component in base_dn
+        let base_components = Self::scope_base_components(base_dn);
+        Self::entry_in_scope_with_base_components(dn, &base_components, scope)
+    }
+
+    fn entry_in_subtree_scope(dn: &str, base_dn: &str) -> bool {
+        let base_dn = base_dn.trim();
+        if base_dn.is_empty() {
+            return true;
+        }
+
+        let dn = dn.trim();
+        let dn_bytes = dn.as_bytes();
+        let base_bytes = base_dn.as_bytes();
+        if dn_bytes.len() < base_bytes.len() {
+            return false;
+        }
+
+        let suffix_start = dn_bytes.len() - base_bytes.len();
+        if !dn_bytes[suffix_start..].eq_ignore_ascii_case(base_bytes) {
+            return false;
+        }
+
+        suffix_start == 0 || dn_bytes.get(suffix_start - 1) == Some(&b',')
+    }
+
+    fn scope_base_components(base_dn: &str) -> Vec<&str> {
+        base_dn
             .split(',')
             .rev()
             .map(str::trim)
-            .filter(|c| !c.is_empty())
-        {
+            .filter(|component| !component.is_empty())
+            .collect()
+    }
+
+    fn entry_in_scope_with_base_components(
+        dn: &str,
+        base_components: &[&str],
+        scope: SearchScope,
+    ) -> bool {
+        let mut dn_components = dn.split(',').rev().map(str::trim).filter(|c| !c.is_empty());
+
+        for base_component in base_components {
             let Some(dn_component) = dn_components.next() else {
                 return false;
             };
@@ -1378,33 +1742,55 @@ impl LmdbBackend {
         index_db: Database,
         dn: &str,
         values: &[String],
-        index_types: &BTreeSet<IndexType>,
-    ) -> Vec<(Database, String)> {
+        plan: &AttributeIndexPlan,
+    ) -> Result<Vec<(Database, String)>, BackendError> {
         let mut index_keys = Vec::new();
+        Self::for_each_attribute_index_key(dn, values, plan, |index_key| {
+            index_keys.push((index_db, index_key));
+            Ok(())
+        })?;
 
-        if index_types.contains(&IndexType::Presence) && !values.is_empty() {
-            index_keys.push((index_db, Self::presence_index_key(dn)));
+        Ok(index_keys)
+    }
+
+    fn for_each_attribute_index_key<F>(
+        dn: &str,
+        values: &[String],
+        plan: &AttributeIndexPlan,
+        mut visit: F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(String) -> Result<(), BackendError>,
+    {
+        let has_presence = plan.index_types.contains(&IndexType::Presence);
+        let has_equality = plan.index_types.contains(&IndexType::Equality);
+        let has_substring = plan.index_types.contains(&IndexType::Substring);
+        let has_ordering = plan.index_types.contains(&IndexType::Ordering);
+
+        if has_presence && !values.is_empty() {
+            visit(Self::presence_index_key(dn))?;
         }
 
         for value in values {
-            let value_lower = value.to_lowercase();
-
-            if index_types.contains(&IndexType::Equality) {
-                index_keys.push((index_db, Self::equality_index_key(&value_lower, dn)));
+            if has_equality {
+                let normalized_value = plan.normalize_equality_value(value)?;
+                visit(Self::equality_index_key(&normalized_value, dn))?;
             }
 
-            if index_types.contains(&IndexType::Substring) {
-                for token in Self::substring_index_tokens(&value_lower) {
-                    index_keys.push((index_db, Self::substring_index_key(&token, dn)));
+            if has_substring {
+                let normalized_value = plan.normalize_substring_value(value)?;
+                for token in Self::substring_index_tokens(&normalized_value) {
+                    visit(Self::substring_index_key(&token, dn))?;
                 }
             }
 
-            if index_types.contains(&IndexType::Ordering) {
-                index_keys.push((index_db, Self::ordering_index_key(&value_lower, dn)));
+            if has_ordering {
+                let normalized_value = plan.normalize_ordering_value(value)?;
+                visit(Self::ordering_index_key(&normalized_value, dn))?;
             }
         }
 
-        index_keys
+        Ok(())
     }
 
     fn substring_index_tokens(value: &str) -> BTreeSet<String> {
@@ -1419,43 +1805,80 @@ impl LmdbBackend {
             .collect()
     }
 
-    fn substring_query_token(parts: &[SearchSubstringPart]) -> Option<String> {
-        let best_segment = parts
+    fn substring_query_tokens(parts: &[SearchSubstringPart]) -> Vec<String> {
+        let mut segments = parts
             .iter()
-            .map(|part| match part {
-                SearchSubstringPart::Initial(value)
-                | SearchSubstringPart::Any(value)
-                | SearchSubstringPart::Final(value) => value,
+            .filter_map(|part| {
+                let value = match part {
+                    SearchSubstringPart::Initial(value)
+                    | SearchSubstringPart::Any(value)
+                    | SearchSubstringPart::Final(value) => value,
+                };
+                let char_len = value.chars().count();
+                (char_len >= SUBSTRING_INDEX_TOKEN_LEN).then_some((char_len, value.as_str()))
             })
-            .filter(|value| value.chars().count() >= SUBSTRING_INDEX_TOKEN_LEN)
-            .max_by_key(|value| value.chars().count())?;
+            .collect::<Vec<_>>();
+        segments.sort_by(|left, right| right.0.cmp(&left.0));
 
-        Some(
-            best_segment
-                .to_lowercase()
-                .chars()
-                .take(SUBSTRING_INDEX_TOKEN_LEN)
-                .collect(),
-        )
+        let mut unique = HashSet::new();
+        let mut tokens = Vec::new();
+        for (_, segment) in segments {
+            Self::push_bounded_substring_query_tokens(segment, &mut unique, &mut tokens);
+            if tokens.len() >= SUBSTRING_QUERY_MAX_TOKENS {
+                break;
+            }
+        }
+        tokens
+    }
+
+    fn push_bounded_substring_query_tokens(
+        segment: &str,
+        unique: &mut HashSet<String>,
+        tokens: &mut Vec<String>,
+    ) {
+        let segment_tokens = Self::substring_segment_tokens(segment);
+        if segment_tokens.is_empty() {
+            return;
+        }
+
+        let mut candidate_indexes = Vec::with_capacity(segment_tokens.len().min(4));
+        candidate_indexes.push(segment_tokens.len() - 1);
+        candidate_indexes.push(0);
+        candidate_indexes.push(segment_tokens.len() / 2);
+        if segment_tokens.len() > 3 {
+            candidate_indexes.push(segment_tokens.len() / 3);
+        }
+
+        for index in candidate_indexes {
+            if tokens.len() >= SUBSTRING_QUERY_MAX_TOKENS {
+                break;
+            }
+            let token = &segment_tokens[index];
+            if unique.insert(token.clone()) {
+                tokens.push(token.clone());
+            }
+        }
+    }
+
+    fn substring_segment_tokens(value: &str) -> Vec<String> {
+        let chars = value.chars().collect::<Vec<_>>();
+        if chars.len() < SUBSTRING_INDEX_TOKEN_LEN {
+            return Vec::new();
+        }
+
+        let mut unique = HashSet::new();
+        let mut tokens = Vec::new();
+        for window in chars.windows(SUBSTRING_INDEX_TOKEN_LEN) {
+            let token = window.iter().collect::<String>();
+            if unique.insert(token.clone()) {
+                tokens.push(token);
+            }
+        }
+        tokens
     }
 
     fn attribute_index_metadata_key(attribute: &str) -> String {
         format!("attribute_index_v1:{}", attribute)
-    }
-
-    fn attribute_index_config_value(index_types: &BTreeMap<String, BTreeSet<IndexType>>) -> String {
-        index_types
-            .iter()
-            .map(|(attribute, types)| {
-                let labels = types
-                    .iter()
-                    .map(|index_type| index_type.label())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("{attribute}:{labels}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     fn ensure_attribute_indexes_backfilled(
@@ -1463,9 +1886,9 @@ impl LmdbBackend {
         entries_db: Database,
         metadata_db: Database,
         attr_indexes: &HashMap<String, Database>,
-        index_types: &BTreeMap<String, BTreeSet<IndexType>>,
+        index_plan: &IndexPlan,
     ) -> Result<(), BackendError> {
-        let configured_attributes = Self::attribute_index_config_value(index_types);
+        let configured_attributes = index_plan.config_value();
         let pending_indexes = {
             let txn = env.begin_ro_txn().map_err(|e| {
                 BackendError::Storage(format!(
@@ -1489,9 +1912,10 @@ impl LmdbBackend {
                 attr_indexes
                     .iter()
                     .filter_map(|(attr, index_db)| {
-                        index_types
+                        index_plan
+                            .attributes
                             .get(attr)
-                            .map(|types| (attr.clone(), *index_db, types.clone()))
+                            .map(|plan| (attr.clone(), *index_db, plan.clone()))
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -1501,8 +1925,8 @@ impl LmdbBackend {
                     match txn.get(metadata_db, &metadata_key.as_bytes()) {
                         Ok(value) if value == ATTRIBUTE_INDEX_VERSION => {}
                         Ok(_) | Err(lmdb::Error::NotFound) => {
-                            if let Some(types) = index_types.get(attr) {
-                                pending.push((attr.clone(), *index_db, types.clone()));
+                            if let Some(plan) = index_plan.attributes.get(attr) {
+                                pending.push((attr.clone(), *index_db, plan.clone()));
                             }
                         }
                         Err(e) => {
@@ -1547,7 +1971,7 @@ impl LmdbBackend {
 
         let pending_by_attr = pending_indexes
             .iter()
-            .map(|(attr, index_db, types)| (attr.clone(), (*index_db, types.clone())))
+            .map(|(attr, index_db, plan)| (attr.clone(), (*index_db, plan.clone())))
             .collect::<HashMap<_, _>>();
         let index_entries = {
             let txn = env.begin_ro_txn().map_err(|e| {
@@ -1577,11 +2001,11 @@ impl LmdbBackend {
                         continue;
                     }
 
-                    let attr_lower = attr_name.to_lowercase();
-                    if let Some((index_db, types)) = pending_by_attr.get(&attr_lower) {
+                    let attr_lower = ldap_attribute_key(attr_name);
+                    if let Some((index_db, plan)) = pending_by_attr.get(attr_lower.as_ref()) {
                         index_entries.extend(Self::attribute_index_keys(
-                            *index_db, &entry.dn, values, types,
-                        ));
+                            *index_db, &entry.dn, values, plan,
+                        )?);
                     }
                 }
             }
@@ -1703,21 +2127,34 @@ impl LmdbBackend {
         dn: &str,
         attributes: &HashMap<String, Vec<String>>,
     ) -> Result<(), BackendError> {
+        self.update_attribute_indexes_for_filter(txn, dn, attributes, None)
+    }
+
+    fn update_attribute_indexes_for_filter(
+        &self,
+        txn: &mut lmdb::RwTransaction,
+        dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+        attribute_filter: Option<&HashSet<String>>,
+    ) -> Result<(), BackendError> {
         let indexes = self
             .attr_indexes
             .try_read()
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
 
         for (attr_name, values) in attributes {
-            let attr_lower = attr_name.to_lowercase();
+            let attr_lower = ldap_attribute_key(attr_name);
+            if attribute_filter.is_some_and(|filter| !filter.contains(attr_lower.as_ref())) {
+                continue;
+            }
 
             // Check if this attribute is indexed
-            if let Some(index_db) = indexes.get(&attr_lower)
-                && let Some(index_types) = self.index_config.index_types_for(&attr_lower)
+            if let Some(index_db) = indexes.get(attr_lower.as_ref())
+                && let Some(plan) = self
+                    .index_plan
+                    .attribute_plan_normalized(attr_lower.as_ref())
             {
-                for (_, index_key) in
-                    Self::attribute_index_keys(*index_db, dn, values, &index_types)
-                {
+                Self::for_each_attribute_index_key(dn, values, plan, |index_key| {
                     txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
                         .map_err(|e| {
                             BackendError::Storage(format!(
@@ -1725,7 +2162,8 @@ impl LmdbBackend {
                                 attr_name, e
                             ))
                         })?;
-                }
+                    Ok(())
+                })?;
             }
         }
 
@@ -1741,21 +2179,34 @@ impl LmdbBackend {
         dn: &str,
         attributes: &HashMap<String, Vec<String>>,
     ) -> Result<(), BackendError> {
+        self.remove_attribute_indexes_for_filter(txn, dn, attributes, None)
+    }
+
+    fn remove_attribute_indexes_for_filter(
+        &self,
+        txn: &mut lmdb::RwTransaction,
+        dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+        attribute_filter: Option<&HashSet<String>>,
+    ) -> Result<(), BackendError> {
         let indexes = self
             .attr_indexes
             .try_read()
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
 
         for (attr_name, values) in attributes {
-            let attr_lower = attr_name.to_lowercase();
+            let attr_lower = ldap_attribute_key(attr_name);
+            if attribute_filter.is_some_and(|filter| !filter.contains(attr_lower.as_ref())) {
+                continue;
+            }
 
             // Check if this attribute is indexed
-            if let Some(index_db) = indexes.get(&attr_lower)
-                && let Some(index_types) = self.index_config.index_types_for(&attr_lower)
+            if let Some(index_db) = indexes.get(attr_lower.as_ref())
+                && let Some(plan) = self
+                    .index_plan
+                    .attribute_plan_normalized(attr_lower.as_ref())
             {
-                for (_, index_key) in
-                    Self::attribute_index_keys(*index_db, dn, values, &index_types)
-                {
+                Self::for_each_attribute_index_key(dn, values, plan, |index_key| {
                     txn.del(*index_db, &index_key.as_bytes(), None)
                         .or_else(|e| match e {
                             lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
@@ -1764,7 +2215,8 @@ impl LmdbBackend {
                                 attr_name, e
                             ))),
                         })?;
-                }
+                    Ok(())
+                })?;
             }
         }
 
@@ -1780,12 +2232,33 @@ impl LmdbBackend {
         attribute: &str,
         value: &str,
     ) -> Result<Vec<String>, BackendError> {
-        let attr_lower = attribute.to_lowercase();
-        let value_lower = value.to_lowercase();
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        Ok(self
+            .search_by_index_in_txn(&txn, attribute, value)?
+            .unwrap_or_default())
+    }
 
-        if !self.has_index_type(&attr_lower, IndexType::Equality) {
-            return Ok(Vec::new());
+    fn search_by_index_in_txn(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        attribute: &str,
+        value: &str,
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let attr_lower = ldap_attribute_key(attribute);
+
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(attr_lower.as_ref())
+        else {
+            return Ok(None);
+        };
+        if !plan.index_types.contains(&IndexType::Equality) {
+            return Ok(None);
         }
+        let normalized_value = plan.normalize_equality_value(value)?;
 
         let indexes = self
             .attr_indexes
@@ -1793,120 +2266,181 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
 
         // Check if this attribute has an index
-        let index_db = match indexes.get(&attr_lower) {
+        let index_db = match indexes.get(attr_lower.as_ref()) {
             Some(db) => *db,
-            None => {
-                // Attribute not indexed, return empty result
-                return Ok(Vec::new());
-            }
+            None => return Ok(None),
         };
-
-        let txn = self
-            .env
-            .begin_ro_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
-        let search_prefix = Self::equality_index_prefix(&value_lower);
-        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes())
+        let search_prefix = Self::equality_index_prefix(&normalized_value);
+        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes()).map(Some)
     }
 
+    #[cfg(test)]
     fn search_present_by_index(&self, attribute: &str) -> Result<Vec<String>, BackendError> {
-        let attr_lower = attribute.to_lowercase();
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        Ok(self
+            .search_present_by_index_in_txn(&txn, attribute)?
+            .unwrap_or_default())
+    }
 
-        if !self.has_index_type(&attr_lower, IndexType::Presence) {
-            return Ok(Vec::new());
+    fn search_present_by_index_in_txn(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        attribute: &str,
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let attr_lower = ldap_attribute_key(attribute);
+
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(attr_lower.as_ref())
+        else {
+            return Ok(None);
+        };
+        if !plan.index_types.contains(&IndexType::Presence) {
+            return Ok(None);
         }
 
         let indexes = self
             .attr_indexes
             .try_read()
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
-        let index_db = match indexes.get(&attr_lower) {
+        let index_db = match indexes.get(attr_lower.as_ref()) {
             Some(db) => *db,
-            None => return Ok(Vec::new()),
+            None => return Ok(None),
         };
 
-        let txn = self
-            .env
-            .begin_ro_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
         let search_prefix = Self::presence_index_prefix();
-        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes())
+        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes()).map(Some)
     }
 
-    fn search_substring_by_index(
+    fn search_substring_by_index_in_txn(
         &self,
+        txn: &lmdb::RoTransaction<'_>,
         attribute: &str,
         parts: &[SearchSubstringPart],
-    ) -> Result<Option<Vec<String>>, BackendError> {
-        let attr_lower = attribute.to_lowercase();
+    ) -> Result<Option<SubstringIndexCandidates>, BackendError> {
+        let attr_lower = ldap_attribute_key(attribute);
 
-        if !self.has_index_type(&attr_lower, IndexType::Substring) {
-            return Ok(None);
-        }
-
-        let Some(token) = Self::substring_query_token(parts) else {
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(attr_lower.as_ref())
+        else {
             return Ok(None);
         };
+        if !plan.index_types.contains(&IndexType::Substring) {
+            return Ok(None);
+        }
+        let normalized_parts = parts
+            .iter()
+            .map(|part| match part {
+                SearchSubstringPart::Initial(value) => plan
+                    .normalize_substring_value(value)
+                    .map(SearchSubstringPart::Initial),
+                SearchSubstringPart::Any(value) => plan
+                    .normalize_substring_value(value)
+                    .map(SearchSubstringPart::Any),
+                SearchSubstringPart::Final(value) => plan
+                    .normalize_substring_value(value)
+                    .map(SearchSubstringPart::Final),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let tokens = Self::substring_query_tokens(&normalized_parts);
+        if tokens.is_empty() {
+            return Ok(None);
+        }
 
         let indexes = self
             .attr_indexes
             .try_read()
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
-        let index_db = match indexes.get(&attr_lower) {
+        let index_db = match indexes.get(attr_lower.as_ref()) {
             Some(db) => *db,
             None => return Ok(None),
         };
 
-        let txn = self
-            .env
-            .begin_ro_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
-        let search_prefix = Self::substring_index_prefix(&token);
-        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes()).map(Some)
+
+        let mut candidate_dns: Option<Vec<String>> = None;
+        for token in tokens {
+            let search_prefix = Self::substring_index_prefix(&token);
+            let token_dns =
+                Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes())?;
+            if token_dns.is_empty() {
+                return Ok(Some(SubstringIndexCandidates {
+                    attribute: attr_lower.into_owned(),
+                    normalized_parts,
+                    dns: Vec::new(),
+                }));
+            }
+            candidate_dns = Some(match candidate_dns {
+                Some(existing) => {
+                    let token_dns = token_dns.into_iter().collect::<HashSet<_>>();
+                    existing
+                        .into_iter()
+                        .filter(|dn| token_dns.contains(dn))
+                        .collect()
+                }
+                None => token_dns,
+            });
+            if candidate_dns.as_ref().is_some_and(Vec::is_empty) {
+                break;
+            }
+        }
+
+        Ok(Some(SubstringIndexCandidates {
+            attribute: attr_lower.into_owned(),
+            normalized_parts,
+            dns: candidate_dns.unwrap_or_default(),
+        }))
     }
 
-    fn search_ordering_by_index(
+    fn search_ordering_by_index_in_txn(
         &self,
+        txn: &lmdb::RoTransaction<'_>,
         attribute: &str,
         value: &str,
         greater_or_equal: bool,
     ) -> Result<Option<Vec<String>>, BackendError> {
-        let attr_lower = attribute.to_lowercase();
+        let attr_lower = ldap_attribute_key(attribute);
 
-        if !self.has_index_type(&attr_lower, IndexType::Ordering) {
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(attr_lower.as_ref())
+        else {
+            return Ok(None);
+        };
+        if !plan.index_types.contains(&IndexType::Ordering) {
             return Ok(None);
         }
+        let normalized_value = plan.normalize_ordering_value(value)?;
 
         let indexes = self
             .attr_indexes
             .try_read()
             .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
-        let index_db = match indexes.get(&attr_lower) {
+        let index_db = match indexes.get(attr_lower.as_ref()) {
             Some(db) => *db,
             None => return Ok(None),
         };
 
-        let txn = self
-            .env
-            .begin_ro_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
 
-        let value_lower = value.to_lowercase();
         let seek_key = if greater_or_equal {
-            Self::ordering_index_key(&value_lower, "")
+            Self::ordering_index_key(&normalized_value, "")
         } else {
             Self::ordering_index_prefix().to_string()
         };
@@ -1926,14 +2460,19 @@ impl LmdbBackend {
         }
 
         let mut results = Vec::new();
-        if Self::push_ordering_candidate(first_key, &value_lower, greater_or_equal, &mut results)? {
+        if Self::push_ordering_candidate(
+            first_key,
+            &normalized_value,
+            greater_or_equal,
+            &mut results,
+        )? {
             for (key, _value) in cursor.iter() {
                 if !key.starts_with(Self::ordering_index_prefix().as_bytes()) {
                     break;
                 }
                 if !Self::push_ordering_candidate(
                     key,
-                    &value_lower,
+                    &normalized_value,
                     greater_or_equal,
                     &mut results,
                 )? {
@@ -1969,19 +2508,55 @@ impl LmdbBackend {
         }
     }
 
-    fn load_entries_by_dns(
+    fn load_entries_by_dns_in_txn(
         &self,
+        txn: &lmdb::RoTransaction<'_>,
         dns: &[String],
         base_dn: &str,
         scope: SearchScope,
+        dedupe_dns: bool,
     ) -> Result<Vec<DirectoryEntry>, BackendError> {
-        let txn = self
-            .env
-            .begin_ro_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
-        let mut results = Vec::new();
+        self.load_entries_by_dns_in_txn_filtering(txn, dns, base_dn, scope, dedupe_dns, |_| {
+            Ok(true)
+        })
+    }
+
+    fn load_entries_by_dns_in_txn_filtering<F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        dns: &[String],
+        base_dn: &str,
+        scope: SearchScope,
+        dedupe_dns: bool,
+        mut include_entry: F,
+    ) -> Result<Vec<DirectoryEntry>, BackendError>
+    where
+        F: FnMut(&StoredEntry) -> Result<bool, BackendError>,
+    {
+        let base_components =
+            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
+        let mut results = Vec::with_capacity(dns.len());
+        let mut seen_dns = dedupe_dns.then(|| HashSet::with_capacity(dns.len()));
 
         for dn in dns {
+            if seen_dns
+                .as_mut()
+                .is_some_and(|seen_dns| !seen_dns.insert(dn.as_str()))
+            {
+                continue;
+            }
+            let in_scope = if scope == SearchScope(2) {
+                Self::entry_in_subtree_scope(dn, base_dn)
+            } else {
+                Self::entry_in_scope_with_base_components(
+                    dn,
+                    base_components.as_deref().unwrap_or(&[]),
+                    scope,
+                )
+            };
+            if !in_scope {
+                continue;
+            }
             let entry_bytes = match txn.get(self.entries_db, &dn.as_bytes()) {
                 Ok(bytes) => bytes,
                 Err(lmdb::Error::NotFound) => continue,
@@ -1990,19 +2565,79 @@ impl LmdbBackend {
             let entry: StoredEntry = bincode::deserialize(entry_bytes).map_err(|e| {
                 BackendError::Storage(format!("Failed to deserialize entry: {}", e))
             })?;
-            if Self::entry_in_scope(&entry.dn, base_dn, scope) {
-                results.push(entry.to_directory_entry());
+            if !include_entry(&entry)? {
+                continue;
             }
+            results.push(entry.to_directory_entry());
         }
 
         Ok(results)
     }
 
+    fn stored_entry_matches_normalized_substring(
+        entry: &StoredEntry,
+        attribute: &str,
+        normalized_parts: &[SearchSubstringPart],
+        plan: &AttributeIndexPlan,
+    ) -> Result<bool, BackendError> {
+        let Some(values) = entry.attributes.get(attribute) else {
+            return Ok(false);
+        };
+
+        for value in values {
+            let normalized_value = plan.normalize_substring_value(value)?;
+            if Self::normalized_substring_matches(&normalized_value, normalized_parts) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn normalized_substring_matches(value: &str, parts: &[SearchSubstringPart]) -> bool {
+        let mut remainder = value;
+
+        for part in parts {
+            match part {
+                SearchSubstringPart::Initial(segment) => {
+                    let Some(next_remainder) = remainder.strip_prefix(segment) else {
+                        return false;
+                    };
+                    remainder = next_remainder;
+                }
+                SearchSubstringPart::Any(segment) => {
+                    if segment.is_empty() {
+                        continue;
+                    }
+                    let Some(index) = remainder.find(segment) else {
+                        return false;
+                    };
+                    remainder = &remainder[index + segment.len()..];
+                }
+                SearchSubstringPart::Final(segment) => return remainder.ends_with(segment),
+            }
+        }
+
+        true
+    }
+
+    fn search_entries_uncovered_report(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+    ) -> Result<SearchEntriesWithHintReport, BackendError> {
+        Ok(SearchEntriesWithHintReport {
+            entries: self
+                .search_entries_internal(base_dn, scope)?
+                .into_iter()
+                .map(|entry| entry.to_directory_entry())
+                .collect(),
+            hint_covers_filter: false,
+        })
+    }
+
     /// Check if an attribute is indexed
     pub fn is_indexed(&self, attribute: &str) -> bool {
-        self.index_config
-            .effective_index_types()
-            .contains_key(&attribute.to_lowercase())
+        self.index_plan.attribute_plan(attribute).is_some()
     }
 
     /// Check if an attribute has a specific index type configured.
@@ -2011,7 +2646,52 @@ impl LmdbBackend {
     }
 
     fn has_index_type(&self, attribute: &str, index_type: IndexType) -> bool {
-        self.index_config.has_index_type(attribute, index_type)
+        self.index_plan.has_index_type(attribute, index_type)
+    }
+
+    pub fn attribute_index_readiness(&self) -> Result<Vec<AttributeIndexReadiness>, BackendError> {
+        let txn = self.env.begin_ro_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin attribute index readiness txn: {}",
+                e
+            ))
+        })?;
+        let configured_attributes = self.index_plan.config_value();
+        let config_ready = match txn.get(
+            self.metadata_db,
+            &ATTRIBUTE_INDEX_CONFIG_METADATA_KEY.as_bytes(),
+        ) {
+            Ok(value) => value == configured_attributes.as_bytes(),
+            Err(lmdb::Error::NotFound) => false,
+            Err(e) => {
+                return Err(BackendError::Storage(format!(
+                    "Failed to read attribute index config metadata: {}",
+                    e
+                )));
+            }
+        };
+
+        let mut readiness = Vec::new();
+        for (attribute, plan) in &self.index_plan.attributes {
+            let metadata_key = Self::attribute_index_metadata_key(attribute);
+            let attribute_ready = match txn.get(self.metadata_db, &metadata_key.as_bytes()) {
+                Ok(value) => value == ATTRIBUTE_INDEX_VERSION,
+                Err(lmdb::Error::NotFound) => false,
+                Err(e) => {
+                    return Err(BackendError::Storage(format!(
+                        "Failed to read attribute index readiness for {}: {}",
+                        attribute, e
+                    )));
+                }
+            };
+            readiness.push(AttributeIndexReadiness {
+                attribute: attribute.clone(),
+                index_types: plan.index_types.iter().copied().collect(),
+                ready: config_ready && attribute_ready,
+            });
+        }
+
+        Ok(readiness)
     }
 
     pub fn configured_max_readers(&self) -> u32 {
@@ -2206,10 +2886,10 @@ impl DirectoryBackend for LmdbBackend {
     ) -> Result<bool, BackendError> {
         let entry = self.get_entry_internal(dn)?.ok_or(BackendError::NotFound)?;
 
-        let attribute = attribute.to_lowercase();
+        let attribute = ldap_attribute_key(attribute);
         Ok(entry
             .attributes
-            .get(&attribute)
+            .get(attribute.as_ref())
             .map(|values| values.iter().any(|v| v == value))
             .unwrap_or(false))
     }
@@ -2277,46 +2957,107 @@ impl DirectoryBackend for LmdbBackend {
         scope: SearchScope,
         hint: Option<SearchCandidateHint>,
     ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        Ok(self
+            .search_entries_with_hint_report(base_dn, scope, hint)
+            .await?
+            .entries)
+    }
+
+    async fn search_entries_with_hint_report(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        hint: Option<SearchCandidateHint>,
+    ) -> Result<SearchEntriesWithHintReport, BackendError> {
         let Some(hint) = hint else {
-            return self.search_entries(base_dn, scope).await;
+            return self.search_entries_uncovered_report(base_dn, scope);
         };
 
-        let candidates = match hint {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+
+        let (candidates, hint_covers_filter, dedupe_dns) = match hint {
             SearchCandidateHint::Equality { attribute, value } => {
-                if !self.has_index_type(&attribute, IndexType::Equality) {
-                    return self.search_entries(base_dn, scope).await;
-                }
-                self.search_by_index(&attribute, &value)?
+                let Some(candidates) = self.search_by_index_in_txn(&txn, &attribute, &value)?
+                else {
+                    drop(txn);
+                    return self.search_entries_uncovered_report(base_dn, scope);
+                };
+                (candidates, true, false)
             }
             SearchCandidateHint::Present { attribute } => {
-                if !self.has_index_type(&attribute, IndexType::Presence) {
-                    return self.search_entries(base_dn, scope).await;
-                }
-                self.search_present_by_index(&attribute)?
+                let Some(candidates) = self.search_present_by_index_in_txn(&txn, &attribute)?
+                else {
+                    drop(txn);
+                    return self.search_entries_uncovered_report(base_dn, scope);
+                };
+                (candidates, true, false)
             }
             SearchCandidateHint::Substring { attribute, parts } => {
-                let Some(candidates) = self.search_substring_by_index(&attribute, &parts)? else {
-                    return self.search_entries(base_dn, scope).await;
+                let Some(candidates) =
+                    self.search_substring_by_index_in_txn(&txn, &attribute, &parts)?
+                else {
+                    drop(txn);
+                    return self.search_entries_uncovered_report(base_dn, scope);
                 };
-                candidates
+                let Some(plan) = self
+                    .index_plan
+                    .attribute_plan_normalized(&candidates.attribute)
+                else {
+                    drop(txn);
+                    return self.search_entries_uncovered_report(base_dn, scope);
+                };
+                return Ok(SearchEntriesWithHintReport {
+                    entries: self.load_entries_by_dns_in_txn_filtering(
+                        &txn,
+                        &candidates.dns,
+                        base_dn,
+                        scope,
+                        false,
+                        |entry| {
+                            Self::stored_entry_matches_normalized_substring(
+                                entry,
+                                &candidates.attribute,
+                                &candidates.normalized_parts,
+                                plan,
+                            )
+                        },
+                    )?,
+                    hint_covers_filter: false,
+                });
             }
             SearchCandidateHint::GreaterOrEqual { attribute, value } => {
-                let Some(candidates) = self.search_ordering_by_index(&attribute, &value, true)?
+                let Some(candidates) =
+                    self.search_ordering_by_index_in_txn(&txn, &attribute, &value, true)?
                 else {
-                    return self.search_entries(base_dn, scope).await;
+                    drop(txn);
+                    return self.search_entries_uncovered_report(base_dn, scope);
                 };
-                candidates
+                (candidates, true, true)
             }
             SearchCandidateHint::LessOrEqual { attribute, value } => {
-                let Some(candidates) = self.search_ordering_by_index(&attribute, &value, false)?
+                let Some(candidates) =
+                    self.search_ordering_by_index_in_txn(&txn, &attribute, &value, false)?
                 else {
-                    return self.search_entries(base_dn, scope).await;
+                    drop(txn);
+                    return self.search_entries_uncovered_report(base_dn, scope);
                 };
-                candidates
+                (candidates, true, true)
             }
         };
 
-        self.load_entries_by_dns(&candidates, base_dn, scope)
+        Ok(SearchEntriesWithHintReport {
+            entries: self.load_entries_by_dns_in_txn(
+                &txn,
+                &candidates,
+                base_dn,
+                scope,
+                dedupe_dns,
+            )?,
+            hint_covers_filter,
+        })
     }
 
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
@@ -2372,6 +3113,32 @@ impl DirectoryBackend for LmdbBackend {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn schema_with_matching_rule_attrs() -> LdapSchema {
+        let mut schema = LdapSchema::with_core_schema();
+        schema
+            .load_ldif_str(
+                "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.40.1 NAME 'exampleNumber' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.40.2 NAME 'exampleExactCode' EQUALITY caseExactMatch SUBSTR caseExactSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+",
+            )
+            .unwrap();
+        schema
+    }
+
+    #[test]
+    fn substring_query_tokens_use_bounded_spread_across_long_segments() {
+        let tokens = LmdbBackend::substring_query_tokens(&[SearchSubstringPart::Any(
+            "fixture user 000000".to_string(),
+        )]);
+
+        assert!(tokens.len() <= SUBSTRING_QUERY_MAX_TOKENS);
+        assert!(tokens.contains(&"fix".to_string()));
+        assert!(tokens.contains(&"000".to_string()));
+    }
 
     #[tokio::test]
     async fn test_lmdb_backend_create() {
@@ -3188,6 +3955,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_schema_index_plan_normalizes_integer_equality_and_ordering_keys() {
+        let dir = tempdir().unwrap();
+        let schema = schema_with_matching_rule_attrs();
+        let backend = LmdbBackend::new_with_schema_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "exampleNumber".to_string(),
+                    index_types: vec![IndexType::Equality, IndexType::Ordering],
+                }],
+            },
+            &schema,
+        )
+        .unwrap();
+
+        for (uid, value) in [("negative", "-1"), ("two", "0002"), ("ten", "10")] {
+            let mut attributes = HashMap::new();
+            attributes.insert("exampleNumber".to_string(), vec![value.to_string()]);
+            let entry = DirectoryEntry::new(format!("uid={uid},dc=example,dc=org"), attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+        }
+
+        assert_eq!(
+            backend.search_by_index("exampleNumber", "2").unwrap(),
+            vec!["uid=two,dc=example,dc=org".to_string()]
+        );
+
+        let greater_or_equal = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::GreaterOrEqual {
+                    attribute: "exampleNumber".to_string(),
+                    value: "2".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.dn)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            greater_or_equal,
+            vec![
+                "uid=two,dc=example,dc=org".to_string(),
+                "uid=ten,dc=example,dc=org".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schema_index_plan_preserves_case_exact_substring_keys() {
+        let dir = tempdir().unwrap();
+        let schema = schema_with_matching_rule_attrs();
+        let backend = LmdbBackend::new_with_schema_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "exampleExactCode".to_string(),
+                    index_types: vec![IndexType::Substring],
+                }],
+            },
+            &schema,
+        )
+        .unwrap();
+
+        for (uid, value) in [("upper", "CaseToken"), ("lower", "casetoken")] {
+            let mut attributes = HashMap::new();
+            attributes.insert("exampleExactCode".to_string(), vec![value.to_string()]);
+            let entry = DirectoryEntry::new(format!("uid={uid},dc=example,dc=org"), attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+        }
+
+        let results = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Substring {
+                    attribute: "exampleExactCode".to_string(),
+                    parts: vec![SearchSubstringPart::Any("Case".to_string())],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].dn, "uid=upper,dc=example,dc=org");
+    }
+
+    #[tokio::test]
+    async fn test_attribute_index_readiness_reports_backfilled_schema_indexes() {
+        let dir = tempdir().unwrap();
+        let schema = schema_with_matching_rule_attrs();
+        let backend = LmdbBackend::new_with_schema_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "exampleNumber".to_string(),
+                    index_types: vec![IndexType::Equality, IndexType::Ordering],
+                }],
+            },
+            &schema,
+        )
+        .unwrap();
+
+        let readiness = backend.attribute_index_readiness().unwrap();
+        assert_eq!(readiness.len(), 1);
+        assert_eq!(readiness[0].attribute, "examplenumber");
+        assert_eq!(
+            readiness[0].index_types,
+            vec![IndexType::Equality, IndexType::Ordering]
+        );
+        assert!(readiness[0].ready);
+    }
+
+    #[tokio::test]
+    async fn test_matching_rule_change_rebuilds_existing_index_keys() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+        let mut case_ignore_schema = LdapSchema::with_core_schema();
+        case_ignore_schema
+            .load_ldif_str(
+                "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+",
+            )
+            .unwrap();
+        let mut case_exact_schema = LdapSchema::with_core_schema();
+        case_exact_schema
+            .load_ldif_str(
+                "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseExactMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+",
+            )
+            .unwrap();
+        let index_config = IndexConfig {
+            indexed_attributes: Vec::new(),
+            attribute_indexes: vec![AttributeIndexConfig {
+                attribute: "exampleRuleShift".to_string(),
+                index_types: vec![IndexType::Equality],
+            }],
+        };
+
+        {
+            let backend = LmdbBackend::new_with_schema_config(
+                &db_path,
+                100,
+                1,
+                index_config.clone(),
+                &case_ignore_schema,
+            )
+            .unwrap();
+            let mut attributes = HashMap::new();
+            attributes.insert("exampleRuleShift".to_string(), vec!["Alpha".to_string()]);
+            backend
+                .add_entry(
+                    DirectoryEntry::new("uid=alpha,dc=example,dc=org", attributes),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                backend
+                    .search_by_index("exampleRuleShift", "alpha")
+                    .unwrap(),
+                vec!["uid=alpha,dc=example,dc=org".to_string()]
+            );
+        }
+
+        let backend =
+            LmdbBackend::new_with_schema_config(&db_path, 100, 1, index_config, &case_exact_schema)
+                .unwrap();
+
+        assert!(
+            backend
+                .search_by_index("exampleRuleShift", "alpha")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            backend
+                .search_by_index("exampleRuleShift", "Alpha")
+                .unwrap(),
+            vec!["uid=alpha,dc=example,dc=org".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn test_typed_substring_index_hint_uses_index_candidates() {
         let dir = tempdir().unwrap();
         let backend = LmdbBackend::new_with_config(
@@ -3289,6 +4255,57 @@ mod tests {
 
         assert_eq!(multi_value_results.len(), 1);
         assert_eq!(multi_value_results[0].dn, "uid=multi,dc=example,dc=org");
+    }
+
+    #[tokio::test]
+    async fn test_typed_substring_index_hint_intersects_multiple_tokens() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "description".to_string(),
+                    index_types: vec![IndexType::Substring],
+                }],
+            },
+        )
+        .unwrap();
+
+        for (uid, description) in [
+            ("target", "fixture user 000000 alpha"),
+            ("same_prefix", "fixture user 999999 alpha"),
+            ("same_suffix", "archive user 000000 alpha"),
+        ] {
+            let mut attributes = HashMap::new();
+            attributes.insert("description".to_string(), vec![description.to_string()]);
+            backend
+                .add_entry(
+                    DirectoryEntry::new(format!("uid={uid},dc=example,dc=org"), attributes),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+
+        let results = backend
+            .search_entries_with_hint(
+                "dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Substring {
+                    attribute: "description".to_string(),
+                    parts: vec![SearchSubstringPart::Any("fixture user 000000".to_string())],
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.dn)
+            .collect::<Vec<_>>();
+
+        assert_eq!(results, vec!["uid=target,dc=example,dc=org".to_string()]);
     }
 
     #[tokio::test]
@@ -3430,6 +4447,29 @@ mod tests {
 
         assert_eq!(scoped_ge.len(), 1);
         assert_eq!(scoped_ge[0].dn, "uid=multi,ou=people,dc=example,dc=org");
+
+        let broad_scoped_ge = backend
+            .search_entries_with_hint(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::GreaterOrEqual {
+                    attribute: "code".to_string(),
+                    value: "ALPHA".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.dn)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            broad_scoped_ge,
+            vec![
+                "uid=alpha,ou=people,dc=example,dc=org".to_string(),
+                "uid=multi,ou=people,dc=example,dc=org".to_string()
+            ]
+        );
 
         let less_or_equal = backend
             .search_entries_with_hint(
@@ -3705,6 +4745,166 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].dn, "uid=alice,ou=people,dc=example,dc=org");
+    }
+
+    #[tokio::test]
+    async fn test_search_entries_with_hint_report_marks_exact_index_coverage() {
+        let dir = tempdir().unwrap();
+        let schema = schema_with_matching_rule_attrs();
+        let backend = LmdbBackend::new_with_schema_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: vec!["cn".to_string(), "mail".to_string()],
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "exampleNumber".to_string(),
+                    index_types: vec![IndexType::Ordering],
+                }],
+            },
+            &schema,
+        )
+        .unwrap();
+
+        let mut alice_attributes = HashMap::new();
+        alice_attributes.insert("cn".to_string(), vec!["Alice".to_string()]);
+        alice_attributes.insert("mail".to_string(), vec!["alice@example.org".to_string()]);
+        alice_attributes.insert("exampleNumber".to_string(), vec!["42".to_string()]);
+        backend
+            .add_entry(
+                DirectoryEntry::new("uid=alice,ou=people,dc=example,dc=org", alice_attributes),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let mut bob_attributes = HashMap::new();
+        bob_attributes.insert("cn".to_string(), vec!["Bob".to_string()]);
+        bob_attributes.insert("mail".to_string(), vec!["bob@example.org".to_string()]);
+        bob_attributes.insert("exampleNumber".to_string(), vec!["7".to_string()]);
+        backend
+            .add_entry(
+                DirectoryEntry::new("uid=bob,ou=people,dc=example,dc=org", bob_attributes),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let equality_report = backend
+            .search_entries_with_hint_report(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Equality {
+                    attribute: "cn".to_string(),
+                    value: "alice".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(equality_report.hint_covers_filter);
+        assert_eq!(equality_report.entries.len(), 1);
+        assert_eq!(
+            equality_report.entries[0].dn,
+            "uid=alice,ou=people,dc=example,dc=org"
+        );
+
+        let presence_report = backend
+            .search_entries_with_hint_report(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Present {
+                    attribute: "mail".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(presence_report.hint_covers_filter);
+        assert_eq!(presence_report.entries.len(), 2);
+
+        let ordering_report = backend
+            .search_entries_with_hint_report(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::GreaterOrEqual {
+                    attribute: "exampleNumber".to_string(),
+                    value: "42".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ordering_report.hint_covers_filter);
+        assert_eq!(ordering_report.entries.len(), 1);
+        assert_eq!(
+            ordering_report.entries[0].dn,
+            "uid=alice,ou=people,dc=example,dc=org"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_entries_with_hint_report_keeps_partial_and_fallback_uncovered() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new_with_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "description".to_string(),
+                    index_types: vec![IndexType::Substring],
+                }],
+            },
+        )
+        .unwrap();
+
+        for (uid, description) in [
+            ("alice", "fixture user 000000 alpha"),
+            ("bob", "fixture user 000001 beta"),
+        ] {
+            let mut attributes = HashMap::new();
+            attributes.insert("description".to_string(), vec![description.to_string()]);
+            backend
+                .add_entry(
+                    DirectoryEntry::new(
+                        format!("uid={uid},ou=people,dc=example,dc=org"),
+                        attributes,
+                    ),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+
+        let substring_report = backend
+            .search_entries_with_hint_report(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Substring {
+                    attribute: "description".to_string(),
+                    parts: vec![SearchSubstringPart::Any("fixture user 000000".to_string())],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!substring_report.hint_covers_filter);
+        assert_eq!(substring_report.entries.len(), 1);
+        assert_eq!(
+            substring_report.entries[0].dn,
+            "uid=alice,ou=people,dc=example,dc=org"
+        );
+
+        let fallback_report = backend
+            .search_entries_with_hint_report(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Present {
+                    attribute: "description".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!fallback_report.hint_covers_filter);
+        assert_eq!(fallback_report.entries.len(), 2);
     }
 
     #[tokio::test]

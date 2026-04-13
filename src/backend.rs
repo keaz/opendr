@@ -107,24 +107,21 @@ impl OperationalAttributes {
 
     /// Check if a given attribute name is an operational attribute
     pub fn is_operational(attr_name: &str) -> bool {
-        matches!(
-            attr_name.to_lowercase().as_str(),
-            "entrycsn"
-                | "entryuuid"
-                | "createtimestamp"
-                | "modifytimestamp"
-                | "creatorsname"
-                | "modifiersname"
-                | "subschemasubentry"
-                | "hassubordinates"
-                | "numsubordinates"
-                | "structuralobjectclass"
-                | "pwdchangedtime"
-                | "pwdaccountlockedtime"
-                | "pwdfailuretime"
-                | "pwdhistory"
-                | "contextcsn"
-        )
+        attr_name.eq_ignore_ascii_case("entrycsn")
+            || attr_name.eq_ignore_ascii_case("entryuuid")
+            || attr_name.eq_ignore_ascii_case("createtimestamp")
+            || attr_name.eq_ignore_ascii_case("modifytimestamp")
+            || attr_name.eq_ignore_ascii_case("creatorsname")
+            || attr_name.eq_ignore_ascii_case("modifiersname")
+            || attr_name.eq_ignore_ascii_case("subschemasubentry")
+            || attr_name.eq_ignore_ascii_case("hassubordinates")
+            || attr_name.eq_ignore_ascii_case("numsubordinates")
+            || attr_name.eq_ignore_ascii_case("structuralobjectclass")
+            || attr_name.eq_ignore_ascii_case("pwdchangedtime")
+            || attr_name.eq_ignore_ascii_case("pwdaccountlockedtime")
+            || attr_name.eq_ignore_ascii_case("pwdfailuretime")
+            || attr_name.eq_ignore_ascii_case("pwdhistory")
+            || attr_name.eq_ignore_ascii_case("contextcsn")
     }
 }
 
@@ -288,6 +285,19 @@ pub trait DirectoryBackend: Send + Sync {
         self.search_entries(base_dn, scope).await
     }
 
+    async fn search_entries_with_hint_report(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        hint: Option<SearchCandidateHint>,
+    ) -> Result<SearchEntriesWithHintReport, BackendError> {
+        let entries = self.search_entries_with_hint(base_dn, scope, hint).await?;
+        Ok(SearchEntriesWithHintReport {
+            entries,
+            hint_covers_filter: false,
+        })
+    }
+
     async fn search_entries_paginated(
         &self,
         base_dn: &str,
@@ -383,6 +393,12 @@ pub enum SearchCandidateHint {
         attribute: String,
         value: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchEntriesWithHintReport {
+    pub entries: Vec<DirectoryEntry>,
+    pub hint_covers_filter: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

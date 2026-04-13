@@ -1,12 +1,14 @@
 use crate::backend::{DirectoryEntry, SearchCandidateHint, SearchSubstringPart};
 use crate::replication::RenameChange;
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
+use crate::schema::{LdapSchema, MatchingRuleError, ResolvedMatchingRule};
 use crate::search_fsm::SearchEntry;
 use lber::common::TagClass;
 use lber::structures::Tag;
 use ldap_parser::filter::{Filter, Substring};
 use ldap3::parse_filter;
-use std::collections::HashMap;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{HashMap, HashSet};
 
 const AND_FILTER: u64 = 0;
 const OR_FILTER: u64 = 1;
@@ -61,10 +63,57 @@ pub(crate) enum CompiledLdapFilter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreparedLdapFilter {
+    And(Vec<PreparedLdapFilter>),
+    Or(Vec<PreparedLdapFilter>),
+    Not(Box<PreparedLdapFilter>),
+    Equality {
+        attribute: String,
+        rule: ResolvedMatchingRule,
+        normalized_value: String,
+    },
+    Substrings {
+        attribute: String,
+        rule: ResolvedMatchingRule,
+        normalized_parts: Vec<SubstringPart>,
+    },
+    GreaterOrEqual {
+        attribute: String,
+        rule: ResolvedMatchingRule,
+        normalized_value: String,
+        ordering_key: String,
+    },
+    LessOrEqual {
+        attribute: String,
+        rule: ResolvedMatchingRule,
+        normalized_value: String,
+        ordering_key: String,
+    },
+    Present {
+        attribute: String,
+    },
+    Extensible {
+        attribute: Option<String>,
+        rule: ResolvedMatchingRule,
+        normalized_value: String,
+        dn_attributes: bool,
+        applicable_attributes: Option<HashSet<String>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SubstringPart {
     Initial(String),
     Any(String),
     Final(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterSchemaError {
+    UndefinedAttribute(String),
+    InappropriateMatching(String),
+    InvalidAttributeSyntax(String),
+    InvalidFilter(String),
 }
 
 #[derive(Debug, Clone)]
@@ -75,11 +124,47 @@ pub(crate) struct PreparedChange {
     dn: String,
 }
 
+impl std::fmt::Display for FilterSchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UndefinedAttribute(message) => write!(f, "undefined attribute type: {}", message),
+            Self::InappropriateMatching(message) => {
+                write!(f, "inappropriate matching: {}", message)
+            }
+            Self::InvalidAttributeSyntax(message) => {
+                write!(f, "invalid attribute syntax: {}", message)
+            }
+            Self::InvalidFilter(message) => write!(f, "invalid filter: {}", message),
+        }
+    }
+}
+
+impl std::error::Error for FilterSchemaError {}
+
+impl From<MatchingRuleError> for FilterSchemaError {
+    fn from(error: MatchingRuleError) -> Self {
+        match error {
+            MatchingRuleError::AttributeNotFound(attribute) => Self::UndefinedAttribute(attribute),
+            MatchingRuleError::InvalidSyntax { .. } => {
+                Self::InvalidAttributeSyntax(error.to_string())
+            }
+            MatchingRuleError::NoMatchingRule { .. }
+            | MatchingRuleError::UnsupportedRule(_)
+            | MatchingRuleError::MatchingRuleNotFound(_)
+            | MatchingRuleError::InapplicableRule { .. } => {
+                Self::InappropriateMatching(error.to_string())
+            }
+            MatchingRuleError::MissingDependency(message) => Self::InvalidFilter(message),
+        }
+    }
+}
+
 pub(crate) fn compile_filter(filter: &str) -> Result<CompiledLdapFilter, String> {
     let tag = parse_filter(filter).map_err(|_| format!("invalid LDAP filter syntax: {filter}"))?;
     CompiledLdapFilter::from_tag(&tag)
 }
 
+#[cfg(test)]
 pub(crate) fn extract_search_candidate_hint(filter: &Filter<'_>) -> Option<SearchCandidateHint> {
     CompiledLdapFilter::from_search_filter(filter)
         .ok()
@@ -92,15 +177,71 @@ pub(crate) fn extract_search_candidate_hint_from_str(filter: &str) -> Option<Sea
         .and_then(|compiled| compiled.search_candidate_hint())
 }
 
+#[cfg(test)]
 pub(crate) fn matches_search_filter(entry: &DirectoryEntry, filter: &Filter<'_>) -> bool {
     CompiledLdapFilter::from_search_filter(filter)
         .map(|compiled| compiled.matches(entry))
         .unwrap_or(false)
 }
 
-pub(crate) fn matches_filter_string(entry: &DirectoryEntry, filter: &str) -> Result<bool, String> {
-    let compiled = compile_filter(filter)?;
-    Ok(compiled.matches(entry))
+pub(crate) fn validate_search_filter(
+    schema: &LdapSchema,
+    filter: &Filter<'_>,
+) -> Result<(), FilterSchemaError> {
+    prepare_search_filter_with_schema(schema, filter).map(|_| ())
+}
+
+pub(crate) fn matches_search_filter_with_schema(
+    entry: &DirectoryEntry,
+    filter: &Filter<'_>,
+    schema: &LdapSchema,
+) -> Result<bool, FilterSchemaError> {
+    CompiledLdapFilter::from_search_filter(filter)
+        .map_err(FilterSchemaError::InvalidFilter)?
+        .prepare_with_schema(schema)?
+        .matches_entry(entry)
+}
+
+pub(crate) fn prepare_search_filter_with_schema(
+    schema: &LdapSchema,
+    filter: &Filter<'_>,
+) -> Result<PreparedLdapFilter, FilterSchemaError> {
+    CompiledLdapFilter::from_search_filter(filter)
+        .map_err(FilterSchemaError::InvalidFilter)?
+        .prepare_with_schema(schema)
+}
+
+pub(crate) fn compare_attribute_with_schema(
+    schema: &LdapSchema,
+    _dn: &str,
+    attributes: &HashMap<String, Vec<String>>,
+    attribute: &str,
+    assertion: &str,
+) -> Result<bool, FilterSchemaError> {
+    schema.resolve_attribute_matching_profile(attribute)?;
+    let attribute_key = attribute.to_ascii_lowercase();
+    let Some(values) = attribute_values(attributes, &attribute_key) else {
+        return Ok(false);
+    };
+    validate_compare_assertion(schema, attribute, assertion)?;
+    let rule = schema.equality_rule_for_attribute(attribute)?;
+    for candidate in values {
+        if rule.values_equal(candidate, assertion)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn validate_compare_assertion(
+    schema: &LdapSchema,
+    attribute: &str,
+    assertion: &str,
+) -> Result<(), FilterSchemaError> {
+    let rule = schema.equality_rule_for_attribute(attribute)?;
+    ensure_supported_rule(&rule)?;
+    rule.normalize_value(assertion)?;
+    Ok(())
 }
 
 pub(crate) fn prepare_change(
@@ -225,6 +366,193 @@ impl CompiledLdapFilter {
                 value: value.clone(),
             }),
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validate_with_schema(
+        &self,
+        schema: &LdapSchema,
+    ) -> Result<(), FilterSchemaError> {
+        match self {
+            Self::And(filters) | Self::Or(filters) => {
+                for filter in filters {
+                    filter.validate_with_schema(schema)?;
+                }
+                Ok(())
+            }
+            Self::Not(filter) => filter.validate_with_schema(schema),
+            Self::Equality { attribute, value } => {
+                let rule = schema.equality_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                rule.normalize_value(value)?;
+                Ok(())
+            }
+            Self::Substrings { attribute, parts } => {
+                let rule = schema.substring_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                for part in parts {
+                    normalize_substring_part_for_rule(part, &rule)?;
+                }
+                Ok(())
+            }
+            Self::GreaterOrEqual { attribute, value } | Self::LessOrEqual { attribute, value } => {
+                let rule = schema.ordering_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                rule.ordering_key(value)?;
+                Ok(())
+            }
+            Self::Present { attribute } => {
+                schema.resolve_attribute_matching_profile(attribute)?;
+                Ok(())
+            }
+            Self::ApproxMatch { attribute, .. } => {
+                schema.resolve_attribute_matching_profile(attribute)?;
+                Err(FilterSchemaError::InappropriateMatching(format!(
+                    "approximate matching is not supported for {}",
+                    attribute
+                )))
+            }
+            Self::Extensible {
+                attribute,
+                matching_rule,
+                value,
+                ..
+            } => {
+                let rule = match (attribute.as_deref(), matching_rule.as_deref()) {
+                    (Some(attribute), Some(matching_rule)) => {
+                        schema.matching_rule_applies_to_attribute(matching_rule, attribute)?
+                    }
+                    (Some(attribute), None) => schema.equality_rule_for_attribute(attribute)?,
+                    (None, Some(matching_rule)) => schema.resolve_matching_rule(matching_rule)?,
+                    (None, None) => {
+                        return Err(FilterSchemaError::InvalidFilter(
+                            "extensible match requires an attribute or matching rule".to_string(),
+                        ));
+                    }
+                };
+                ensure_supported_rule(&rule)?;
+                rule.normalize_value(value)?;
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn prepare_with_schema(
+        &self,
+        schema: &LdapSchema,
+    ) -> Result<PreparedLdapFilter, FilterSchemaError> {
+        match self {
+            Self::And(filters) => filters
+                .iter()
+                .map(|filter| filter.prepare_with_schema(schema))
+                .collect::<Result<Vec<_>, _>>()
+                .map(PreparedLdapFilter::And),
+            Self::Or(filters) => filters
+                .iter()
+                .map(|filter| filter.prepare_with_schema(schema))
+                .collect::<Result<Vec<_>, _>>()
+                .map(PreparedLdapFilter::Or),
+            Self::Not(filter) => filter
+                .prepare_with_schema(schema)
+                .map(Box::new)
+                .map(PreparedLdapFilter::Not),
+            Self::Equality { attribute, value } => {
+                let rule = schema.equality_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                let normalized_value = rule.normalize_value(value)?;
+                Ok(PreparedLdapFilter::Equality {
+                    attribute: attribute.clone(),
+                    rule,
+                    normalized_value,
+                })
+            }
+            Self::Substrings { attribute, parts } => {
+                let rule = schema.substring_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                let normalized_parts = parts
+                    .iter()
+                    .map(|part| normalize_substring_part_for_rule(part, &rule))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PreparedLdapFilter::Substrings {
+                    attribute: attribute.clone(),
+                    rule,
+                    normalized_parts,
+                })
+            }
+            Self::GreaterOrEqual { attribute, value } => {
+                let rule = schema.ordering_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                let normalized_value = rule.normalize_value(value)?;
+                let ordering_key = rule.ordering_key(value)?;
+                Ok(PreparedLdapFilter::GreaterOrEqual {
+                    attribute: attribute.clone(),
+                    rule,
+                    normalized_value,
+                    ordering_key,
+                })
+            }
+            Self::LessOrEqual { attribute, value } => {
+                let rule = schema.ordering_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                let normalized_value = rule.normalize_value(value)?;
+                let ordering_key = rule.ordering_key(value)?;
+                Ok(PreparedLdapFilter::LessOrEqual {
+                    attribute: attribute.clone(),
+                    rule,
+                    normalized_value,
+                    ordering_key,
+                })
+            }
+            Self::Present { attribute } => {
+                schema.resolve_attribute_matching_profile(attribute)?;
+                Ok(PreparedLdapFilter::Present {
+                    attribute: attribute.clone(),
+                })
+            }
+            Self::ApproxMatch { attribute, .. } => {
+                schema.resolve_attribute_matching_profile(attribute)?;
+                Err(FilterSchemaError::InappropriateMatching(format!(
+                    "approximate matching is not supported for {}",
+                    attribute
+                )))
+            }
+            Self::Extensible {
+                attribute,
+                matching_rule,
+                value,
+                dn_attributes,
+            } => {
+                let (rule, applicable_attributes) =
+                    match (attribute.as_deref(), matching_rule.as_deref()) {
+                        (Some(attribute), Some(matching_rule)) => (
+                            schema.matching_rule_applies_to_attribute(matching_rule, attribute)?,
+                            None,
+                        ),
+                        (Some(attribute), None) => {
+                            (schema.equality_rule_for_attribute(attribute)?, None)
+                        }
+                        (None, Some(matching_rule)) => (
+                            schema.resolve_matching_rule(matching_rule)?,
+                            Some(applicable_attribute_names_for_rule(schema, matching_rule)),
+                        ),
+                        (None, None) => {
+                            return Err(FilterSchemaError::InvalidFilter(
+                                "extensible match requires an attribute or matching rule"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                ensure_supported_rule(&rule)?;
+                let normalized_value = rule.normalize_value(value)?;
+                Ok(PreparedLdapFilter::Extensible {
+                    attribute: attribute.clone(),
+                    rule,
+                    normalized_value,
+                    dn_attributes: *dn_attributes,
+                    applicable_attributes,
+                })
+            }
         }
     }
 
@@ -362,6 +690,15 @@ impl CompiledLdapFilter {
         self.matches_attributes(&entry.dn, &entry.attributes)
     }
 
+    #[cfg(test)]
+    fn matches_with_schema(
+        &self,
+        entry: &DirectoryEntry,
+        schema: &LdapSchema,
+    ) -> Result<bool, FilterSchemaError> {
+        self.matches_attributes_with_schema(schema, &entry.dn, &entry.attributes)
+    }
+
     pub(crate) fn matches_search_entry(&self, entry: &SearchEntry) -> bool {
         self.matches_attributes(&entry.dn, &entry.attributes)
     }
@@ -410,6 +747,273 @@ impl CompiledLdapFilter {
             ),
         }
     }
+
+    #[cfg(test)]
+    fn matches_attributes_with_schema(
+        &self,
+        schema: &LdapSchema,
+        dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> Result<bool, FilterSchemaError> {
+        match self {
+            Self::And(filters) => {
+                for filter in filters {
+                    if !filter.matches_attributes_with_schema(schema, dn, attributes)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Self::Or(filters) => {
+                for filter in filters {
+                    if filter.matches_attributes_with_schema(schema, dn, attributes)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::Not(filter) => {
+                Ok(!filter.matches_attributes_with_schema(schema, dn, attributes)?)
+            }
+            Self::Equality { attribute, value } => {
+                let rule = schema.equality_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                Ok(attribute_values(attributes, attribute)
+                    .map(|values| values_match_rule(values, value, &rule))
+                    .transpose()?
+                    .unwrap_or(false))
+            }
+            Self::Substrings { attribute, parts } => {
+                let rule = schema.substring_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                let normalized_parts = parts
+                    .iter()
+                    .map(|part| normalize_substring_part_for_rule(part, &rule))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(attribute_values(attributes, attribute)
+                    .map(|values| matches_substrings_with_rule(values, &normalized_parts, &rule))
+                    .transpose()?
+                    .unwrap_or(false))
+            }
+            Self::GreaterOrEqual { attribute, value } => {
+                let rule = schema.ordering_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                Ok(attribute_values(attributes, attribute)
+                    .map(|values| values_compare_rule(values, value, &rule, CmpExpectation::Ge))
+                    .transpose()?
+                    .unwrap_or(false))
+            }
+            Self::LessOrEqual { attribute, value } => {
+                let rule = schema.ordering_rule_for_attribute(attribute)?;
+                ensure_supported_rule(&rule)?;
+                Ok(attribute_values(attributes, attribute)
+                    .map(|values| values_compare_rule(values, value, &rule, CmpExpectation::Le))
+                    .transpose()?
+                    .unwrap_or(false))
+            }
+            Self::Present { attribute } => {
+                schema.resolve_attribute_matching_profile(attribute)?;
+                Ok(attribute_values(attributes, attribute).is_some())
+            }
+            Self::ApproxMatch { attribute, .. } => {
+                schema.resolve_attribute_matching_profile(attribute)?;
+                Err(FilterSchemaError::InappropriateMatching(format!(
+                    "approximate matching is not supported for {}",
+                    attribute
+                )))
+            }
+            Self::Extensible {
+                attribute,
+                matching_rule,
+                value,
+                dn_attributes,
+            } => matches_extensible_with_schema(
+                schema,
+                dn,
+                attributes,
+                attribute.as_deref(),
+                matching_rule.as_deref(),
+                value,
+                *dn_attributes,
+            ),
+        }
+    }
+}
+
+impl PreparedLdapFilter {
+    pub(crate) fn search_candidate_hint(&self) -> Option<SearchCandidateHint> {
+        match self {
+            Self::And(filters) => filters.iter().find_map(Self::search_candidate_hint),
+            Self::Equality {
+                attribute,
+                normalized_value,
+                ..
+            } => Some(SearchCandidateHint::Equality {
+                attribute: attribute.clone(),
+                value: normalized_value.clone(),
+            }),
+            Self::Present { attribute } => Some(SearchCandidateHint::Present {
+                attribute: attribute.clone(),
+            }),
+            Self::Substrings {
+                attribute,
+                normalized_parts,
+                ..
+            } if normalized_parts.iter().any(|part| {
+                substring_part_value(part).chars().count() >= SUBSTRING_INDEX_MIN_CHARS
+            }) =>
+            {
+                Some(SearchCandidateHint::Substring {
+                    attribute: attribute.clone(),
+                    parts: normalized_parts
+                        .iter()
+                        .map(SearchSubstringPart::from)
+                        .collect(),
+                })
+            }
+            Self::GreaterOrEqual {
+                attribute,
+                normalized_value,
+                ..
+            } => Some(SearchCandidateHint::GreaterOrEqual {
+                attribute: attribute.clone(),
+                value: normalized_value.clone(),
+            }),
+            Self::LessOrEqual {
+                attribute,
+                normalized_value,
+                ..
+            } => Some(SearchCandidateHint::LessOrEqual {
+                attribute: attribute.clone(),
+                value: normalized_value.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn exact_index_coverage_hint(&self) -> Option<SearchCandidateHint> {
+        match self {
+            Self::Equality {
+                attribute,
+                normalized_value,
+                ..
+            } => Some(SearchCandidateHint::Equality {
+                attribute: attribute.clone(),
+                value: normalized_value.clone(),
+            }),
+            Self::Present { attribute } => Some(SearchCandidateHint::Present {
+                attribute: attribute.clone(),
+            }),
+            Self::GreaterOrEqual {
+                attribute,
+                normalized_value,
+                ..
+            } => Some(SearchCandidateHint::GreaterOrEqual {
+                attribute: attribute.clone(),
+                value: normalized_value.clone(),
+            }),
+            Self::LessOrEqual {
+                attribute,
+                normalized_value,
+                ..
+            } => Some(SearchCandidateHint::LessOrEqual {
+                attribute: attribute.clone(),
+                value: normalized_value.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn matches_entry(&self, entry: &DirectoryEntry) -> Result<bool, FilterSchemaError> {
+        self.matches_attributes(&entry.dn, &entry.attributes)
+    }
+
+    pub(crate) fn matches_search_entry(
+        &self,
+        entry: &SearchEntry,
+    ) -> Result<bool, FilterSchemaError> {
+        self.matches_attributes(&entry.dn, &entry.attributes)
+    }
+
+    fn matches_attributes(
+        &self,
+        dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> Result<bool, FilterSchemaError> {
+        match self {
+            Self::And(filters) => {
+                for filter in filters {
+                    if !filter.matches_attributes(dn, attributes)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Self::Or(filters) => {
+                for filter in filters {
+                    if filter.matches_attributes(dn, attributes)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::Not(filter) => Ok(!filter.matches_attributes(dn, attributes)?),
+            Self::Equality {
+                attribute,
+                rule,
+                normalized_value,
+            } => Ok(attribute_values(attributes, attribute)
+                .map(|values| values_match_normalized_rule(values, normalized_value, rule))
+                .transpose()?
+                .unwrap_or(false)),
+            Self::Substrings {
+                attribute,
+                rule,
+                normalized_parts,
+            } => Ok(attribute_values(attributes, attribute)
+                .map(|values| matches_substrings_with_rule(values, normalized_parts, rule))
+                .transpose()?
+                .unwrap_or(false)),
+            Self::GreaterOrEqual {
+                attribute,
+                rule,
+                ordering_key,
+                ..
+            } => Ok(attribute_values(attributes, attribute)
+                .map(|values| {
+                    values_compare_ordering_key(values, ordering_key, rule, CmpExpectation::Ge)
+                })
+                .transpose()?
+                .unwrap_or(false)),
+            Self::LessOrEqual {
+                attribute,
+                rule,
+                ordering_key,
+                ..
+            } => Ok(attribute_values(attributes, attribute)
+                .map(|values| {
+                    values_compare_ordering_key(values, ordering_key, rule, CmpExpectation::Le)
+                })
+                .transpose()?
+                .unwrap_or(false)),
+            Self::Present { attribute } => Ok(attribute_values(attributes, attribute).is_some()),
+            Self::Extensible {
+                attribute,
+                rule,
+                normalized_value,
+                dn_attributes,
+                applicable_attributes,
+            } => matches_prepared_extensible(
+                dn,
+                attributes,
+                attribute.as_deref(),
+                rule,
+                normalized_value,
+                *dn_attributes,
+                applicable_attributes.as_ref(),
+            ),
+        }
+    }
 }
 
 impl From<&SubstringPart> for SearchSubstringPart {
@@ -420,6 +1024,185 @@ impl From<&SubstringPart> for SearchSubstringPart {
             SubstringPart::Final(value) => Self::Final(value.clone()),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CmpExpectation {
+    Ge,
+    Le,
+}
+
+fn ensure_supported_rule(rule: &ResolvedMatchingRule) -> Result<(), FilterSchemaError> {
+    if rule.is_supported() {
+        Ok(())
+    } else {
+        Err(FilterSchemaError::InappropriateMatching(format!(
+            "unsupported matching rule {}",
+            rule.primary_name
+        )))
+    }
+}
+
+fn normalize_substring_part_for_rule(
+    part: &SubstringPart,
+    rule: &ResolvedMatchingRule,
+) -> Result<SubstringPart, FilterSchemaError> {
+    let value = rule.normalize_substring_fragment(substring_part_value(part))?;
+    Ok(match part {
+        SubstringPart::Initial(_) => SubstringPart::Initial(value),
+        SubstringPart::Any(_) => SubstringPart::Any(value),
+        SubstringPart::Final(_) => SubstringPart::Final(value),
+    })
+}
+
+#[cfg(test)]
+fn values_match_rule(
+    values: &[String],
+    assertion: &str,
+    rule: &ResolvedMatchingRule,
+) -> Result<bool, FilterSchemaError> {
+    for candidate in values {
+        if rule.values_equal(candidate, assertion)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn values_match_normalized_rule(
+    values: &[String],
+    normalized_assertion: &str,
+    rule: &ResolvedMatchingRule,
+) -> Result<bool, FilterSchemaError> {
+    for candidate in values {
+        if rule.normalize_value(candidate)? == normalized_assertion {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+fn values_compare_rule(
+    values: &[String],
+    assertion: &str,
+    rule: &ResolvedMatchingRule,
+    expectation: CmpExpectation,
+) -> Result<bool, FilterSchemaError> {
+    for candidate in values {
+        let ordering = rule.compare_values(candidate, assertion)?;
+        let matched = match expectation {
+            CmpExpectation::Ge => matches!(ordering, CmpOrdering::Greater | CmpOrdering::Equal),
+            CmpExpectation::Le => matches!(ordering, CmpOrdering::Less | CmpOrdering::Equal),
+        };
+        if matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn values_compare_ordering_key(
+    values: &[String],
+    assertion_key: &str,
+    rule: &ResolvedMatchingRule,
+    expectation: CmpExpectation,
+) -> Result<bool, FilterSchemaError> {
+    for candidate in values {
+        let candidate_key = rule.ordering_key(candidate)?;
+        let ordering = candidate_key.as_str().cmp(assertion_key);
+        let matched = match expectation {
+            CmpExpectation::Ge => matches!(ordering, CmpOrdering::Greater | CmpOrdering::Equal),
+            CmpExpectation::Le => matches!(ordering, CmpOrdering::Less | CmpOrdering::Equal),
+        };
+        if matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn matches_substrings_with_rule(
+    values: &[String],
+    normalized_parts: &[SubstringPart],
+    rule: &ResolvedMatchingRule,
+) -> Result<bool, FilterSchemaError> {
+    for value in values {
+        let normalized_value = rule.normalize_value(value)?;
+        if substring_matches(&normalized_value, normalized_parts) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn matches_prepared_extensible(
+    dn: &str,
+    attributes: &HashMap<String, Vec<String>>,
+    attribute: Option<&str>,
+    rule: &ResolvedMatchingRule,
+    normalized_value: &str,
+    dn_attributes: bool,
+    applicable_attributes: Option<&HashSet<String>>,
+) -> Result<bool, FilterSchemaError> {
+    if let Some(attribute) = attribute {
+        if attribute_values(attributes, attribute)
+            .map(|values| values_match_normalized_rule(values, normalized_value, rule))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+
+        return if dn_attributes {
+            values_match_normalized_rule(
+                &dn_attribute_values(dn, Some(attribute)),
+                normalized_value,
+                rule,
+            )
+        } else {
+            Ok(false)
+        };
+    }
+
+    for (attribute, values) in attributes {
+        if applicable_attributes
+            .map(|attributes| attributes.contains(attribute.as_str()))
+            .unwrap_or(true)
+            && values_match_normalized_rule(values, normalized_value, rule)?
+        {
+            return Ok(true);
+        }
+    }
+
+    if dn_attributes {
+        for value in dn_attribute_values(dn, None) {
+            if rule.normalize_value(&value)? == normalized_value {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn applicable_attribute_names_for_rule(
+    schema: &LdapSchema,
+    matching_rule: &str,
+) -> HashSet<String> {
+    let mut applicable = HashSet::new();
+    for attribute in schema.attribute_types_unique_sorted() {
+        if schema
+            .matching_rule_applies_to_attribute(matching_rule, &attribute.oid)
+            .is_ok()
+        {
+            applicable.insert(attribute.oid.to_ascii_lowercase());
+            for name in attribute.names {
+                applicable.insert(name.to_ascii_lowercase());
+            }
+        }
+    }
+    applicable
 }
 
 fn change_type_label(change_type: &ChangeType) -> &'static str {
@@ -622,6 +1405,82 @@ fn matches_extensible(
             .any(|value| extensible_value_matches(value, assertion, matching_rule))
 }
 
+#[cfg(test)]
+fn matches_extensible_with_schema(
+    schema: &LdapSchema,
+    dn: &str,
+    attributes: &HashMap<String, Vec<String>>,
+    attribute: Option<&str>,
+    matching_rule: Option<&str>,
+    assertion: &str,
+    dn_attributes: bool,
+) -> Result<bool, FilterSchemaError> {
+    match (attribute, matching_rule) {
+        (Some(attribute), Some(matching_rule)) => {
+            let rule = schema.matching_rule_applies_to_attribute(matching_rule, attribute)?;
+            ensure_supported_rule(&rule)?;
+            if attribute_values(attributes, attribute)
+                .map(|values| values_match_rule(values, assertion, &rule))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+            if dn_attributes {
+                return values_match_rule(
+                    &dn_attribute_values(dn, Some(attribute)),
+                    assertion,
+                    &rule,
+                );
+            }
+            Ok(false)
+        }
+        (Some(attribute), None) => {
+            let rule = schema.equality_rule_for_attribute(attribute)?;
+            ensure_supported_rule(&rule)?;
+            if attribute_values(attributes, attribute)
+                .map(|values| values_match_rule(values, assertion, &rule))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+            if dn_attributes {
+                return values_match_rule(
+                    &dn_attribute_values(dn, Some(attribute)),
+                    assertion,
+                    &rule,
+                );
+            }
+            Ok(false)
+        }
+        (None, Some(matching_rule)) => {
+            let rule = schema.resolve_matching_rule(matching_rule)?;
+            ensure_supported_rule(&rule)?;
+            for (attribute, values) in attributes {
+                if schema
+                    .matching_rule_applies_to_attribute(matching_rule, attribute)
+                    .is_ok()
+                    && values_match_rule(values, assertion, &rule)?
+                {
+                    return Ok(true);
+                }
+            }
+            if dn_attributes {
+                for value in dn_attribute_values(dn, None) {
+                    if rule.values_equal(&value, assertion)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        (None, None) => Err(FilterSchemaError::InvalidFilter(
+            "extensible match requires an attribute or matching rule".to_string(),
+        )),
+    }
+}
+
 fn extensible_value_matches(candidate: &str, assertion: &str, matching_rule: Option<&str>) -> bool {
     match matching_rule {
         None | Some("caseexactmatch") | Some("2.5.13.5") => candidate == assertion,
@@ -709,6 +1568,7 @@ fn bytes_to_string(value: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::csn::Csn;
+    use crate::schema::LdapSchema;
     use std::collections::HashMap;
 
     fn test_entry(dn: &str, object_class: &str, cn: &str) -> DirectoryEntry {
@@ -792,6 +1652,144 @@ mod tests {
             })
         );
         assert_eq!(extract_search_candidate_hint_from_str("(cn=Al*)"), None);
+    }
+
+    #[test]
+    fn schema_filter_matching_uses_attribute_matching_rules() {
+        let schema = LdapSchema::with_core_schema();
+        let filter = compile_filter("(cn=  ALICE   SMITH )").unwrap();
+        let entry = test_entry("cn=alice,dc=example,dc=com", "person", "Alice Smith");
+
+        assert!(filter.matches_with_schema(&entry, &schema).unwrap());
+    }
+
+    #[test]
+    fn prepared_schema_filter_matches_existing_schema_evaluator() {
+        let mut schema = LdapSchema::with_core_schema();
+        schema
+            .load_ldif_str(
+                "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+",
+            )
+            .unwrap();
+
+        let filter = compile_filter("(&(cn=  ALICE   SMITH )(exampleNumber>=0020))").unwrap();
+        let prepared = filter.prepare_with_schema(&schema).unwrap();
+        let mut matching = test_entry("cn=alice,dc=example,dc=com", "person", "Alice Smith");
+        matching
+            .attributes
+            .insert("examplenumber".to_string(), vec!["42".to_string()]);
+        let mut non_matching = test_entry("cn=alice,dc=example,dc=com", "person", "Alice Smith");
+        non_matching
+            .attributes
+            .insert("examplenumber".to_string(), vec!["9".to_string()]);
+
+        assert_eq!(
+            prepared.matches_entry(&matching).unwrap(),
+            filter.matches_with_schema(&matching, &schema).unwrap()
+        );
+        assert_eq!(
+            prepared.matches_entry(&non_matching).unwrap(),
+            filter.matches_with_schema(&non_matching, &schema).unwrap()
+        );
+    }
+
+    #[test]
+    fn prepared_schema_filter_reuses_normalized_substring_and_extensible_assertions() {
+        let schema = LdapSchema::with_core_schema();
+        let substring_filter = compile_filter("(cn=*ALICE*)").unwrap();
+        let extensible_filter = compile_filter("(:caseIgnoreMatch:=  ALICE   SMITH )").unwrap();
+        let substring_plan = substring_filter.prepare_with_schema(&schema).unwrap();
+        let extensible_plan = extensible_filter.prepare_with_schema(&schema).unwrap();
+        let entry = test_entry("cn=alice,dc=example,dc=com", "person", "Alice Smith");
+
+        assert!(substring_plan.matches_entry(&entry).unwrap());
+        assert!(extensible_plan.matches_entry(&entry).unwrap());
+    }
+
+    #[test]
+    fn prepared_schema_filter_exposes_normalized_index_hints() {
+        let mut schema = LdapSchema::with_core_schema();
+        schema
+            .load_ldif_str(
+                "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+",
+            )
+            .unwrap();
+
+        let ordering_plan = compile_filter("(exampleNumber>=00042)")
+            .unwrap()
+            .prepare_with_schema(&schema)
+            .unwrap();
+        assert_eq!(
+            ordering_plan.search_candidate_hint(),
+            Some(SearchCandidateHint::GreaterOrEqual {
+                attribute: "examplenumber".to_string(),
+                value: "42".to_string(),
+            })
+        );
+
+        let equality_plan = compile_filter("(cn=  ALICE   SMITH )")
+            .unwrap()
+            .prepare_with_schema(&schema)
+            .unwrap();
+        assert_eq!(
+            equality_plan.search_candidate_hint(),
+            Some(SearchCandidateHint::Equality {
+                attribute: "cn".to_string(),
+                value: "alice smith".to_string(),
+            })
+        );
+        assert_eq!(
+            equality_plan.exact_index_coverage_hint(),
+            equality_plan.search_candidate_hint()
+        );
+
+        let compound_plan = compile_filter("(&(cn=Alice)(sn=Smith))")
+            .unwrap()
+            .prepare_with_schema(&schema)
+            .unwrap();
+        assert_eq!(compound_plan.exact_index_coverage_hint(), None);
+    }
+
+    #[test]
+    fn schema_filter_validation_rejects_illegal_or_unknown_comparisons() {
+        let schema = LdapSchema::with_core_schema();
+
+        let unknown = compile_filter("(missingAttribute=value)").unwrap();
+        assert!(matches!(
+            unknown.validate_with_schema(&schema),
+            Err(FilterSchemaError::UndefinedAttribute(_))
+        ));
+
+        let no_ordering = compile_filter("(cn>=Alice)").unwrap();
+        assert!(matches!(
+            no_ordering.validate_with_schema(&schema),
+            Err(FilterSchemaError::InappropriateMatching(_))
+        ));
+    }
+
+    #[test]
+    fn schema_filter_validation_rejects_invalid_assertion_syntax() {
+        let mut schema = LdapSchema::with_core_schema();
+        schema
+            .load_ldif_str(
+                "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+",
+            )
+            .unwrap();
+
+        let invalid_integer = compile_filter("(exampleNumber>=not-an-int)").unwrap();
+        assert!(matches!(
+            invalid_integer.validate_with_schema(&schema),
+            Err(FilterSchemaError::InvalidAttributeSyntax(_))
+        ));
     }
 
     #[test]

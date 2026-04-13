@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use crate::backend::{DirectoryBackend, DirectoryEntry, OperationalAttributes};
 use crate::fsm::SearchResultCode;
-use crate::ldap_filter_eval::CompiledLdapFilter;
+use crate::ldap_filter_eval::{CompiledLdapFilter, PreparedLdapFilter};
 use crate::metrics::{FsmType, MetricsCollector, OperationType};
 use crate::operational_attrs::parse_attribute_request;
 use crate::parser::encode_search_entry_parts_with_controls;
+use crate::schema::LdapSchema;
 use crate::search_fsm::{
     EntryFormatter, FilterMatcher, SearchBackend, SearchEntry, SearchFsmImpl, SearchMetrics,
 };
@@ -80,11 +81,49 @@ impl SearchBackend for ProductionSearchBackendAdapter {
 #[derive(Debug, Default)]
 pub struct ProductionFilterMatcher {
     compiled_filter: Option<(String, CompiledLdapFilter)>,
+    prepared_filter: Option<(String, PreparedLdapFilter)>,
+    schema: Option<LdapSchema>,
+    filter_covered_by_index: bool,
 }
 
 impl ProductionFilterMatcher {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_schema(schema: LdapSchema) -> Self {
+        Self {
+            compiled_filter: None,
+            prepared_filter: None,
+            schema: Some(schema),
+            filter_covered_by_index: false,
+        }
+    }
+
+    pub(crate) fn with_schema_and_prepared_filter(
+        schema: LdapSchema,
+        filter: String,
+        prepared_filter: PreparedLdapFilter,
+    ) -> Self {
+        Self {
+            compiled_filter: None,
+            prepared_filter: Some((filter, prepared_filter)),
+            schema: Some(schema),
+            filter_covered_by_index: false,
+        }
+    }
+
+    pub(crate) fn with_index_covered_prepared_filter(
+        schema: LdapSchema,
+        filter: String,
+        prepared_filter: PreparedLdapFilter,
+    ) -> Self {
+        Self {
+            compiled_filter: None,
+            prepared_filter: Some((filter, prepared_filter)),
+            schema: Some(schema),
+            filter_covered_by_index: true,
+        }
     }
 
     fn with_compiled_filter<T>(
@@ -109,16 +148,68 @@ impl ProductionFilterMatcher {
             .expect("compiled filter populated before use");
         Ok(operation(compiled))
     }
+
+    fn with_prepared_filter<T>(
+        &mut self,
+        filter: &str,
+        operation: impl FnOnce(&PreparedLdapFilter) -> T,
+    ) -> Result<T, String> {
+        let cache_hit = self
+            .prepared_filter
+            .as_ref()
+            .map(|(cached_filter, _)| cached_filter == filter)
+            .unwrap_or(false);
+
+        if !cache_hit {
+            let compiled = crate::ldap_filter_eval::compile_filter(filter)?;
+            let prepared = compiled
+                .prepare_with_schema(
+                    self.schema
+                        .as_ref()
+                        .expect("schema-aware filter preparation requires a schema"),
+                )
+                .map_err(|err| err.to_string())?;
+            self.compiled_filter = Some((filter.to_string(), compiled));
+            self.prepared_filter = Some((filter.to_string(), prepared));
+        }
+
+        let (_, prepared) = self
+            .prepared_filter
+            .as_ref()
+            .expect("prepared filter populated before use");
+        Ok(operation(prepared))
+    }
 }
 
 #[async_trait]
 impl FilterMatcher for ProductionFilterMatcher {
     async fn matches_filter(&mut self, entry: &SearchEntry, filter: &str) -> Result<bool, String> {
-        self.with_compiled_filter(filter, |compiled| compiled.matches_search_entry(entry))
+        if self.schema.is_some() {
+            if self.filter_covered_by_index
+                && self
+                    .prepared_filter
+                    .as_ref()
+                    .map(|(cached_filter, _)| cached_filter == filter)
+                    .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+            self.with_prepared_filter(filter, |prepared| {
+                prepared
+                    .matches_search_entry(entry)
+                    .map_err(|err| err.to_string())
+            })?
+        } else {
+            self.with_compiled_filter(filter, |compiled| Ok(compiled.matches_search_entry(entry)))?
+        }
     }
 
     async fn validate_filter(&mut self, filter: &str) -> Result<(), String> {
-        self.with_compiled_filter(filter, |_| ())
+        if self.schema.is_some() {
+            self.with_prepared_filter(filter, |_| Ok(()))?
+        } else {
+            self.with_compiled_filter(filter, |_| Ok(()))?
+        }
     }
 
     fn extract_indexed_attributes(&self, _filter: &str) -> Vec<String> {
@@ -211,7 +302,7 @@ impl AttributeProjection {
             parse_attribute_request(requested_attributes);
         let requested_lower = requested_attributes
             .iter()
-            .map(|attribute| attribute.to_lowercase())
+            .map(|attribute| attribute.to_ascii_lowercase())
             .collect::<Vec<_>>();
         let include_all_user = requested_attributes.is_empty()
             || requested_lower.iter().any(|attribute| attribute == "*");
@@ -351,17 +442,78 @@ fn project_search_entry_attributes(
         .attributes
         .iter()
         .filter(|(name, _)| {
-            let key = name.to_lowercase();
-            let is_operational = OperationalAttributes::is_operational(&key);
+            let is_operational = OperationalAttributes::is_operational(name);
 
             if is_operational {
-                projection.include_all_operational || projection.specific_operational.contains(&key)
+                projection.include_all_operational
+                    || projection
+                        .specific_operational
+                        .iter()
+                        .any(|requested| requested.eq_ignore_ascii_case(name))
             } else if projection.include_all_user {
                 projection.include_user
             } else {
-                projection.include_user && projection.requested_lower.contains(&key)
+                projection.include_user
+                    && projection
+                        .requested_lower
+                        .iter()
+                        .any(|requested| requested.eq_ignore_ascii_case(name))
             }
         })
         .map(|(name, values)| (name.clone(), values.clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ldap_filter_eval::compile_filter;
+    use std::collections::HashMap;
+
+    fn search_entry_with_cn(cn: &str) -> SearchEntry {
+        SearchEntry {
+            dn: format!("cn={cn},dc=example,dc=org"),
+            attributes: HashMap::from([
+                ("cn".to_string(), vec![cn.to_string()]),
+                ("objectclass".to_string(), vec!["person".to_string()]),
+            ]),
+            object_classes: vec!["person".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn index_covered_prepared_filter_skips_redundant_matching() {
+        let schema = LdapSchema::with_core_schema();
+        let filter = "(cn=Alice)";
+        let prepared = compile_filter(filter)
+            .unwrap()
+            .prepare_with_schema(&schema)
+            .unwrap();
+        let entry = search_entry_with_cn("Bob");
+        let mut matcher = ProductionFilterMatcher::with_index_covered_prepared_filter(
+            schema,
+            filter.to_string(),
+            prepared,
+        );
+
+        assert!(matcher.matches_filter(&entry, filter).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn uncovered_prepared_filter_still_matches_entry_values() {
+        let schema = LdapSchema::with_core_schema();
+        let filter = "(cn=Alice)";
+        let prepared = compile_filter(filter)
+            .unwrap()
+            .prepare_with_schema(&schema)
+            .unwrap();
+        let entry = search_entry_with_cn("Bob");
+        let mut matcher = ProductionFilterMatcher::with_schema_and_prepared_filter(
+            schema,
+            filter.to_string(),
+            prepared,
+        );
+
+        assert!(!matcher.matches_filter(&entry, filter).await.unwrap());
+    }
 }

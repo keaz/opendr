@@ -55,6 +55,9 @@ nc -h
 # Basic replication test
 ./e2e_tests/test_single_provider_single_consumer.sh
 
+# Schema management test
+./e2e_tests/test_schema_management.sh
+
 # Multi-consumer test
 ./e2e_tests/test_multi_consumer.sh
 
@@ -137,6 +140,27 @@ export RUN_ROOT=/tmp/my_test_dir
 **Example**:
 ```bash
 ./e2e_tests/test_single_provider_single_consumer.sh
+```
+
+### test_schema_management.sh
+
+**Purpose**: Validate schema definition and validation behavior through LDAP clients
+
+**Tests**:
+- CLI validation and explanation of startup-loaded external schema definitions
+- Schema-aware index config rejection for unknown attributes
+- `cn=Subschema` publication of custom attribute types, object classes, matching rules, content rules, name forms, and structure rules
+- ADD validation for required attributes, syntax checks, single-value attributes, allowed attribute sets, and DIT content rules
+- MODIFY validation against the post-modification entry image
+- ModifyDN validation against name-form RDN rules
+- Authenticated online schema additions persisted to `99-online.ldif`
+- Restart reload of online schema definitions
+
+**Duration**: ~30-60 seconds
+
+**Example**:
+```bash
+./e2e_tests/test_schema_management.sh
 ```
 
 ### test_multi_consumer.sh

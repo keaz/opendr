@@ -4,6 +4,7 @@
 //! with file loading, environment variables, and validation.
 
 use opendr::config::ServerConfig;
+use opendr::schema::LdapSchema;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -756,6 +757,64 @@ types = ["bogus"]
             .unwrap_err()
             .to_string()
             .contains("unsupported backend index type for cn: bogus")
+    );
+}
+
+#[test]
+fn test_schema_index_validation_allows_supported_ordering_rule() {
+    let toml = r#"
+[backend]
+indexed_attributes = []
+
+[[backend.indexes]]
+attribute = "exampleNumber"
+types = ["equality", "ordering"]
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    config.validate().unwrap();
+
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(
+            "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.50.1 NAME 'exampleNumber' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+",
+        )
+        .unwrap();
+
+    config.validate_indexes_against_schema(&schema).unwrap();
+}
+
+#[test]
+fn test_schema_index_validation_rejects_missing_substring_rule() {
+    let toml = r#"
+[backend]
+indexed_attributes = []
+
+[[backend.indexes]]
+attribute = "exampleCode"
+types = ["substring"]
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    config.validate().unwrap();
+
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(
+            "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.50.2 NAME 'exampleCode' EQUALITY caseExactMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+",
+        )
+        .unwrap();
+
+    let err = config.validate_indexes_against_schema(&schema).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("substring index for exampleCode requires a substring matching rule")
     );
 }
 

@@ -65,6 +65,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub backend: BackendSettings,
 
+    /// LDAP schema loading and validation settings
+    #[serde(default)]
+    pub schema: SchemaSettings,
+
     /// TLS/SSL settings
     #[serde(default)]
     pub tls: TlsSettings,
@@ -210,6 +214,30 @@ pub struct AttributeIndexSettings {
     /// Index types to maintain, e.g. "equality", "presence", "substring", "ordering".
     #[serde(default)]
     pub types: Vec<String>,
+}
+
+/// LDAP schema loading and validation settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaSettings {
+    /// Enable schema validation and publication.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Directory containing RFC LDIF schema files.
+    #[serde(default = "default_schema_dir")]
+    pub schema_dir: PathBuf,
+
+    /// Built-in schema bundles to load before external files.
+    #[serde(default = "default_builtin_schemas")]
+    pub load_builtin: Vec<String>,
+
+    /// Treat malformed schema as a startup error.
+    #[serde(default = "default_true")]
+    pub strict_validation: bool,
+
+    /// Allow LDAP Modify operations against the subschema entry.
+    #[serde(default)]
+    pub allow_online_updates: bool,
 }
 
 /// TLS settings
@@ -631,6 +659,12 @@ fn default_lmdb_max_size() -> usize {
 fn default_lmdb_max_readers() -> u32 {
     126
 }
+fn default_schema_dir() -> PathBuf {
+    PathBuf::from("config/schema")
+}
+fn default_builtin_schemas() -> Vec<String> {
+    vec!["core".to_string()]
+}
 fn default_indexed_attributes() -> Vec<String> {
     vec![
         "cn".to_string(),
@@ -853,6 +887,18 @@ impl Default for BackendSettings {
             import_sample_data: false,
             indexed_attributes: default_indexed_attributes(),
             indexes: Vec::new(),
+        }
+    }
+}
+
+impl Default for SchemaSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            schema_dir: default_schema_dir(),
+            load_builtin: default_builtin_schemas(),
+            strict_validation: true,
+            allow_online_updates: false,
         }
     }
 }
@@ -1169,6 +1215,130 @@ impl ServerConfig {
         )
     }
 
+    /// Load the configured LDAP schema registry.
+    pub fn load_schema(&self) -> Result<crate::schema::LdapSchema, ConfigError> {
+        let mut schema = if self.schema.enabled
+            && self
+                .schema
+                .load_builtin
+                .iter()
+                .any(|bundle| bundle.eq_ignore_ascii_case("core"))
+        {
+            crate::schema::LdapSchema::with_core_schema()
+        } else {
+            crate::schema::LdapSchema::new()
+        };
+
+        if self.schema.enabled
+            && let Err(err) = schema.load_schema_dir(&self.schema.schema_dir)
+        {
+            if self.schema.strict_validation {
+                return Err(ConfigError::ValidationError(err.to_string()));
+            }
+            log::warn!(
+                "Ignoring schema load error because strict_validation=false: {}",
+                err
+            );
+        }
+
+        Ok(schema)
+    }
+
+    /// Validate configured backend indexes against the loaded LDAP schema.
+    pub fn validate_indexes_against_schema(
+        &self,
+        schema: &crate::schema::LdapSchema,
+    ) -> Result<(), ConfigError> {
+        if !self.performance.indexing_enabled {
+            return Ok(());
+        }
+        for attribute in &self.backend.indexed_attributes {
+            if schema.get_attribute_type(attribute).is_none() {
+                return Err(ConfigError::ValidationError(format!(
+                    "backend.indexed_attributes references unknown schema attribute: {}",
+                    attribute
+                )));
+            }
+            let rule = schema
+                .equality_rule_for_attribute(attribute)
+                .map_err(|err| {
+                    ConfigError::ValidationError(format!(
+                        "equality index for {} requires an equality matching rule: {}",
+                        attribute, err
+                    ))
+                })?;
+            if !rule.is_supported() {
+                return Err(ConfigError::ValidationError(format!(
+                    "equality index for {} uses unsupported matching rule {}",
+                    attribute, rule.primary_name
+                )));
+            }
+        }
+        for index in &self.backend.indexes {
+            if schema.get_attribute_type(&index.attribute).is_none() {
+                return Err(ConfigError::ValidationError(format!(
+                    "backend.indexes references unknown schema attribute: {}",
+                    index.attribute
+                )));
+            }
+            for index_type in &index.types {
+                match index_type.to_ascii_lowercase().as_str() {
+                    "equality" | "eq" => {
+                        let rule = schema
+                            .equality_rule_for_attribute(&index.attribute)
+                            .map_err(|err| {
+                                ConfigError::ValidationError(format!(
+                                    "equality index for {} requires an equality matching rule: {}",
+                                    index.attribute, err
+                                ))
+                            })?;
+                        if !rule.is_supported() {
+                            return Err(ConfigError::ValidationError(format!(
+                                "equality index for {} uses unsupported matching rule {}",
+                                index.attribute, rule.primary_name
+                            )));
+                        }
+                    }
+                    "ordering" | "ord" => {
+                        let rule = schema
+                            .ordering_rule_for_attribute(&index.attribute)
+                            .map_err(|err| {
+                                ConfigError::ValidationError(format!(
+                                    "ordering index for {} requires an ordering matching rule: {}",
+                                    index.attribute, err
+                                ))
+                            })?;
+                        if !rule.is_supported() {
+                            return Err(ConfigError::ValidationError(format!(
+                                "ordering index for {} uses unsupported matching rule {}",
+                                index.attribute, rule.primary_name
+                            )));
+                        }
+                    }
+                    "substring" | "sub" => {
+                        let rule = schema
+                            .substring_rule_for_attribute(&index.attribute)
+                            .map_err(|err| {
+                                ConfigError::ValidationError(format!(
+                                    "substring index for {} requires a substring matching rule: {}",
+                                    index.attribute, err
+                                ))
+                            })?;
+                        if !rule.is_supported() {
+                            return Err(ConfigError::ValidationError(format!(
+                                "substring index for {} uses unsupported matching rule {}",
+                                index.attribute, rule.primary_name
+                            )));
+                        }
+                    }
+                    "presence" | "pres" => {}
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Convert ServerConfig to FsmServerConfig for FSM server usage
     pub fn to_fsm_server_config(&self) -> crate::fsm_server::FsmServerConfig {
         use crate::connection_pool::ResourceLimits;
@@ -1364,6 +1534,19 @@ impl ServerConfig {
                         index.attribute, index_type
                     )));
                 }
+            }
+        }
+        if self.schema.enabled && self.schema.schema_dir.as_os_str().is_empty() {
+            return Err(ConfigError::ValidationError(
+                "schema.schema_dir cannot be empty when schema is enabled".to_string(),
+            ));
+        }
+        for builtin in &self.schema.load_builtin {
+            if !["core"].contains(&builtin.as_str()) {
+                return Err(ConfigError::ValidationError(format!(
+                    "unsupported builtin schema bundle: {}",
+                    builtin
+                )));
             }
         }
 

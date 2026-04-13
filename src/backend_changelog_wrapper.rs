@@ -33,6 +33,7 @@ use tokio::sync::broadcast;
 
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, SearchCandidateHint,
+    SearchEntriesWithHintReport,
 };
 use crate::change_observer::ChangeObserver;
 use crate::replication::{ChangelogTracker, encode_rename_change_with_actor};
@@ -298,6 +299,17 @@ impl DirectoryBackend for ChangelogBackendWrapper {
     ) -> Result<Vec<DirectoryEntry>, BackendError> {
         self.backend
             .search_entries_with_hint(base_dn, scope, hint)
+            .await
+    }
+
+    async fn search_entries_with_hint_report(
+        &self,
+        base_dn: &str,
+        scope: Scope,
+        hint: Option<SearchCandidateHint>,
+    ) -> Result<SearchEntriesWithHintReport, BackendError> {
+        self.backend
+            .search_entries_with_hint_report(base_dn, scope, hint)
             .await
     }
 

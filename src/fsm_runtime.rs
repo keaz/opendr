@@ -38,11 +38,15 @@ use crate::extended_op_fsm::ExtendedOpFsmImpl;
 use crate::fsm::{AuthState, ConnectionFsm, SaslFsm, StateMachine};
 use crate::fsm_operation_registry::{FsmOperationRegistry, OperationInfo};
 use crate::fsm_request::{FsmRequestContext, FsmRequestRejection, build_request_context};
+use crate::ldap_filter_eval::PreparedLdapFilter;
 use crate::sasl_fsm::SaslFsmImpl;
+use crate::schema::LdapSchema;
 use crate::search_fsm::SearchFsmImpl;
 use crate::write_fsm::{SchemaValidator, WriteFsmImpl};
 
 pub use crate::fsm_operation_registry::OperationType;
+
+const PREPARED_SEARCH_FILTER_CACHE_CAPACITY: usize = 16;
 
 struct DirectoryAuthenticationBackend {
     backend: Arc<dyn DirectoryBackend>,
@@ -193,6 +197,12 @@ pub struct ConnectionFsmSet {
 
     /// Schema validator for write operations
     schema_validator: Arc<dyn SchemaValidator>,
+
+    /// Small immutable-schema cache for repeated search filters on this connection.
+    prepared_search_filters: Vec<(String, PreparedLdapFilter)>,
+
+    /// Immutable-schema snapshot reused for all operations on this connection.
+    immutable_schema_snapshot: Option<Arc<LdapSchema>>,
 }
 
 impl ConnectionFsmSet {
@@ -283,6 +293,8 @@ impl ConnectionFsmSet {
             operations: FsmOperationRegistry::default(),
             backend,
             schema_validator,
+            prepared_search_filters: Vec::new(),
+            immutable_schema_snapshot: None,
         }
     }
 
@@ -329,6 +341,45 @@ impl ConnectionFsmSet {
     /// Check if the connection is authenticated
     pub fn is_authenticated(&self) -> bool {
         self.auth.is_authenticated()
+    }
+
+    /// Get a prepared search filter cached for this connection.
+    pub(crate) fn prepared_search_filter(&self, filter: &str) -> Option<PreparedLdapFilter> {
+        self.prepared_search_filters
+            .iter()
+            .rev()
+            .find_map(|(cached_filter, prepared)| {
+                (cached_filter == filter).then(|| prepared.clone())
+            })
+    }
+
+    /// Cache a prepared search filter for repeated immutable-schema searches.
+    pub(crate) fn remember_prepared_search_filter(
+        &mut self,
+        filter: String,
+        prepared_filter: PreparedLdapFilter,
+    ) {
+        if let Some(index) = self
+            .prepared_search_filters
+            .iter()
+            .position(|(cached_filter, _)| cached_filter == &filter)
+        {
+            self.prepared_search_filters.remove(index);
+        } else if self.prepared_search_filters.len() >= PREPARED_SEARCH_FILTER_CACHE_CAPACITY {
+            self.prepared_search_filters.remove(0);
+        }
+
+        self.prepared_search_filters.push((filter, prepared_filter));
+    }
+
+    /// Get the immutable schema snapshot cached for this connection.
+    pub(crate) fn immutable_schema_snapshot(&self) -> Option<Arc<LdapSchema>> {
+        self.immutable_schema_snapshot.clone()
+    }
+
+    /// Remember an immutable schema snapshot for this connection.
+    pub(crate) fn remember_immutable_schema_snapshot(&mut self, schema: Arc<LdapSchema>) {
+        self.immutable_schema_snapshot = Some(schema);
     }
 
     /// Build the shared request context used by the FSM dispatcher.

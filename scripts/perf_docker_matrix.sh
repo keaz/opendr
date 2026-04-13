@@ -37,8 +37,10 @@ OPENDR_LMDB_MAX_READERS="${OPENDR_LMDB_MAX_READERS:-256}"
 OPENDR_MAX_CONNECTIONS="${OPENDR_MAX_CONNECTIONS:-512}"
 OPENDR_MAX_CONNECTIONS_PER_IP="${OPENDR_MAX_CONNECTIONS_PER_IP:-256}"
 OPENDR_MAX_OPERATIONS_PER_CONNECTION="${OPENDR_MAX_OPERATIONS_PER_CONNECTION:-200}"
-DEFAULT_OPENDR_INDEX_BENCHMARK_TOML=$'[[backend.indexes]]\nattribute = "description"\ntypes = ["substring"]\n\n[[backend.indexes]]\nattribute = "sn"\ntypes = ["ordering"]'
+DEFAULT_OPENDR_INDEX_BENCHMARK_TOML=$'[[backend.indexes]]\nattribute = "description"\ntypes = ["substring"]\n\n[[backend.indexes]]\nattribute = "benchmarkOrder"\ntypes = ["ordering"]'
+DEFAULT_OPENDR_INDEX_BENCHMARK_SCHEMA_LDIF=$'dn: cn=schema\nattributeTypes: ( 1.3.6.1.4.1.55555.200.1 NAME \'benchmarkOrder\' DESC \'Benchmark integer ordering key\' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )\nobjectClasses: ( 1.3.6.1.4.1.55555.200.2 NAME \'benchmarkIndexedObject\' DESC \'Benchmark auxiliary object class for index probes\' SUP top AUXILIARY MAY benchmarkOrder )'
 OPENDR_BACKEND_INDEXES_TOML=""
+OPENDR_SCHEMA_LDIF=""
 PERF_CLIENT_IMAGE=""
 PERF_CLIENT_HOST="127.0.0.1"
 PERF_CLIENT_NETWORK="server"
@@ -97,6 +99,8 @@ Options:
   --opendr-runtime VALUE   OpenDR server runtime: legacy or fsm (default: fsm)
   --opendr-backend-indexes-toml VALUE
                           TOML snippet appended to OpenDR Docker server.toml for typed backend indexes
+  --opendr-schema-ldif VALUE
+                          LDIF schema snippet written into the OpenDR Docker schema directory
   --opendj-image TAG       OpenDJ image tag (default: openidentityplatform/opendj:5.0.4)
   --perf-client-image TAG  Optional Docker image for ldap_perf_client instead of the host binary
   --perf-client-host HOST  Hostname the Dockerized perf client uses for published LDAP ports (default: 127.0.0.1)
@@ -220,6 +224,10 @@ while [[ $# -gt 0 ]]; do
       OPENDR_BACKEND_INDEXES_TOML="$2"
       shift 2
       ;;
+    --opendr-schema-ldif)
+      OPENDR_SCHEMA_LDIF="$2"
+      shift 2
+      ;;
     --opendj-image)
       OPENDJ_IMAGE="$2"
       shift 2
@@ -313,6 +321,9 @@ case "${PROFILE_SET}" in
     fi
     if [[ -z "${OPENDR_BACKEND_INDEXES_TOML}" ]]; then
       OPENDR_BACKEND_INDEXES_TOML="${DEFAULT_OPENDR_INDEX_BENCHMARK_TOML}"
+    fi
+    if [[ -z "${OPENDR_SCHEMA_LDIF}" ]]; then
+      OPENDR_SCHEMA_LDIF="${DEFAULT_OPENDR_INDEX_BENCHMARK_SCHEMA_LDIF}"
     fi
     ;;
   sasl)
@@ -841,6 +852,7 @@ run_profile() {
         -e OPENDR_MAX_CONNECTIONS_PER_IP="${OPENDR_MAX_CONNECTIONS_PER_IP}" \
         -e OPENDR_MAX_OPERATIONS_PER_CONNECTION="${OPENDR_MAX_OPERATIONS_PER_CONNECTION}" \
         -e OPENDR_BACKEND_INDEXES_TOML="${OPENDR_BACKEND_INDEXES_TOML}" \
+        -e OPENDR_SCHEMA_LDIF="${OPENDR_SCHEMA_LDIF}" \
         "${image}" \
         >/dev/null
       ;;
@@ -1345,10 +1357,10 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "index_presence_mail_throughput": bench_value("index_presence_mail", "throughput_ops_per_sec"),
             "index_substring_description_mean_ms": bench_value("index_substring_description", "mean_ms"),
             "index_substring_description_throughput": bench_value("index_substring_description", "throughput_ops_per_sec"),
-            "index_ordering_sn_ge_mean_ms": bench_value("index_ordering_sn_ge", "mean_ms"),
-            "index_ordering_sn_ge_throughput": bench_value("index_ordering_sn_ge", "throughput_ops_per_sec"),
-            "index_ordering_sn_le_mean_ms": bench_value("index_ordering_sn_le", "mean_ms"),
-            "index_ordering_sn_le_throughput": bench_value("index_ordering_sn_le", "throughput_ops_per_sec"),
+            "index_ordering_benchmark_order_ge_mean_ms": bench_value("index_ordering_benchmark_order_ge", "mean_ms"),
+            "index_ordering_benchmark_order_ge_throughput": bench_value("index_ordering_benchmark_order_ge", "throughput_ops_per_sec"),
+            "index_ordering_benchmark_order_le_mean_ms": bench_value("index_ordering_benchmark_order_le", "mean_ms"),
+            "index_ordering_benchmark_order_le_throughput": bench_value("index_ordering_benchmark_order_le", "throughput_ops_per_sec"),
             "max_concurrent_index_search_clients_tested": max_concurrent_index_search_clients_tested,
             "max_concurrent_index_search_clients_zero_failure": max_concurrent_index_search_clients_zero_failure,
             "max_concurrent_index_search_failure_rate_percent": max_concurrent_index_search_failure_rate_percent,
@@ -1396,7 +1408,7 @@ summary_md = root / "comparison-summary.md"
 summary_csv = root / "comparison-summary.csv"
 
 csv_lines = [
-    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,index_benchmark,sasl_plain_benchmark,sasl_plain_authcid_format,skip_sasl_plain_admin_benchmark,concurrent_index_search_clients,concurrent_index_search_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,sasl_plain_bind_admin_mean_ms,sasl_plain_bind_fixture_user_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,index_equality_uid_mean_ms,index_equality_uid_throughput,index_presence_mail_mean_ms,index_presence_mail_throughput,index_substring_description_mean_ms,index_substring_description_throughput,index_ordering_sn_ge_mean_ms,index_ordering_sn_ge_throughput,index_ordering_sn_le_mean_ms,index_ordering_sn_le_throughput,max_concurrent_index_search_clients_tested,max_concurrent_index_search_clients_zero_failure,max_concurrent_index_search_failure_rate_percent,peak_concurrent_index_search_success_throughput,peak_concurrent_index_search_attempt_throughput,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput,max_concurrent_sasl_plain_bind_clients_tested,max_concurrent_sasl_plain_bind_clients_zero_failure,max_concurrent_sasl_plain_bind_failure_rate_percent,peak_concurrent_sasl_plain_bind_success_throughput,peak_concurrent_sasl_plain_bind_attempt_throughput"
+    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,index_benchmark,sasl_plain_benchmark,sasl_plain_authcid_format,skip_sasl_plain_admin_benchmark,concurrent_index_search_clients,concurrent_index_search_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,sasl_plain_bind_admin_mean_ms,sasl_plain_bind_fixture_user_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,index_equality_uid_mean_ms,index_equality_uid_throughput,index_presence_mail_mean_ms,index_presence_mail_throughput,index_substring_description_mean_ms,index_substring_description_throughput,index_ordering_benchmark_order_ge_mean_ms,index_ordering_benchmark_order_ge_throughput,index_ordering_benchmark_order_le_mean_ms,index_ordering_benchmark_order_le_throughput,max_concurrent_index_search_clients_tested,max_concurrent_index_search_clients_zero_failure,max_concurrent_index_search_failure_rate_percent,peak_concurrent_index_search_success_throughput,peak_concurrent_index_search_attempt_throughput,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput,max_concurrent_sasl_plain_bind_clients_tested,max_concurrent_sasl_plain_bind_clients_zero_failure,max_concurrent_sasl_plain_bind_failure_rate_percent,peak_concurrent_sasl_plain_bind_success_throughput,peak_concurrent_sasl_plain_bind_attempt_throughput"
 ]
 for run in runs:
     csv_lines.append(
@@ -1457,10 +1469,10 @@ for run in runs:
                 csv_value(run["index_presence_mail_throughput"]),
                 csv_value(run["index_substring_description_mean_ms"]),
                 csv_value(run["index_substring_description_throughput"]),
-                csv_value(run["index_ordering_sn_ge_mean_ms"]),
-                csv_value(run["index_ordering_sn_ge_throughput"]),
-                csv_value(run["index_ordering_sn_le_mean_ms"]),
-                csv_value(run["index_ordering_sn_le_throughput"]),
+                csv_value(run["index_ordering_benchmark_order_ge_mean_ms"]),
+                csv_value(run["index_ordering_benchmark_order_ge_throughput"]),
+                csv_value(run["index_ordering_benchmark_order_le_mean_ms"]),
+                csv_value(run["index_ordering_benchmark_order_le_throughput"]),
                 fmt_int(run["max_concurrent_index_search_clients_tested"]),
                 fmt_int(run["max_concurrent_index_search_clients_zero_failure"]),
                 csv_value(run["max_concurrent_index_search_failure_rate_percent"]),
@@ -1568,7 +1580,7 @@ if runs:
         )
         for run in runs:
             lines.append(
-                f"| {run['product']} | {run['profile']} | {fmt_number(run['index_equality_uid_mean_ms'])} | {fmt_number(run['index_presence_mail_mean_ms'])} | {fmt_number(run['index_substring_description_mean_ms'])} | {fmt_number(run['index_ordering_sn_ge_mean_ms'])} | {fmt_number(run['index_ordering_sn_le_mean_ms'])} | {fmt_int(run['max_concurrent_index_search_clients_tested'])} | {fmt_int(run['max_concurrent_index_search_clients_zero_failure'])} | {fmt_number(run['max_concurrent_index_search_failure_rate_percent'], 2)} | {fmt_number(run['peak_concurrent_index_search_success_throughput'], 2)} |"
+                f"| {run['product']} | {run['profile']} | {fmt_number(run['index_equality_uid_mean_ms'])} | {fmt_number(run['index_presence_mail_mean_ms'])} | {fmt_number(run['index_substring_description_mean_ms'])} | {fmt_number(run['index_ordering_benchmark_order_ge_mean_ms'])} | {fmt_number(run['index_ordering_benchmark_order_le_mean_ms'])} | {fmt_int(run['max_concurrent_index_search_clients_tested'])} | {fmt_int(run['max_concurrent_index_search_clients_zero_failure'])} | {fmt_number(run['max_concurrent_index_search_failure_rate_percent'], 2)} | {fmt_number(run['peak_concurrent_index_search_success_throughput'], 2)} |"
             )
 
     incomplete_runs = [run for run in runs if run["status"] != "success"]
