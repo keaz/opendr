@@ -516,7 +516,22 @@ fn replication_entries_match(
     existing: &crate::backend::DirectoryEntry,
     desired: &crate::backend::DirectoryEntry,
 ) -> bool {
-    existing.dn == desired.dn && existing.attributes == desired.attributes
+    existing.dn == desired.dn
+        && existing.attributes == desired.attributes
+        && (!replication_has_operational_attributes(&desired.operational_attributes)
+            || existing.operational_attributes == desired.operational_attributes)
+}
+
+fn replication_has_operational_attributes(attrs: &crate::backend::OperationalAttributes) -> bool {
+    attrs.entry_csn.is_some()
+        || attrs.entry_uuid.is_some()
+        || attrs.create_timestamp.is_some()
+        || attrs.modify_timestamp.is_some()
+        || attrs.creators_name.is_some()
+        || attrs.modifiers_name.is_some()
+        || attrs.last_successful_login.is_some()
+        || attrs.last_failed_login.is_some()
+        || attrs.failed_login_count.is_some()
 }
 
 fn replication_replace_modifications(
@@ -629,6 +644,13 @@ fn directory_entry_from_search_entry(
         modify_timestamp: take_first_attr_case_insensitive(&mut entry.attrs, "modifyTimestamp"),
         creators_name: take_first_attr_case_insensitive(&mut entry.attrs, "creatorsName"),
         modifiers_name: take_first_attr_case_insensitive(&mut entry.attrs, "modifiersName"),
+        last_successful_login: take_first_attr_case_insensitive(
+            &mut entry.attrs,
+            "lastSuccessfulLogin",
+        ),
+        last_failed_login: take_first_attr_case_insensitive(&mut entry.attrs, "lastFailedLogin"),
+        failed_login_count: take_first_attr_case_insensitive(&mut entry.attrs, "failedLoginCount")
+            .and_then(|count| count.parse::<u64>().ok()),
     };
 
     crate::backend::DirectoryEntry::with_operational_attrs(
@@ -1593,6 +1615,20 @@ impl BatchProcessor for BatchProcessorImpl {
                     .await
                 {
                     Ok(_) => {
+                        if replication_has_operational_attributes(&dir_entry.operational_attributes)
+                        {
+                            self.backend
+                                .replace_operational_attributes(
+                                    &dir_entry.dn,
+                                    dir_entry.operational_attributes.clone(),
+                                )
+                                .await
+                                .map_err(|e| ConsumerError::ProcessingError {
+                                    message: format!(
+                                        "Failed to replay ADD operational attributes for {dn}: {e}"
+                                    ),
+                                })?;
+                        }
                         info!("Replicated ADD: {}", dn);
                     }
                     Err(crate::backend::BackendError::AlreadyExists) => {
@@ -1627,6 +1663,21 @@ impl BatchProcessor for BatchProcessorImpl {
                                             "Failed to reconcile existing ADD target for {dn}: {e}"
                                         ),
                                     })?;
+                                if replication_has_operational_attributes(
+                                    &dir_entry.operational_attributes,
+                                ) {
+                                    self.backend
+                                        .replace_operational_attributes(
+                                            dn,
+                                            dir_entry.operational_attributes.clone(),
+                                        )
+                                        .await
+                                        .map_err(|e| ConsumerError::ProcessingError {
+                                            message: format!(
+                                                "Failed to reconcile existing ADD operational attributes for {dn}: {e}"
+                                            ),
+                                        })?;
+                                }
                                 info!("Replicated ADD reconciled existing entry: {}", dn);
                             }
                             None => {
@@ -1675,6 +1726,20 @@ impl BatchProcessor for BatchProcessorImpl {
                     .await
                 {
                     Ok(_) => {
+                        if replication_has_operational_attributes(&dir_entry.operational_attributes)
+                        {
+                            self.backend
+                                .replace_operational_attributes(
+                                    dn,
+                                    dir_entry.operational_attributes.clone(),
+                                )
+                                .await
+                                .map_err(|e| ConsumerError::ProcessingError {
+                                    message: format!(
+                                        "Failed to replay MODIFY operational attributes for {dn}: {e}"
+                                    ),
+                                })?;
+                        }
                         info!("Replicated MODIFY: {}", dn);
                     }
                     Err(e) => {
@@ -2594,6 +2659,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_batch_processor_add_replays_account_authentication_metadata() {
+        let backend = Arc::new(MockBackend::new());
+        let batch_processor = BatchProcessorImpl::new(backend.clone());
+        let mut operational_attributes = OperationalAttributes::for_new_entry(
+            crate::csn::CsnGenerator::new(13).generate(),
+            None,
+        );
+        operational_attributes.last_successful_login = Some("20260413010203Z".to_string());
+        operational_attributes.last_failed_login = Some("20260413040506Z".to_string());
+        operational_attributes.failed_login_count = Some(2);
+        let replicated = DirectoryEntry::with_operational_attrs(
+            "cn=user1,dc=example,dc=org",
+            HashMap::from([
+                ("cn".to_string(), vec!["user1".to_string()]),
+                ("sn".to_string(), vec!["User".to_string()]),
+            ]),
+            operational_attributes,
+        );
+        let encoded = encode_change_bytes(
+            &ChangeType::Add,
+            &replicated.dn,
+            serde_json::to_vec(&replicated).unwrap().as_slice(),
+        );
+
+        batch_processor.apply_entry(&encoded).await.unwrap();
+
+        let stored = backend
+            .get_entry("cn=user1,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.operational_attributes.last_successful_login,
+            Some("20260413010203Z".to_string())
+        );
+        assert_eq!(
+            stored.operational_attributes.last_failed_login,
+            Some("20260413040506Z".to_string())
+        );
+        assert_eq!(stored.operational_attributes.failed_login_count, Some(2));
+    }
+
+    #[tokio::test]
     async fn test_batch_processor_modify_replays_modifier_metadata() {
         let backend = Arc::new(MockBackend::new());
         let batch_processor = BatchProcessorImpl::new(backend.clone());
@@ -2627,6 +2735,9 @@ mod tests {
                 creators_name: Some(creator.clone()),
                 modifiers_name: Some(modifier.clone()),
                 entry_uuid: Some(uuid::Uuid::new_v4().to_string()),
+                last_successful_login: None,
+                last_failed_login: None,
+                failed_login_count: None,
             },
         );
         let encoded = encode_change_bytes(

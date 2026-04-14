@@ -15,6 +15,7 @@ INDEX_BENCHMARK="false"
 SASL_PLAIN_BENCHMARK="false"
 SASL_PLAIN_AUTHCID_FORMAT="dn"
 SKIP_SASL_PLAIN_ADMIN_BENCHMARK="false"
+SKIP_FULL_COUNTS="false"
 CONCURRENT_INDEX_SEARCH_CLIENTS=""
 CONCURRENT_INDEX_SEARCH_ITERATIONS="20"
 CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS="1"
@@ -33,6 +34,7 @@ OPENDR_IMAGE="opendr:docker-perf"
 OPENDJ_IMAGE="openidentityplatform/opendj:5.0.4"
 PRODUCTS="opendr,opendj"
 OPENDR_RUNTIME="fsm"
+OPENDR_LMDB_MAX_SIZE="${OPENDR_LMDB_MAX_SIZE:-1073741824}"
 OPENDR_LMDB_MAX_READERS="${OPENDR_LMDB_MAX_READERS:-256}"
 OPENDR_MAX_CONNECTIONS="${OPENDR_MAX_CONNECTIONS:-512}"
 OPENDR_MAX_CONNECTIONS_PER_IP="${OPENDR_MAX_CONNECTIONS_PER_IP:-256}"
@@ -57,7 +59,7 @@ Usage: scripts/perf_docker_matrix.sh [options]
 
 Options:
   --output-dir PATH         Output directory for the matrix run
-  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl (default: full)
+  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl, million (default: full)
   --products LIST          Comma-separated subset of: opendr,opendj
   --sample-interval SEC    Container stats sample interval (default: 0.25)
   --cpu VALUE              Docker CPU limit for each server container (default: 2)
@@ -69,6 +71,7 @@ Options:
                           SASL PLAIN authcid format: dn or rdn-value (default: dn)
   --skip-sasl-plain-admin-benchmark
                           Skip the admin/root SASL PLAIN bind probe; useful for OpenDJ fixture-user comparisons
+  --skip-full-counts      Skip full-subtree setup/final count verification in the perf client
   --concurrent-index-search-clients LIST
                           Comma-separated concurrent index-search client levels; empty disables (default: disabled)
   --concurrent-index-search-iterations N
@@ -97,6 +100,8 @@ Options:
   --root-password VALUE    Root password used for both products
   --opendr-image TAG       Local OpenDR image tag (default: opendr:docker-perf)
   --opendr-runtime VALUE   OpenDR server runtime: legacy or fsm (default: fsm)
+  --opendr-lmdb-max-size BYTES
+                          OpenDR Docker LMDB map size in bytes (default: 1073741824)
   --opendr-backend-indexes-toml VALUE
                           TOML snippet appended to OpenDR Docker server.toml for typed backend indexes
   --opendr-schema-ldif VALUE
@@ -154,6 +159,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-sasl-plain-admin-benchmark)
       SKIP_SASL_PLAIN_ADMIN_BENCHMARK="true"
+      shift
+      ;;
+    --skip-full-counts)
+      SKIP_FULL_COUNTS="true"
       shift
       ;;
     --concurrent-index-search-clients)
@@ -218,6 +227,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --opendr-runtime)
       OPENDR_RUNTIME="$2"
+      shift 2
+      ;;
+    --opendr-lmdb-max-size)
+      OPENDR_LMDB_MAX_SIZE="$2"
       shift 2
       ;;
     --opendr-backend-indexes-toml)
@@ -335,8 +348,14 @@ case "${PROFILE_SET}" in
       CONCURRENT_BIND_CLIENTS="1,4,8,16,32,64,128"
     fi
     ;;
+  million)
+    LOAD_PROFILES=(
+      "million:1000000:3:3:1"
+    )
+    SKIP_FULL_COUNTS="true"
+    ;;
   *)
-    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl" >&2
+    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl, million" >&2
     exit 1
     ;;
 esac
@@ -652,6 +671,7 @@ write_run_metadata() {
   "cpu_limit": "${CPU_LIMIT}",
   "memory_limit": "${MEMORY_LIMIT}",
   "opendr_runtime": "${OPENDR_RUNTIME}",
+  "opendr_lmdb_max_size": ${OPENDR_LMDB_MAX_SIZE},
   "opendr_lmdb_max_readers": ${OPENDR_LMDB_MAX_READERS},
   "opendr_max_connections": ${OPENDR_MAX_CONNECTIONS},
   "opendr_max_connections_per_ip": ${OPENDR_MAX_CONNECTIONS_PER_IP},
@@ -757,7 +777,16 @@ configure_opendj_index_benchmark_indexes() {
     return 0
   fi
 
+  local ldapmodify=(docker exec -i "${container}" /opt/opendj/bin/ldapmodify)
   local dsconfig=(docker exec "${container}" /opt/opendj/bin/dsconfig)
+  local ldap_options=(
+    --hostname localhost
+    --port 1389
+    --bindDN "cn=admin"
+    --bindPassword "${ROOT_PASSWORD}"
+    --useStartTLS
+    --trustAll
+    --noPropertiesFile)
   local dsconfig_options=(
     --hostname localhost
     --port 4444
@@ -765,6 +794,17 @@ configure_opendj_index_benchmark_indexes() {
     --bindPassword "${ROOT_PASSWORD}"
     --trustAll
     --no-prompt)
+
+  echo "Configuring OpenDJ index benchmark schema..."
+  "${ldapmodify[@]}" "${ldap_options[@]}" >/dev/null <<'LDIF'
+dn: cn=schema
+changetype: modify
+add: attributeTypes
+attributeTypes: ( 1.3.6.1.4.1.55555.200.1 NAME 'benchmarkOrder' DESC 'Benchmark integer ordering key' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+-
+add: objectClasses
+objectClasses: ( 1.3.6.1.4.1.55555.200.2 NAME 'benchmarkIndexedObject' DESC 'Benchmark auxiliary object class for index probes' SUP top AUXILIARY MAY benchmarkOrder )
+LDIF
 
   echo "Configuring OpenDJ index benchmark indexes..."
   "${dsconfig[@]}" create-backend-index \
@@ -790,13 +830,13 @@ configure_opendj_index_benchmark_indexes() {
   "${dsconfig[@]}" create-backend-index \
     "${dsconfig_options[@]}" \
     --backend-name userRoot \
-    --index-name sn \
+    --index-name benchmarkOrder \
     --set index-type:ordering \
     >/dev/null 2>&1 || true
   "${dsconfig[@]}" set-backend-index-prop \
     "${dsconfig_options[@]}" \
     --backend-name userRoot \
-    --index-name sn \
+    --index-name benchmarkOrder \
     --set index-type:ordering \
     >/dev/null
 }
@@ -847,6 +887,7 @@ run_profile() {
         -e OPENDR_BASE_DN="${BASE_DN}" \
         -e OPENDR_ROOT_USER_DN="cn=admin" \
         -e OPENDR_ROOT_PASSWORD="${ROOT_PASSWORD}" \
+        -e OPENDR_LMDB_MAX_SIZE="${OPENDR_LMDB_MAX_SIZE}" \
         -e OPENDR_LMDB_MAX_READERS="${OPENDR_LMDB_MAX_READERS}" \
         -e OPENDR_MAX_CONNECTIONS="${OPENDR_MAX_CONNECTIONS}" \
         -e OPENDR_MAX_CONNECTIONS_PER_IP="${OPENDR_MAX_CONNECTIONS_PER_IP}" \
@@ -1018,6 +1059,9 @@ run_profile() {
     if [[ "${SKIP_SASL_PLAIN_ADMIN_BENCHMARK}" == "true" ]]; then
       benchmark_cmd+=(--skip-sasl-plain-admin-benchmark)
     fi
+  fi
+  if [[ "${SKIP_FULL_COUNTS}" == "true" ]]; then
+    benchmark_cmd+=(--skip-full-counts)
   fi
   if [[ -n "${CONCURRENT_INDEX_SEARCH_CLIENTS}" ]]; then
     benchmark_cmd+=(
@@ -1319,6 +1363,7 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "concurrent_bind_hot_user_count": metadata.get("concurrent_bind_hot_user_count", 0),
             "cpu_limit": metadata["cpu_limit"],
             "memory_limit": metadata["memory_limit"],
+            "opendr_lmdb_max_size": metadata.get("opendr_lmdb_max_size", 0),
             "benchmark_client": metadata.get("benchmark_client", "target/release/ldap_perf_client"),
             "benchmark_client_host": metadata.get("benchmark_client_host", "127.0.0.1"),
             "benchmark_client_network": metadata.get("benchmark_client_network", "host"),
@@ -1510,6 +1555,7 @@ if runs:
             f"- Benchmark client: `{reference.get('benchmark_client', 'target/release/ldap_perf_client')}`",
             f"- Benchmark client host: `{reference.get('benchmark_client_host', '127.0.0.1')}`",
             f"- Benchmark client network: `{reference.get('benchmark_client_network', 'host')}`",
+            f"- OpenDR LMDB map size: `{reference.get('opendr_lmdb_max_size', 0)}` bytes",
             f"- Timeout budget per profile: `{reference['timeout_seconds']}` seconds",
             f"- Index benchmark probes: `{str(reference.get('index_benchmark', False)).lower()}`",
             f"- SASL PLAIN bind probes: `{str(reference.get('sasl_plain_benchmark', False)).lower()}`",
@@ -1574,7 +1620,7 @@ if runs:
                 "",
                 "## Index Search Comparison",
                 "",
-                "| Product | Profile | Equality uid mean ms | Presence mail mean ms | Substring description mean ms | Ordering sn >= mean ms | Ordering sn <= mean ms | Max Concurrent Index Search Clients Tested | Max 0% Failure Concurrent Index Search Clients | Max-Test Failure % | Peak Concurrent Index Search Success ops/s |",
+                "| Product | Profile | Equality uid mean ms | Presence mail mean ms | Substring description mean ms | Ordering benchmarkOrder >= mean ms | Ordering benchmarkOrder <= mean ms | Max Concurrent Index Search Clients Tested | Max 0% Failure Concurrent Index Search Clients | Max-Test Failure % | Peak Concurrent Index Search Success ops/s |",
                 "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )

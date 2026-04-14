@@ -32,8 +32,8 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::backend::{
-    BackendError, DirectoryBackend, DirectoryEntry, Modification, SearchCandidateHint,
-    SearchEntriesWithHintReport,
+    BackendError, DirectoryBackend, DirectoryEntry, Modification, OperationalAttributes,
+    SearchCandidateHint, SearchEntriesWithHintReport,
 };
 use crate::change_observer::ChangeObserver;
 use crate::replication::{ChangelogTracker, encode_rename_change_with_actor};
@@ -191,6 +191,39 @@ impl DirectoryBackend for ChangelogBackendWrapper {
     async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError> {
         // Authentication is read-only, no changelog recording needed
         self.backend.authenticate(dn, password).await
+    }
+
+    async fn record_authentication_success(&self, dn: &str) -> Result<bool, BackendError> {
+        let updated = self.backend.record_authentication_success(dn).await?;
+        if updated && let Ok(Some(entry)) = self.backend.get_entry(dn).await {
+            let entry_data = Self::serialize_entry(&entry);
+            self.record_change(ChangeType::Modify, dn.to_string(), entry_data, None);
+        }
+        Ok(updated)
+    }
+
+    async fn record_authentication_failure(&self, dn: &str) -> Result<bool, BackendError> {
+        let updated = self.backend.record_authentication_failure(dn).await?;
+        if updated && let Ok(Some(entry)) = self.backend.get_entry(dn).await {
+            let entry_data = Self::serialize_entry(&entry);
+            self.record_change(ChangeType::Modify, dn.to_string(), entry_data, None);
+        }
+        Ok(updated)
+    }
+
+    async fn replace_operational_attributes(
+        &self,
+        dn: &str,
+        operational_attributes: OperationalAttributes,
+    ) -> Result<(), BackendError> {
+        self.backend
+            .replace_operational_attributes(dn, operational_attributes)
+            .await?;
+        if let Ok(Some(entry)) = self.backend.get_entry(dn).await {
+            let entry_data = Self::serialize_entry(&entry);
+            self.record_change(ChangeType::Modify, dn.to_string(), entry_data, None);
+        }
+        Ok(())
     }
 
     async fn add_entry(

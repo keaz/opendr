@@ -169,6 +169,55 @@ async fn test_write_backend_adapter() {
 }
 
 #[tokio::test]
+async fn test_write_backend_adapter_rejects_server_managed_operational_attrs() {
+    let backend = Arc::new(MockBackend::default());
+    let adapter = WriteBackendAdapter::new(backend.clone());
+    let dn = "cn=protected,dc=example,dc=org";
+
+    let txn_id = adapter.begin_transaction().await.unwrap();
+    let add_result = adapter
+        .add_entry(
+            &txn_id,
+            dn,
+            b"dn: cn=protected,dc=example,dc=org\ncn: protected\nobjectClass: person\nlastSuccessfulLogin: 20260413000000Z\n",
+        )
+        .await;
+    assert!(
+        add_result
+            .unwrap_err()
+            .contains("lastsuccessfullogin is server-managed")
+    );
+    adapter
+        .rollback_transaction(&txn_id, "rejected operational attribute")
+        .await
+        .unwrap();
+
+    let mut attributes = HashMap::new();
+    attributes.insert("cn".to_string(), vec!["protected".to_string()]);
+    attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+    backend
+        .add_entry(DirectoryEntry::new(dn, attributes), b"password".to_vec())
+        .await
+        .unwrap();
+
+    let txn_id = adapter.begin_transaction().await.unwrap();
+    let modifications = vec![Modification::Replace {
+        name: "failedLoginCount".to_string(),
+        values: vec!["9".to_string()],
+    }];
+    let modify_result = adapter.modify_entry(&txn_id, dn, &modifications).await;
+    assert!(
+        modify_result
+            .unwrap_err()
+            .contains("failedLoginCount is server-managed")
+    );
+    adapter
+        .rollback_transaction(&txn_id, "rejected operational attribute")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_write_backend_adapter_rollback_discards_staged_add() {
     let backend = Arc::new(MockBackend::default());
     let adapter = WriteBackendAdapter::new(backend.clone());

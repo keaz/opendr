@@ -39,9 +39,9 @@ use tokio::sync::RwLock;
 
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
-    SearchCandidateHint, SearchEntriesWithHintReport, SearchSubstringPart,
+    OperationalAttributes, SearchCandidateHint, SearchEntriesWithHintReport, SearchSubstringPart,
 };
-use crate::csn::CsnGenerator;
+use crate::csn::{Csn, CsnGenerator};
 use crate::metrics::MetricsCollector;
 use crate::schema::{LdapSchema, ResolvedMatchingRule};
 
@@ -69,6 +69,54 @@ struct StoredEntry {
     /// Operational attributes (entryCSN, timestamps, etc.)
     #[serde(default)]
     pub operational_attributes: crate::backend::OperationalAttributes,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StoredEntryV1 {
+    pub dn: String,
+    pub attributes: HashMap<String, Vec<String>>,
+    pub created_at: u64,
+    pub modified_at: u64,
+    #[serde(default)]
+    pub operational_attributes: OperationalAttributesV1,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OperationalAttributesV1 {
+    pub entry_csn: Option<Csn>,
+    pub entry_uuid: Option<String>,
+    pub create_timestamp: Option<String>,
+    pub modify_timestamp: Option<String>,
+    pub creators_name: Option<String>,
+    pub modifiers_name: Option<String>,
+}
+
+impl From<OperationalAttributesV1> for OperationalAttributes {
+    fn from(value: OperationalAttributesV1) -> Self {
+        Self {
+            entry_csn: value.entry_csn,
+            entry_uuid: value.entry_uuid,
+            create_timestamp: value.create_timestamp,
+            modify_timestamp: value.modify_timestamp,
+            creators_name: value.creators_name,
+            modifiers_name: value.modifiers_name,
+            last_successful_login: None,
+            last_failed_login: None,
+            failed_login_count: None,
+        }
+    }
+}
+
+impl From<StoredEntryV1> for StoredEntry {
+    fn from(value: StoredEntryV1) -> Self {
+        Self {
+            dn: value.dn,
+            attributes: value.attributes,
+            created_at: value.created_at,
+            modified_at: value.modified_at,
+            operational_attributes: value.operational_attributes.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1058,8 +1106,7 @@ impl LmdbBackend {
         let entry_bytes = txn
             .get(self.entries_db, &actual_dn.as_bytes())
             .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
-        let mut entry: StoredEntry = bincode::deserialize(entry_bytes)
-            .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
+        let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
         let indexed_modified_attributes = modifications
             .iter()
             .map(|modification| ldap_attribute_key(&modification.attribute).into_owned())
@@ -1215,8 +1262,7 @@ impl LmdbBackend {
         let entry_bytes = txn
             .get(self.entries_db, &actual_dn.as_bytes())
             .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
-        let entry: StoredEntry = bincode::deserialize(entry_bytes)
-            .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
+        let entry = Self::deserialize_stored_entry(entry_bytes)?;
 
         let new_dn = if let Some(superior) = new_superior {
             format!("{},{}", new_rdn, superior)
@@ -1389,9 +1435,89 @@ impl LmdbBackend {
         Ok(())
     }
 
+    async fn record_account_authentication<F>(
+        &self,
+        dn: &str,
+        update: F,
+    ) -> Result<bool, BackendError>
+    where
+        F: FnOnce(&mut OperationalAttributes, Csn) -> bool,
+    {
+        let _lock = self.write_lock.write().await;
+
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+
+        let normalized_dn = Self::normalize_dn(dn);
+        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Err(lmdb::Error::NotFound) => return Ok(false),
+            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        };
+        let entry_bytes = match txn.get(self.entries_db, &actual_dn.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(lmdb::Error::NotFound) => {
+                return Err(BackendError::Storage(format!(
+                    "DN index references missing entry: {actual_dn}"
+                )));
+            }
+            Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
+        };
+        let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
+
+        let csn = self.csn_generator.generate();
+        if !update(&mut entry.operational_attributes, csn.clone()) {
+            return Ok(false);
+        }
+        entry.modified_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let entry_bytes = bincode::serialize(&entry)
+            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
+        txn.put(
+            self.entries_db,
+            &actual_dn.as_bytes(),
+            &entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+
+        let csn_string = csn.to_ldap_string();
+        txn.put(
+            self.metadata_db,
+            &b"context_csn",
+            &csn_string.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
+
+        self.entry_cache.invalidate(&normalized_dn);
+        Ok(true)
+    }
+
     /// Normalize DN for case-insensitive comparison
     fn normalize_dn(dn: &str) -> String {
         dn.to_lowercase().trim().to_string()
+    }
+
+    fn deserialize_stored_entry(bytes: &[u8]) -> Result<StoredEntry, BackendError> {
+        match bincode::deserialize(bytes) {
+            Ok(entry) => Ok(entry),
+            Err(current_err) => bincode::deserialize::<StoredEntryV1>(bytes)
+                .map(StoredEntry::from)
+                .map_err(|legacy_err| {
+                    BackendError::Storage(format!(
+                        "Failed to deserialize entry: {current_err}; legacy decode failed: {legacy_err}"
+                    ))
+                }),
+        }
     }
 
     /// Get entry by DN with read transaction (optimized for concurrency)
@@ -1421,9 +1547,7 @@ impl LmdbBackend {
         // Get entry data
         match txn.get(self.entries_db, &actual_dn.as_bytes()) {
             Ok(bytes) => {
-                let entry: StoredEntry = bincode::deserialize(bytes).map_err(|e| {
-                    BackendError::Storage(format!("Failed to deserialize entry: {}", e))
-                })?;
+                let entry = Self::deserialize_stored_entry(bytes)?;
                 self.entry_cache.insert(entry.clone());
                 Ok(Some(entry))
             }
@@ -1453,9 +1577,7 @@ impl LmdbBackend {
             let dn = String::from_utf8_lossy(key).to_string();
 
             if Self::entry_in_scope(&dn, base_dn, scope) {
-                let entry: StoredEntry = bincode::deserialize(value).map_err(|e| {
-                    BackendError::Storage(format!("Failed to deserialize entry: {}", e))
-                })?;
+                let entry = Self::deserialize_stored_entry(value)?;
                 results.push(entry);
             }
         }
@@ -1497,9 +1619,7 @@ impl LmdbBackend {
                 continue;
             }
 
-            let entry: StoredEntry = bincode::deserialize(value).map_err(|e| {
-                BackendError::Storage(format!("Failed to deserialize entry: {}", e))
-            })?;
+            let entry = Self::deserialize_stored_entry(value)?;
             results.push(entry);
             matched += 1;
 
@@ -1989,7 +2109,7 @@ impl LmdbBackend {
 
             let mut index_entries = Vec::new();
             for (_, entry_bytes) in cursor.iter() {
-                let entry: StoredEntry = bincode::deserialize(entry_bytes).map_err(|e| {
+                let entry = Self::deserialize_stored_entry(entry_bytes).map_err(|e| {
                     BackendError::Storage(format!(
                         "Failed to deserialize entry during attribute index backfill: {}",
                         e
@@ -2562,9 +2682,7 @@ impl LmdbBackend {
                 Err(lmdb::Error::NotFound) => continue,
                 Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
             };
-            let entry: StoredEntry = bincode::deserialize(entry_bytes).map_err(|e| {
-                BackendError::Storage(format!("Failed to deserialize entry: {}", e))
-            })?;
+            let entry = Self::deserialize_stored_entry(entry_bytes)?;
             if !include_entry(&entry)? {
                 continue;
             }
@@ -2785,6 +2903,58 @@ impl DirectoryBackend for LmdbBackend {
         }
     }
 
+    async fn record_authentication_success(&self, dn: &str) -> Result<bool, BackendError> {
+        self.record_account_authentication(dn, |attrs, csn| attrs.record_successful_login(csn))
+            .await
+    }
+
+    async fn record_authentication_failure(&self, dn: &str) -> Result<bool, BackendError> {
+        self.record_account_authentication(dn, |attrs, csn| attrs.record_failed_login(csn))
+            .await
+    }
+
+    async fn replace_operational_attributes(
+        &self,
+        dn: &str,
+        operational_attributes: OperationalAttributes,
+    ) -> Result<(), BackendError> {
+        let _lock = self.write_lock.write().await;
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+        let normalized_dn = Self::normalize_dn(dn);
+        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
+            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        };
+        let entry_bytes = txn
+            .get(self.entries_db, &actual_dn.as_bytes())
+            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
+        let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
+        entry.operational_attributes = operational_attributes;
+        entry.modified_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let entry_bytes = bincode::serialize(&entry)
+            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
+        txn.put(
+            self.entries_db,
+            &actual_dn.as_bytes(),
+            &entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
+        self.entry_cache.invalidate(&normalized_dn);
+        Ok(())
+    }
+
     async fn get_entry(&self, dn: &str) -> Result<Option<DirectoryEntry>, BackendError> {
         Ok(self.get_entry_internal(dn)?.map(|e| e.to_directory_entry()))
     }
@@ -2828,8 +2998,7 @@ impl DirectoryBackend for LmdbBackend {
         let entry_bytes = txn
             .get(self.entries_db, &actual_dn.as_bytes())
             .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
-        let stored_entry: StoredEntry = bincode::deserialize(entry_bytes)
-            .map_err(|e| BackendError::Storage(format!("Failed to deserialize entry: {}", e)))?;
+        let stored_entry = Self::deserialize_stored_entry(entry_bytes)?;
 
         // Remove from attribute indexes
         self.remove_attribute_indexes(&mut txn, &actual_dn, &stored_entry.attributes)?;

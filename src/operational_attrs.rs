@@ -205,7 +205,12 @@ mod tests {
 
     #[test]
     fn test_parse_specific_operational() {
-        let attrs = vec!["entrycsn".to_string(), "modifytimestamp".to_string()];
+        let attrs = vec![
+            "entrycsn".to_string(),
+            "modifytimestamp".to_string(),
+            "lastSuccessfulLogin".to_string(),
+            "failedLoginCount".to_string(),
+        ];
         let (user, operational, specific) = parse_attribute_request(&attrs);
         assert!(
             !user,
@@ -215,9 +220,11 @@ mod tests {
             !operational,
             "Specific operational should not set include_all flag"
         );
-        assert_eq!(specific.len(), 2);
+        assert_eq!(specific.len(), 4);
         assert!(specific.contains(&"entrycsn".to_string()));
         assert!(specific.contains(&"modifytimestamp".to_string()));
+        assert!(specific.contains(&"lastsuccessfullogin".to_string()));
+        assert!(specific.contains(&"failedlogincount".to_string()));
     }
 
     #[test]
@@ -246,7 +253,9 @@ mod tests {
     #[test]
     fn test_filter_operational_all_requested() {
         let csn = Csn::new(1);
-        let op_attrs = OperationalAttributes::for_new_entry(csn, Some("cn=admin".to_string()));
+        let mut op_attrs = OperationalAttributes::for_new_entry(csn, Some("cn=admin".to_string()));
+        op_attrs.last_failed_login = Some("20260413000000Z".to_string());
+        op_attrs.failed_login_count = Some(1);
         let requested = vec!["+".to_string()];
 
         let result = filter_operational_attributes(&op_attrs, &requested);
@@ -259,6 +268,11 @@ mod tests {
             result.contains_key("createtimestamp"),
             "Should include createTimestamp"
         );
+        assert!(
+            result.contains_key("lastfailedlogin"),
+            "Should include lastFailedLogin"
+        );
+        assert_eq!(result.get("failedlogincount"), Some(&vec!["1".to_string()]));
     }
 
     #[test]

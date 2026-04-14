@@ -154,6 +154,56 @@ struct BackupStoredEntry {
     operational_attributes: OperationalAttributes,
 }
 
+#[derive(Debug, Deserialize)]
+struct BackupStoredEntryV1 {
+    dn: String,
+    attributes: HashMap<String, Vec<String>>,
+    #[serde(rename = "created_at")]
+    _created_at: u64,
+    #[serde(rename = "modified_at")]
+    _modified_at: u64,
+    #[serde(default)]
+    operational_attributes: BackupOperationalAttributesV1,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BackupOperationalAttributesV1 {
+    entry_csn: Option<Csn>,
+    entry_uuid: Option<String>,
+    create_timestamp: Option<String>,
+    modify_timestamp: Option<String>,
+    creators_name: Option<String>,
+    modifiers_name: Option<String>,
+}
+
+impl From<BackupOperationalAttributesV1> for OperationalAttributes {
+    fn from(value: BackupOperationalAttributesV1) -> Self {
+        Self {
+            entry_csn: value.entry_csn,
+            entry_uuid: value.entry_uuid,
+            create_timestamp: value.create_timestamp,
+            modify_timestamp: value.modify_timestamp,
+            creators_name: value.creators_name,
+            modifiers_name: value.modifiers_name,
+            last_successful_login: None,
+            last_failed_login: None,
+            failed_login_count: None,
+        }
+    }
+}
+
+impl From<BackupStoredEntryV1> for BackupStoredEntry {
+    fn from(value: BackupStoredEntryV1) -> Self {
+        Self {
+            dn: value.dn,
+            attributes: value.attributes,
+            _created_at: value._created_at,
+            _modified_at: value._modified_at,
+            operational_attributes: value.operational_attributes.into(),
+        }
+    }
+}
+
 impl BackupStoredEntry {
     fn into_directory_entry(self) -> DirectoryEntry {
         DirectoryEntry::with_operational_attrs(
@@ -161,6 +211,19 @@ impl BackupStoredEntry {
             self.attributes,
             self.operational_attributes,
         )
+    }
+}
+
+fn deserialize_backup_stored_entry(bytes: &[u8]) -> BackupResult<BackupStoredEntry> {
+    match bincode::deserialize(bytes) {
+        Ok(entry) => Ok(entry),
+        Err(current_err) => bincode::deserialize::<BackupStoredEntryV1>(bytes)
+            .map(BackupStoredEntry::from)
+            .map_err(|legacy_err| {
+                BackupError::InvalidBackup(format!(
+                    "failed to deserialize stored LMDB entry: {current_err}; legacy decode failed: {legacy_err}"
+                ))
+            }),
     }
 }
 
@@ -594,7 +657,7 @@ fn read_lmdb_entry_snapshot(
         Err(lmdb::Error::NotFound) => return Ok(None),
         Err(err) => return Err(BackupError::from(err)),
     };
-    let stored: BackupStoredEntry = bincode::deserialize(entry_bytes).map_err(|err| {
+    let stored = deserialize_backup_stored_entry(entry_bytes).map_err(|err| {
         BackupError::InvalidBackup(format!(
             "failed to deserialize stored LMDB entry {}: {}",
             actual_dn, err

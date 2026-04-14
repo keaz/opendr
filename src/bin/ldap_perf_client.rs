@@ -68,6 +68,12 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     preloaded_users: usize,
 
+    #[arg(long, default_value_t = false)]
+    reuse_fixture: bool,
+
+    #[arg(long, default_value_t = false)]
+    skip_full_counts: bool,
+
     #[arg(long, default_value_t = 200)]
     read_iterations: usize,
 
@@ -290,22 +296,45 @@ async fn run(args: Args) -> AppResult<()> {
 
     let mut admin_setup = connect(&args.url, args.starttls, args.insecure).await?;
     simple_bind(&mut admin_setup, &args.bind_dn, &args.password).await?;
-    progress("fixture.count.before_setup");
-    let records_before_setup = count_entries(&mut admin_setup, &args.base_dn).await?;
-    progress("fixture.tree");
-    create_benchmark_tree(&mut admin_setup, &dns).await?;
-    progress("fixture.preload");
-    preload_users(
-        &mut admin_setup,
-        &dns,
-        args.preloaded_users,
-        &args.user_password,
-        &args.name_prefix,
-        run_index_benchmarks,
-    )
-    .await?;
-    progress("fixture.count.after_setup");
-    let records_after_setup = count_entries(&mut admin_setup, &args.base_dn).await?;
+    let skip_full_counts = args.skip_full_counts || args.reuse_fixture;
+    let records_before_setup = if skip_full_counts {
+        progress("fixture.count.before_setup.skipped");
+        expected_fixture_record_count(args.preloaded_users)
+    } else {
+        progress("fixture.count.before_setup");
+        count_entries(&mut admin_setup, &args.base_dn).await?
+    };
+    let records_after_setup = if args.reuse_fixture {
+        progress("fixture.reuse");
+        ensure_existing_fixture(&mut admin_setup, &dns, args.preloaded_users).await?;
+        if skip_full_counts {
+            progress("fixture.count.after_setup.skipped");
+            expected_fixture_record_count(args.preloaded_users)
+        } else {
+            progress("fixture.count.after_setup");
+            count_entries(&mut admin_setup, &args.base_dn).await?
+        }
+    } else {
+        progress("fixture.tree");
+        create_benchmark_tree(&mut admin_setup, &dns).await?;
+        progress("fixture.preload");
+        preload_users(
+            &mut admin_setup,
+            &dns,
+            args.preloaded_users,
+            &args.user_password,
+            &args.name_prefix,
+            run_index_benchmarks,
+        )
+        .await?;
+        if skip_full_counts {
+            progress("fixture.count.after_setup.skipped");
+            expected_fixture_record_count(args.preloaded_users)
+        } else {
+            progress("fixture.count.after_setup");
+            count_entries(&mut admin_setup, &args.base_dn).await?
+        }
+    };
     admin_setup.unbind().await?;
 
     let mut benchmarks = Vec::new();
@@ -776,13 +805,13 @@ async fn run(args: Args) -> AppResult<()> {
         delete_started,
     ));
 
-    progress("fixture.count.after_benchmark");
-    let records_after_benchmark = count_entries(&mut admin_ops, &args.base_dn).await?;
-
-    anonymous_client.unbind().await?;
-    admin_bind_client.unbind().await?;
-    user_bind_client.unbind().await?;
-    admin_ops.unbind().await?;
+    let records_after_benchmark = if skip_full_counts {
+        progress("fixture.count.after_benchmark.skipped");
+        expected_fixture_record_count(args.preloaded_users)
+    } else {
+        progress("fixture.count.after_benchmark");
+        count_entries(&mut admin_ops, &args.base_dn).await?
+    };
 
     let report = BenchmarkReport {
         server_url: args.url.clone(),
@@ -801,14 +830,27 @@ async fn run(args: Args) -> AppResult<()> {
         benchmarks,
     };
 
-    print_human_summary(&report);
-
     if let Some(path) = args.json_out {
         let json = serde_json::to_string_pretty(&report)?;
         std::fs::write(path, json)?;
     }
+    print_human_summary(&report);
+
+    best_effort_unbind("anonymous_client", anonymous_client).await;
+    best_effort_unbind("admin_bind_client", admin_bind_client).await;
+    best_effort_unbind("user_bind_client", user_bind_client).await;
+    best_effort_unbind("password_client", password_client).await;
+    best_effort_unbind("admin_ops", admin_ops).await;
 
     Ok(())
+}
+
+async fn best_effort_unbind(label: &str, mut ldap: Ldap) {
+    match tokio::time::timeout(Duration::from_secs(2), ldap.unbind()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("warning: failed to unbind {label}: {err}"),
+        Err(_) => eprintln!("warning: timed out unbinding {label}"),
+    }
 }
 
 async fn connect(url: &str, starttls: bool, insecure: bool) -> AppResult<Ldap> {
@@ -1224,6 +1266,10 @@ async fn run_concurrent_bind_benchmark(
     )?;
 
     let expected_attempts = concurrency * args.concurrent_bind_iterations;
+    let operation_timeout = Duration::from_millis(args.concurrent_bind_operation_timeout_ms);
+    let per_concurrency_timeout = operation_timeout.saturating_mul(
+        (args.concurrent_bind_warmup_iterations + args.concurrent_bind_iterations + 3) as u32,
+    );
     let (ready_tx, mut ready_rx) = mpsc::channel(concurrency);
     let (start_tx, start_rx) = watch::channel(false);
     let mut handles = Vec::with_capacity(concurrency);
@@ -1241,7 +1287,6 @@ async fn run_concurrent_bind_benchmark(
         let preloaded_users = args.preloaded_users;
         let iterations = args.concurrent_bind_iterations;
         let warmup_iterations = args.concurrent_bind_warmup_iterations;
-        let operation_timeout = Duration::from_millis(args.concurrent_bind_operation_timeout_ms);
         let valid_percent = args.concurrent_bind_valid_percent;
         let wrong_password_percent = args.concurrent_bind_wrong_password_percent;
         let hot_user_percent = args.concurrent_bind_hot_user_percent;
@@ -1351,9 +1396,26 @@ async fn run_concurrent_bind_benchmark(
     }
 
     drop(ready_tx);
+    let timeout_started = Instant::now();
+    let ready_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
     for _ in 0..concurrency {
-        if ready_rx.recv().await.is_none() {
-            break;
+        match tokio::time::timeout_at(ready_deadline, ready_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => break,
+            Err(_) => {
+                for handle in &handles {
+                    handle.abort();
+                }
+                return Ok(build_benchmark_stats_with_counts(
+                    &format!("concurrent_bind_fixture_users_c{concurrency}"),
+                    Vec::new(),
+                    timeout_started,
+                    expected_attempts,
+                    0,
+                    expected_attempts,
+                    concurrency,
+                ));
+            }
         }
     }
 
@@ -1363,15 +1425,23 @@ async fn run_concurrent_bind_benchmark(
     let mut latencies_ms = Vec::with_capacity(expected_attempts);
     let mut successes = 0;
     let mut failures = 0;
-    for handle in handles {
-        match handle.await {
-            Ok(result) => {
+    let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
+    for handle_index in 0..handles.len() {
+        match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
+            Ok(Ok(result)) => {
                 latencies_ms.extend(result.latencies_ms);
                 successes += result.successes;
                 failures += result.failures;
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 failures += args.concurrent_bind_iterations;
+            }
+            Err(_) => {
+                for handle in handles.iter().skip(handle_index) {
+                    handle.abort();
+                    failures += args.concurrent_bind_iterations;
+                }
+                break;
             }
         }
     }
@@ -1399,6 +1469,10 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
     )?;
 
     let expected_attempts = concurrency * args.concurrent_bind_iterations;
+    let operation_timeout = Duration::from_millis(args.concurrent_bind_operation_timeout_ms);
+    let per_concurrency_timeout = operation_timeout.saturating_mul(
+        (args.concurrent_bind_warmup_iterations + args.concurrent_bind_iterations + 3) as u32,
+    );
     let (ready_tx, mut ready_rx) = mpsc::channel(concurrency);
     let (start_tx, start_rx) = watch::channel(false);
     let mut handles = Vec::with_capacity(concurrency);
@@ -1416,7 +1490,6 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
         let preloaded_users = args.preloaded_users;
         let iterations = args.concurrent_bind_iterations;
         let warmup_iterations = args.concurrent_bind_warmup_iterations;
-        let operation_timeout = Duration::from_millis(args.concurrent_bind_operation_timeout_ms);
         let valid_percent = args.concurrent_bind_valid_percent;
         let wrong_password_percent = args.concurrent_bind_wrong_password_percent;
         let hot_user_percent = args.concurrent_bind_hot_user_percent;
@@ -1551,9 +1624,26 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
     }
 
     drop(ready_tx);
+    let timeout_started = Instant::now();
+    let ready_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
     for _ in 0..concurrency {
-        if ready_rx.recv().await.is_none() {
-            break;
+        match tokio::time::timeout_at(ready_deadline, ready_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => break,
+            Err(_) => {
+                for handle in &handles {
+                    handle.abort();
+                }
+                return Ok(build_benchmark_stats_with_counts(
+                    &format!("concurrent_sasl_plain_bind_fixture_users_c{concurrency}"),
+                    Vec::new(),
+                    timeout_started,
+                    expected_attempts,
+                    0,
+                    expected_attempts,
+                    concurrency,
+                ));
+            }
         }
     }
 
@@ -1563,15 +1653,23 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
     let mut latencies_ms = Vec::with_capacity(expected_attempts);
     let mut successes = 0;
     let mut failures = 0;
-    for handle in handles {
-        match handle.await {
-            Ok(result) => {
+    let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
+    for handle_index in 0..handles.len() {
+        match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
+            Ok(Ok(result)) => {
                 latencies_ms.extend(result.latencies_ms);
                 successes += result.successes;
                 failures += result.failures;
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 failures += args.concurrent_bind_iterations;
+            }
+            Err(_) => {
+                for handle in handles.iter().skip(handle_index) {
+                    handle.abort();
+                    failures += args.concurrent_bind_iterations;
+                }
+                break;
             }
         }
     }
@@ -1633,8 +1731,15 @@ async fn run_concurrent_index_search_benchmark(
         "--concurrent-index-search-clients values must be greater than zero",
     )?;
 
-    let specs = index_search_specs(args, dns);
+    let specs = concurrent_index_search_specs(args, dns);
     let expected_attempts = concurrency * args.concurrent_index_search_iterations;
+    let operation_timeout =
+        Duration::from_millis(args.concurrent_index_search_operation_timeout_ms);
+    let per_concurrency_timeout = operation_timeout.saturating_mul(
+        (args.concurrent_index_search_warmup_iterations
+            + args.concurrent_index_search_iterations
+            + 3) as u32,
+    );
     let (ready_tx, mut ready_rx) = mpsc::channel(concurrency);
     let (start_tx, start_rx) = watch::channel(false);
     let mut handles = Vec::with_capacity(concurrency);
@@ -1650,8 +1755,6 @@ async fn run_concurrent_index_search_benchmark(
         let specs = specs.clone();
         let iterations = args.concurrent_index_search_iterations;
         let warmup_iterations = args.concurrent_index_search_warmup_iterations;
-        let operation_timeout =
-            Duration::from_millis(args.concurrent_index_search_operation_timeout_ms);
 
         handles.push(tokio::spawn(async move {
             let mut ldap =
@@ -1729,9 +1832,26 @@ async fn run_concurrent_index_search_benchmark(
     }
 
     drop(ready_tx);
+    let timeout_started = Instant::now();
+    let ready_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
     for _ in 0..concurrency {
-        if ready_rx.recv().await.is_none() {
-            break;
+        match tokio::time::timeout_at(ready_deadline, ready_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => break,
+            Err(_) => {
+                for handle in &handles {
+                    handle.abort();
+                }
+                return Ok(build_benchmark_stats_with_counts(
+                    &format!("concurrent_index_search_c{concurrency}"),
+                    Vec::new(),
+                    timeout_started,
+                    expected_attempts,
+                    0,
+                    expected_attempts,
+                    concurrency,
+                ));
+            }
         }
     }
 
@@ -1741,15 +1861,23 @@ async fn run_concurrent_index_search_benchmark(
     let mut latencies_ms = Vec::with_capacity(expected_attempts);
     let mut successes = 0;
     let mut failures = 0;
-    for handle in handles {
-        match handle.await {
-            Ok(result) => {
+    let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
+    for handle_index in 0..handles.len() {
+        match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
+            Ok(Ok(result)) => {
                 latencies_ms.extend(result.latencies_ms);
                 successes += result.successes;
                 failures += result.failures;
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 failures += args.concurrent_index_search_iterations;
+            }
+            Err(_) => {
+                for handle in handles.iter().skip(handle_index) {
+                    handle.abort();
+                    failures += args.concurrent_index_search_iterations;
+                }
+                break;
             }
         }
     }
@@ -1804,6 +1932,41 @@ fn index_search_specs(args: &Args, dns: &ScenarioDns) -> Vec<IndexSearchSpec> {
             filter: format!("({BENCHMARK_ORDER_ATTRIBUTE}<={midpoint_order})"),
             expected_count: midpoint + 1,
             expected_dn: None,
+        },
+    ]
+}
+
+fn concurrent_index_search_specs(args: &Args, dns: &ScenarioDns) -> Vec<IndexSearchSpec> {
+    let max_order = args.preloaded_users.saturating_sub(1).to_string();
+
+    vec![
+        IndexSearchSpec {
+            operation: "index_equality_uid",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: format!("(uid={})", dns.control_user_uid),
+            expected_count: 1,
+            expected_dn: Some(dns.control_user_dn.clone()),
+        },
+        IndexSearchSpec {
+            operation: "index_substring_description",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: "(description=*fixture user 000000*)".to_string(),
+            expected_count: 1,
+            expected_dn: Some(dns.control_user_dn.clone()),
+        },
+        IndexSearchSpec {
+            operation: "index_ordering_benchmark_order_ge",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: format!("({BENCHMARK_ORDER_ATTRIBUTE}>={max_order})"),
+            expected_count: 1,
+            expected_dn: None,
+        },
+        IndexSearchSpec {
+            operation: "index_ordering_benchmark_order_le",
+            base_dn: dns.users_ou_dn.clone(),
+            filter: format!("({BENCHMARK_ORDER_ATTRIBUTE}<=0)"),
+            expected_count: 1,
+            expected_dn: Some(dns.control_user_dn.clone()),
         },
     ]
 }
@@ -1996,6 +2159,51 @@ async fn create_benchmark_tree(ldap: &mut Ldap, dns: &ScenarioDns) -> AppResult<
     Ok(())
 }
 
+async fn ensure_existing_fixture(
+    ldap: &mut Ldap,
+    dns: &ScenarioDns,
+    expected_users: usize,
+) -> AppResult<()> {
+    ensure(
+        expected_users > 0,
+        "--preloaded-users must be greater than zero when reusing a fixture",
+    )?;
+    for dn in [
+        &dns.benchmark_root_dn,
+        &dns.users_ou_dn,
+        &dns.moved_ou_dn,
+        &dns.writes_ou_dn,
+    ] {
+        let entry = search_single_entry(
+            ldap,
+            dn,
+            Scope::Base,
+            "(objectClass=organizationalUnit)",
+            vec!["ou"],
+        )
+        .await?;
+        ensure(
+            entry.dn.eq_ignore_ascii_case(dn),
+            format!("reused fixture returned unexpected DN for {dn}"),
+        )?;
+    }
+    let entry = search_single_entry(
+        ldap,
+        &dns.control_user_dn,
+        Scope::Base,
+        "(objectClass=inetOrgPerson)",
+        vec!["uid", "cn", "sn", "mail"],
+    )
+    .await?;
+    ensure(
+        entry.dn.eq_ignore_ascii_case(&dns.control_user_dn),
+        format!(
+            "reused fixture is missing expected control user for {expected_users} preloaded users"
+        ),
+    )?;
+    Ok(())
+}
+
 async fn preload_users(
     ldap: &mut Ldap,
     dns: &ScenarioDns,
@@ -2040,6 +2248,10 @@ async fn preload_users(
             ));
         }
         ldap.add(&dn, attributes).await?.success()?;
+        let loaded = index + 1;
+        if count >= 100_000 && (loaded % 100_000 == 0 || loaded == count) {
+            progress(&format!("fixture.preload.{loaded}of{count}"));
+        }
     }
 
     ensure(
@@ -2130,6 +2342,11 @@ async fn count_entries(ldap: &mut Ldap, base_dn: &str) -> AppResult<usize> {
     )
     .await?
     .len())
+}
+
+fn expected_fixture_record_count(preloaded_users: usize) -> usize {
+    // Base entry plus benchmark root/users/moved/writes organizational units.
+    preloaded_users + 5
 }
 
 async fn search_entries(

@@ -69,8 +69,28 @@ async fn test_operational_attributes_to_attributes() {
     assert!(attrs.contains_key("modifytimestamp"));
     assert!(attrs.contains_key("creatorsname"));
     assert!(attrs.contains_key("modifiersname"));
+    assert!(!attrs.contains_key("lastsuccessfullogin"));
+    assert!(!attrs.contains_key("lastfailedlogin"));
+    assert!(!attrs.contains_key("failedlogincount"));
 
     assert_eq!(attrs["entrycsn"][0], csn.to_ldap_string());
+}
+
+#[tokio::test]
+async fn test_account_authentication_operational_attributes_to_attributes() {
+    let generator = CsnGenerator::new(1);
+    let mut op_attrs = OperationalAttributes::for_new_entry(
+        generator.generate(),
+        Some("cn=admin,dc=example,dc=org".to_string()),
+    );
+
+    op_attrs.record_failed_login(generator.generate());
+    op_attrs.record_successful_login(generator.generate());
+
+    let attrs = op_attrs.to_attributes();
+    assert!(attrs.contains_key("lastsuccessfullogin"));
+    assert!(attrs.contains_key("lastfailedlogin"));
+    assert_eq!(attrs.get("failedlogincount"), Some(&vec!["0".to_string()]));
 }
 
 #[tokio::test]
@@ -81,6 +101,9 @@ async fn test_is_operational_attribute() {
     assert!(OperationalAttributes::is_operational("creatorsName"));
     assert!(OperationalAttributes::is_operational("modifiersName"));
     assert!(OperationalAttributes::is_operational("contextCSN"));
+    assert!(OperationalAttributes::is_operational("lastSuccessfulLogin"));
+    assert!(OperationalAttributes::is_operational("lastFailedLogin"));
+    assert!(OperationalAttributes::is_operational("failedLoginCount"));
 
     // Not operational
     assert!(!OperationalAttributes::is_operational("cn"));

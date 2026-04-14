@@ -76,12 +76,15 @@ use crate::server::{
     authorize_attribute_permissions, authorize_operation, build_entry_from_add_request,
     can_skip_search_post_filter, compute_new_dn, convert_ldap_changes_to_modifications,
     entry_is_referral as directory_entry_is_referral, filter_search_entries_for_read_access,
-    handle_sync_search_request, increment_control_counter, log_add_audit_event, log_anonymous_bind,
-    log_compare_audit, log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event,
-    log_modify_audit_event, log_password_modify_audit_event, log_sasl_bind,
-    log_simple_bind_failure, log_simple_bind_success, online_schema_update_result,
-    parse_sync_request_control, referral_urls_for_entry, reject_sync_request,
-    resolve_search_base_dn, resolve_search_candidate_entry, schema_snapshot, shared_schema,
+    first_server_managed_operational_attribute, handle_sync_search_request,
+    increment_control_counter, log_add_audit_event, log_anonymous_bind, log_compare_audit,
+    log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
+    log_password_modify_audit_event, log_sasl_bind, log_simple_bind_failure,
+    log_simple_bind_success, online_schema_update_result, parse_sync_request_control,
+    record_authentication_failure_metadata, record_authentication_success_metadata,
+    referral_urls_for_entry, reject_sync_request, resolve_search_base_dn,
+    resolve_search_candidate_entry, schema_snapshot,
+    server_managed_operational_attribute_diagnostic, shared_schema,
 };
 use crate::shutdown::ShutdownCoordinator;
 use crate::sync_controls::SYNC_REQUEST_OID;
@@ -3557,6 +3560,27 @@ async fn handle_modify_request_with_fsm_runtime(
         .map(|change| change.modification.attr_type.0.to_ascii_lowercase())
         .collect();
     let encoded_changes = encode_modify_changes_for_write_fsm(&modify_req.changes);
+    if let Some(attribute) = first_server_managed_operational_attribute(&modified_attributes) {
+        let diagnostic = server_managed_operational_attribute_diagnostic(&attribute);
+        log_modify_audit_event(
+            request_context,
+            &session,
+            &dn,
+            false,
+            &modified_attributes,
+            Some(&diagnostic),
+        )
+        .await;
+        send_request_result_response(
+            fsm_set,
+            request.message_id as u32,
+            request.response_kind,
+            ResultCode::UnwillingToPerform,
+            &diagnostic,
+        )
+        .await?;
+        return Ok(());
+    }
 
     let authorized = {
         let stream = fsm_set
@@ -3810,6 +3834,19 @@ async fn handle_add_request_with_fsm_runtime(
     }
 
     let added_attributes = entry.attributes.keys().cloned().collect::<Vec<_>>();
+    if let Some(attribute) = first_server_managed_operational_attribute(&added_attributes) {
+        let diagnostic = server_managed_operational_attribute_diagnostic(&attribute);
+        log_add_audit_event(request_context, &session, &dn, false).await;
+        send_request_result_response(
+            fsm_set,
+            request.message_id as u32,
+            request.response_kind,
+            ResultCode::UnwillingToPerform,
+            &diagnostic,
+        )
+        .await?;
+        return Ok(());
+    }
     let authorized = {
         let stream = fsm_set
             .connection_mut()
@@ -5038,6 +5075,7 @@ async fn handle_bind_with_fsm(
         AuthenticationChoice::Simple(password) => {
             let dn = bind_name;
             let is_anonymous_bind = dn.is_empty() && password.as_ref().is_empty();
+            let backend = fsm_set.backend().clone();
             let auth_event = AuthEvent::BindRequest {
                 dn: dn.clone(),
                 password: password.as_ref().to_vec(),
@@ -5057,14 +5095,22 @@ async fn handle_bind_with_fsm(
                                 if let Some(metrics) = metrics {
                                     metrics.record_fsm_state(FsmType::Auth, "simple_bound");
                                 }
-                                if let Some(bound_dn) = fsm_set.authenticated_dn() {
-                                    log_simple_bind_success(request_context, bound_dn).await;
+                                if let Some(bound_dn) =
+                                    fsm_set.authenticated_dn().map(str::to_string)
+                                {
+                                    record_authentication_success_metadata(
+                                        backend.as_ref(),
+                                        &bound_dn,
+                                    )
+                                    .await;
+                                    log_simple_bind_success(request_context, &bound_dn).await;
                                 }
                                 send_bind_success(fsm_set, message_id as u32).await?;
                             } else {
                                 if let Some(metrics) = metrics {
                                     metrics.record_fsm_state(FsmType::Auth, "anonymous");
                                 }
+                                record_authentication_failure_metadata(backend.as_ref(), &dn).await;
                                 log_simple_bind_failure(
                                     request_context,
                                     &dn,
@@ -5247,6 +5293,7 @@ async fn handle_sasl_bind_with_fsm(
         dn: bind_dn.clone(),
         password: parsed.password.to_vec(),
     };
+    let backend = fsm_set.backend().clone();
 
     match fsm_set.auth_mut() {
         AuthenticationFsm::Simple(auth_fsm) => match auth_fsm.handle_event(auth_event).await {
@@ -5254,6 +5301,7 @@ async fn handle_sasl_bind_with_fsm(
                 if let Some(metrics) = metrics {
                     metrics.record_fsm_state(FsmType::Auth, "sasl_bound");
                 }
+                record_authentication_success_metadata(backend.as_ref(), &bind_dn).await;
                 log_sasl_bind(request_context, bind_dn.as_str(), "PLAIN", true, None).await;
                 send_bind_success(fsm_set, message_id).await?;
             }
@@ -5261,6 +5309,7 @@ async fn handle_sasl_bind_with_fsm(
                 if let Some(metrics) = metrics {
                     metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
                 }
+                record_authentication_failure_metadata(backend.as_ref(), &bind_dn).await;
                 log_sasl_bind(
                     request_context,
                     bind_dn.as_str(),

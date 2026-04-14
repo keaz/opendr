@@ -453,7 +453,7 @@ const troubleshootingRows = [
   ["Startup exits before listener", "Config path, log4rs path, secret source exclusivity, TLS file existence, and port conflicts."],
   ["LMDB root bind fails", "`root_password_file` must contain the full `{SSHA512}` hash, and the bind DN includes the base DN."],
   ["StartTLS bind fails", "Bind again after StartTLS because authentication state is reset."],
-  ["Search misses operational attributes", "Request `+` or explicit names such as `entryCSN` and `entryUUID`."],
+  ["Search misses operational attributes", "Request `+` or explicit names such as `entryCSN`, `entryUUID`, `lastSuccessfulLogin`, and `failedLoginCount`."],
   ["Replication stalls", "Provider changelog, consumer cookie, provider URL, bind credentials, listener mode, and retry logs."],
   ["Incremental backup fails", "Provider or both mode, persistent changelog path, changelog capacity, and parent checkpoint."],
 ];
@@ -461,51 +461,71 @@ const troubleshootingRows = [
 const fsmVsOpenDjRuntime = {
   labels: ["Light", "Moderate", "Heavy", "Stress"],
   series: [
-    { label: "OpenDR FSM", values: [403.261, 558.925, 955.953, 2272.271], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [1026.66, 1359.839, 2019.819, 4982.452], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [371.562, 541.61, 876.78, 1990.305], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [928.909, 1273.73, 1781.491, 4399.629], color: "#f2b26d" },
   ],
 };
 
 const fsmVsOpenDjSubtreeSearch = {
   labels: ["Light", "Moderate", "Heavy", "Stress"],
   series: [
-    { label: "OpenDR FSM", values: [1.138, 4.474, 7.508, 15.799], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [6.05, 22.3, 38.378, 84.331], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [0.592, 2.538, 4.459, 10.488], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [4.081, 15.649, 24.809, 46.323], color: "#f2b26d" },
   ],
 };
 
 const fsmVsOpenDjMemory = {
   labels: ["Light", "Moderate", "Heavy", "Stress"],
   series: [
-    { label: "OpenDR FSM", values: [4.06, 6.89, 10.62, 11.48], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [955.9, 813.3, 804.9, 849], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [3.34, 4.09, 6.39, 7.72], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [813.2, 818.95, 812.95, 987.33], color: "#f2b26d" },
   ],
 };
 
 const concurrentBindThroughput: BarChartDatum[] = [
-  { label: "OpenDR FSM", value: 55397.02, color: "#7ce8c8" },
-  { label: "OpenDJ", value: 6525.77, color: "#f2b26d" },
+  { label: "OpenDR FSM", value: 45826.68, color: "#7ce8c8" },
+  { label: "OpenDJ", value: 29087.05, color: "#f2b26d" },
 ];
 
 const saslPlainBindLatency = {
-  labels: ["Light", "Moderate", "Heavy", "Stress"],
+  labels: ["SASL-auth"],
   series: [
-    { label: "OpenDR FSM", values: [0.061, 0.064, 0.062, 0.063], color: "#7ce8c8" },
-    { label: "OpenDJ", values: [0.409, 0.5, 0.353, 0.404], color: "#f2b26d" },
+    { label: "OpenDR FSM", values: [0.04], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [0.226], color: "#f2b26d" },
   ],
 };
 
 const saslPlainBindThroughput: BarChartDatum[] = [
-  { label: "OpenDR FSM", value: 195708.6, color: "#7ce8c8" },
-  { label: "OpenDJ", value: 10222.17, color: "#f2b26d" },
+  { label: "OpenDR FSM", value: 139135.46, color: "#7ce8c8" },
+  { label: "OpenDJ", value: 16600.31, color: "#f2b26d" },
 ];
 
 const indexSearchLatency = {
-  labels: ["uid eq", "mail present", "desc substring", "sn >=", "sn <="],
+  labels: ["uid eq", "mail present", "desc substring", "benchmarkOrder >=", "benchmarkOrder <="],
   series: [
-    { label: "OpenDR FSM", values: [0.108, 7.067, 3.9, 4.018, 3.977], color: "#7ce8c8" },
+    { label: "OpenDR FSM", values: [0.103, 5.944, 1.268, 3.187, 3.183], color: "#7ce8c8" },
+    { label: "OpenDJ", values: [0.275, 15.062, 4.228, 8.436, 8.548], color: "#f2b26d" },
   ],
 };
+
+const millionOpenDrRows = [
+  ["Preloaded users", "1,000,000"],
+  ["Records after setup", "1,000,005"],
+  ["OpenDR cache size", "1,000 entries"],
+  ["LMDB data directory", "3.20 GiB"],
+  ["Serial subtree search mean", "10,749.753 ms"],
+  ["Serial base search mean", "141.304 ms"],
+  ["Simple-bind concurrency peak", "17,008.19 ops/s"],
+  ["Simple-bind max 0% failure clients", "128"],
+  ["SASL PLAIN concurrency peak", "48,469.70 ops/s"],
+  ["SASL PLAIN max 0% failure clients", "128"],
+  ["Sampled peak server memory", "3.75 GiB"],
+];
+
+const millionConcurrentThroughput: BarChartDatum[] = [
+  { label: "Simple bind", value: 17008.19, color: "#7ce8c8" },
+  { label: "SASL PLAIN", value: 48469.7, color: "#f2b26d" },
+];
 
 const docsHref = (file: string) => `${import.meta.env.BASE_URL}${file}`;
 const assetHref = (file: string) => `${import.meta.env.BASE_URL}${file}`;
@@ -889,7 +909,10 @@ cargo build --release`}</code></pre>
                 <strong>Authentication support:</strong> FSM and legacy
                 runtimes support simple bind, anonymous bind, and SASL PLAIN
                 over LDAPS or StartTLS. Other SASL mechanisms are not
-                production-enabled.
+                production-enabled. User bind metadata is recorded through
+                server-managed operational attributes including{" "}
+                <code>lastSuccessfulLogin</code>, <code>lastFailedLogin</code>,
+                and <code>failedLoginCount</code>.
               </div>
             </section>
 
@@ -899,8 +922,8 @@ cargo build --release`}</code></pre>
               <p>
                 The site includes the complete Docker benchmark report from{" "}
                 <code>docs/DOCKER_PERF_COMPARISON.md</code>. The results are
-                bounded Docker regression profiles, not a completed 10M-user
-                benchmark.
+                bounded Docker regression profiles plus the OpenDR 1M-user
+                baseline, not a completed 10M-user benchmark.
               </p>
 
               <h3>Run the performance matrix</h3>
@@ -912,7 +935,7 @@ cargo build --release`}</code></pre>
   --products opendr,opendj \\
   --opendr-runtime fsm \\
   --benchmark-timeout 240 \\
-  --output-dir target/perf/docker-matrix-edition2024-full-tuned-hostclient-20260413`}</code></pre>
+  --output-dir target/perf/full-rerun-20260414-091948`}</code></pre>
                 </section>
                 <section>
                   <h3>Simple bind concurrency run</h3>
@@ -925,7 +948,7 @@ cargo build --release`}</code></pre>
   --concurrent-bind-iterations 20 \\
   --concurrent-bind-warmup-iterations 1 \\
   --concurrent-bind-operation-timeout-ms 5000 \\
-  --output-dir target/perf/docker-matrix-edition2024-concurrent-bind-tuned-hostclient-20260413`}</code></pre>
+  --output-dir target/perf/concurrency-coalesced-20260414-091023`}</code></pre>
                 </section>
                 <section>
                   <h3>SASL PLAIN comparison run</h3>
@@ -933,7 +956,7 @@ cargo build --release`}</code></pre>
   --profile-set sasl \\
   --products opendr,opendj \\
   --opendr-runtime fsm \\
-  --benchmark-timeout 240 \\
+  --benchmark-timeout 600 \\
   --concurrent-bind-clients 1,4,8,16,32,64,128 \\
   --concurrent-bind-iterations 20 \\
   --concurrent-bind-warmup-iterations 1 \\
@@ -941,7 +964,7 @@ cargo build --release`}</code></pre>
   --sasl-plain-authcid-format rdn-value \\
   --skip-sasl-plain-admin-benchmark \\
   --perf-client-image opendr:docker-perf-client \\
-  --output-dir target/perf/docker-matrix-edition2024-sasl-concurrency-20260413`}</code></pre>
+  --output-dir target/perf/sasl-guarded-20260414-090609`}</code></pre>
                 </section>
                 <section>
                   <h3>Index-type comparison run</h3>
@@ -949,34 +972,55 @@ cargo build --release`}</code></pre>
   --profile-set index \\
   --products opendr,opendj \\
   --opendr-runtime fsm \\
-  --benchmark-timeout 240 \\
-  --concurrent-index-search-clients 1,4,8,16,32 \\
-  --concurrent-index-search-iterations 20 \\
-  --concurrent-index-search-warmup-iterations 1 \\
-  --concurrent-index-search-operation-timeout-ms 5000 \\
-  --perf-client-image opendr:docker-perf-client \\
-  --output-dir target/perf/docker-matrix-edition2024-index-20260413`}</code></pre>
-                </section>
-                <section>
-                  <h3>OpenDJ index timeout confirmation</h3>
-                  <pre><code>{`./scripts/perf_docker_matrix.sh \\
-  --profile-set index \\
-  --products opendj \\
-  --opendr-runtime fsm \\
   --benchmark-timeout 600 \\
   --concurrent-index-search-clients 1,4,8,16,32 \\
   --concurrent-index-search-iterations 20 \\
   --concurrent-index-search-warmup-iterations 1 \\
   --concurrent-index-search-operation-timeout-ms 5000 \\
   --perf-client-image opendr:docker-perf-client \\
-  --output-dir target/perf/docker-matrix-edition2024-index-opendj-600-20260413`}</code></pre>
+  --output-dir target/perf/index-guarded-both-20260414-091425`}</code></pre>
+                </section>
+                <section>
+                  <h3>1M OpenDR preload run</h3>
+                  <pre><code>{`./scripts/perf_docker_matrix.sh \\
+  --profile-set million \\
+  --products opendr \\
+  --opendr-runtime fsm \\
+  --opendr-lmdb-max-size 17179869184 \\
+  --benchmark-timeout 7200 \\
+  --sample-interval 5 \\
+  --perf-client-image opendr:docker-perf-client \\
+  --output-dir target/perf/opendr-million-16g-20260414-103048`}</code></pre>
                 </section>
               </div>
 
               <div className="callout warning">
                 Run the matrix from the repository root with Docker available.
                 The documented runs use bounded 2 CPU and 4 GiB container
-                limits, StartTLS enabled, and generated benchmark fixtures.
+                limits, StartTLS enabled, generated benchmark fixtures, and
+                the Docker entrypoint default <code>performance.cache_size = 1000</code>.
+                Cache hit/miss metrics were not captured in these artifacts
+                because the perf harness samples container CPU and memory only.
+              </div>
+
+              <h3>1M OpenDR baseline</h3>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Metric</th>
+                      <th>Value</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {millionOpenDrRows.map(([metric, value]) => (
+                      <tr key={metric}>
+                        <td>{metric}</td>
+                        <td>{value}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
 
               <h3>Performance charts</h3>
@@ -1028,27 +1072,27 @@ cargo build --release`}</code></pre>
                 />
                 <SimpleBarChart
                   title="Peak successful bind throughput"
-                  description="Higher is better. Dedicated tuned host-client auth-concurrency profile; both products reached 128 clients at 0% failure."
+                  description="Higher is better. Guarded auth-concurrency profile across all tested rows; see the report for failure rates by client level."
                   data={concurrentBindThroughput}
                   unit="ops/s"
                   onExpand={() => setExpandedChart({
                     kind: "simple",
                     title: "Peak successful bind throughput",
-                    description: "Higher is better. Dedicated tuned host-client auth-concurrency profile; both products reached 128 clients at 0% failure.",
+                    description: "Higher is better. Guarded auth-concurrency profile across all tested rows; see the report for failure rates by client level.",
                     data: concurrentBindThroughput,
                     unit: "ops/s",
                   })}
                 />
                 <GroupedBarChart
                   title="SASL PLAIN bind mean"
-                  description="Lower is better. Fixture-user SASL PLAIN bind latency from the serial SASL artifact."
+                  description="Lower is better. Fixture-user SASL PLAIN bind latency from the guarded sasl-auth profile."
                   labels={saslPlainBindLatency.labels}
                   series={saslPlainBindLatency.series}
                   unit="ms"
                   onExpand={() => setExpandedChart({
                     kind: "grouped",
                     title: "SASL PLAIN bind mean",
-                    description: "Lower is better. Fixture-user SASL PLAIN bind latency from the serial SASL artifact.",
+                    description: "Lower is better. Fixture-user SASL PLAIN bind latency from the guarded sasl-auth profile.",
                     labels: saslPlainBindLatency.labels,
                     series: saslPlainBindLatency.series,
                     unit: "ms",
@@ -1069,17 +1113,30 @@ cargo build --release`}</code></pre>
                 />
                 <GroupedBarChart
                   title="Indexed search latency"
-                  description="Lower is better. Mean OpenDR latency for equality, presence, substring, and ordering probes; OpenDJ timed out before a comparable result."
+                  description="Lower is better. Mean latency for equality, presence, substring, and benchmarkOrder ordering probes."
                   labels={indexSearchLatency.labels}
                   series={indexSearchLatency.series}
                   unit="ms"
                   onExpand={() => setExpandedChart({
                     kind: "grouped",
                     title: "Indexed search latency",
-                    description: "Lower is better. Mean OpenDR latency for equality, presence, substring, and ordering probes; OpenDJ timed out before a comparable result.",
+                    description: "Lower is better. Mean latency for equality, presence, substring, and benchmarkOrder ordering probes.",
                     labels: indexSearchLatency.labels,
                     series: indexSearchLatency.series,
                     unit: "ms",
+                  })}
+                />
+                <SimpleBarChart
+                  title="1M OpenDR auth concurrency"
+                  description="Higher is better. OpenDR-only 1M fixture with 0% failures through 128 clients."
+                  data={millionConcurrentThroughput}
+                  unit="ops/s"
+                  onExpand={() => setExpandedChart({
+                    kind: "simple",
+                    title: "1M OpenDR auth concurrency",
+                    description: "Higher is better. OpenDR-only 1M fixture with 0% failures through 128 clients.",
+                    data: millionConcurrentThroughput,
+                    unit: "ops/s",
                   })}
                 />
               </div>

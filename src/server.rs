@@ -29,6 +29,7 @@ use crate::audit::{AuditEvent, AuditEventType, AuditLevel, AuditLogger};
 use crate::backend::SearchCandidateHint;
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
+    OperationalAttributes,
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
@@ -2516,6 +2517,45 @@ pub(crate) async fn log_simple_bind_failure(
         .await;
 }
 
+pub(crate) async fn record_authentication_success_metadata(
+    backend: &dyn DirectoryBackend,
+    user_dn: &str,
+) {
+    if let Err(err) = backend.record_authentication_success(user_dn).await {
+        error!(
+            "Failed to update account authentication success metadata for {}: {}",
+            user_dn, err
+        );
+    }
+}
+
+pub(crate) async fn record_authentication_failure_metadata(
+    backend: &dyn DirectoryBackend,
+    user_dn: &str,
+) {
+    if let Err(err) = backend.record_authentication_failure(user_dn).await {
+        error!(
+            "Failed to update account authentication failure metadata for {}: {}",
+            user_dn, err
+        );
+    }
+}
+
+pub(crate) fn first_server_managed_operational_attribute<I, S>(attributes: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    attributes.into_iter().find_map(|attribute| {
+        let attribute = attribute.as_ref();
+        OperationalAttributes::is_operational(attribute).then(|| attribute.to_string())
+    })
+}
+
+pub(crate) fn server_managed_operational_attribute_diagnostic(attribute: &str) -> String {
+    format!("operational attribute {attribute} is server-managed")
+}
+
 pub(crate) async fn log_sasl_bind(
     request_context: &RequestContext,
     user_dn: &str,
@@ -2823,6 +2863,11 @@ async fn handle_bind_request_with_session_and_context(
             match backend.authenticate(&dn, password.as_ref()).await {
                 Ok(true) => {
                     session.bind(dn);
+                    record_authentication_success_metadata(
+                        backend,
+                        session.bound_dn().unwrap_or(""),
+                    )
+                    .await;
                     log_simple_bind_success(
                         request_context,
                         session.bound_dn().unwrap_or("anonymous"),
@@ -2832,6 +2877,7 @@ async fn handle_bind_request_with_session_and_context(
                 }
                 Ok(false) => {
                     session.clear();
+                    record_authentication_failure_metadata(backend, &dn).await;
                     log_simple_bind_failure(request_context, &dn, "invalid credentials").await;
                     send_bind_response(
                         socket,
@@ -2964,11 +3010,13 @@ async fn handle_bind_request_with_session_and_context(
             match backend.authenticate(&bind_dn, parsed.password).await {
                 Ok(true) => {
                     session.bind(bind_dn.clone());
+                    record_authentication_success_metadata(backend, &bind_dn).await;
                     log_sasl_bind(request_context, &bind_dn, "PLAIN", true, None).await;
                     send_bind_success(socket, message_id).await?;
                 }
                 Ok(false) => {
                     session.clear();
+                    record_authentication_failure_metadata(backend, &bind_dn).await;
                     log_sasl_bind(
                         request_context,
                         &bind_dn,
@@ -6253,6 +6301,28 @@ pub(crate) async fn handle_modify_request_with_context(
         .iter()
         .map(|modification| modification.attribute.clone())
         .collect();
+    if let Some(attribute) = first_server_managed_operational_attribute(&modified_attributes) {
+        let diagnostic = server_managed_operational_attribute_diagnostic(&attribute);
+        log_modify_audit_event(
+            request_context,
+            session,
+            &dn,
+            false,
+            &modified_attributes,
+            Some(&diagnostic),
+        )
+        .await;
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::Modify,
+            ResultCode::UnwillingToPerform,
+            &dn,
+            &diagnostic,
+        )
+        .await?;
+        return Ok(());
+    }
 
     if !authorize_operation(
         socket,
@@ -6459,6 +6529,31 @@ pub(crate) async fn handle_add_request_with_context(
     }
 
     let added_attributes = entry.attributes.keys().cloned().collect::<Vec<_>>();
+    if let Some(attribute) = first_server_managed_operational_attribute(&added_attributes) {
+        let diagnostic = server_managed_operational_attribute_diagnostic(&attribute);
+        log_generic_audit_event(
+            request_context,
+            session,
+            AuditLevel::Error,
+            AuditEventType::DataModification,
+            "add",
+            false,
+            Some(&dn),
+            Some(&diagnostic),
+            Vec::new(),
+        )
+        .await;
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::Add,
+            ResultCode::UnwillingToPerform,
+            &dn,
+            &diagnostic,
+        )
+        .await?;
+        return Ok(());
+    }
     if !authorize_attribute_permissions(
         socket,
         backend,
@@ -7624,86 +7719,19 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
         }
     }
 
-    // Add operational attributes if requested
-    // Check for "+" (all operational) or specific operational attribute names
     if include_all_operational
-        || requested.iter().any(|attr| {
-            attr.eq_ignore_ascii_case("entrycsn")
-                || attr.eq_ignore_ascii_case("entryuuid")
-                || attr.eq_ignore_ascii_case("createtimestamp")
-                || attr.eq_ignore_ascii_case("modifytimestamp")
-                || attr.eq_ignore_ascii_case("creatorsname")
-                || attr.eq_ignore_ascii_case("modifiersname")
-        })
+        || requested
+            .iter()
+            .any(|attr| OperationalAttributes::is_operational(attr))
     {
-        let op_attrs = &entry.operational_attributes;
-
-        // entryCSN
-        if (include_all_operational || requested.iter().any(|a| a.eq_ignore_ascii_case("entrycsn")))
-            && let Some(entry_csn) = op_attrs.entry_csn.as_ref()
-        {
-            selected.push(("entryCSN".to_string(), vec![entry_csn.to_ldap_string()]));
-        }
-
-        if (include_all_operational
-            || requested
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case("entryuuid")))
-            && let Some(entry_uuid) = op_attrs.entry_uuid.as_ref()
-        {
-            selected.push(("entryUUID".to_string(), vec![entry_uuid.clone()]));
-        }
-
-        // createTimestamp
-        if (include_all_operational
-            || requested
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case("createtimestamp")))
-            && op_attrs.create_timestamp.is_some()
-        {
-            selected.push((
-                "createTimestamp".to_string(),
-                vec![op_attrs.create_timestamp.clone().unwrap()],
-            ));
-        }
-
-        // modifyTimestamp
-        if (include_all_operational
-            || requested
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case("modifytimestamp")))
-            && op_attrs.modify_timestamp.is_some()
-        {
-            selected.push((
-                "modifyTimestamp".to_string(),
-                vec![op_attrs.modify_timestamp.clone().unwrap()],
-            ));
-        }
-
-        // creatorsName
-        if (include_all_operational
-            || requested
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case("creatorsname")))
-            && op_attrs.creators_name.is_some()
-        {
-            selected.push((
-                "creatorsName".to_string(),
-                vec![op_attrs.creators_name.clone().unwrap()],
-            ));
-        }
-
-        // modifiersName
-        if (include_all_operational
-            || requested
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case("modifiersname")))
-            && op_attrs.modifiers_name.is_some()
-        {
-            selected.push((
-                "modifiersName".to_string(),
-                vec![op_attrs.modifiers_name.clone().unwrap()],
-            ));
+        for (name, values) in entry.operational_attributes.to_attributes() {
+            if include_all_operational
+                || requested
+                    .iter()
+                    .any(|attribute| attribute.eq_ignore_ascii_case(&name))
+            {
+                selected.push((name, values));
+            }
         }
     }
 

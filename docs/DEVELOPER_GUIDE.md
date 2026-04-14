@@ -616,13 +616,17 @@ Search fails:
 - Subtree and one-level scope depend on DN normalization by lowercasing and
   trimming, not full LDAP DN canonicalization.
 - Request `+` or explicit operational attributes for `entryCSN`, `entryUUID`,
-  and other operational values.
+  `lastSuccessfulLogin`, `lastFailedLogin`, `failedLoginCount`, and other
+  operational values.
 
 Write fails:
 
 - Check authentication first; mutations require an authenticated session.
 - Check schema errors: missing `objectClass`, missing `cn`/`sn` for `person`,
   unknown attributes, missing structural class, and single-value violations.
+- Do not include server-managed operational attributes such as `entryCSN`,
+  `lastSuccessfulLogin`, `lastFailedLogin`, or `failedLoginCount` in add or
+  modify requests.
 - Check access-control default policy and any in-memory ACI rules.
 
 Replication stalls:

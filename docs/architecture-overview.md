@@ -212,9 +212,16 @@ Backend writes maintain operational attributes such as:
 - create and modify timestamps
 - creators and modifiers names
 - `contextCSN`
+- `lastSuccessfulLogin`
+- `lastFailedLogin`
+- `failedLoginCount`
 
 Operational attributes are hidden from normal search results unless the client
 requests `+` or explicit operational attribute names.
+Simple bind and SASL PLAIN update account authentication metadata on the target
+entry. Failed binds increment `failedLoginCount`; a successful bind sets
+`lastSuccessfulLogin` and resets `failedLoginCount` to `0`. Clients cannot add
+or modify server-managed operational attributes directly.
 
 ## Known Implementation Boundaries
 

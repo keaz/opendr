@@ -29,6 +29,15 @@ pub struct OperationalAttributes {
     pub creators_name: Option<String>,
     /// modifiersName - DN of the user who last modified the entry (RFC 4512)
     pub modifiers_name: Option<String>,
+    /// lastSuccessfulLogin - Last successful account authentication timestamp
+    #[serde(default)]
+    pub last_successful_login: Option<String>,
+    /// lastFailedLogin - Last failed account authentication timestamp
+    #[serde(default)]
+    pub last_failed_login: Option<String>,
+    /// failedLoginCount - Consecutive failed authentication attempts
+    #[serde(default)]
+    pub failed_login_count: Option<u64>,
 }
 
 impl OperationalAttributes {
@@ -41,6 +50,9 @@ impl OperationalAttributes {
             modify_timestamp: None,
             creators_name: None,
             modifiers_name: None,
+            last_successful_login: None,
+            last_failed_login: None,
+            failed_login_count: None,
         }
     }
 
@@ -54,6 +66,9 @@ impl OperationalAttributes {
             modify_timestamp: Some(timestamp),
             creators_name: creator_dn.clone(),
             modifiers_name: creator_dn,
+            last_successful_login: None,
+            last_failed_login: None,
+            failed_login_count: None,
         }
     }
 
@@ -64,6 +79,36 @@ impl OperationalAttributes {
         if let Some(modifier_dn) = modifier_dn {
             self.modifiers_name = Some(modifier_dn);
         }
+    }
+
+    /// Update server-managed account metadata after a successful authentication.
+    pub fn record_successful_login(&mut self, csn: Csn) -> bool {
+        let timestamp = Self::current_timestamp();
+        self.record_successful_login_at(csn, timestamp)
+    }
+
+    fn record_successful_login_at(&mut self, csn: Csn, timestamp: String) -> bool {
+        if self.last_successful_login.as_deref() == Some(timestamp.as_str())
+            && self.failed_login_count == Some(0)
+        {
+            return false;
+        }
+
+        self.entry_csn = Some(csn);
+        self.modify_timestamp = Some(timestamp.clone());
+        self.last_successful_login = Some(timestamp);
+        self.failed_login_count = Some(0);
+        true
+    }
+
+    /// Update server-managed account metadata after a failed authentication.
+    pub fn record_failed_login(&mut self, csn: Csn) -> bool {
+        let timestamp = Self::current_timestamp();
+        self.entry_csn = Some(csn);
+        self.modify_timestamp = Some(timestamp.clone());
+        self.last_failed_login = Some(timestamp);
+        self.failed_login_count = Some(self.failed_login_count.unwrap_or(0).saturating_add(1));
+        true
     }
 
     /// Get current timestamp in LDAP GeneralizedTime format (RFC 4517)
@@ -101,6 +146,15 @@ impl OperationalAttributes {
         if let Some(ref dn) = self.modifiers_name {
             attrs.insert("modifiersname".to_string(), vec![dn.clone()]);
         }
+        if let Some(ref ts) = self.last_successful_login {
+            attrs.insert("lastsuccessfullogin".to_string(), vec![ts.clone()]);
+        }
+        if let Some(ref ts) = self.last_failed_login {
+            attrs.insert("lastfailedlogin".to_string(), vec![ts.clone()]);
+        }
+        if let Some(count) = self.failed_login_count {
+            attrs.insert("failedlogincount".to_string(), vec![count.to_string()]);
+        }
 
         attrs
     }
@@ -121,6 +175,9 @@ impl OperationalAttributes {
             || attr_name.eq_ignore_ascii_case("pwdaccountlockedtime")
             || attr_name.eq_ignore_ascii_case("pwdfailuretime")
             || attr_name.eq_ignore_ascii_case("pwdhistory")
+            || attr_name.eq_ignore_ascii_case("lastsuccessfullogin")
+            || attr_name.eq_ignore_ascii_case("lastfailedlogin")
+            || attr_name.eq_ignore_ascii_case("failedlogincount")
             || attr_name.eq_ignore_ascii_case("contextcsn")
     }
 }
@@ -199,6 +256,25 @@ impl std::error::Error for BackendError {}
 #[async_trait]
 pub trait DirectoryBackend: Send + Sync {
     async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError>;
+
+    async fn record_authentication_success(&self, dn: &str) -> Result<bool, BackendError> {
+        let _ = dn;
+        Ok(false)
+    }
+
+    async fn record_authentication_failure(&self, dn: &str) -> Result<bool, BackendError> {
+        let _ = dn;
+        Ok(false)
+    }
+
+    async fn replace_operational_attributes(
+        &self,
+        dn: &str,
+        operational_attributes: OperationalAttributes,
+    ) -> Result<(), BackendError> {
+        let _ = (dn, operational_attributes);
+        Ok(())
+    }
 
     async fn get_entry(&self, dn: &str) -> Result<Option<DirectoryEntry>, BackendError>;
 
@@ -575,6 +651,30 @@ impl MockBackend {
 
         Ok(())
     }
+
+    async fn record_account_authentication<F>(
+        &self,
+        dn: &str,
+        update: F,
+    ) -> Result<bool, BackendError>
+    where
+        F: FnOnce(&mut OperationalAttributes, Csn) -> bool,
+    {
+        let mut entries = self.entries.write().await;
+        let Some(stored) = entries.get_mut(dn) else {
+            return Ok(false);
+        };
+
+        let csn = self.csn_generator.generate();
+        if !update(&mut stored.entry.operational_attributes, csn.clone()) {
+            return Ok(false);
+        }
+
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
+
+        Ok(true)
+    }
 }
 
 impl Default for MockBackend {
@@ -594,6 +694,28 @@ impl DirectoryBackend for MockBackend {
             .get(dn)
             .map(|entry| password_matches(entry.password.as_slice(), password))
             .unwrap_or(false))
+    }
+
+    async fn record_authentication_success(&self, dn: &str) -> Result<bool, BackendError> {
+        self.record_account_authentication(dn, |attrs, csn| attrs.record_successful_login(csn))
+            .await
+    }
+
+    async fn record_authentication_failure(&self, dn: &str) -> Result<bool, BackendError> {
+        self.record_account_authentication(dn, |attrs, csn| attrs.record_failed_login(csn))
+            .await
+    }
+
+    async fn replace_operational_attributes(
+        &self,
+        dn: &str,
+        operational_attributes: OperationalAttributes,
+    ) -> Result<(), BackendError> {
+        let mut entries = self.entries.write().await;
+        let stored = entries.get_mut(dn).ok_or(BackendError::NotFound)?;
+        stored.entry.operational_attributes = operational_attributes;
+
+        Ok(())
     }
 
     async fn get_entry(&self, dn: &str) -> Result<Option<DirectoryEntry>, BackendError> {
@@ -989,5 +1111,40 @@ fn entry_in_scope(dn: &str, base_components: &[String], scope: SearchScope) -> b
                     .map(|component| component.to_lowercase()))
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OperationalAttributes;
+    use crate::csn::Csn;
+
+    #[test]
+    fn successful_login_noops_when_timestamp_and_failed_count_are_unchanged() {
+        let mut attrs = OperationalAttributes::new();
+        let timestamp = "20260414010203Z".to_string();
+
+        assert!(attrs.record_successful_login_at(Csn::with_values(1, 1, 1, 0), timestamp.clone()));
+        assert_eq!(
+            attrs.last_successful_login.as_deref(),
+            Some(timestamp.as_str())
+        );
+        assert_eq!(attrs.failed_login_count, Some(0));
+        let entry_csn = attrs.entry_csn.clone();
+
+        assert!(!attrs.record_successful_login_at(Csn::with_values(2, 1, 2, 0), timestamp));
+        assert_eq!(attrs.entry_csn, entry_csn);
+        assert_eq!(attrs.failed_login_count, Some(0));
+    }
+
+    #[test]
+    fn successful_login_same_second_still_resets_failed_count() {
+        let mut attrs = OperationalAttributes::new();
+        let timestamp = "20260414010203Z".to_string();
+        attrs.last_successful_login = Some(timestamp.clone());
+        attrs.failed_login_count = Some(3);
+
+        assert!(attrs.record_successful_login_at(Csn::with_values(1, 1, 1, 0), timestamp));
+        assert_eq!(attrs.failed_login_count, Some(0));
     }
 }

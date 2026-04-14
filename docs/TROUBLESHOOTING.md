@@ -109,7 +109,9 @@ ldapsearch -x -H ldap://127.0.0.1:1389 \
 ```
 
 Common operational attributes include `entryCSN`, `entryUUID`, timestamps,
-creators/modifiers, and `contextCSN`.
+creators/modifiers, `contextCSN`, `lastSuccessfulLogin`, `lastFailedLogin`, and
+`failedLoginCount`. Failed user binds increment `failedLoginCount`; successful
+user binds reset it to `0`.
 
 ### Indexed search still scans
 

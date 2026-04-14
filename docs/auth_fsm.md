@@ -111,6 +111,20 @@ pub struct AuthStats {
 }
 ```
 
+### Account Operational Metadata
+
+The server bind paths persist account authentication metadata on user entries
+after credential checks complete:
+
+- `lastSuccessfulLogin` records the timestamp of the last successful user bind.
+- `lastFailedLogin` records the timestamp of the last failed user bind.
+- `failedLoginCount` counts consecutive failed user binds and resets to `0`
+  after a successful bind.
+
+These values are server-managed operational attributes. Search clients must
+request `+` or the explicit attribute names to read them, and add or modify
+requests cannot set them directly.
+
 ### User Information
 
 Successfully authenticated users have associated information:

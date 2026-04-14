@@ -853,6 +853,48 @@ async fn filter_readable_operational_attributes(
         } else {
             None
         },
+        last_successful_login: if attrs.last_successful_login.is_some()
+            && can_read_operational_attribute(
+                engine,
+                user_dn,
+                target_dn,
+                "lastSuccessfulLogin",
+                backend,
+            )
+            .await
+        {
+            attrs.last_successful_login.clone()
+        } else {
+            None
+        },
+        last_failed_login: if attrs.last_failed_login.is_some()
+            && can_read_operational_attribute(
+                engine,
+                user_dn,
+                target_dn,
+                "lastFailedLogin",
+                backend,
+            )
+            .await
+        {
+            attrs.last_failed_login.clone()
+        } else {
+            None
+        },
+        failed_login_count: if attrs.failed_login_count.is_some()
+            && can_read_operational_attribute(
+                engine,
+                user_dn,
+                target_dn,
+                "failedLoginCount",
+                backend,
+            )
+            .await
+        {
+            attrs.failed_login_count
+        } else {
+            None
+        },
     }
 }
 

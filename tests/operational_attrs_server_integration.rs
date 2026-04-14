@@ -61,6 +61,98 @@ async fn test_e2e_add_and_search_with_operational_attrs() {
     );
 }
 
+#[tokio::test]
+async fn test_account_authentication_metadata_tracks_failures_and_success() {
+    let backend = Arc::new(MockBackend::new());
+
+    let mut attributes = HashMap::new();
+    attributes.insert("cn".to_string(), vec!["Login User".to_string()]);
+    attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+
+    let dn = "cn=Login User,ou=users,dc=example,dc=com";
+    let entry = DirectoryEntry::new(dn, attributes);
+    backend
+        .add_entry(entry, b"password".to_vec())
+        .await
+        .unwrap();
+
+    assert!(backend.record_authentication_failure(dn).await.unwrap());
+    assert!(backend.record_authentication_failure(dn).await.unwrap());
+
+    let after_failures = backend.get_entry(dn).await.unwrap().unwrap();
+    assert!(
+        after_failures
+            .operational_attributes
+            .last_failed_login
+            .is_some()
+    );
+    assert_eq!(
+        after_failures.operational_attributes.failed_login_count,
+        Some(2)
+    );
+    assert!(
+        after_failures
+            .operational_attributes
+            .last_successful_login
+            .is_none()
+    );
+
+    assert!(backend.record_authentication_success(dn).await.unwrap());
+
+    let after_success = backend.get_entry(dn).await.unwrap().unwrap();
+    assert!(
+        after_success
+            .operational_attributes
+            .last_successful_login
+            .is_some()
+    );
+    assert_eq!(
+        after_success.operational_attributes.failed_login_count,
+        Some(0)
+    );
+    assert_eq!(
+        after_success.operational_attributes.last_failed_login,
+        after_failures.operational_attributes.last_failed_login
+    );
+}
+
+#[tokio::test]
+async fn test_authentication_metadata_is_searchable_as_operational_attributes() {
+    let backend = Arc::new(MockBackend::new());
+
+    let mut attributes = HashMap::new();
+    attributes.insert("cn".to_string(), vec!["Search Login".to_string()]);
+    attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+
+    let dn = "cn=Search Login,ou=users,dc=example,dc=com";
+    let entry = DirectoryEntry::new(dn, attributes);
+    backend
+        .add_entry(entry, b"password".to_vec())
+        .await
+        .unwrap();
+    backend.record_authentication_failure(dn).await.unwrap();
+    backend.record_authentication_success(dn).await.unwrap();
+
+    let adapter = SearchBackendAdapter::new(backend);
+    let requested_attrs = vec![
+        "lastSuccessfulLogin".to_string(),
+        "failedLoginCount".to_string(),
+    ];
+    let result = adapter
+        .get_entry(dn, &requested_attrs)
+        .await
+        .unwrap()
+        .expect("Entry should exist");
+
+    assert!(result.attributes.contains_key("lastsuccessfullogin"));
+    assert_eq!(
+        result.attributes.get("failedlogincount"),
+        Some(&vec!["0".to_string()])
+    );
+    assert!(!result.attributes.contains_key("lastfailedlogin"));
+    assert!(!result.attributes.contains_key("cn"));
+}
+
 /// Test end-to-end flow: Add entry → Modify entry → Search shows updated timestamps
 #[tokio::test]
 async fn test_e2e_modify_updates_operational_attrs() {
@@ -203,6 +295,47 @@ async fn test_e2e_lmdb_operational_attrs() {
         assert!(
             !result.attributes.contains_key("createtimestamp"),
             "Should not have non-requested createTimestamp"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_lmdb_authentication_metadata_persists_and_resets() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().to_path_buf();
+    let dn = "cn=Persistent Login,dc=example,dc=com";
+
+    {
+        let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Persistent Login".to_string()]);
+        attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+
+        let entry = DirectoryEntry::new(dn, attributes);
+        backend
+            .add_entry(entry, b"password".to_vec())
+            .await
+            .unwrap();
+        backend.record_authentication_failure(dn).await.unwrap();
+    }
+
+    {
+        let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
+        let restored = backend.get_entry(dn).await.unwrap().unwrap();
+        assert!(restored.operational_attributes.last_failed_login.is_some());
+        assert_eq!(restored.operational_attributes.failed_login_count, Some(1));
+
+        backend.record_authentication_success(dn).await.unwrap();
+        let after_success = backend.get_entry(dn).await.unwrap().unwrap();
+        assert!(
+            after_success
+                .operational_attributes
+                .last_successful_login
+                .is_some()
+        );
+        assert_eq!(
+            after_success.operational_attributes.failed_login_count,
+            Some(0)
         );
     }
 }

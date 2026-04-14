@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::backend::{
     DirectoryBackend, DirectoryEntry, Modification as BackendMod, ModifyOperation,
+    OperationalAttributes,
 };
 use crate::fsm::{WriteOperation, WriteResultCode};
 use crate::metrics::{FsmType, MetricsCollector};
@@ -16,7 +17,7 @@ use crate::write_fsm::{
 #[derive(Debug, Clone)]
 enum PendingWriteOperation {
     Add {
-        entry: DirectoryEntry,
+        entry: Box<DirectoryEntry>,
         password: Vec<u8>,
     },
     Modify {
@@ -101,7 +102,7 @@ impl WriteBackendAdapter {
         match operation {
             PendingWriteOperation::Add { entry, password } => self
                 .backend
-                .add_entry_with_actor(entry, password, actor_dn)
+                .add_entry_with_actor(*entry, password, actor_dn)
                 .await
                 .map_err(|e| format!("Backend add_entry error: {}", e)),
             PendingWriteOperation::Modify { dn, modifications } => self
@@ -152,6 +153,9 @@ impl WriteBackendAdapter {
             };
 
             let key = key.trim().to_lowercase();
+            if OperationalAttributes::is_operational(&key) {
+                return Err(server_managed_operational_attribute_diagnostic(&key));
+            }
             let value = value.trim().to_string();
             if key == "userpassword" && password.is_empty() {
                 password = value.as_bytes().to_vec();
@@ -160,6 +164,18 @@ impl WriteBackendAdapter {
         }
 
         Ok((DirectoryEntry::new(dn, attributes), password))
+    }
+}
+
+fn server_managed_operational_attribute_diagnostic(attribute: &str) -> String {
+    format!("operational attribute {attribute} is server-managed")
+}
+
+fn write_mod_attribute(modification: &WriteMod) -> &str {
+    match modification {
+        WriteMod::Add { name, .. }
+        | WriteMod::Delete { name, .. }
+        | WriteMod::Replace { name, .. } => name,
     }
 }
 
@@ -394,7 +410,7 @@ impl WriteBackend for WriteBackendAdapter {
         self.queue_operation(
             txn_id,
             PendingWriteOperation::Add {
-                entry: dir_entry,
+                entry: Box::new(dir_entry),
                 password,
             },
         )
@@ -407,6 +423,13 @@ impl WriteBackend for WriteBackendAdapter {
         modifications: &[WriteMod],
     ) -> Result<(), String> {
         self.ensure_open_transaction(txn_id)?;
+        if let Some(attribute) = modifications
+            .iter()
+            .map(write_mod_attribute)
+            .find(|attribute| OperationalAttributes::is_operational(attribute))
+        {
+            return Err(server_managed_operational_attribute_diagnostic(attribute));
+        }
 
         let mods: Vec<BackendMod> = modifications
             .iter()
