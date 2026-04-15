@@ -7224,7 +7224,7 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
         )
         .unwrap();
 
-        for (uid, value) in [("negative", "-1"), ("two", "0002"), ("ten", "10")] {
+        for (uid, value) in [("negative", "-1"), ("two", "2"), ("ten", "10")] {
             let mut attributes = HashMap::new();
             attributes.insert("exampleNumber".to_string(), vec![value.to_string()]);
             let entry = DirectoryEntry::new(format!("uid={uid},dc=example,dc=org"), attributes);

@@ -778,6 +778,53 @@ async fn compare_matching_attribute_returns_true() {
 }
 
 #[tokio::test]
+async fn compare_uses_schema_case_ignore_matching() {
+    let mut backend = MockDirectory::new();
+    let entry = DirectoryEntry::new(
+        "cn=Strasse,dc=example,dc=org",
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            ("cn".to_string(), vec!["Straße Smith".to_string()]),
+            ("sn".to_string(), vec!["Smith".to_string()]),
+        ]),
+    );
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Strasse,dc=example,dc=org")
+        .return_once(move |_| Ok(Some(entry)));
+
+    let request = CompareRequest {
+        entry: LdapDN(Cow::Owned("cn=Strasse,dc=example,dc=org".to_string())),
+        ava: AttributeValueAssertion {
+            attribute_desc: LdapString(Cow::Owned("cn".to_string())),
+            assertion_value: Cow::Owned(b"STRASSE SMITH".to_vec()),
+        },
+    };
+
+    let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+    server::handle_compare_request(&mut server_stream, &backend, 222, request)
+        .await
+        .unwrap();
+
+    let data = read_response(&mut client_stream).await;
+    let (_, messages) = parse_ldap_messages(&data).unwrap();
+
+    match &messages[0].protocol_op {
+        ProtocolOp::CompareResponse(result) => {
+            assert_eq!(
+                result.result_code,
+                ldap_parser::ldap::ResultCode::CompareTrue
+            );
+        }
+        other => panic!("unexpected response: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn compare_non_matching_attribute_returns_false() {
     let mut backend = MockDirectory::new();
     let entry = person_entry("cn=Alice,dc=example,dc=org");

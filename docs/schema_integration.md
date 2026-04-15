@@ -127,6 +127,9 @@ same attribute definitions: equality filters use the equality matching rule,
 substring filters use the substring matching rule, and ordering filters require
 an ordering matching rule.
 
+The supported RFC 4517 syntax validators and matching-rule normalizers are
+tracked in [LDAP_SYNTAX_MATCHING_SUPPORT.md](LDAP_SYNTAX_MATCHING_SUPPORT.md).
+
 ### Online Schema Updates
 
 Online updates are disabled by default. Enable them only for deployments that need authorized LDAP clients to update schema without restarting:

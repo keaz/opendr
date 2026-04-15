@@ -1621,10 +1621,20 @@ mod tests {
     #[test]
     fn schema_filter_matching_uses_attribute_matching_rules() {
         let schema = LdapSchema::with_core_schema();
-        let filter = compile_filter("(cn=  ALICE   SMITH )").unwrap();
-        let entry = test_entry("cn=alice,dc=example,dc=com", "person", "Alice Smith");
+        let filter = compile_filter("(cn=STRASSE SMITH)").unwrap();
+        let mut entry = test_entry("cn=alice,dc=example,dc=com", "person", "Straße Smith");
+        entry.attributes.insert(
+            "telephonenumber".to_string(),
+            vec!["+1 555-0100".to_string()],
+        );
 
         assert!(filter.matches_with_schema(&entry, &schema).unwrap());
+        assert!(
+            compile_filter("(telephoneNumber=*5550100)")
+                .unwrap()
+                .matches_with_schema(&entry, &schema)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1639,7 +1649,7 @@ attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMa
             )
             .unwrap();
 
-        let filter = compile_filter("(&(cn=  ALICE   SMITH )(exampleNumber>=0020))").unwrap();
+        let filter = compile_filter("(&(cn=  ALICE   SMITH )(exampleNumber>=20))").unwrap();
         let prepared = filter.prepare_with_schema(&schema).unwrap();
         let mut matching = test_entry("cn=alice,dc=example,dc=com", "person", "Alice Smith");
         matching
@@ -1685,7 +1695,7 @@ attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMa
             )
             .unwrap();
 
-        let ordering_plan = compile_filter("(exampleNumber>=00042)")
+        let ordering_plan = compile_filter("(exampleNumber>=42)")
             .unwrap()
             .prepare_with_schema(&schema)
             .unwrap();
@@ -1696,6 +1706,12 @@ attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMa
                 value: "42".to_string(),
             })
         );
+        assert!(matches!(
+            compile_filter("(exampleNumber>=00042)")
+                .unwrap()
+                .prepare_with_schema(&schema),
+            Err(FilterSchemaError::InvalidAttributeSyntax(_))
+        ));
 
         let equality_plan = compile_filter("(cn=  ALICE   SMITH )")
             .unwrap()

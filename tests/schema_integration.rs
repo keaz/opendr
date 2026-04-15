@@ -30,6 +30,46 @@ fn test_full_person_entry_validation() {
 }
 
 #[test]
+fn test_rfc4517_core_syntax_validation() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Alice Johnson".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Johnson".to_string()]);
+    attributes.insert("mail".to_string(), vec!["alice@example.org".to_string()]);
+    attributes.insert(
+        "telephoneNumber".to_string(),
+        vec!["+1 555-0100".to_string()],
+    );
+    assert!(schema.validate_entry(&attributes).is_ok());
+
+    attributes.insert("telephoneNumber".to_string(), vec!["+1_555".to_string()]);
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "telephoneNumber"
+    ));
+
+    attributes.insert(
+        "telephoneNumber".to_string(),
+        vec!["+1 555-0100".to_string()],
+    );
+    attributes.insert("mail".to_string(), vec!["alice@exámple.org".to_string()]);
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "mail"
+    ));
+}
+
+#[test]
 fn test_inet_org_person_full_attributes() {
     let schema = LdapSchema::with_core_schema();
 

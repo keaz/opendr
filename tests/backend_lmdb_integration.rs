@@ -9,8 +9,12 @@
 
 use base64::Engine;
 use ldap_parser::ldap::SearchScope;
-use opendr::backend::{DirectoryBackend, DirectoryEntry, Modification, ModifyOperation};
-use opendr::backend_lmdb::{IndexConfig, LmdbBackend};
+use opendr::backend::{
+    DirectoryBackend, DirectoryEntry, Modification, ModifyOperation, SearchCandidateHint,
+    SearchSubstringPart,
+};
+use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBackend};
+use opendr::schema::LdapSchema;
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,6 +95,72 @@ async fn test_lmdb_basic_crud() {
         .await
         .unwrap();
     assert!(deleted.is_none());
+}
+
+#[tokio::test]
+async fn test_lmdb_indexes_use_schema_matching_rule_normalization() {
+    let dir = tempdir().unwrap();
+    let schema = LdapSchema::default();
+    let backend = LmdbBackend::new_with_schema_config(
+        dir.path(),
+        100,
+        1,
+        IndexConfig {
+            indexed_attributes: Vec::new(),
+            attribute_indexes: vec![AttributeIndexConfig {
+                attribute: "telephoneNumber".to_string(),
+                index_types: vec![IndexType::Equality, IndexType::Substring],
+            }],
+        },
+        &schema,
+    )
+    .unwrap();
+
+    for (cn, telephone) in [("Alice", "+1 555-0100"), ("Bob", "+1 555-0111")] {
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
+        attributes.insert("cn".to_string(), vec![cn.to_string()]);
+        attributes.insert("sn".to_string(), vec![cn.to_string()]);
+        attributes.insert("telephoneNumber".to_string(), vec![telephone.to_string()]);
+        backend
+            .add_entry(
+                DirectoryEntry::new(format!("cn={cn},dc=example,dc=org"), attributes),
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+
+    let exact = backend
+        .search_entries_with_hint(
+            "dc=example,dc=org",
+            SearchScope(2),
+            Some(SearchCandidateHint::Equality {
+                attribute: "telephoneNumber".to_string(),
+                value: "+15550100".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].dn, "cn=Alice,dc=example,dc=org");
+
+    let substring = backend
+        .search_entries_with_hint(
+            "dc=example,dc=org",
+            SearchScope(2),
+            Some(SearchCandidateHint::Substring {
+                attribute: "telephoneNumber".to_string(),
+                parts: vec![SearchSubstringPart::Any("5550100".to_string())],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(substring.len(), 1);
+    assert_eq!(substring[0].dn, "cn=Alice,dc=example,dc=org");
 }
 
 #[tokio::test]

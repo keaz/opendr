@@ -2,6 +2,10 @@
 // Implements schema enforcement for entries and attributes
 
 use base64::{Engine as _, engine::general_purpose};
+use chrono::{
+    DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone,
+    Timelike, Utc,
+};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -544,7 +548,7 @@ impl LdapSchema {
                 names: vec!["telephoneNumber".to_string()],
                 description: Some("Telephone number".to_string()),
                 equality: Some("telephoneNumberMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.50".to_string(),
                 single_value: false,
             },
             AttributeType {
@@ -576,6 +580,7 @@ impl LdapSchema {
         ] {
             self.set_attribute_substring_rule(attr_name, "caseIgnoreSubstringsMatch");
         }
+        self.set_attribute_substring_rule("telephoneNumber", "telephoneNumberSubstringsMatch");
 
         // Core object classes
         let core_classes = vec![
@@ -679,6 +684,8 @@ impl LdapSchema {
             ("1.3.6.1.4.1.1466.115.121.1.27", "Integer"),
             ("1.3.6.1.4.1.1466.115.121.1.38", "OID"),
             ("1.3.6.1.4.1.1466.115.121.1.40", "Octet String"),
+            ("1.3.6.1.4.1.1466.115.121.1.41", "Postal Address"),
+            ("1.3.6.1.4.1.1466.115.121.1.50", "Telephone Number"),
         ];
         for (oid, description) in syntaxes {
             let _ = self.try_add_ldap_syntax(LdapSyntax {
@@ -710,6 +717,7 @@ impl LdapSchema {
                 "caseExactSubstringsMatch",
                 "1.3.6.1.4.1.1466.115.121.1.15",
             ),
+            ("2.5.13.13", "booleanMatch", "1.3.6.1.4.1.1466.115.121.1.7"),
             ("2.5.13.14", "integerMatch", "1.3.6.1.4.1.1466.115.121.1.27"),
             (
                 "2.5.13.15",
@@ -749,7 +757,12 @@ impl LdapSchema {
             (
                 "2.5.13.20",
                 "telephoneNumberMatch",
-                "1.3.6.1.4.1.1466.115.121.1.15",
+                "1.3.6.1.4.1.1466.115.121.1.50",
+            ),
+            (
+                "2.5.13.21",
+                "telephoneNumberSubstringsMatch",
+                "1.3.6.1.4.1.1466.115.121.1.50",
             ),
         ];
         for (oid, name, syntax) in matching_rules {
@@ -1931,43 +1944,36 @@ impl LdapSchema {
         attr_name: &str,
         value: &str,
     ) -> Result<(), SchemaError> {
-        let syntax_oid = attr_type
-            .syntax
-            .split_once('{')
-            .map_or(attr_type.syntax.as_str(), |(oid, _)| oid);
-        let is_valid = match syntax_oid {
-            // Boolean
-            "1.3.6.1.4.1.1466.115.121.1.7" => value == "TRUE" || value == "FALSE",
-            // Distinguished Name.
-            "1.3.6.1.4.1.1466.115.121.1.12" => canonicalize_dn(value).is_ok(),
-            // Directory String
-            "1.3.6.1.4.1.1466.115.121.1.15" => !value.is_empty(),
-            // Generalized Time: YYYYMMDDHHMMSSZ.
-            "1.3.6.1.4.1.1466.115.121.1.24" => {
-                value.len() == 15
-                    && value.ends_with('Z')
-                    && value[..14].chars().all(|ch| ch.is_ascii_digit())
-            }
-            // IA5 String
-            "1.3.6.1.4.1.1466.115.121.1.26" => value.is_ascii(),
-            // Integer
-            "1.3.6.1.4.1.1466.115.121.1.27" => value.parse::<i64>().is_ok(),
-            // OID
-            "1.3.6.1.4.1.1466.115.121.1.38" => is_valid_oid_or_descriptor(value),
-            // Octet String and unsupported syntaxes are accepted until a
-            // specific validator is implemented.
-            "1.3.6.1.4.1.1466.115.121.1.40" => true,
-            _ => true,
-        };
+        let effective = self
+            .resolve_effective_attribute(attr_type, &mut HashSet::new())
+            .map_err(|err| SchemaError::InvalidSyntax(attr_name.to_string(), err.to_string()))?;
+        let (declared_syntax_oid, inline_length) =
+            parse_syntax_with_optional_length(&effective.syntax_oid)?;
+        let syntax_length = effective.syntax_length.or(inline_length);
 
-        if !is_valid {
+        if let Some(max_chars) = syntax_length
+            && value.chars().count() > max_chars
+        {
             return Err(SchemaError::InvalidSyntax(
                 attr_name.to_string(),
-                format!("value does not conform to syntax {}", attr_type.syntax),
+                format!(
+                    "value length {} exceeds syntax bound {} for {}",
+                    value.chars().count(),
+                    max_chars,
+                    effective.syntax_oid
+                ),
             ));
         }
 
-        Ok(())
+        validate_ldap_syntax_value(&declared_syntax_oid, value).map_err(|reason| {
+            SchemaError::InvalidSyntax(
+                attr_name.to_string(),
+                format!(
+                    "value does not conform to syntax {}: {}",
+                    effective.syntax_oid, reason
+                ),
+            )
+        })
     }
 
     /// Collect all superior class names recursively
@@ -2340,6 +2346,69 @@ fn base_syntax_oid(syntax: &str) -> &str {
     syntax.split_once('{').map_or(syntax, |(oid, _)| oid)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupportedSyntaxKind {
+    Boolean,
+    DistinguishedName,
+    DirectoryString,
+    GeneralizedTime,
+    Ia5String,
+    Integer,
+    ObjectIdentifier,
+    OctetString,
+    PostalAddress,
+    TelephoneNumber,
+}
+
+fn supported_syntax_kind(syntax_oid: &str) -> Option<SupportedSyntaxKind> {
+    match syntax_oid {
+        "1.3.6.1.4.1.1466.115.121.1.7" => Some(SupportedSyntaxKind::Boolean),
+        "1.3.6.1.4.1.1466.115.121.1.12" => Some(SupportedSyntaxKind::DistinguishedName),
+        "1.3.6.1.4.1.1466.115.121.1.15" => Some(SupportedSyntaxKind::DirectoryString),
+        "1.3.6.1.4.1.1466.115.121.1.24" => Some(SupportedSyntaxKind::GeneralizedTime),
+        "1.3.6.1.4.1.1466.115.121.1.26" => Some(SupportedSyntaxKind::Ia5String),
+        "1.3.6.1.4.1.1466.115.121.1.27" => Some(SupportedSyntaxKind::Integer),
+        "1.3.6.1.4.1.1466.115.121.1.38" => Some(SupportedSyntaxKind::ObjectIdentifier),
+        "1.3.6.1.4.1.1466.115.121.1.40" => Some(SupportedSyntaxKind::OctetString),
+        "1.3.6.1.4.1.1466.115.121.1.41" => Some(SupportedSyntaxKind::PostalAddress),
+        "1.3.6.1.4.1.1466.115.121.1.50" => Some(SupportedSyntaxKind::TelephoneNumber),
+        _ => None,
+    }
+}
+
+fn validate_ldap_syntax_value(syntax_oid: &str, value: &str) -> Result<(), String> {
+    let Some(kind) = supported_syntax_kind(syntax_oid) else {
+        return Err(format!("unsupported LDAP syntax {}", syntax_oid));
+    };
+
+    match kind {
+        SupportedSyntaxKind::Boolean => {
+            if matches!(value, "TRUE" | "FALSE") {
+                Ok(())
+            } else {
+                Err("boolean values must be TRUE or FALSE".to_string())
+            }
+        }
+        SupportedSyntaxKind::DistinguishedName => canonicalize_dn(value)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        SupportedSyntaxKind::DirectoryString => prepare_directory_string(value).map(|_| ()),
+        SupportedSyntaxKind::GeneralizedTime => parse_generalized_time(value).map(|_| ()),
+        SupportedSyntaxKind::Ia5String => validate_ia5_string(value),
+        SupportedSyntaxKind::Integer => parse_integer_syntax(value).map(|_| ()),
+        SupportedSyntaxKind::ObjectIdentifier => {
+            if is_valid_oid_or_descriptor(value) {
+                Ok(())
+            } else {
+                Err("value must be a numeric OID or descriptor".to_string())
+            }
+        }
+        SupportedSyntaxKind::OctetString => Ok(()),
+        SupportedSyntaxKind::PostalAddress => validate_postal_address(value),
+        SupportedSyntaxKind::TelephoneNumber => validate_telephone_number(value),
+    }
+}
+
 fn resolved_matching_rule(rule: &MatchingRule) -> ResolvedMatchingRule {
     ResolvedMatchingRule {
         oid: rule.oid.clone(),
@@ -2365,6 +2434,7 @@ fn matching_rules_are_same(left: &ResolvedMatchingRule, right: &ResolvedMatching
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedMatchingRuleKind {
+    Boolean,
     CaseIgnore,
     CaseExact,
     CaseIgnoreIa5,
@@ -2375,6 +2445,8 @@ enum SupportedMatchingRuleKind {
     DistinguishedName,
     ObjectIdentifier,
     OctetString,
+    TelephoneNumber,
+    TelephoneNumberSubstring,
     CaseIgnoreSubstring,
     CaseExactSubstring,
 }
@@ -2387,6 +2459,7 @@ fn supported_matching_rule_kind(rule: &ResolvedMatchingRule) -> Option<Supported
         ("1.3.6.1.4.1.1466.109.114.2", _) | (_, "caseignoreia5match") => {
             Some(SupportedMatchingRuleKind::CaseIgnoreIa5)
         }
+        ("2.5.13.13", _) | (_, "booleanmatch") => Some(SupportedMatchingRuleKind::Boolean),
         ("2.5.13.14", _) | (_, "integermatch") => Some(SupportedMatchingRuleKind::Integer),
         ("2.5.13.15", _) | (_, "integerorderingmatch") => {
             Some(SupportedMatchingRuleKind::IntegerOrdering)
@@ -2404,6 +2477,12 @@ fn supported_matching_rule_kind(rule: &ResolvedMatchingRule) -> Option<Supported
             Some(SupportedMatchingRuleKind::ObjectIdentifier)
         }
         ("2.5.13.17", _) | (_, "octetstringmatch") => Some(SupportedMatchingRuleKind::OctetString),
+        ("2.5.13.20", _) | (_, "telephonenumbermatch") => {
+            Some(SupportedMatchingRuleKind::TelephoneNumber)
+        }
+        ("2.5.13.21", _) | (_, "telephonenumbersubstringsmatch") => {
+            Some(SupportedMatchingRuleKind::TelephoneNumberSubstring)
+        }
         ("2.5.13.4", _) | (_, "caseignoresubstringsmatch") => {
             Some(SupportedMatchingRuleKind::CaseIgnoreSubstring)
         }
@@ -2422,22 +2501,21 @@ fn normalize_matching_rule_value(
         return Err(MatchingRuleError::UnsupportedRule(rule.label().to_string()));
     };
     match kind {
+        SupportedMatchingRuleKind::Boolean => {
+            validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.7", value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))?;
+            Ok(value.to_string())
+        }
         SupportedMatchingRuleKind::CaseIgnore | SupportedMatchingRuleKind::CaseIgnoreSubstring => {
-            Ok(normalize_directory_string_case_ignore(value))
+            normalize_directory_string_case_ignore(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
         SupportedMatchingRuleKind::CaseExact | SupportedMatchingRuleKind::CaseExactSubstring => {
-            Ok(normalize_directory_string(value))
+            normalize_directory_string(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
-        SupportedMatchingRuleKind::CaseIgnoreIa5 => {
-            if !value.is_ascii() {
-                return Err(invalid_matching_syntax(
-                    rule,
-                    value,
-                    "IA5 values must contain only ASCII characters",
-                ));
-            }
-            Ok(normalize_directory_string(value).to_ascii_lowercase())
-        }
+        SupportedMatchingRuleKind::CaseIgnoreIa5 => normalize_ia5_string_case_ignore(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
         SupportedMatchingRuleKind::Integer | SupportedMatchingRuleKind::IntegerOrdering => {
             parse_integer_for_rule(rule, value).map(|value| value.to_string())
         }
@@ -2448,17 +2526,21 @@ fn normalize_matching_rule_value(
         SupportedMatchingRuleKind::DistinguishedName => normalize_dn_value_for_matching(value)
             .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
         SupportedMatchingRuleKind::ObjectIdentifier => {
-            let normalized = value.trim();
-            if !is_valid_oid_or_descriptor(normalized) {
+            if !is_valid_oid_or_descriptor(value) {
                 return Err(invalid_matching_syntax(
                     rule,
                     value,
                     "value must be a numeric OID or descriptor",
                 ));
             }
-            Ok(normalized.to_ascii_lowercase())
+            Ok(value.to_ascii_lowercase())
         }
         SupportedMatchingRuleKind::OctetString => Ok(value.to_string()),
+        SupportedMatchingRuleKind::TelephoneNumber
+        | SupportedMatchingRuleKind::TelephoneNumberSubstring => {
+            normalize_telephone_number_for_matching(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+        }
     }
 }
 
@@ -2477,7 +2559,8 @@ fn matching_rule_ordering_key(
         }
         SupportedMatchingRuleKind::GeneralizedTime
         | SupportedMatchingRuleKind::GeneralizedTimeOrdering => {
-            normalize_generalized_time_for_rule(rule, value)
+            generalized_time_ordering_key(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
         _ => Err(MatchingRuleError::UnsupportedRule(format!(
             "{} is not an ordering rule",
@@ -2500,92 +2583,329 @@ fn compare_matching_rule_values(
         }
         SupportedMatchingRuleKind::GeneralizedTime
         | SupportedMatchingRuleKind::GeneralizedTimeOrdering => {
-            Ok(normalize_generalized_time_for_rule(rule, left)?
-                .cmp(&normalize_generalized_time_for_rule(rule, right)?))
+            Ok(matching_rule_ordering_key(rule, left)?
+                .cmp(&matching_rule_ordering_key(rule, right)?))
         }
         _ => Ok(normalize_matching_rule_value(rule, left)?
             .cmp(&normalize_matching_rule_value(rule, right)?)),
     }
 }
 
-fn normalize_directory_string(value: &str) -> String {
-    if directory_string_is_already_normalized(value) {
-        return value.to_string();
-    }
-
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+fn normalize_directory_string(value: &str) -> Result<String, String> {
+    prepare_directory_string(value)
 }
 
-fn normalize_directory_string_case_ignore(value: &str) -> String {
-    if directory_string_is_already_normalized(value) {
-        return if value.is_ascii() {
-            value.to_ascii_lowercase()
-        } else {
-            value.to_lowercase()
-        };
-    }
+fn normalize_directory_string_case_ignore(value: &str) -> Result<String, String> {
+    prepare_directory_string(value).map(|value| rfc4518_case_fold(&value))
+}
 
-    let normalized = normalize_directory_string(value);
-    if normalized.is_ascii() {
-        normalized.to_ascii_lowercase()
+fn prepare_directory_string(value: &str) -> Result<String, String> {
+    let prepared = prepare_unicode_string(value)?;
+    if prepared.is_empty() {
+        Err("Directory String values must not be empty".to_string())
     } else {
-        normalized.to_lowercase()
+        Ok(prepared)
     }
 }
 
-fn directory_string_is_already_normalized(value: &str) -> bool {
-    if value.is_empty() {
-        return true;
-    }
-
-    let mut previous_was_whitespace = true;
+fn prepare_unicode_string(value: &str) -> Result<String, String> {
+    let mut mapped = String::with_capacity(value.len());
     for ch in value.chars() {
+        if is_prohibited_string_char(ch) {
+            return Err(format!(
+                "value contains prohibited code point U+{:04X}",
+                ch as u32
+            ));
+        }
         if ch.is_whitespace() {
-            if previous_was_whitespace {
-                return false;
-            }
-            previous_was_whitespace = true;
+            mapped.push(' ');
         } else {
-            previous_was_whitespace = false;
+            mapped.push(ch);
         }
     }
-    !previous_was_whitespace
+
+    Ok(mapped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn rfc4518_case_fold(value: &str) -> String {
+    let mut folded = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\u{00DF}' | '\u{1E9E}' => folded.push_str("ss"),
+            '\u{03C2}' => folded.push('\u{03C3}'),
+            _ => folded.extend(ch.to_lowercase()),
+        }
+    }
+    folded
+}
+
+fn is_prohibited_string_char(ch: char) -> bool {
+    matches!(ch, '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}')
+}
+
+fn validate_ia5_string(value: &str) -> Result<(), String> {
+    if !value.is_ascii() {
+        return Err("IA5 values must contain only ASCII characters".to_string());
+    }
+    if value.chars().any(is_prohibited_string_char) {
+        return Err("IA5 values must not contain control characters".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_ia5_string_case_ignore(value: &str) -> Result<String, String> {
+    validate_ia5_string(value)?;
+    Ok(value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase())
 }
 
 fn parse_integer_for_rule(
     rule: &ResolvedMatchingRule,
     value: &str,
 ) -> Result<i128, MatchingRuleError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(invalid_matching_syntax(
-            rule,
-            value,
-            "integer value is empty",
-        ));
+    parse_integer_syntax(value).map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+}
+
+fn parse_integer_syntax(value: &str) -> Result<i128, String> {
+    let digits = if let Some(rest) = value.strip_prefix('-') {
+        if rest.is_empty() {
+            return Err("integer value is missing digits".to_string());
+        }
+        if rest == "0" || (rest.len() > 1 && rest.starts_with('0')) {
+            return Err("integer values must not contain leading zeroes".to_string());
+        }
+        rest
+    } else {
+        if value.is_empty() {
+            return Err("integer value is empty".to_string());
+        }
+        if value.len() > 1 && value.starts_with('0') {
+            return Err("integer values must not contain leading zeroes".to_string());
+        }
+        value
+    };
+
+    if !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("value is not a valid integer".to_string());
     }
-    trimmed
+
+    value
         .parse::<i128>()
-        .map_err(|_| invalid_matching_syntax(rule, value, "value is not a valid integer"))
+        .map_err(|_| "integer value is outside the supported i128 range".to_string())
 }
 
 fn normalize_generalized_time_for_rule(
     rule: &ResolvedMatchingRule,
     value: &str,
 ) -> Result<String, MatchingRuleError> {
-    let normalized = value.trim().to_ascii_uppercase();
-    if normalized.len() == 15
-        && normalized.ends_with('Z')
-        && normalized[..14].chars().all(|ch| ch.is_ascii_digit())
-    {
-        Ok(normalized)
-    } else {
-        Err(invalid_matching_syntax(
-            rule,
-            value,
-            "expected generalized time in YYYYMMDDHHMMSSZ form",
-        ))
+    normalize_generalized_time(value)
+        .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+}
+
+fn normalize_generalized_time(value: &str) -> Result<String, String> {
+    let time = parse_generalized_time(value)?;
+    Ok(format_generalized_time(&time, false))
+}
+
+fn generalized_time_ordering_key(value: &str) -> Result<String, String> {
+    let time = parse_generalized_time(value)?;
+    Ok(format_generalized_time(&time, true))
+}
+
+fn parse_generalized_time(value: &str) -> Result<DateTime<Utc>, String> {
+    if value.is_empty() {
+        return Err("generalized time value is empty".to_string());
     }
+    if value.chars().any(char::is_whitespace) {
+        return Err("generalized time values must not contain whitespace".to_string());
+    }
+
+    let upper = value.to_ascii_uppercase();
+    let (time_part, offset_seconds) = if let Some(time_part) = upper.strip_suffix('Z') {
+        (time_part, 0)
+    } else {
+        let Some((offset_start, sign)) = upper
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| matches!(ch, '+' | '-'))
+        else {
+            return Err("generalized time requires Z or +/-HHMM timezone".to_string());
+        };
+        let offset = &upper[offset_start + 1..];
+        if offset.len() != 4 || !offset.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err("timezone offset must use +/-HHMM".to_string());
+        }
+        let hours = parse_decimal_u32(&offset[..2], "timezone hour")?;
+        let minutes = parse_decimal_u32(&offset[2..], "timezone minute")?;
+        if hours > 23 || minutes > 59 {
+            return Err("timezone offset is out of range".to_string());
+        }
+        let seconds = (hours as i32 * 3600) + (minutes as i32 * 60);
+        let signed_seconds = if sign == '-' { -seconds } else { seconds };
+        (&upper[..offset_start], signed_seconds)
+    };
+
+    let (time_digits, fraction) = if let Some((digits, fraction)) = time_part.split_once('.') {
+        (digits, Some(fraction))
+    } else if let Some((digits, fraction)) = time_part.split_once(',') {
+        (digits, Some(fraction))
+    } else {
+        (time_part, None)
+    };
+
+    if !matches!(time_digits.len(), 10 | 12 | 14)
+        || !time_digits.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err("expected YYYYMMDDHH[MM[SS]] generalized time".to_string());
+    }
+
+    let year = parse_decimal_i32(&time_digits[0..4], "year")?;
+    let month = parse_decimal_u32(&time_digits[4..6], "month")?;
+    let day = parse_decimal_u32(&time_digits[6..8], "day")?;
+    let hour = parse_decimal_u32(&time_digits[8..10], "hour")?;
+    let minute = if time_digits.len() >= 12 {
+        parse_decimal_u32(&time_digits[10..12], "minute")?
+    } else {
+        0
+    };
+    let second = if time_digits.len() == 14 {
+        parse_decimal_u32(&time_digits[12..14], "second")?
+    } else {
+        0
+    };
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)
+        .ok_or_else(|| "generalized time date is out of range".to_string())?;
+    let time = NaiveTime::from_hms_opt(hour, minute, second)
+        .ok_or_else(|| "generalized time clock value is out of range".to_string())?;
+    let mut naive = NaiveDateTime::new(date, time);
+
+    if let Some(fraction) = fraction {
+        let unit_nanos = match time_digits.len() {
+            10 => 3_600_000_000_000_u128,
+            12 => 60_000_000_000_u128,
+            14 => 1_000_000_000_u128,
+            _ => unreachable!("validated generalized time length"),
+        };
+        let (extra_seconds, extra_nanos) = fractional_duration(fraction, unit_nanos)?;
+        naive = naive
+            .checked_add_signed(Duration::seconds(extra_seconds))
+            .and_then(|value| value.checked_add_signed(Duration::nanoseconds(extra_nanos)))
+            .ok_or_else(|| "generalized time fraction overflows date range".to_string())?;
+    }
+
+    let offset = FixedOffset::east_opt(offset_seconds)
+        .ok_or_else(|| "timezone offset is out of range".to_string())?;
+    let local = offset
+        .from_local_datetime(&naive)
+        .single()
+        .ok_or_else(|| "generalized time is ambiguous for timezone".to_string())?;
+    Ok(local.with_timezone(&Utc))
+}
+
+fn format_generalized_time(time: &DateTime<Utc>, fixed_fraction: bool) -> String {
+    let base = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        time.year(),
+        time.month(),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second()
+    );
+    let nanos = time.nanosecond();
+    if fixed_fraction {
+        format!("{base}.{nanos:09}Z")
+    } else if nanos == 0 {
+        format!("{base}Z")
+    } else {
+        let mut fraction = format!("{nanos:09}");
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+        format!("{base}.{fraction}Z")
+    }
+}
+
+fn fractional_duration(fraction: &str, unit_nanos: u128) -> Result<(i64, i64), String> {
+    if fraction.is_empty() || !fraction.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("generalized time fraction must contain digits".to_string());
+    }
+
+    let mut numerator = 0_u128;
+    let mut scale = 1_u128;
+    for ch in fraction.chars().take(18) {
+        numerator = numerator * 10 + u128::from(ch as u8 - b'0');
+        scale *= 10;
+    }
+
+    let total_nanos = numerator
+        .checked_mul(unit_nanos)
+        .ok_or_else(|| "generalized time fraction is too large".to_string())?
+        / scale;
+    Ok((
+        (total_nanos / 1_000_000_000) as i64,
+        (total_nanos % 1_000_000_000) as i64,
+    ))
+}
+
+fn parse_decimal_u32(value: &str, label: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid generalized time {}", label))
+}
+
+fn parse_decimal_i32(value: &str, label: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .map_err(|_| format!("invalid generalized time {}", label))
+}
+
+fn validate_postal_address(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("Postal Address values must not be empty".to_string());
+    }
+    for line in value.split('$') {
+        if line.is_empty() {
+            return Err("Postal Address lines must not be empty".to_string());
+        }
+        prepare_directory_string(line)?;
+    }
+    Ok(())
+}
+
+fn validate_telephone_number(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("Telephone Number values must not be empty".to_string());
+    }
+    if value.chars().all(is_printable_string_char) {
+        Ok(())
+    } else {
+        Err("Telephone Number values must use PrintableString characters".to_string())
+    }
+}
+
+fn normalize_telephone_number_for_matching(value: &str) -> Result<String, String> {
+    validate_telephone_number(value)?;
+    let mut normalized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, ' ' | '-') {
+            continue;
+        }
+        normalized.extend(ch.to_lowercase());
+    }
+    Ok(normalized)
+}
+
+fn is_printable_string_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            ' ' | '\'' | '(' | ')' | '+' | ',' | '-' | '.' | '/' | ':' | '=' | '?'
+        )
 }
 
 fn normalize_dn_value_for_matching(value: &str) -> Result<String, String> {
@@ -2609,21 +2929,36 @@ fn is_valid_oid_or_descriptor(value: &str) -> bool {
 }
 
 fn is_valid_numeric_oid(value: &str) -> bool {
-    let mut parts = value.split('.');
-    let Some(first) = parts.next() else {
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return false;
+    }
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return false;
+    }
+    if parts
+        .iter()
+        .any(|part| part.len() > 1 && part.starts_with('0'))
+    {
+        return false;
+    }
+
+    let Ok(first) = parts[0].parse::<u32>() else {
         return false;
     };
-    if first.is_empty() || !first.chars().all(|ch| ch.is_ascii_digit()) {
+    let Ok(second) = parts[1].parse::<u32>() else {
+        return false;
+    };
+    if first > 2 {
         return false;
     }
-    let mut has_more = false;
-    for part in parts {
-        has_more = true;
-        if part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()) {
-            return false;
-        }
+    if first < 2 && second > 39 {
+        return false;
     }
-    has_more
+    true
 }
 
 fn is_valid_descriptor(value: &str) -> bool {
@@ -2631,8 +2966,7 @@ fn is_valid_descriptor(value: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    (first.is_ascii_alphabetic())
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == ';')
+    first.is_ascii_alphabetic() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 fn parse_syntax_with_optional_length(value: &str) -> Result<(String, Option<usize>), SchemaError> {
@@ -3652,9 +3986,9 @@ attributeTypes: ( 1.3.6.1.4.1.55555.30.2 NAME 'exampleChildNumber' SUP exampleBa
             schema
                 .resolve_matching_rule("caseIgnoreMatch")
                 .unwrap()
-                .normalize_value("  Alice   Smith ")
+                .normalize_value("  Straße   Smith ")
                 .unwrap(),
-            "alice smith"
+            "strasse smith"
         );
         assert_eq!(
             schema
@@ -3676,9 +4010,24 @@ attributeTypes: ( 1.3.6.1.4.1.55555.30.2 NAME 'exampleChildNumber' SUP exampleBa
             schema
                 .resolve_matching_rule("integerMatch")
                 .unwrap()
-                .normalize_value("00042")
+                .normalize_value("42")
                 .unwrap(),
             "42"
+        );
+        assert!(matches!(
+            schema
+                .resolve_matching_rule("integerMatch")
+                .unwrap()
+                .normalize_value("00042"),
+            Err(MatchingRuleError::InvalidSyntax { .. })
+        ));
+        assert_eq!(
+            schema
+                .resolve_matching_rule("booleanMatch")
+                .unwrap()
+                .normalize_value("TRUE")
+                .unwrap(),
+            "TRUE"
         );
         assert_eq!(
             schema
@@ -3695,6 +4044,14 @@ attributeTypes: ( 1.3.6.1.4.1.55555.30.2 NAME 'exampleChildNumber' SUP exampleBa
                 .normalize_value("CN")
                 .unwrap(),
             "cn"
+        );
+        assert_eq!(
+            schema
+                .resolve_matching_rule("telephoneNumberMatch")
+                .unwrap()
+                .normalize_value("+1 555-0100")
+                .unwrap(),
+            "+15550100"
         );
         assert_eq!(
             schema
@@ -3719,7 +4076,11 @@ attributeTypes: ( 1.3.6.1.4.1.55555.30.2 NAME 'exampleChildNumber' SUP exampleBa
         assert!(integer_rule.ordering_key("-1").unwrap() < integer_rule.ordering_key("2").unwrap());
         assert_eq!(
             time_rule.ordering_key("20260102030405Z").unwrap(),
-            "20260102030405Z"
+            "20260102030405.000000000Z"
+        );
+        assert_eq!(
+            time_rule.normalize_value("20260102030405+0530").unwrap(),
+            "20260101213405Z"
         );
         assert!(
             time_rule
@@ -3727,6 +4088,42 @@ attributeTypes: ( 1.3.6.1.4.1.55555.30.2 NAME 'exampleChildNumber' SUP exampleBa
                 .unwrap()
                 .is_lt()
         );
+    }
+
+    #[test]
+    fn rfc4517_syntax_validators_cover_advertised_set() {
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.7", "TRUE").is_ok());
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.7", "true").is_err());
+        assert!(
+            validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.12", "cn=Alice,dc=example")
+                .is_ok()
+        );
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.15", "Jorg").is_ok());
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.15", "").is_err());
+        assert!(
+            validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.24", "20260102030405Z").is_ok()
+        );
+        assert!(
+            validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.24", "20260230030405Z").is_err()
+        );
+        assert!(
+            validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.26", "user@example.org").is_ok()
+        );
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.26", "Jorg").is_ok());
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.27", "-42").is_ok());
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.27", "042").is_err());
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.38", "2.5.4.3").is_ok());
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.38", "2.05").is_err());
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.40", "\0").is_ok());
+        assert!(
+            validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.41", "Line 1$Line 2").is_ok()
+        );
+        assert!(
+            validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.41", "Line 1$$Line 3").is_err()
+        );
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.50", "+1 555-0100").is_ok());
+        assert!(validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.50", "+1_555").is_err());
+        assert!(validate_ldap_syntax_value("1.2.3.4", "anything").is_err());
     }
 
     #[test]
