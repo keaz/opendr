@@ -15,7 +15,7 @@ use ldap_parser::parse_ldap_messages;
 use mockall::mock;
 use opendr::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
-    SearchCandidateHint,
+    NativeModifyError, SearchCandidateHint,
 };
 use opendr::schema::LdapSchema;
 use opendr::server;
@@ -50,6 +50,13 @@ mock! {
             modifications: Vec<Modification>,
             actor_dn: Option<String>,
         ) -> Result<(), BackendError>;
+        async fn modify_entry_validated_with_actor(
+            &self,
+            dn: &str,
+            modifications: Vec<Modification>,
+            actor_dn: Option<String>,
+            schema: &LdapSchema,
+        ) -> Result<(), NativeModifyError>;
         async fn compare_attribute(
             &self,
             dn: &str,
@@ -440,12 +447,8 @@ async fn base_object_search_uses_get_entry_fast_path() {
 async fn modify_success_returns_success_response() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_get_entry()
-        .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
-        .return_once(|_| Ok(Some(person_entry("cn=Alice,dc=example,dc=org"))));
-    backend
-        .expect_modify_entry_with_actor()
-        .withf(|dn, modifications, actor_dn| {
+        .expect_modify_entry_validated_with_actor()
+        .withf(|dn, modifications, actor_dn, _schema| {
             dn == "cn=Alice,dc=example,dc=org"
                 && modifications.len() == 1
                 && modifications[0].operation == ModifyOperation::Replace
@@ -453,7 +456,7 @@ async fn modify_success_returns_success_response() {
                 && modifications[0].values == ["Alice Updated"]
                 && actor_dn.is_none()
         })
-        .return_once(|_, _, _| Ok(()));
+        .return_once(|_, _, _, _| Ok(()));
 
     let request = ModifyRequest {
         object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
@@ -491,12 +494,8 @@ async fn modify_success_returns_success_response() {
 async fn modify_backend_error_returns_mapping() {
     let mut backend = MockDirectory::new();
     backend
-        .expect_get_entry()
-        .withf(|dn| dn == "cn=Missing,dc=example,dc=org")
-        .return_once(|_| Ok(Some(person_entry("cn=Missing,dc=example,dc=org"))));
-    backend
-        .expect_modify_entry_with_actor()
-        .returning(|_, _, _| Err(BackendError::NotFound));
+        .expect_modify_entry_validated_with_actor()
+        .returning(|_, _, _, _| Err(NativeModifyError::Backend(BackendError::NotFound)));
 
     let request = ModifyRequest {
         object: LdapDN(Cow::Owned("cn=Missing,dc=example,dc=org".to_string())),

@@ -7,7 +7,8 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use opendr::backend::{
-    DirectoryBackend, DirectoryEntry, MockBackend, SearchCandidateHint, SearchSubstringPart,
+    DirectoryBackend, DirectoryEntry, MockBackend, Modification, ModifyOperation,
+    SearchCandidateHint, SearchSubstringPart,
 };
 use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBackend};
 use opendr::schema::LdapSchema;
@@ -139,6 +140,36 @@ objectClasses: ( 1.3.6.1.4.1.55555.250.2 NAME 'benchmarkIndexedObject' DESC 'Ben
     });
 
     (dir, backend)
+}
+
+fn setup_lmdb_modify_backend() -> (TempDir, Arc<LmdbBackend>, Arc<LdapSchema>) {
+    let dir = tempdir().unwrap();
+    let schema = Arc::new(LdapSchema::with_core_schema());
+    let backend = Arc::new(LmdbBackend::new(dir.path(), 100, 1).unwrap());
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        for i in 0..100 {
+            let mut attributes = HashMap::new();
+            attributes.insert(
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            );
+            attributes.insert("cn".to_string(), vec![format!("modify user {i}")]);
+            attributes.insert("sn".to_string(), vec![format!("user {i}")]);
+            attributes.insert("telephoneNumber".to_string(), vec!["555-0100".to_string()]);
+
+            let entry = DirectoryEntry::new(
+                format!("cn=modify-user-{i},ou=people,dc=example,dc=org"),
+                attributes,
+            );
+            backend
+                .add_entry(entry, format!("password{i}").as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+    });
+
+    (dir, backend, schema)
 }
 
 fn bench_read_operations(c: &mut Criterion) {
@@ -327,11 +358,62 @@ fn bench_lmdb_indexed_search_hints(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lmdb_modify_operations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lmdb_modify");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let (_legacy_dir, legacy_backend, _) = setup_lmdb_modify_backend();
+    group.bench_function("modify_entry_replace", |b| {
+        b.iter(|| {
+            let backend = legacy_backend.clone();
+            rt.block_on(async move {
+                backend
+                    .modify_entry(
+                        black_box("cn=modify-user-50,ou=people,dc=example,dc=org"),
+                        vec![Modification {
+                            operation: ModifyOperation::Replace,
+                            attribute: "telephoneNumber".to_string(),
+                            values: vec!["555-0199".to_string()],
+                        }],
+                    )
+                    .await
+                    .unwrap();
+            })
+        });
+    });
+
+    let (_native_dir, native_backend, schema) = setup_lmdb_modify_backend();
+    group.bench_function("native_validated_modify_entry_replace", |b| {
+        b.iter(|| {
+            let backend = native_backend.clone();
+            let schema = schema.clone();
+            rt.block_on(async move {
+                backend
+                    .modify_entry_validated_with_actor(
+                        black_box("cn=modify-user-50,ou=people,dc=example,dc=org"),
+                        vec![Modification {
+                            operation: ModifyOperation::Replace,
+                            attribute: "telephoneNumber".to_string(),
+                            values: vec!["555-0199".to_string()],
+                        }],
+                        None,
+                        &schema,
+                    )
+                    .await
+                    .unwrap();
+            })
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read_operations,
     bench_authentication,
     bench_search_operations,
-    bench_lmdb_indexed_search_hints
+    bench_lmdb_indexed_search_hints,
+    bench_lmdb_modify_operations
 );
 criterion_main!(benches);

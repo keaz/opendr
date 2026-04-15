@@ -239,6 +239,13 @@ pub enum BackendError {
     Storage(String),
 }
 
+/// Errors from schema-validated native modify operations.
+#[derive(Debug)]
+pub enum NativeModifyError {
+    Backend(BackendError),
+    Schema(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticationOutcome {
     Success,
@@ -271,6 +278,36 @@ impl fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+impl NativeModifyError {
+    pub fn schema_violation(message: impl Into<String>) -> Self {
+        Self::Schema(message.into())
+    }
+
+    pub fn into_backend_error(self) -> BackendError {
+        match self {
+            Self::Backend(err) => err,
+            Self::Schema(message) => BackendError::Storage(message),
+        }
+    }
+}
+
+impl fmt::Display for NativeModifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(err) => write!(f, "{}", err),
+            Self::Schema(message) => write!(f, "{}", message),
+        }
+    }
+}
+
+impl std::error::Error for NativeModifyError {}
+
+impl From<BackendError> for NativeModifyError {
+    fn from(err: BackendError) -> Self {
+        Self::Backend(err)
+    }
+}
 
 /// Trait describing the operations required from the directory data store.
 #[cfg_attr(test, mockall::automock)]
@@ -358,6 +395,37 @@ pub trait DirectoryBackend: Send + Sync {
     ) -> Result<(), BackendError> {
         let _ = actor_dn;
         self.modify_entry(dn, modifications).await
+    }
+
+    /// Validate and apply a modify operation as one backend operation.
+    ///
+    /// Backends with transactional storage should override this method so the
+    /// current entry is read inside the write transaction, schema validation is
+    /// performed against the candidate attributes, and cache invalidation only
+    /// happens after the write commits.
+    async fn modify_entry_validated_with_actor(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<String>,
+        schema: &crate::schema::LdapSchema,
+    ) -> Result<(), NativeModifyError> {
+        let existing_entry = self
+            .get_entry(dn)
+            .await?
+            .ok_or(NativeModifyError::Backend(BackendError::NotFound))?;
+        let mut candidate_attributes = existing_entry.attributes.clone();
+        apply_modifications_to_attributes(&mut candidate_attributes, &modifications);
+        schema
+            .validate_modified_entry(&existing_entry.attributes, &candidate_attributes)
+            .map_err(|err| {
+                NativeModifyError::schema_violation(format!("Schema validation failed: {}", err))
+            })?;
+
+        self.modify_entry_with_actor(dn, modifications, actor_dn)
+            .await?;
+
+        Ok(())
     }
 
     async fn compare_attribute(
@@ -531,6 +599,42 @@ pub struct Modification {
     pub operation: ModifyOperation,
     pub attribute: String,
     pub values: Vec<String>,
+}
+
+pub fn apply_modifications_to_attributes(
+    attributes: &mut HashMap<String, Vec<String>>,
+    modifications: &[Modification],
+) {
+    for modification in modifications {
+        let attribute = modification.attribute.to_lowercase();
+        match modification.operation {
+            ModifyOperation::Add => {
+                let values = attributes.entry(attribute).or_default();
+                for value in &modification.values {
+                    if !values.contains(value) {
+                        values.push(value.clone());
+                    }
+                }
+            }
+            ModifyOperation::Delete => {
+                if modification.values.is_empty() {
+                    attributes.remove(&attribute);
+                } else if let Some(values) = attributes.get_mut(&attribute) {
+                    values.retain(|value| !modification.values.contains(value));
+                    if values.is_empty() {
+                        attributes.remove(&attribute);
+                    }
+                }
+            }
+            ModifyOperation::Replace => {
+                if modification.values.is_empty() {
+                    attributes.remove(&attribute);
+                } else {
+                    attributes.insert(attribute, modification.values.clone());
+                }
+            }
+        }
+    }
 }
 
 struct StoredEntry {
@@ -811,6 +915,39 @@ impl DirectoryBackend for MockBackend {
     ) -> Result<(), BackendError> {
         self.modify_entry_internal(dn, modifications, actor_dn.as_deref())
             .await
+    }
+
+    async fn modify_entry_validated_with_actor(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<String>,
+        schema: &crate::schema::LdapSchema,
+    ) -> Result<(), NativeModifyError> {
+        let mut entries = self.entries.write().await;
+        let stored = entries.get_mut(dn).ok_or(BackendError::NotFound)?;
+        let mut candidate_attributes = stored.entry.attributes.clone();
+        apply_modifications_to_attributes(&mut candidate_attributes, &modifications);
+        schema
+            .validate_modified_entry(&stored.entry.attributes, &candidate_attributes)
+            .map_err(|err| {
+                NativeModifyError::schema_violation(format!("Schema validation failed: {}", err))
+            })?;
+
+        let csn = self.csn_generator.generate();
+        stored
+            .entry
+            .operational_attributes
+            .for_modified_entry(csn.clone(), actor_dn.as_deref().map(str::to_string));
+
+        for modification in &modifications {
+            apply_modification(&mut stored.entry, &mut stored.password, modification);
+        }
+
+        let mut context_csn = self.context_csn.write().await;
+        *context_csn = Some(csn);
+
+        Ok(())
     }
 
     async fn compare_attribute(

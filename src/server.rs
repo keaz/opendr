@@ -30,7 +30,7 @@ use crate::auth_metadata::AuthMetadataRecorder;
 use crate::backend::SearchCandidateHint;
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
-    OperationalAttributes,
+    NativeModifyError, OperationalAttributes,
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
@@ -6414,75 +6414,13 @@ pub(crate) async fn handle_modify_request_with_context(
         return Ok(());
     }
 
-    let existing_entry = match backend.get_entry(&dn).await {
-        Ok(Some(existing_entry)) => existing_entry,
-        Ok(None) => {
-            send_result(
-                socket,
-                message_id,
-                ResponseOp::Modify,
-                ResultCode::NoSuchObject,
-                &dn,
-                "no such object",
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(err) => {
-            error!("Modify lookup failed for {}: {}", dn, err);
-            log_modify_audit_event(
-                request_context,
-                session,
-                &dn,
-                false,
-                &modified_attributes,
-                Some(diagnostic_for_error(&err)),
-            )
-            .await;
-            send_result(
-                socket,
-                message_id,
-                ResponseOp::Modify,
-                map_backend_error(&err),
-                &dn,
-                diagnostic_for_error(&err),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let mut candidate_attributes = existing_entry.attributes.clone();
-    apply_modifications_to_attributes(&mut candidate_attributes, &modifications);
-    if let Err(schema_error) =
-        schema.validate_modified_entry(&existing_entry.attributes, &candidate_attributes)
-    {
-        error!(
-            "Schema validation failed for modify {}: {}",
-            dn, schema_error
-        );
-        log_modify_audit_event(
-            request_context,
-            session,
-            &dn,
-            false,
-            &modified_attributes,
-            Some(&format!("Schema validation failed: {}", schema_error)),
-        )
-        .await;
-        send_result(
-            socket,
-            message_id,
-            ResponseOp::Modify,
-            ResultCode::ObjectClassViolation,
-            &dn,
-            &format!("Schema validation failed: {}", schema_error),
-        )
-        .await?;
-        return Ok(());
-    }
-
     match backend
-        .modify_entry_with_actor(&dn, modifications, session.bound_dn().map(str::to_string))
+        .modify_entry_validated_with_actor(
+            &dn,
+            modifications,
+            session.bound_dn().map(str::to_string),
+            schema,
+        )
         .await
     {
         Ok(()) => {
@@ -6505,7 +6443,28 @@ pub(crate) async fn handle_modify_request_with_context(
             )
             .await?;
         }
-        Err(err) => {
+        Err(NativeModifyError::Schema(diagnostic)) => {
+            error!("Schema validation failed for modify {}: {}", dn, diagnostic);
+            log_modify_audit_event(
+                request_context,
+                session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(&diagnostic),
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ObjectClassViolation,
+                &dn,
+                &diagnostic,
+            )
+            .await?;
+        }
+        Err(NativeModifyError::Backend(err)) => {
             error!("Modify operation failed for {}: {}", dn, err);
             log_modify_audit_event(
                 request_context,
@@ -7838,42 +7797,6 @@ pub(crate) fn convert_ldap_changes_to_modifications(changes: &[Change<'_>]) -> V
 
 fn convert_modifications(changes: Vec<Change<'_>>) -> Vec<Modification> {
     convert_ldap_changes_to_modifications(&changes)
-}
-
-fn apply_modifications_to_attributes(
-    attributes: &mut HashMap<String, Vec<String>>,
-    modifications: &[Modification],
-) {
-    for modification in modifications {
-        let attribute = modification.attribute.to_lowercase();
-        match modification.operation {
-            ModifyOperation::Add => {
-                let values = attributes.entry(attribute).or_default();
-                for value in &modification.values {
-                    if !values.contains(value) {
-                        values.push(value.clone());
-                    }
-                }
-            }
-            ModifyOperation::Delete => {
-                if modification.values.is_empty() {
-                    attributes.remove(&attribute);
-                } else if let Some(values) = attributes.get_mut(&attribute) {
-                    values.retain(|value| !modification.values.contains(value));
-                    if values.is_empty() {
-                        attributes.remove(&attribute);
-                    }
-                }
-            }
-            ModifyOperation::Replace => {
-                if modification.values.is_empty() {
-                    attributes.remove(&attribute);
-                } else {
-                    attributes.insert(attribute, modification.values.clone());
-                }
-            }
-        }
-    }
 }
 
 pub(crate) fn build_entry_from_add_request(

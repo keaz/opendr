@@ -24,7 +24,7 @@ use tokio::time::sleep;
 use crate::aci::Permission;
 use crate::audit::{AuditEventType, AuditLevel};
 use crate::auth_metadata::AuthMetadataRecorder;
-use crate::backend::{DirectoryBackend, DirectoryEntry, OperationalAttributes};
+use crate::backend::{DirectoryBackend, DirectoryEntry, NativeModifyError, OperationalAttributes};
 use crate::backend_adapters::{
     AllowAllCompareAccessControl, AllowAllWriteAciChecker, CompareBackendAdapter,
     PassthroughSchemaValidator, ProductionAttributeComparator, ProductionCompareMetrics,
@@ -3552,17 +3552,16 @@ async fn handle_modify_request_with_fsm_runtime(
     modify_req: ldap_parser::ldap::ModifyRequest<'_>,
     schema: &LdapSchema,
     request_context: &RequestContext,
-    runtime_context: &FsmServerRuntimeContext,
+    _runtime_context: &FsmServerRuntimeContext,
 ) -> Result<(), String> {
     let session = legacy_session_from_fsm(fsm_set);
     let backend = fsm_set.backend().clone();
     let dn = modify_req.object.0.as_ref().trim().to_owned();
-    let modified_attributes: Vec<String> = modify_req
-        .changes
+    let modifications = convert_ldap_changes_to_modifications(&modify_req.changes);
+    let modified_attributes: Vec<String> = modifications
         .iter()
-        .map(|change| change.modification.attr_type.0.to_ascii_lowercase())
+        .map(|modification| modification.attribute.clone())
         .collect();
-    let encoded_changes = encode_modify_changes_for_write_fsm(&modify_req.changes);
     if let Some(attribute) = first_server_managed_operational_attribute(&modified_attributes) {
         let diagnostic = server_managed_operational_attribute_diagnostic(&attribute);
         log_modify_audit_event(
@@ -3659,124 +3658,59 @@ async fn handle_modify_request_with_fsm_runtime(
         }
     }
 
-    let existing_entry = match backend.get_entry(&dn).await {
-        Ok(Some(existing_entry)) => existing_entry,
-        Ok(None) => {
-            send_request_result_response(
-                fsm_set,
-                request.message_id as u32,
-                request.response_kind,
-                ResultCode::NoSuchObject,
-                "no such object",
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(err) => {
-            error!("Modify lookup failed for {}: {}", dn, err);
-            log_modify_audit_event(
-                request_context,
-                &session,
-                &dn,
-                false,
-                &modified_attributes,
-                Some(backend_diagnostic(&err)),
-            )
-            .await;
-            send_request_result_response(
-                fsm_set,
-                request.message_id as u32,
-                request.response_kind,
-                map_backend_error_code(&err),
-                backend_diagnostic(&err),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let mut candidate_attributes = existing_entry.attributes.clone();
-    apply_ldap_changes_to_attributes(&mut candidate_attributes, &modify_req.changes);
-    if let Err(schema_error) =
-        schema.validate_modified_entry(&existing_entry.attributes, &candidate_attributes)
-    {
-        let diagnostic = format!("Schema validation failed: {}", schema_error);
-        error!(
-            "Schema validation failed for modify {}: {}",
-            dn, schema_error
-        );
-        log_modify_audit_event(
-            request_context,
-            &session,
+    if let Err(err) = backend
+        .modify_entry_validated_with_actor(
             &dn,
-            false,
-            &modified_attributes,
-            Some(&diagnostic),
+            modifications,
+            session.bound_dn().map(str::to_string),
+            schema,
         )
-        .await;
-        send_request_result_response(
-            fsm_set,
-            request.message_id as u32,
-            request.response_kind,
-            ResultCode::ObjectClassViolation,
-            &diagnostic,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let write_config = WriteFsmConfig {
-        strict_schema_validation: false,
-        enable_aci_checks: false,
-        enable_audit_logging: false,
-        ..WriteFsmConfig::default()
-    };
-
-    let mut write_fsm = WriteFsmImpl::with_config(
-        Box::new(
-            WriteBackendAdapter::new(backend).with_actor(session.bound_dn().map(str::to_string)),
-        ),
-        Box::new(PassthroughSchemaValidator),
-        Box::new(AllowAllWriteAciChecker),
-        write_config,
-    );
-
-    if let Some(bound_dn) = fsm_set.authenticated_dn() {
-        write_fsm = write_fsm.with_user_dn(bound_dn.to_string());
-    }
-    if let Some(metrics) = runtime_context.metrics.as_ref() {
-        write_fsm = write_fsm.with_metrics(Box::new(ProductionWriteMetrics::new(metrics.clone())));
-    }
-
-    if let Err(err) = write_fsm
-        .handle_event(WriteEvent::StartWrite(WriteOperation::Modify {
-            dn: dn.clone(),
-            changes: encoded_changes,
-        }))
         .await
     {
-        return send_modify_write_fsm_error(
-            fsm_set,
-            request,
-            request_context,
-            &session,
-            &dn,
-            &modified_attributes,
-            err,
-        )
-        .await;
-    }
-
-    if let Err(err) = write_fsm.handle_event(WriteEvent::ValidationComplete).await {
-        return send_modify_write_fsm_error(
-            fsm_set,
-            request,
-            request_context,
-            &session,
-            &dn,
-            &modified_attributes,
-            err,
-        )
-        .await;
+        match err {
+            NativeModifyError::Schema(diagnostic) => {
+                error!("Schema validation failed for modify {}: {}", dn, diagnostic);
+                log_modify_audit_event(
+                    request_context,
+                    &session,
+                    &dn,
+                    false,
+                    &modified_attributes,
+                    Some(&diagnostic),
+                )
+                .await;
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    ResultCode::ObjectClassViolation,
+                    &diagnostic,
+                )
+                .await?;
+                return Ok(());
+            }
+            NativeModifyError::Backend(err) => {
+                error!("Modify operation failed for {}: {}", dn, err);
+                log_modify_audit_event(
+                    request_context,
+                    &session,
+                    &dn,
+                    false,
+                    &modified_attributes,
+                    Some(backend_diagnostic(&err)),
+                )
+                .await;
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
     }
 
     log_modify_audit_event(
@@ -4391,41 +4325,6 @@ async fn send_add_write_fsm_error(
     .await
 }
 
-async fn send_modify_write_fsm_error(
-    fsm_set: &mut ConnectionFsmSet,
-    request: &FsmRequestContext,
-    request_context: &RequestContext,
-    session: &ConnectionSession,
-    dn: &str,
-    modified_attributes: &[String],
-    error: WriteFsmError,
-) -> Result<(), String> {
-    let (result_code, diagnostic) = write_fsm_error_response(&error);
-
-    log_modify_audit_event(
-        request_context,
-        session,
-        dn,
-        false,
-        modified_attributes,
-        if diagnostic.is_empty() {
-            None
-        } else {
-            Some(diagnostic.as_str())
-        },
-    )
-    .await;
-
-    send_request_result_response(
-        fsm_set,
-        request.message_id as u32,
-        request.response_kind,
-        result_code,
-        &diagnostic,
-    )
-    .await
-}
-
 async fn send_moddn_write_fsm_error(
     fsm_set: &mut ConnectionFsmSet,
     request: &FsmRequestContext,
@@ -4483,73 +4382,6 @@ fn backend_diagnostic(err: &crate::backend::BackendError) -> &'static str {
         crate::backend::BackendError::AlreadyExists => "entry already exists",
         crate::backend::BackendError::NotFound => "no such object",
         crate::backend::BackendError::Storage(_) => "backend failure",
-    }
-}
-
-fn encode_modify_changes_for_write_fsm(changes: &[ldap_parser::ldap::Change<'_>]) -> Vec<u8> {
-    let mut encoded = String::new();
-
-    for change in changes {
-        let operation = match change.operation.0 {
-            0 => "add",
-            1 => "delete",
-            2 => "replace",
-            _ => "replace",
-        };
-        let attribute = change.modification.attr_type.0.to_ascii_lowercase();
-        encoded.push_str(&format!("{}: {}\n", operation, attribute));
-        for value in &change.modification.attr_vals {
-            encoded.push_str(&format!(
-                "{}: {}\n",
-                attribute,
-                String::from_utf8_lossy(value.0.as_ref())
-            ));
-        }
-    }
-
-    encoded.into_bytes()
-}
-
-fn apply_ldap_changes_to_attributes(
-    attributes: &mut HashMap<String, Vec<String>>,
-    changes: &[ldap_parser::ldap::Change<'_>],
-) {
-    for change in changes {
-        let attribute = change.modification.attr_type.0.to_ascii_lowercase();
-        let values = change
-            .modification
-            .attr_vals
-            .iter()
-            .map(|value| String::from_utf8_lossy(value.0.as_ref()).to_string())
-            .collect::<Vec<_>>();
-        match change.operation.0 {
-            0 => {
-                let existing_values = attributes.entry(attribute).or_default();
-                for value in values {
-                    if !existing_values.contains(&value) {
-                        existing_values.push(value);
-                    }
-                }
-            }
-            1 => {
-                if values.is_empty() {
-                    attributes.remove(&attribute);
-                } else if let Some(existing_values) = attributes.get_mut(&attribute) {
-                    existing_values.retain(|value| !values.contains(value));
-                    if existing_values.is_empty() {
-                        attributes.remove(&attribute);
-                    }
-                }
-            }
-            2 => {
-                if values.is_empty() {
-                    attributes.remove(&attribute);
-                } else {
-                    attributes.insert(attribute, values);
-                }
-            }
-            _ => {}
-        }
     }
 }
 

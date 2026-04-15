@@ -39,8 +39,8 @@ use tokio::sync::RwLock;
 
 use crate::backend::{
     AuthenticationMetadataUpdate, AuthenticationOutcome, BackendError, DirectoryBackend,
-    DirectoryEntry, Modification, ModifyOperation, OperationalAttributes, SearchCandidateHint,
-    SearchEntriesWithHintReport, SearchSubstringPart,
+    DirectoryEntry, Modification, NativeModifyError, OperationalAttributes, SearchCandidateHint,
+    SearchEntriesWithHintReport, SearchSubstringPart, apply_modifications_to_attributes,
 };
 use crate::csn::{Csn, CsnGenerator};
 use crate::metrics::MetricsCollector;
@@ -1264,6 +1264,18 @@ impl LmdbBackend {
         modifications: Vec<Modification>,
         actor_dn: Option<&str>,
     ) -> Result<(), BackendError> {
+        self.modify_entry_internal_validated(dn, modifications, actor_dn, None)
+            .await
+            .map_err(NativeModifyError::into_backend_error)
+    }
+
+    async fn modify_entry_internal_validated(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<&str>,
+        schema: Option<&LdapSchema>,
+    ) -> Result<(), NativeModifyError> {
         let _lock = self.write_lock.write().await;
 
         let mut txn = self
@@ -1274,8 +1286,10 @@ impl LmdbBackend {
         let normalized_dn = Self::normalize_dn(dn);
         let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
             Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
-            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound.into()),
+            Err(e) => {
+                return Err(BackendError::Storage(format!("DN lookup failed: {}", e)).into());
+            }
         };
         let entry_bytes = txn
             .get(self.entries_db, &actual_dn.as_bytes())
@@ -1290,42 +1304,26 @@ impl LmdbBackend {
                     .is_some()
             })
             .collect::<HashSet<_>>();
-        let old_attributes =
-            (!indexed_modified_attributes.is_empty()).then(|| entry.attributes.clone());
-        let mut password_touched = false;
+        let old_attributes = (schema.is_some() || !indexed_modified_attributes.is_empty())
+            .then(|| entry.attributes.clone());
+        let password_touched = modifications.iter().any(|modification| {
+            ldap_attribute_key(&modification.attribute).as_ref() == "userpassword"
+        });
 
-        for modification in modifications {
-            let attribute = ldap_attribute_key(&modification.attribute).into_owned();
-            if attribute == "userpassword" {
-                password_touched = true;
-            }
-            match modification.operation {
-                ModifyOperation::Add => {
-                    let existing = entry.attributes.entry(attribute).or_default();
-                    for value in modification.values {
-                        if !existing.contains(&value) {
-                            existing.push(value);
-                        }
-                    }
-                }
-                ModifyOperation::Delete => {
-                    if modification.values.is_empty() {
-                        entry.attributes.remove(&attribute);
-                    } else if let Some(existing) = entry.attributes.get_mut(&attribute) {
-                        existing.retain(|v| !modification.values.contains(v));
-                        if existing.is_empty() {
-                            entry.attributes.remove(&attribute);
-                        }
-                    }
-                }
-                ModifyOperation::Replace => {
-                    if modification.values.is_empty() {
-                        entry.attributes.remove(&attribute);
-                    } else {
-                        entry.attributes.insert(attribute, modification.values);
-                    }
-                }
-            }
+        apply_modifications_to_attributes(&mut entry.attributes, &modifications);
+
+        if let Some(schema) = schema {
+            let original_attributes = old_attributes
+                .as_ref()
+                .expect("old attributes are captured when schema validation is enabled");
+            schema
+                .validate_modified_entry(original_attributes, &entry.attributes)
+                .map_err(|err| {
+                    NativeModifyError::schema_violation(format!(
+                        "Schema validation failed: {}",
+                        err
+                    ))
+                })?;
         }
 
         entry.modified_at = std::time::SystemTime::now()
@@ -3314,6 +3312,17 @@ impl DirectoryBackend for LmdbBackend {
             .await
     }
 
+    async fn modify_entry_validated_with_actor(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<String>,
+        schema: &LdapSchema,
+    ) -> Result<(), NativeModifyError> {
+        self.modify_entry_internal_validated(dn, modifications, actor_dn.as_deref(), Some(schema))
+            .await
+    }
+
     async fn compare_attribute(
         &self,
         dn: &str,
@@ -3548,6 +3557,7 @@ impl DirectoryBackend for LmdbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ModifyOperation;
     use tempfile::tempdir;
 
     fn schema_with_matching_rule_attrs() -> LdapSchema {
@@ -3824,6 +3834,123 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.len, 1);
+    }
+
+    #[tokio::test]
+    async fn test_native_modify_preserves_auth_cache_for_non_password_modify() {
+        let dir = tempdir().unwrap();
+        let schema = LdapSchema::with_core_schema();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
+        attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+        attributes.insert("sn".to_string(), vec!["cached".to_string()]);
+        let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
+        backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
+
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+        backend
+            .modify_entry_validated_with_actor(
+                "cn=cached,dc=example,dc=org",
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "telephoneNumber".to_string(),
+                    values: vec!["555-0100".to_string()],
+                }],
+                None,
+                &schema,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+        let stats = backend.auth_cache_stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.len, 1);
+    }
+
+    #[tokio::test]
+    async fn test_native_modify_updates_auth_cache_after_password_modify() {
+        let dir = tempdir().unwrap();
+        let schema = LdapSchema::with_core_schema();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
+        attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+        attributes.insert("sn".to_string(), vec!["cached".to_string()]);
+        let entry = DirectoryEntry::new("cn=cached,dc=example,dc=org", attributes);
+        backend
+            .add_entry(entry, b"old-secret".to_vec())
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+                .await
+                .unwrap()
+        );
+        backend
+            .modify_entry_validated_with_actor(
+                "cn=cached,dc=example,dc=org",
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "userPassword".to_string(),
+                    values: vec!["new-secret".to_string()],
+                }],
+                None,
+                &schema,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !backend
+                .authenticate("cn=cached,dc=example,dc=org", b"old-secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .authenticate("cn=cached,dc=example,dc=org", b"new-secret")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -5107,6 +5234,227 @@ attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseEx
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 2);
         assert_eq!(stats.len, 1);
+    }
+
+    #[tokio::test]
+    async fn test_native_modify_invalidates_entry_cache_after_commit() {
+        let dir = tempdir().unwrap();
+        let schema = LdapSchema::with_core_schema();
+        let db_path = dir.path().to_path_buf();
+
+        {
+            let backend = LmdbBackend::new(&db_path, 100, 1).unwrap();
+            let mut attributes = HashMap::new();
+            attributes.insert(
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            );
+            attributes.insert("cn".to_string(), vec!["before".to_string()]);
+            attributes.insert("sn".to_string(), vec!["Person".to_string()]);
+            let entry = DirectoryEntry::new("uid=modify,dc=example,dc=org", attributes);
+            backend.add_entry(entry, vec![]).await.unwrap();
+        }
+
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            &db_path,
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        backend
+            .get_entry("uid=modify,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .modify_entry_validated_with_actor(
+                "uid=modify,dc=example,dc=org",
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "cn".to_string(),
+                    values: vec!["after".to_string()],
+                }],
+                None,
+                &schema,
+            )
+            .await
+            .unwrap();
+
+        let updated = backend
+            .get_entry("uid=modify,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.attributes["cn"], vec!["after".to_string()]);
+
+        let stats = backend.entry_cache_stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.len, 1);
+    }
+
+    #[tokio::test]
+    async fn test_native_modify_updates_attribute_indexes() {
+        let dir = tempdir().unwrap();
+        let schema = LdapSchema::with_core_schema();
+        let backend = LmdbBackend::new_with_schema_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: vec!["cn".to_string()],
+                attribute_indexes: Vec::new(),
+            },
+            &schema,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
+        attributes.insert("cn".to_string(), vec!["before".to_string()]);
+        attributes.insert("sn".to_string(), vec!["Person".to_string()]);
+        let dn = "uid=indexed,dc=example,dc=org";
+        backend
+            .add_entry(DirectoryEntry::new(dn, attributes), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.search_by_index("cn", "before").unwrap(),
+            vec![dn.to_string()]
+        );
+        backend
+            .modify_entry_validated_with_actor(
+                dn,
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "cn".to_string(),
+                    values: vec!["after".to_string()],
+                }],
+                None,
+                &schema,
+            )
+            .await
+            .unwrap();
+
+        assert!(backend.search_by_index("cn", "before").unwrap().is_empty());
+        assert_eq!(
+            backend.search_by_index("cn", "after").unwrap(),
+            vec![dn.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_native_modify_schema_violation_does_not_change_entry_or_cache() {
+        let dir = tempdir().unwrap();
+        let schema = LdapSchema::with_core_schema();
+        let backend = LmdbBackend::new_with_runtime_and_cache_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig::default(),
+            126,
+            2,
+        )
+        .unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "objectClass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
+        attributes.insert("cn".to_string(), vec!["cached".to_string()]);
+        attributes.insert("sn".to_string(), vec!["cached".to_string()]);
+        let dn = "cn=cached,dc=example,dc=org";
+        backend
+            .add_entry(DirectoryEntry::new(dn, attributes), b"secret".to_vec())
+            .await
+            .unwrap();
+
+        backend.get_entry(dn).await.unwrap().unwrap();
+        let err = backend
+            .modify_entry_validated_with_actor(
+                dn,
+                vec![Modification {
+                    operation: ModifyOperation::Delete,
+                    attribute: "sn".to_string(),
+                    values: Vec::new(),
+                }],
+                None,
+                &schema,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, NativeModifyError::Schema(_)));
+        let unchanged = backend.get_entry(dn).await.unwrap().unwrap();
+        assert_eq!(unchanged.attributes["sn"], vec!["cached".to_string()]);
+        let stats = backend.entry_cache_stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn test_native_modify_matches_backend_modify_for_valid_add_delete_replace() {
+        let legacy_dir = tempdir().unwrap();
+        let native_dir = tempdir().unwrap();
+        let schema = LdapSchema::with_core_schema();
+        let legacy_backend = LmdbBackend::new(legacy_dir.path(), 100, 1).unwrap();
+        let native_backend = LmdbBackend::new(native_dir.path(), 100, 1).unwrap();
+        let dn = "cn=compare,dc=example,dc=org";
+
+        for backend in [&legacy_backend, &native_backend] {
+            let mut attributes = HashMap::new();
+            attributes.insert(
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            );
+            attributes.insert("cn".to_string(), vec!["before".to_string()]);
+            attributes.insert("sn".to_string(), vec!["Person".to_string()]);
+            attributes.insert("telephoneNumber".to_string(), vec!["555-0100".to_string()]);
+            backend
+                .add_entry(DirectoryEntry::new(dn, attributes), b"secret".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let modifications = vec![
+            Modification {
+                operation: ModifyOperation::Delete,
+                attribute: "telephoneNumber".to_string(),
+                values: vec!["555-0100".to_string()],
+            },
+            Modification {
+                operation: ModifyOperation::Add,
+                attribute: "telephoneNumber".to_string(),
+                values: vec!["555-0101".to_string()],
+            },
+            Modification {
+                operation: ModifyOperation::Replace,
+                attribute: "cn".to_string(),
+                values: vec!["after".to_string()],
+            },
+        ];
+
+        legacy_backend
+            .modify_entry(dn, modifications.clone())
+            .await
+            .unwrap();
+        native_backend
+            .modify_entry_validated_with_actor(dn, modifications, None, &schema)
+            .await
+            .unwrap();
+
+        let legacy_entry = legacy_backend.get_entry(dn).await.unwrap().unwrap();
+        let native_entry = native_backend.get_entry(dn).await.unwrap().unwrap();
+        assert_eq!(legacy_entry.attributes, native_entry.attributes);
     }
 
     #[tokio::test]

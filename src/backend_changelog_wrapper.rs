@@ -32,13 +32,14 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::backend::{
-    BackendError, DirectoryBackend, DirectoryEntry, Modification, OperationalAttributes,
-    SearchCandidateHint, SearchEntriesWithHintReport,
+    BackendError, DirectoryBackend, DirectoryEntry, Modification, NativeModifyError,
+    OperationalAttributes, SearchCandidateHint, SearchEntriesWithHintReport,
 };
 use crate::change_observer::ChangeObserver;
 use crate::replication::{ChangelogTracker, encode_rename_change_with_actor};
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 use crate::replication_service::ReplicationProviderLifecycle;
+use crate::schema::LdapSchema;
 
 #[cfg(test)]
 use crate::replication::RenameChange;
@@ -288,6 +289,25 @@ impl DirectoryBackend for ChangelogBackendWrapper {
         Ok(())
     }
 
+    async fn modify_entry_validated_with_actor(
+        &self,
+        dn: &str,
+        modifications: Vec<Modification>,
+        actor_dn: Option<String>,
+        schema: &LdapSchema,
+    ) -> Result<(), NativeModifyError> {
+        self.backend
+            .modify_entry_validated_with_actor(dn, modifications, actor_dn.clone(), schema)
+            .await?;
+
+        if let Ok(Some(entry)) = self.backend.get_entry(dn).await {
+            let entry_data = Self::serialize_entry(&entry);
+            self.record_change(ChangeType::Modify, dn.to_string(), entry_data, actor_dn);
+        }
+
+        Ok(())
+    }
+
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
         self.delete_entry_with_actor(dn, None).await
     }
@@ -434,7 +454,11 @@ mod tests {
     fn create_test_entry(dn: &str) -> DirectoryEntry {
         let mut attributes = HashMap::new();
         attributes.insert("cn".to_string(), vec!["Test User".to_string()]);
-        attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+        attributes.insert("sn".to_string(), vec!["User".to_string()]);
+        attributes.insert(
+            "objectclass".to_string(),
+            vec!["top".to_string(), "person".to_string()],
+        );
         DirectoryEntry::new(dn, attributes)
     }
 
@@ -545,6 +569,47 @@ mod tests {
         let entries = changelog.get_all();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].originator.as_deref(), Some(actor.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_native_modify_entry_with_actor_records_originator() {
+        let backend = MockBackend::new();
+        let entry = create_test_entry("cn=test,dc=example,dc=com");
+        backend
+            .add_entry_with_actor(
+                entry,
+                vec![],
+                Some("cn=creator,dc=example,dc=com".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let backend = Arc::new(backend);
+        let changelog = Arc::new(ChangelogTracker::new());
+        let wrapper = ChangelogBackendWrapper::new(backend, Some(changelog.clone()));
+        let actor = "cn=modifier,dc=example,dc=com".to_string();
+        let schema = LdapSchema::with_core_schema();
+
+        wrapper
+            .modify_entry_validated_with_actor(
+                "cn=test,dc=example,dc=com",
+                vec![Modification {
+                    operation: crate::backend::ModifyOperation::Replace,
+                    attribute: "cn".to_string(),
+                    values: vec!["Modified User".to_string()],
+                }],
+                Some(actor.clone()),
+                &schema,
+            )
+            .await
+            .unwrap();
+
+        let entries = changelog.get_all();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].originator.as_deref(), Some(actor.as_str()));
+
+        let stored: DirectoryEntry = serde_json::from_slice(&entries[0].change_data).unwrap();
+        assert_eq!(stored.attributes["cn"], vec!["Modified User".to_string()]);
     }
 
     #[tokio::test]
