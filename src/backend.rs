@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use ldap_parser::ldap::SearchScope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::csn::Csn;
 
@@ -484,6 +484,34 @@ pub trait DirectoryBackend: Send + Sync {
         })
     }
 
+    fn supports_search_entry_streaming(&self) -> bool {
+        false
+    }
+
+    async fn stream_search_entries_with_hint_report(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        hint: Option<SearchCandidateHint>,
+    ) -> Result<SearchEntriesStreamReport, BackendError> {
+        let report = self
+            .search_entries_with_hint_report(base_dn, scope, hint)
+            .await?;
+        let (sender, entries) = mpsc::channel(64);
+        tokio::spawn(async move {
+            for entry in report.entries {
+                if sender.send(Ok(entry)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(SearchEntriesStreamReport {
+            entries,
+            hint_covers_filter: report.hint_covers_filter,
+        })
+    }
+
     async fn search_entries_paginated(
         &self,
         base_dn: &str,
@@ -584,6 +612,13 @@ pub enum SearchCandidateHint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchEntriesWithHintReport {
     pub entries: Vec<DirectoryEntry>,
+    pub hint_covers_filter: bool,
+}
+
+pub type SearchEntryStreamReceiver = mpsc::Receiver<Result<DirectoryEntry, BackendError>>;
+
+pub struct SearchEntriesStreamReport {
+    pub entries: SearchEntryStreamReceiver,
     pub hint_covers_filter: bool,
 }
 

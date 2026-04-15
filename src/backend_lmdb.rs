@@ -40,7 +40,8 @@ use tokio::sync::RwLock;
 use crate::backend::{
     AuthenticationMetadataUpdate, AuthenticationOutcome, BackendError, DirectoryBackend,
     DirectoryEntry, Modification, NativeModifyError, OperationalAttributes, SearchCandidateHint,
-    SearchEntriesWithHintReport, SearchSubstringPart, apply_modifications_to_attributes,
+    SearchEntriesStreamReport, SearchEntriesWithHintReport, SearchSubstringPart,
+    apply_modifications_to_attributes,
 };
 use crate::csn::{Csn, CsnGenerator};
 use crate::metrics::MetricsCollector;
@@ -536,6 +537,49 @@ struct SubstringIndexCandidates {
     dns: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+enum SearchStreamPlan {
+    Uncovered {
+        base_dn: String,
+        scope: SearchScope,
+    },
+    Equality {
+        base_dn: String,
+        scope: SearchScope,
+        attribute: String,
+        value: String,
+    },
+    Present {
+        base_dn: String,
+        scope: SearchScope,
+        attribute: String,
+    },
+    Substring {
+        base_dn: String,
+        scope: SearchScope,
+        attribute: String,
+        parts: Vec<SearchSubstringPart>,
+    },
+    Ordering {
+        base_dn: String,
+        scope: SearchScope,
+        attribute: String,
+        value: String,
+        greater_or_equal: bool,
+    },
+}
+
+impl SearchStreamPlan {
+    fn hint_covers_filter(&self) -> bool {
+        matches!(
+            self,
+            SearchStreamPlan::Equality { .. }
+                | SearchStreamPlan::Present { .. }
+                | SearchStreamPlan::Ordering { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeIndexReadiness {
     pub attribute: String,
@@ -771,6 +815,7 @@ fn ldap_attribute_key(attribute: &str) -> Cow<'_, str> {
 }
 
 /// LMDB-based persistent backend optimized for read performance
+#[derive(Clone)]
 pub struct LmdbBackend {
     /// LMDB environment
     env: Arc<Environment>,
@@ -2864,6 +2909,679 @@ impl LmdbBackend {
         Ok(results)
     }
 
+    fn search_stream_plan(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        hint: Option<SearchCandidateHint>,
+    ) -> Result<SearchStreamPlan, BackendError> {
+        let uncovered = || SearchStreamPlan::Uncovered {
+            base_dn: base_dn.to_string(),
+            scope,
+        };
+
+        let Some(hint) = hint else {
+            return Ok(uncovered());
+        };
+
+        match hint {
+            SearchCandidateHint::Equality { attribute, value } => {
+                if self.index_ready_for_search(&attribute, IndexType::Equality)? {
+                    Ok(SearchStreamPlan::Equality {
+                        base_dn: base_dn.to_string(),
+                        scope,
+                        attribute,
+                        value,
+                    })
+                } else {
+                    Ok(uncovered())
+                }
+            }
+            SearchCandidateHint::Present { attribute } => {
+                if self.index_ready_for_search(&attribute, IndexType::Presence)? {
+                    Ok(SearchStreamPlan::Present {
+                        base_dn: base_dn.to_string(),
+                        scope,
+                        attribute,
+                    })
+                } else {
+                    Ok(uncovered())
+                }
+            }
+            SearchCandidateHint::Substring { attribute, parts } => {
+                if self.index_ready_for_search(&attribute, IndexType::Substring)? {
+                    Ok(SearchStreamPlan::Substring {
+                        base_dn: base_dn.to_string(),
+                        scope,
+                        attribute,
+                        parts,
+                    })
+                } else {
+                    Ok(uncovered())
+                }
+            }
+            SearchCandidateHint::GreaterOrEqual { attribute, value } => {
+                if self.index_ready_for_search(&attribute, IndexType::Ordering)? {
+                    Ok(SearchStreamPlan::Ordering {
+                        base_dn: base_dn.to_string(),
+                        scope,
+                        attribute,
+                        value,
+                        greater_or_equal: true,
+                    })
+                } else {
+                    Ok(uncovered())
+                }
+            }
+            SearchCandidateHint::LessOrEqual { attribute, value } => {
+                if self.index_ready_for_search(&attribute, IndexType::Ordering)? {
+                    Ok(SearchStreamPlan::Ordering {
+                        base_dn: base_dn.to_string(),
+                        scope,
+                        attribute,
+                        value,
+                        greater_or_equal: false,
+                    })
+                } else {
+                    Ok(uncovered())
+                }
+            }
+        }
+    }
+
+    fn index_ready_for_search(
+        &self,
+        attribute: &str,
+        index_type: IndexType,
+    ) -> Result<bool, BackendError> {
+        let attr_lower = ldap_attribute_key(attribute);
+        if !self.has_index_type(attr_lower.as_ref(), index_type) {
+            return Ok(false);
+        }
+
+        let indexes = self
+            .attr_indexes
+            .try_read()
+            .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
+        Ok(indexes.contains_key(attr_lower.as_ref()))
+    }
+
+    fn stream_search_entries_plan<F>(
+        &self,
+        plan: SearchStreamPlan,
+        mut send_entry: F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        match plan {
+            SearchStreamPlan::Uncovered { base_dn, scope } => {
+                self.stream_uncovered_entries(&base_dn, scope, &mut send_entry)
+            }
+            SearchStreamPlan::Equality {
+                base_dn,
+                scope,
+                attribute,
+                value,
+            } => self.stream_equality_index_entries(
+                &base_dn,
+                scope,
+                &attribute,
+                &value,
+                &mut send_entry,
+            ),
+            SearchStreamPlan::Present {
+                base_dn,
+                scope,
+                attribute,
+            } => self.stream_presence_index_entries(&base_dn, scope, &attribute, &mut send_entry),
+            SearchStreamPlan::Substring {
+                base_dn,
+                scope,
+                attribute,
+                parts,
+            } => self.stream_substring_index_entries(
+                &base_dn,
+                scope,
+                &attribute,
+                &parts,
+                &mut send_entry,
+            ),
+            SearchStreamPlan::Ordering {
+                base_dn,
+                scope,
+                attribute,
+                value,
+                greater_or_equal,
+            } => self.stream_ordering_index_entries(
+                &base_dn,
+                scope,
+                &attribute,
+                &value,
+                greater_or_equal,
+                &mut send_entry,
+            ),
+        }
+    }
+
+    fn stream_uncovered_entries<F>(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+
+        let base_components =
+            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
+        let mut cursor = txn
+            .open_ro_cursor(self.entries_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+
+        for (key, value) in cursor.iter() {
+            let dn = std::str::from_utf8(key)
+                .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in entry DN: {}", e)))?;
+            if !Self::entry_in_scope_with_prepared_base(
+                dn,
+                base_dn,
+                base_components.as_deref(),
+                scope,
+            ) {
+                continue;
+            }
+            let entry = Self::deserialize_stored_entry(value)?;
+            if !send_entry(entry.to_directory_entry()) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn stream_equality_index_entries<F>(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        attribute: &str,
+        value: &str,
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let attr_lower = ldap_attribute_key(attribute);
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(attr_lower.as_ref())
+        else {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        };
+        if !plan.index_types.contains(&IndexType::Equality) {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        }
+        let normalized_value = plan.normalize_equality_value(value)?;
+        let Some(index_db) = self.index_db_for_attribute(attr_lower.as_ref())? else {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        };
+        let search_prefix = Self::equality_index_prefix(&normalized_value);
+        self.stream_entries_by_index_prefix_in_txn(
+            &txn,
+            index_db,
+            search_prefix.as_bytes(),
+            base_dn,
+            scope,
+            false,
+            Self::include_all_stored_entry,
+            send_entry,
+        )
+    }
+
+    fn stream_presence_index_entries<F>(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        attribute: &str,
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let attr_lower = ldap_attribute_key(attribute);
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(attr_lower.as_ref())
+        else {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        };
+        if !plan.index_types.contains(&IndexType::Presence) {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        }
+        let Some(index_db) = self.index_db_for_attribute(attr_lower.as_ref())? else {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        };
+        let search_prefix = Self::presence_index_prefix();
+        self.stream_entries_by_index_prefix_in_txn(
+            &txn,
+            index_db,
+            search_prefix.as_bytes(),
+            base_dn,
+            scope,
+            false,
+            Self::include_all_stored_entry,
+            send_entry,
+        )
+    }
+
+    fn stream_substring_index_entries<F>(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        attribute: &str,
+        parts: &[SearchSubstringPart],
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let Some(candidates) = self.search_substring_by_index_in_txn(&txn, attribute, parts)?
+        else {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        };
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(&candidates.attribute)
+        else {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        };
+
+        self.stream_entries_by_dns_in_txn_filtering(
+            &txn,
+            &candidates.dns,
+            base_dn,
+            scope,
+            false,
+            |entry| {
+                Self::stored_entry_matches_normalized_substring(
+                    entry,
+                    &candidates.attribute,
+                    &candidates.normalized_parts,
+                    plan,
+                )
+            },
+            send_entry,
+        )
+    }
+
+    fn stream_ordering_index_entries<F>(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        attribute: &str,
+        value: &str,
+        greater_or_equal: bool,
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let attr_lower = ldap_attribute_key(attribute);
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(attr_lower.as_ref())
+        else {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        };
+        if !plan.index_types.contains(&IndexType::Ordering) {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        }
+        let normalized_value = plan.normalize_ordering_value(value)?;
+        let Some(index_db) = self.index_db_for_attribute(attr_lower.as_ref())? else {
+            return self.stream_uncovered_entries(base_dn, scope, send_entry);
+        };
+
+        let mut cursor = txn
+            .open_ro_cursor(index_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+        let seek_key = if greater_or_equal {
+            Self::ordering_index_key(&normalized_value, "")
+        } else {
+            Self::ordering_index_prefix().to_string()
+        };
+        let first_key = match cursor.get(Some(seek_key.as_bytes()), None, LMDB_SET_RANGE_OP) {
+            Ok((Some(key), _)) => key,
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(()),
+            Err(e) => {
+                return Err(BackendError::Storage(format!(
+                    "Failed to seek ordering index cursor: {}",
+                    e
+                )));
+            }
+        };
+        if !first_key.starts_with(Self::ordering_index_prefix().as_bytes()) {
+            return Ok(());
+        }
+
+        let base_components =
+            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
+        let mut seen_dns = HashSet::new();
+        let mut keep_streaming = self.stream_ordering_index_key(
+            &txn,
+            first_key,
+            &normalized_value,
+            greater_or_equal,
+            base_dn,
+            base_components.as_deref(),
+            scope,
+            &mut seen_dns,
+            send_entry,
+        )?;
+
+        if keep_streaming {
+            for (key, _value) in cursor.iter() {
+                if !key.starts_with(Self::ordering_index_prefix().as_bytes()) {
+                    break;
+                }
+                keep_streaming = self.stream_ordering_index_key(
+                    &txn,
+                    key,
+                    &normalized_value,
+                    greater_or_equal,
+                    base_dn,
+                    base_components.as_deref(),
+                    scope,
+                    &mut seen_dns,
+                    send_entry,
+                )?;
+                if !keep_streaming {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_ordering_index_key<F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        key: &[u8],
+        target_value: &str,
+        greater_or_equal: bool,
+        base_dn: &str,
+        base_components: Option<&[&str]>,
+        scope: SearchScope,
+        seen_dns: &mut HashSet<String>,
+        send_entry: &mut F,
+    ) -> Result<bool, BackendError>
+    where
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let Some((value, dn)) = Self::ordering_index_key_parts(key)? else {
+            return Ok(false);
+        };
+
+        let in_range = if greater_or_equal {
+            value >= target_value
+        } else {
+            value <= target_value
+        };
+        if !in_range {
+            return Ok(greater_or_equal);
+        }
+        if !seen_dns.insert(dn.to_string()) {
+            return Ok(true);
+        }
+
+        let mut include_all = Self::include_all_stored_entry;
+        self.stream_entry_by_dn_in_txn(
+            txn,
+            dn,
+            base_dn,
+            base_components,
+            scope,
+            &mut include_all,
+            send_entry,
+        )
+    }
+
+    fn index_db_for_attribute(&self, attribute: &str) -> Result<Option<Database>, BackendError> {
+        let indexes = self
+            .attr_indexes
+            .try_read()
+            .map_err(|e| BackendError::Storage(format!("Failed to acquire index lock: {}", e)))?;
+        Ok(indexes.get(attribute).copied())
+    }
+
+    fn include_all_stored_entry(_: &StoredEntry) -> Result<bool, BackendError> {
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_entries_by_index_prefix_in_txn<I, F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        index_db: Database,
+        prefix: &[u8],
+        base_dn: &str,
+        scope: SearchScope,
+        dedupe_dns: bool,
+        mut include_entry: I,
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        I: FnMut(&StoredEntry) -> Result<bool, BackendError>,
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let mut cursor = txn
+            .open_ro_cursor(index_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+        let prefix_bytes = prefix;
+        let first_key = match cursor.get(Some(prefix), None, LMDB_SET_RANGE_OP) {
+            Ok((Some(key), _)) => key,
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(()),
+            Err(e) => {
+                return Err(BackendError::Storage(format!(
+                    "Failed to seek attribute index cursor: {}",
+                    e
+                )));
+            }
+        };
+        if !first_key.starts_with(prefix_bytes) {
+            return Ok(());
+        }
+
+        let prefix = std::str::from_utf8(prefix)
+            .map_err(|e| BackendError::Storage(format!("Invalid index prefix encoding: {}", e)))?;
+        let base_components =
+            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
+        let mut seen_dns = dedupe_dns.then(HashSet::new);
+        let mut keep_streaming = self.stream_index_key_entry(
+            txn,
+            first_key,
+            prefix,
+            base_dn,
+            base_components.as_deref(),
+            scope,
+            seen_dns.as_mut(),
+            &mut include_entry,
+            send_entry,
+        )?;
+
+        if keep_streaming {
+            for (key, _value) in cursor.iter() {
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                keep_streaming = self.stream_index_key_entry(
+                    txn,
+                    key,
+                    prefix,
+                    base_dn,
+                    base_components.as_deref(),
+                    scope,
+                    seen_dns.as_mut(),
+                    &mut include_entry,
+                    send_entry,
+                )?;
+                if !keep_streaming {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_index_key_entry<I, F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        key: &[u8],
+        prefix: &str,
+        base_dn: &str,
+        base_components: Option<&[&str]>,
+        scope: SearchScope,
+        seen_dns: Option<&mut HashSet<String>>,
+        include_entry: &mut I,
+        send_entry: &mut F,
+    ) -> Result<bool, BackendError>
+    where
+        I: FnMut(&StoredEntry) -> Result<bool, BackendError>,
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let key = std::str::from_utf8(key)
+            .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
+        let Some(dn) = key.strip_prefix(prefix) else {
+            return Ok(true);
+        };
+        if let Some(seen_dns) = seen_dns
+            && !seen_dns.insert(dn.to_string())
+        {
+            return Ok(true);
+        }
+        self.stream_entry_by_dn_in_txn(
+            txn,
+            dn,
+            base_dn,
+            base_components,
+            scope,
+            include_entry,
+            send_entry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_entries_by_dns_in_txn_filtering<I, F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        dns: &[String],
+        base_dn: &str,
+        scope: SearchScope,
+        dedupe_dns: bool,
+        mut include_entry: I,
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        I: FnMut(&StoredEntry) -> Result<bool, BackendError>,
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        let base_components =
+            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
+        let mut seen_dns = dedupe_dns.then(|| HashSet::with_capacity(dns.len()));
+
+        for dn in dns {
+            if seen_dns
+                .as_mut()
+                .is_some_and(|seen_dns| !seen_dns.insert(dn.clone()))
+            {
+                continue;
+            }
+            if !self.stream_entry_by_dn_in_txn(
+                txn,
+                dn,
+                base_dn,
+                base_components.as_deref(),
+                scope,
+                &mut include_entry,
+                send_entry,
+            )? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_entry_by_dn_in_txn<I, F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        dn: &str,
+        base_dn: &str,
+        base_components: Option<&[&str]>,
+        scope: SearchScope,
+        include_entry: &mut I,
+        send_entry: &mut F,
+    ) -> Result<bool, BackendError>
+    where
+        I: FnMut(&StoredEntry) -> Result<bool, BackendError>,
+        F: FnMut(DirectoryEntry) -> bool,
+    {
+        if !Self::entry_in_scope_with_prepared_base(dn, base_dn, base_components, scope) {
+            return Ok(true);
+        }
+        let entry_bytes = match txn.get(self.entries_db, &dn.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(lmdb::Error::NotFound) => return Ok(true),
+            Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
+        };
+        let entry = Self::deserialize_stored_entry(entry_bytes)?;
+        if !include_entry(&entry)? {
+            return Ok(true);
+        }
+        Ok(send_entry(entry.to_directory_entry()))
+    }
+
+    fn entry_in_scope_with_prepared_base(
+        dn: &str,
+        base_dn: &str,
+        base_components: Option<&[&str]>,
+        scope: SearchScope,
+    ) -> bool {
+        if scope == SearchScope(2) {
+            Self::entry_in_subtree_scope(dn, base_dn)
+        } else {
+            Self::entry_in_scope_with_base_components(
+                dn,
+                base_components.expect("base components are prepared for non-subtree scope"),
+                scope,
+            )
+        }
+    }
+
     fn stored_entry_matches_normalized_substring(
         entry: &StoredEntry,
         attribute: &str,
@@ -3505,6 +4223,35 @@ impl DirectoryBackend for LmdbBackend {
         })
     }
 
+    fn supports_search_entry_streaming(&self) -> bool {
+        true
+    }
+
+    async fn stream_search_entries_with_hint_report(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        hint: Option<SearchCandidateHint>,
+    ) -> Result<SearchEntriesStreamReport, BackendError> {
+        let plan = self.search_stream_plan(base_dn, scope, hint)?;
+        let hint_covers_filter = plan.hint_covers_filter();
+        let backend = self.clone();
+        let (sender, entries) = tokio::sync::mpsc::channel(128);
+
+        tokio::task::spawn_blocking(move || {
+            let result = backend
+                .stream_search_entries_plan(plan, |entry| sender.blocking_send(Ok(entry)).is_ok());
+            if let Err(err) = result {
+                let _ = sender.blocking_send(Err(err));
+            }
+        });
+
+        Ok(SearchEntriesStreamReport {
+            entries,
+            hint_covers_filter,
+        })
+    }
+
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
         let txn = self.env.begin_ro_txn().map_err(|e| {
             BackendError::Storage(format!("Failed to begin read transaction: {}", e))
@@ -3559,6 +4306,16 @@ mod tests {
     use super::*;
     use crate::backend::ModifyOperation;
     use tempfile::tempdir;
+
+    async fn collect_stream_dns(
+        mut report: SearchEntriesStreamReport,
+    ) -> Result<Vec<String>, BackendError> {
+        let mut dns = Vec::new();
+        while let Some(entry) = report.entries.recv().await {
+            dns.push(entry?.dn);
+        }
+        Ok(dns)
+    }
 
     fn schema_with_matching_rule_attrs() -> LdapSchema {
         let mut schema = LdapSchema::with_core_schema();
@@ -4957,6 +5714,93 @@ attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseEx
             .collect::<Vec<_>>();
 
         assert_eq!(results, vec!["uid=target,dc=example,dc=org".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_search_entry_stream_matches_vector_for_equality_hint() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        for (dn, uid) in [
+            ("uid=alice,dc=example,dc=org", "alice"),
+            ("uid=bob,dc=example,dc=org", "bob"),
+            ("uid=alice,dc=other,dc=org", "alice"),
+        ] {
+            let mut attributes = HashMap::new();
+            attributes.insert("uid".to_string(), vec![uid.to_string()]);
+            attributes.insert("cn".to_string(), vec![uid.to_string()]);
+            backend
+                .add_entry(DirectoryEntry::new(dn, attributes), vec![])
+                .await
+                .unwrap();
+        }
+
+        let hint = Some(SearchCandidateHint::Equality {
+            attribute: "uid".to_string(),
+            value: "alice".to_string(),
+        });
+        let vector_report = backend
+            .search_entries_with_hint_report("dc=example,dc=org", SearchScope(2), hint.clone())
+            .await
+            .unwrap();
+        let stream_report = backend
+            .stream_search_entries_with_hint_report("dc=example,dc=org", SearchScope(2), hint)
+            .await
+            .unwrap();
+
+        assert!(vector_report.hint_covers_filter);
+        assert!(stream_report.hint_covers_filter);
+        let vector_dns = vector_report
+            .entries
+            .into_iter()
+            .map(|entry| entry.dn)
+            .collect::<Vec<_>>();
+        let stream_dns = collect_stream_dns(stream_report).await.unwrap();
+        assert_eq!(stream_dns, vector_dns);
+        assert_eq!(stream_dns, vec!["uid=alice,dc=example,dc=org".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_search_entry_stream_falls_back_for_unindexed_hint() {
+        let dir = tempdir().unwrap();
+        let backend =
+            LmdbBackend::new_with_config(dir.path(), 100, 1, IndexConfig::disabled()).unwrap();
+
+        for (uid, description) in [("alice", "alpha"), ("bob", "beta")] {
+            let mut attributes = HashMap::new();
+            attributes.insert("uid".to_string(), vec![uid.to_string()]);
+            attributes.insert("description".to_string(), vec![description.to_string()]);
+            backend
+                .add_entry(
+                    DirectoryEntry::new(format!("uid={uid},dc=example,dc=org"), attributes),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+
+        let hint = Some(SearchCandidateHint::Equality {
+            attribute: "description".to_string(),
+            value: "alpha".to_string(),
+        });
+        let vector_report = backend
+            .search_entries_with_hint_report("dc=example,dc=org", SearchScope(2), hint.clone())
+            .await
+            .unwrap();
+        let stream_report = backend
+            .stream_search_entries_with_hint_report("dc=example,dc=org", SearchScope(2), hint)
+            .await
+            .unwrap();
+
+        assert!(!vector_report.hint_covers_filter);
+        assert!(!stream_report.hint_covers_filter);
+        let vector_dns = vector_report
+            .entries
+            .into_iter()
+            .map(|entry| entry.dn)
+            .collect::<Vec<_>>();
+        let stream_dns = collect_stream_dns(stream_report).await.unwrap();
+        assert_eq!(stream_dns, vector_dns);
     }
 
     #[tokio::test]

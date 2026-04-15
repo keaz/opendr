@@ -24,7 +24,10 @@ use tokio::time::sleep;
 use crate::aci::Permission;
 use crate::audit::{AuditEventType, AuditLevel};
 use crate::auth_metadata::AuthMetadataRecorder;
-use crate::backend::{DirectoryBackend, DirectoryEntry, NativeModifyError, OperationalAttributes};
+use crate::backend::{
+    DirectoryBackend, DirectoryEntry, NativeModifyError, OperationalAttributes,
+    SearchEntryStreamReceiver,
+};
 use crate::backend_adapters::{
     AllowAllCompareAccessControl, AllowAllWriteAciChecker, CompareBackendAdapter,
     PassthroughSchemaValidator, ProductionAttributeComparator, ProductionCompareMetrics,
@@ -1542,6 +1545,59 @@ async fn handle_search_request_with_fsm_runtime(
         "plain_search load candidates base={effective_base_dn} scope={} hint={search_hint:?}",
         search_req.scope.0
     ));
+    let can_stream_index_covered_plain_search = paged_results.is_none()
+        && backend.supports_search_entry_streaming()
+        && requested_sort.is_none()
+        && exact_index_hint.as_ref() == search_hint.as_ref()
+        && search_hint.is_some()
+        && !matches!(search_req.deref_aliases.0, 1 | 3)
+        && can_skip_search_post_filter(&session, request_context);
+    if can_stream_index_covered_plain_search {
+        let stream_report = match backend
+            .stream_search_entries_with_hint_report(
+                &effective_base_dn,
+                search_req.scope,
+                search_hint.clone(),
+            )
+            .await
+        {
+            Ok(stream_report) => stream_report,
+            Err(err) => {
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let index_covers_filter = stream_report.hint_covers_filter
+            && !matches!(search_req.deref_aliases.0, 1 | 3)
+            && can_skip_search_post_filter(&session, request_context);
+        if index_covers_filter {
+            emit_index_covered_plain_search_stream(
+                fsm_set,
+                request,
+                request_context,
+                runtime_context.metrics.as_deref(),
+                stream_report.entries,
+                manage_dsa_it,
+                search_req.scope,
+                &attribute_selection,
+                search_req.types_only,
+                search_started_at,
+                search_req.time_limit,
+                search_req.size_limit,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     let search_report = match backend
         .search_entries_with_hint_report(&effective_base_dn, search_req.scope, search_hint.clone())
         .await
@@ -2709,6 +2765,147 @@ async fn emit_plain_search_references(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn emit_index_covered_plain_search_stream(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    metrics: Option<&MetricsCollector>,
+    mut entries: SearchEntryStreamReceiver,
+    manage_dsa_it: bool,
+    scope: ldap_parser::ldap::SearchScope,
+    requested_attributes: &[String],
+    types_only: bool,
+    started_at: Instant,
+    time_limit: u32,
+    size_limit: u32,
+) -> Result<(), String> {
+    let projection = DirectoryAttributeProjection::new(requested_attributes);
+    let effective_size_limit = (size_limit != 0).then_some(size_limit as usize);
+    let mut pending_entry_bytes = Vec::with_capacity(FSM_SEARCH_ENTRY_WRITE_BATCH_BYTES);
+    let mut emitted_entries = 0usize;
+    let mut search_references = Vec::new();
+
+    record_streaming_direct_search_start(metrics);
+
+    while let Some(entry_result) = entries.recv().await {
+        if search_time_limit_exceeded(started_at, time_limit) {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+            record_direct_search_complete(metrics, emitted_entries, started_at, false);
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::TimeLimitExceeded,
+                "time limit exceeded",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                record_direct_search_complete(metrics, emitted_entries, started_at, false);
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if !manage_dsa_it && directory_entry_is_referral(&entry) {
+            let referrals = match referral_urls_for_entry(&entry) {
+                Ok(referrals) => referrals,
+                Err(diagnostic) => {
+                    flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                    record_direct_search_complete(metrics, emitted_entries, started_at, false);
+                    send_request_result_response(
+                        fsm_set,
+                        request.message_id as u32,
+                        request.response_kind,
+                        ResultCode::OperationsError,
+                        &diagnostic,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            if scope == ldap_parser::ldap::SearchScope::BaseObject {
+                flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                increment_control_counter(request_context, "ldap_referral_results_total", 1);
+                record_direct_search_complete(metrics, emitted_entries, started_at, true);
+                send_request_result_response_with_referrals(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    ResultCode::Referral,
+                    &entry.dn,
+                    "search base is a referral",
+                    &referrals,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            search_references.push(referrals);
+            continue;
+        }
+
+        if effective_size_limit.is_some_and(|limit| emitted_entries >= limit) {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+            record_direct_search_complete(metrics, emitted_entries, started_at, false);
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::SizeLimitExceeded,
+                "size limit exceeded",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let selected_attributes = project_directory_entry_attributes(&entry, &projection);
+        let encoded_entry = encode_search_entry_parts_with_controls(
+            request.message_id as u32,
+            &entry.dn,
+            &selected_attributes,
+            types_only,
+            &[],
+        )
+        .map_err(|err| format!("failed to encode search entry: {err:?}"))?;
+        pending_entry_bytes.extend(encoded_entry);
+        emitted_entries += 1;
+
+        if pending_entry_bytes.len() >= FSM_SEARCH_ENTRY_WRITE_BATCH_BYTES {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+        }
+    }
+
+    flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+    emit_plain_search_references(fsm_set, request, request_context, &search_references).await?;
+    let response_controls = native_search_done_controls(None, ResultCode::Success)?;
+    record_direct_search_complete(metrics, emitted_entries, started_at, true);
+    send_request_result_response_with_controls(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        ResultCode::Success,
+        "",
+        "",
+        &response_controls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn emit_index_covered_plain_search(
     fsm_set: &mut ConnectionFsmSet,
     request: &FsmRequestContext,
@@ -2804,6 +3001,14 @@ fn record_direct_search_start(metrics: Option<&MetricsCollector>, candidates: us
     metrics.increment_counter("ldap_search_candidates_found", candidates as u64);
     metrics.increment_counter("ldap_search_entries_seen", candidates as u64);
     metrics.increment_counter("ldap_search_entries_matched", candidates as u64);
+}
+
+fn record_streaming_direct_search_start(metrics: Option<&MetricsCollector>) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    metrics.record_operation_start(MetricsOperationType::Search, "");
+    metrics.record_fsm_state(FsmType::Search, "searching");
 }
 
 fn record_direct_search_complete(
@@ -5593,7 +5798,9 @@ mod tests {
         inner: MockBackend,
         direct_search_calls: AtomicUsize,
         hinted_search_calls: AtomicUsize,
+        stream_search_calls: AtomicUsize,
         hints: Mutex<Vec<Option<SearchCandidateHint>>>,
+        streaming_supported: bool,
     }
 
     impl HintTrackingBackend {
@@ -5602,7 +5809,16 @@ mod tests {
                 inner: MockBackend::default(),
                 direct_search_calls: AtomicUsize::new(0),
                 hinted_search_calls: AtomicUsize::new(0),
+                stream_search_calls: AtomicUsize::new(0),
                 hints: Mutex::new(Vec::new()),
+                streaming_supported: false,
+            }
+        }
+
+        fn new_streaming() -> Self {
+            Self {
+                streaming_supported: true,
+                ..Self::new()
             }
         }
 
@@ -5616,6 +5832,10 @@ mod tests {
 
         fn hinted_search_calls(&self) -> usize {
             self.hinted_search_calls.load(Ordering::SeqCst)
+        }
+
+        fn stream_search_calls(&self) -> usize {
+            self.stream_search_calls.load(Ordering::SeqCst)
         }
 
         fn recorded_hints(&self) -> Vec<Option<SearchCandidateHint>> {
@@ -5692,6 +5912,53 @@ mod tests {
             self.hinted_search_calls.fetch_add(1, Ordering::SeqCst);
             self.hints.lock().unwrap().push(hint);
             self.inner.search_entries(base_dn, scope).await
+        }
+
+        fn supports_search_entry_streaming(&self) -> bool {
+            self.streaming_supported
+        }
+
+        async fn stream_search_entries_with_hint_report(
+            &self,
+            base_dn: &str,
+            scope: ldap_parser::ldap::SearchScope,
+            hint: Option<SearchCandidateHint>,
+        ) -> Result<crate::backend::SearchEntriesStreamReport, BackendError> {
+            self.stream_search_calls.fetch_add(1, Ordering::SeqCst);
+            self.hints.lock().unwrap().push(hint.clone());
+            let mut entries = self.inner.search_entries(base_dn, scope).await?;
+            let hint_covers_filter = matches!(
+                hint,
+                Some(SearchCandidateHint::Equality { .. })
+                    | Some(SearchCandidateHint::Present { .. })
+            );
+            if hint_covers_filter {
+                entries.retain(|entry| match hint.as_ref() {
+                    Some(SearchCandidateHint::Equality { attribute, value }) => entry
+                        .attributes
+                        .get(&attribute.to_ascii_lowercase())
+                        .map(|values| values.iter().any(|candidate| candidate == value))
+                        .unwrap_or(false),
+                    Some(SearchCandidateHint::Present { attribute }) => entry
+                        .attributes
+                        .contains_key(&attribute.to_ascii_lowercase()),
+                    _ => true,
+                });
+            }
+
+            let (sender, receiver) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                for entry in entries {
+                    if sender.send(Ok(entry)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            Ok(crate::backend::SearchEntriesStreamReport {
+                entries: receiver,
+                hint_covers_filter,
+            })
         }
 
         async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
@@ -6670,6 +6937,72 @@ mod tests {
         ));
         assert_eq!(backend.direct_search_calls(), 0);
         assert_eq!(backend.hinted_search_calls(), 1);
+        assert_eq!(
+            backend.recorded_hints(),
+            vec![Some(SearchCandidateHint::Equality {
+                attribute: "cn".to_string(),
+                value: "alice".to_string(),
+            })]
+        );
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_streams_index_covered_plain_search_when_supported() {
+        let backend = Arc::new(HintTrackingBackend::new_streaming());
+        backend
+            .insert_entry(DirectoryEntry::new(
+                "cn=alice,dc=example,dc=org",
+                HashMap::from([
+                    ("objectClass".to_string(), vec!["person".to_string()]),
+                    ("cn".to_string(), vec!["alice".to_string()]),
+                ]),
+            ))
+            .await;
+        backend
+            .insert_entry(DirectoryEntry::new(
+                "cn=bob,dc=example,dc=org",
+                HashMap::from([
+                    ("objectClass".to_string(), vec!["person".to_string()]),
+                    ("cn".to_string(), vec!["bob".to_string()]),
+                ]),
+            ))
+            .await;
+
+        let backend_for_server: Arc<dyn DirectoryBackend> = backend.clone();
+        let (server_task, mut client_stream) = spawn_test_connection(backend_for_server).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                124,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::EqualityMatch(RasnAttributeValueAssertion::new(
+                    b"cn".to_vec().into(),
+                    b"alice".to_vec().into(),
+                )),
+                &["cn"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=alice,dc=example,dc=org".to_string()]
+        );
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+        assert_eq!(backend.direct_search_calls(), 0);
+        assert_eq!(backend.hinted_search_calls(), 0);
+        assert_eq!(backend.stream_search_calls(), 1);
         assert_eq!(
             backend.recorded_hints(),
             vec![Some(SearchCandidateHint::Equality {
