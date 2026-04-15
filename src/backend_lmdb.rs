@@ -12,6 +12,7 @@
 //! The backend uses multiple LMDB databases (tables):
 //! - `entries`: DN → Entry data (primary storage)
 //! - `passwords`: DN → Password hash (separate for security)
+//! - `credentials_by_normalized_dn`: Normalized DN → compact credential record (bind hot path)
 //! - `dn_index`: Normalized DN → Original DN (case-insensitive lookups)
 //! - `attr_index_{name}`: Attribute value → DN (attribute indexing)
 //!
@@ -59,6 +60,10 @@ const SUBSTRING_INDEX_TOKEN_LEN: usize = 3;
 const SUBSTRING_QUERY_MAX_TOKENS: usize = 2;
 const ATTRIBUTE_INDEX_VERSION: &[u8] = b"1";
 const ATTRIBUTE_INDEX_CONFIG_METADATA_KEY: &str = "attribute_indexes_v1:configured";
+const CREDENTIAL_INDEX_VERSION: &[u8] = b"2";
+const CREDENTIAL_INDEX_METADATA_KEY: &str = "credential_index_v1:ready";
+const CREDENTIAL_RECORD_FORMAT_VERSION: u8 = 1;
+const CREDENTIAL_INDEX_BACKFILL_BATCH_SIZE: usize = 10_000;
 
 /// Serialized entry structure for LMDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1070,6 +1075,8 @@ pub struct LmdbBackend {
     entries_db: Database,
     /// Passwords database (separate for security)
     passwords_db: Database,
+    /// Compact credential records keyed by normalized DN for the bind hot path.
+    credentials_by_normalized_dn_db: Database,
     /// DN index for case-insensitive lookups
     dn_index_db: Database,
     /// Metadata database (for contextCSN, etc.)
@@ -1242,6 +1249,15 @@ impl LmdbBackend {
             .create_db(Some("passwords"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create passwords db: {}", e)))?;
 
+        let credentials_by_normalized_dn_db = env
+            .create_db(
+                Some("credentials_by_normalized_dn"),
+                lmdb::DatabaseFlags::empty(),
+            )
+            .map_err(|e| {
+                BackendError::Storage(format!("Failed to create credential index db: {}", e))
+            })?;
+
         let dn_index_db = env
             .create_db(Some("dn_index"), lmdb::DatabaseFlags::empty())
             .map_err(|e| BackendError::Storage(format!("Failed to create dn_index db: {}", e)))?;
@@ -1269,6 +1285,12 @@ impl LmdbBackend {
             &attr_indexes,
             &index_plan,
         )?;
+        Self::ensure_credential_index_backfilled(
+            &env,
+            passwords_db,
+            metadata_db,
+            credentials_by_normalized_dn_db,
+        )?;
 
         // Initialize CSN generator with replica ID
         let csn_generator = Arc::new(CsnGenerator::new(replica_id));
@@ -1277,6 +1299,7 @@ impl LmdbBackend {
             env,
             entries_db,
             passwords_db,
+            credentials_by_normalized_dn_db,
             dn_index_db,
             metadata_db,
             attr_indexes: Arc::new(RwLock::new(attr_indexes)),
@@ -1348,6 +1371,7 @@ impl LmdbBackend {
                 WriteFlags::empty(),
             )
             .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+            self.put_credential_index(&mut txn, &normalized_dn, &password_hash)?;
         }
 
         txn.put(
@@ -1462,6 +1486,7 @@ impl LmdbBackend {
                     .map_err(|e| {
                         BackendError::Storage(format!("Failed to write password: {}", e))
                     })?;
+                    self.put_credential_index(&mut txn, &normalized_dn, &password_hash)?;
                 }
 
                 txn.put(
@@ -1654,6 +1679,7 @@ impl LmdbBackend {
                     WriteFlags::empty(),
                 )
                 .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+                self.put_credential_index(&mut txn, &normalized_dn, &password_hash)?;
             } else {
                 txn.del(self.passwords_db, &entry.dn.as_bytes(), None)
                     .or_else(|e| match e {
@@ -1662,6 +1688,17 @@ impl LmdbBackend {
                             "Failed to delete password".to_string(),
                         )),
                     })?;
+                txn.del(
+                    self.credentials_by_normalized_dn_db,
+                    &normalized_dn.as_bytes(),
+                    None,
+                )
+                .or_else(|e| match e {
+                    lmdb::Error::NotFound => Ok(()),
+                    _ => Err(BackendError::Storage(
+                        "Failed to delete credential index".to_string(),
+                    )),
+                })?;
             }
         }
 
@@ -1796,6 +1833,17 @@ impl LmdbBackend {
                     "Failed to delete password".to_string(),
                 )),
             })?;
+        txn.del(
+            self.credentials_by_normalized_dn_db,
+            &normalized_dn.as_bytes(),
+            None,
+        )
+        .or_else(|e| match e {
+            lmdb::Error::NotFound => Ok(()),
+            _ => Err(BackendError::Storage(
+                "Failed to delete credential index".to_string(),
+            )),
+        })?;
 
         txn.put(
             self.entries_db,
@@ -1823,6 +1871,7 @@ impl LmdbBackend {
                 WriteFlags::empty(),
             )
             .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+            self.put_credential_index(&mut txn, &normalized_new_dn, password_hash)?;
         }
         self.update_attribute_indexes(&mut txn, &new_dn, &new_stored_entry.attributes)?;
         let csn_string = csn.to_ldap_string();
@@ -1886,6 +1935,7 @@ impl LmdbBackend {
             WriteFlags::empty(),
         )
         .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
+        self.put_credential_index(&mut txn, &normalized_dn, hashed_password)?;
 
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -2249,6 +2299,68 @@ impl LmdbBackend {
         })
     }
 
+    fn encode_credential_record(record: &AuthCredentialRecord) -> Option<Vec<u8>> {
+        let salt_len = u16::try_from(record.salt.len()).ok()?;
+        let mut bytes = Vec::with_capacity(1 + 2 + record.hash.len() + record.salt.len());
+        bytes.push(CREDENTIAL_RECORD_FORMAT_VERSION);
+        bytes.extend_from_slice(&salt_len.to_be_bytes());
+        bytes.extend_from_slice(&record.hash);
+        bytes.extend_from_slice(&record.salt);
+        Some(bytes)
+    }
+
+    fn credential_index_value_from_hash(stored_hash: &str) -> Vec<u8> {
+        Self::decode_ssha512_hash(stored_hash)
+            .and_then(|record| Self::encode_credential_record(&record))
+            .unwrap_or_else(|| stored_hash.as_bytes().to_vec())
+    }
+
+    fn credential_index_value_from_password_bytes(stored_hash: &[u8]) -> Vec<u8> {
+        std::str::from_utf8(stored_hash)
+            .map(Self::credential_index_value_from_hash)
+            .unwrap_or_else(|_| stored_hash.to_vec())
+    }
+
+    fn decode_credential_index_value(bytes: &[u8]) -> Option<AuthCredentialRecord> {
+        if let Some((&version, rest)) = bytes.split_first()
+            && version == CREDENTIAL_RECORD_FORMAT_VERSION
+        {
+            if rest.len() < 2 + 64 {
+                return None;
+            }
+            let salt_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+            let credential = &rest[2..];
+            if credential.len() != 64 + salt_len {
+                return None;
+            }
+            let mut hash = [0; 64];
+            hash.copy_from_slice(&credential[..64]);
+            return Some(AuthCredentialRecord {
+                hash,
+                salt: credential[64..].to_vec(),
+            });
+        }
+
+        let stored_hash = String::from_utf8_lossy(bytes);
+        Self::decode_ssha512_hash(&stored_hash)
+    }
+
+    fn put_credential_index(
+        &self,
+        txn: &mut lmdb::RwTransaction<'_>,
+        normalized_dn: &str,
+        password_hash: &str,
+    ) -> Result<(), BackendError> {
+        let credential_value = Self::credential_index_value_from_hash(password_hash);
+        txn.put(
+            self.credentials_by_normalized_dn_db,
+            &normalized_dn.as_bytes(),
+            &credential_value,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write credential index: {}", e)))
+    }
+
     fn verify_ssha512_record(password: &[u8], record: &AuthCredentialRecord) -> bool {
         // Hash the provided password with the stored salt
         let mut hasher = Sha512::new();
@@ -2474,6 +2586,106 @@ impl LmdbBackend {
 
     fn attribute_index_metadata_key(attribute: &str) -> String {
         format!("attribute_index_v1:{}", attribute)
+    }
+
+    fn ensure_credential_index_backfilled(
+        env: &Arc<Environment>,
+        passwords_db: Database,
+        metadata_db: Database,
+        credentials_by_normalized_dn_db: Database,
+    ) -> Result<(), BackendError> {
+        {
+            let txn = env.begin_ro_txn().map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to begin credential index metadata read txn: {}",
+                    e
+                ))
+            })?;
+            match txn.get(metadata_db, &CREDENTIAL_INDEX_METADATA_KEY.as_bytes()) {
+                Ok(value) if value == CREDENTIAL_INDEX_VERSION => return Ok(()),
+                Ok(_) | Err(lmdb::Error::NotFound) => {}
+                Err(e) => {
+                    return Err(BackendError::Storage(format!(
+                        "Failed to read credential index metadata: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        let read_txn = env.begin_ro_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin credential index backfill read txn: {}",
+                e
+            ))
+        })?;
+        let mut cursor = read_txn.open_ro_cursor(passwords_db).map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to open passwords cursor for credential index backfill: {}",
+                e
+            ))
+        })?;
+        let mut txn = env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin credential index backfill txn: {}",
+                e
+            ))
+        })?;
+        let mut pending_writes = 0usize;
+        for (dn_bytes, password_hash) in cursor.iter() {
+            let dn = std::str::from_utf8(dn_bytes).map_err(|e| {
+                BackendError::Storage(format!(
+                    "Invalid UTF-8 DN in password database during credential index backfill: {}",
+                    e
+                ))
+            })?;
+            let normalized_dn = Self::normalize_dn(dn);
+            let credential_value = Self::credential_index_value_from_password_bytes(password_hash);
+            txn.put(
+                credentials_by_normalized_dn_db,
+                &normalized_dn.as_bytes(),
+                &credential_value,
+                WriteFlags::empty(),
+            )
+            .map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to backfill credential index for {}: {}",
+                    dn, e
+                ))
+            })?;
+            pending_writes += 1;
+            if pending_writes >= CREDENTIAL_INDEX_BACKFILL_BATCH_SIZE {
+                txn.commit().map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Failed to commit credential index backfill batch: {}",
+                        e
+                    ))
+                })?;
+                txn = env.begin_rw_txn().map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Failed to begin credential index backfill batch txn: {}",
+                        e
+                    ))
+                })?;
+                pending_writes = 0;
+            }
+        }
+        drop(cursor);
+        drop(read_txn);
+        txn.put(
+            metadata_db,
+            &CREDENTIAL_INDEX_METADATA_KEY.as_bytes(),
+            &CREDENTIAL_INDEX_VERSION,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| {
+            BackendError::Storage(format!("Failed to mark credential index ready: {}", e))
+        })?;
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!("Failed to commit credential index backfill: {}", e))
+        })?;
+
+        Ok(())
     }
 
     fn ensure_attribute_indexes_backfilled(
@@ -4295,33 +4507,48 @@ impl DirectoryBackend for LmdbBackend {
 
         log::debug!("Authentication cache miss - DN: {dn}, Normalized: {normalized_dn}");
 
-        // Get actual DN from index
-        let actual_dn = {
-            let _profile_phase = PerfPhase::start("lmdb_authenticate", "dn_index_lookup", None);
-            match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                Err(lmdb::Error::NotFound) => {
-                    log::debug!("DN not found in index: {}", normalized_dn);
-                    self.record_auth_cache_metrics();
-                    return Ok(false);
-                }
-                Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
-            }
-        };
-
-        // Get password hash
-        let stored_password_bytes = {
+        // Get credential bytes from the normalized index first. Older
+        // stores are backfilled on open; the legacy fallback keeps auth
+        // tolerant if the index is missing a row.
+        let stored_credential_bytes = {
             let _profile_phase = PerfPhase::start("lmdb_authenticate", "password_lookup", None);
-            match txn.get(self.passwords_db, &actual_dn.as_bytes()) {
-                Ok(stored_password_bytes) => stored_password_bytes,
+            match txn.get(
+                self.credentials_by_normalized_dn_db,
+                &normalized_dn.as_bytes(),
+            ) {
+                Ok(stored_credential_bytes) => stored_credential_bytes,
                 Err(lmdb::Error::NotFound) => {
-                    log::debug!("Password not found for DN: {}", actual_dn);
-                    self.record_auth_cache_metrics();
-                    return Ok(false);
+                    let _profile_phase =
+                        PerfPhase::start("lmdb_authenticate", "dn_index_lookup", None);
+                    let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+                        Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                        Err(lmdb::Error::NotFound) => {
+                            log::debug!("DN not found in index: {}", normalized_dn);
+                            self.record_auth_cache_metrics();
+                            return Ok(false);
+                        }
+                        Err(e) => {
+                            return Err(BackendError::Storage(format!("DN lookup failed: {}", e)));
+                        }
+                    };
+                    match txn.get(self.passwords_db, &actual_dn.as_bytes()) {
+                        Ok(stored_password_bytes) => stored_password_bytes,
+                        Err(lmdb::Error::NotFound) => {
+                            log::debug!("Password not found for DN: {}", actual_dn);
+                            self.record_auth_cache_metrics();
+                            return Ok(false);
+                        }
+                        Err(e) => {
+                            return Err(BackendError::Storage(format!(
+                                "Password lookup failed: {}",
+                                e
+                            )));
+                        }
+                    }
                 }
                 Err(e) => {
                     return Err(BackendError::Storage(format!(
-                        "Password lookup failed: {}",
+                        "Credential index lookup failed: {}",
                         e
                     )));
                 }
@@ -4329,9 +4556,8 @@ impl DirectoryBackend for LmdbBackend {
         };
         {
             let _profile_phase = PerfPhase::start("lmdb_authenticate", "verify_hash", None);
-            let stored_password_str = String::from_utf8_lossy(stored_password_bytes);
-            let Some(record) = Self::decode_ssha512_hash(&stored_password_str) else {
-                log::debug!("Unsupported password hash format for DN: {}", actual_dn);
+            let Some(record) = Self::decode_credential_index_value(stored_credential_bytes) else {
+                log::debug!("Unsupported password hash format for DN: {}", normalized_dn);
                 self.record_auth_cache_metrics();
                 return Ok(false);
             };
@@ -4548,6 +4774,17 @@ impl DirectoryBackend for LmdbBackend {
                     "Failed to delete password".to_string(),
                 )),
             })?;
+        txn.del(
+            self.credentials_by_normalized_dn_db,
+            &normalized_dn.as_bytes(),
+            None,
+        )
+        .or_else(|e| match e {
+            lmdb::Error::NotFound => Ok(()),
+            _ => Err(BackendError::Storage(
+                "Failed to delete credential index".to_string(),
+            )),
+        })?;
 
         // Delete DN index
         txn.del(self.dn_index_db, &normalized_dn.as_bytes(), None)
@@ -4950,6 +5187,22 @@ mod tests {
         Ok(entries)
     }
 
+    fn credential_index_value(backend: &LmdbBackend, dn: &str) -> Option<Vec<u8>> {
+        let txn = backend.env.begin_ro_txn().unwrap();
+        let normalized_dn = LmdbBackend::normalize_dn(dn);
+        txn.get(
+            backend.credentials_by_normalized_dn_db,
+            &normalized_dn.as_bytes(),
+        )
+        .ok()
+        .map(|bytes| bytes.to_vec())
+    }
+
+    fn credential_index_record(backend: &LmdbBackend, dn: &str) -> Option<AuthCredentialRecord> {
+        credential_index_value(backend, dn)
+            .and_then(|bytes| LmdbBackend::decode_credential_index_value(&bytes))
+    }
+
     fn schema_with_matching_rule_attrs() -> LdapSchema {
         let mut schema = LdapSchema::with_core_schema();
         schema
@@ -5254,6 +5507,124 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
         let after_second_bind = backend.auth_cache_stats();
         assert_eq!(after_second_bind.hits, 1);
         assert_eq!(after_second_bind.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn test_credential_index_tracks_add_modify_rename_and_delete() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Credential User".to_string()]);
+        let entry = DirectoryEntry::new("cn=credential,dc=example,dc=org", attributes);
+        backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
+
+        let credential_value =
+            credential_index_value(&backend, "CN=CREDENTIAL,dc=example,dc=org").unwrap();
+        assert_eq!(
+            credential_value.first().copied(),
+            Some(CREDENTIAL_RECORD_FORMAT_VERSION)
+        );
+        assert!(credential_index_record(&backend, "CN=CREDENTIAL,dc=example,dc=org").is_some());
+        assert!(
+            backend
+                .authenticate("CN=CREDENTIAL,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+
+        backend
+            .modify_entry(
+                "cn=credential,dc=example,dc=org",
+                vec![Modification {
+                    operation: ModifyOperation::Replace,
+                    attribute: "userPassword".to_string(),
+                    values: vec!["new-secret".to_string()],
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .authenticate("cn=credential,dc=example,dc=org", b"new-secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .authenticate("cn=credential,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+
+        backend
+            .rename_entry("cn=credential,dc=example,dc=org", "cn=renamed", true, None)
+            .await
+            .unwrap();
+        assert!(credential_index_record(&backend, "cn=credential,dc=example,dc=org").is_none());
+        assert!(credential_index_record(&backend, "cn=renamed,dc=example,dc=org").is_some());
+        assert!(
+            backend
+                .authenticate("CN=RENAMED,dc=example,dc=org", b"new-secret")
+                .await
+                .unwrap()
+        );
+
+        backend
+            .delete_entry("cn=renamed,dc=example,dc=org")
+            .await
+            .unwrap();
+        assert!(credential_index_record(&backend, "cn=renamed,dc=example,dc=org").is_none());
+        assert!(
+            !backend
+                .authenticate("cn=renamed,dc=example,dc=org", b"new-secret")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_credential_index_backfills_existing_password_database_on_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+            let mut attributes = HashMap::new();
+            attributes.insert("cn".to_string(), vec!["Backfill User".to_string()]);
+            let entry = DirectoryEntry::new("cn=backfill,dc=example,dc=org", attributes);
+            backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
+
+            let normalized_dn = LmdbBackend::normalize_dn("cn=backfill,dc=example,dc=org");
+            let mut txn = backend.env.begin_rw_txn().unwrap();
+            txn.del(
+                backend.credentials_by_normalized_dn_db,
+                &normalized_dn.as_bytes(),
+                None,
+            )
+            .unwrap();
+            txn.del(
+                backend.metadata_db,
+                &CREDENTIAL_INDEX_METADATA_KEY.as_bytes(),
+                None,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+            assert!(credential_index_record(&backend, "cn=backfill,dc=example,dc=org").is_none());
+        }
+
+        let reopened = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+        let credential_value =
+            credential_index_value(&reopened, "cn=backfill,dc=example,dc=org").unwrap();
+        assert_eq!(
+            credential_value.first().copied(),
+            Some(CREDENTIAL_RECORD_FORMAT_VERSION)
+        );
+        assert!(credential_index_record(&reopened, "cn=backfill,dc=example,dc=org").is_some());
+        assert!(
+            reopened
+                .authenticate("cn=backfill,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

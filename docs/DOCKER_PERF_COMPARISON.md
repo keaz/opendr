@@ -203,6 +203,43 @@ Interpretation:
 - Modify rows remain write-bound and are not improved by this auth-specific
   change.
 
+## Targeted 10M Credential-Index Auth Run
+
+Artifact roots:
+
+- `target/perf/opendr-credential-index-10m-c8-cache50k-rerun-8cpu-30g-20260415-132251/`
+- `target/perf/opendr-credential-index-10m-c8-8cpu-30g-20260415-131632/`
+
+This run targeted issue #139 after adding the LMDB
+`credentials_by_normalized_dn` database. The database is keyed by normalized DN
+and stores compact decoded SSHA512 hash/salt records, while the legacy
+`passwords` database still stores the original `{SSHA512}` strings. Existing
+fixtures are backfilled on open in 10k-row LMDB write batches.
+
+Both rows reused the existing 10M LDAPCon-style fixture after credential-index
+backfill, used the `perf` profile with `-C target-cpu=native`, 8 CPUs, 30 GiB
+memory, `lmdb_max_readers = 4096`, async coalesced auth metadata, and c8-only
+LDAPCon-style probes.
+
+| Cache capacity | Auth attempts | Auth failures | Auth mean ms | Auth p95 ms | Auth success ops/s | OpenLDAP LMDB public auth ops/s | Difference |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| `50000` | 800 | 0 | 0.571 | 1.307 | 13,777.79 | 16,942 | -18.7% |
+| `10000000` | 800 | 0 | 0.970 | 2.675 | 7,694.81 | 16,942 | -54.6% |
+
+Interpretation:
+
+- The 50k-cache c8 auth row is effectively flat against the issue #131 baseline
+  of 13,919.54 ops/s, so the compact normalized credential index removes work
+  from the miss path but does not yet close the OpenLDAP LMDB gap in this
+  10M random-user benchmark.
+- The 10M-cache setting is not currently a throughput win for the c8 auth row.
+  It raised container memory to about 17.56 GiB and reduced auth throughput,
+  likely because cache preallocation and large-cache behavior dominate before
+  the random-user working set becomes warm.
+- Follow-up auth work should focus on reducing cache overhead for very large
+  capacities, cache prewarming or lazy allocation strategy, and profiling the
+  remaining TLS/client/server phases around simple bind.
+
 ## Completed 10M LDAPCon-Style OpenDR Run
 
 Artifact root: `target/perf/opendr-ldapcon-10m-8cpu-30g-20260415-000605/`

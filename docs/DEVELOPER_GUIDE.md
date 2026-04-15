@@ -354,9 +354,15 @@ LMDB databases include:
 
 - `entries`: primary serialized directory entries
 - `passwords`: password hashes
+- `credentials_by_normalized_dn`: normalized DN to compact credential record for bind cache misses
 - `dn_index`: case-insensitive DN lookup
 - `metadata`: contextCSN and index metadata
 - `idx_<attribute>`: per-attribute indexes
+
+The credential index is derived from `passwords` on startup when missing or stale.
+It avoids the extra normalized-DN lookup and repeated SSHA512 base64 decoding on
+the bind hot path while preserving the existing `{SSHA512}` password-hash format
+and the legacy `passwords` database.
 
 Legacy `indexed_attributes` entries get equality and presence indexes. Typed
 indexes add explicit LDAP search categories:

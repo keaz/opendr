@@ -245,6 +245,8 @@ types = ["ordering"]
 
 When a new index is configured after data already exists, the LMDB backend rebuilds the configured attribute index keys during startup without modifying LDAP entries, operational attributes, or CSNs. Approximate-match filters currently use the equality index path because OpenDR's approximate-match semantics are case-insensitive equality.
 
+For bind-heavy workloads, LMDB also maintains `credentials_by_normalized_dn`, a normalized-DN-to-compact-credential index used on authentication cache misses. Existing stores are backfilled during startup from the legacy `passwords` database; `passwords` still stores the same `{SSHA512}` format for compatibility and restore tooling, while the credential index stores decoded SSHA512 hash and salt bytes for the bind hot path.
+
 ### 5. Verify Listener-Based Replication
 
 Add data to the provider:

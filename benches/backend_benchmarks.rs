@@ -3,6 +3,7 @@
 //! This benchmark suite compares the performance of different backend
 //! implementations, with a focus on read operations.
 
+use std::cell::Cell;
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -46,8 +47,12 @@ fn setup_mock_backend() -> Arc<MockBackend> {
 }
 
 fn setup_lmdb_backend() -> Arc<LmdbBackend> {
+    setup_lmdb_backend_with_cache_size(100)
+}
+
+fn setup_lmdb_backend_with_cache_size(cache_size: usize) -> Arc<LmdbBackend> {
     let dir = tempdir().unwrap();
-    let backend = Arc::new(LmdbBackend::new(dir.path(), 100, 1).unwrap());
+    let backend = Arc::new(LmdbBackend::new(dir.path(), cache_size, 1).unwrap());
 
     // Add test entries
     tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -70,6 +75,17 @@ fn setup_lmdb_backend() -> Arc<LmdbBackend> {
     });
 
     backend
+}
+
+fn auth_workload_users(count: usize) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|i| {
+            (
+                format!("uid=user{},ou=people,dc=example,dc=org", i),
+                format!("password{}", i).into_bytes(),
+            )
+        })
+        .collect()
 }
 
 fn setup_lmdb_indexed_backend() -> (TempDir, Arc<LmdbBackend>) {
@@ -282,6 +298,51 @@ fn bench_authentication(c: &mut Criterion) {
             })
         });
     });
+
+    let random_users = auth_workload_users(1000);
+    let random_sequence = (0..random_users.len())
+        .map(|i| (i * 37) % random_users.len())
+        .collect::<Vec<_>>();
+
+    let lmdb_small_cache_backend = setup_lmdb_backend_with_cache_size(16);
+    let small_cache_cursor = Cell::new(0usize);
+    group.bench_function(
+        "lmdb_backend_random_user_auth_cache_below_working_set",
+        |b| {
+            b.iter(|| {
+                let cursor = small_cache_cursor.get();
+                small_cache_cursor.set((cursor + 1) % random_sequence.len());
+                let user_idx = random_sequence[cursor];
+                let (dn, password) = &random_users[user_idx];
+                let backend = lmdb_small_cache_backend.clone();
+                rt.block_on(async move {
+                    let _ = backend
+                        .authenticate(black_box(dn.as_str()), black_box(password.as_slice()))
+                        .await;
+                })
+            });
+        },
+    );
+
+    let lmdb_large_cache_backend = setup_lmdb_backend_with_cache_size(2048);
+    let large_cache_cursor = Cell::new(0usize);
+    group.bench_function(
+        "lmdb_backend_random_user_auth_cache_above_working_set",
+        |b| {
+            b.iter(|| {
+                let cursor = large_cache_cursor.get();
+                large_cache_cursor.set((cursor + 1) % random_sequence.len());
+                let user_idx = random_sequence[cursor];
+                let (dn, password) = &random_users[user_idx];
+                let backend = lmdb_large_cache_backend.clone();
+                rt.block_on(async move {
+                    let _ = backend
+                        .authenticate(black_box(dn.as_str()), black_box(password.as_slice()))
+                        .await;
+                })
+            });
+        },
+    );
 
     group.finish();
 }
