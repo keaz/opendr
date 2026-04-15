@@ -121,7 +121,11 @@ async fn build_legacy_security_config(
         None
     };
 
-    if audit_logger.is_none() && access_control.is_none() {
+    let security_policy = config.security.effective_policy();
+    if audit_logger.is_none()
+        && access_control.is_none()
+        && security_policy == server::LegacySecurityPolicy::default()
+    {
         return Ok(None);
     }
 
@@ -135,6 +139,7 @@ async fn build_legacy_security_config(
         },
         access_control,
         root_dn: Some(config.server.root_user_dn.clone()),
+        security_policy,
     })))
 }
 

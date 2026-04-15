@@ -101,6 +101,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub auth_metadata: AuthMetadataSettings,
 
+    /// Authentication and RFC 4513 security policy settings
+    #[serde(default)]
+    pub security: SecuritySettings,
+
     /// Performance tuning settings
     #[serde(default)]
     pub performance: PerformanceSettings,
@@ -607,6 +611,34 @@ pub struct AuthMetadataSettings {
     pub overflow_policy: String,
 }
 
+/// Authentication and transport-security policy settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecuritySettings {
+    /// Security profile: "development" or "production".
+    #[serde(default = "default_security_profile")]
+    pub profile: String,
+
+    /// Override whether anonymous bind is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_anonymous_bind: Option<bool>,
+
+    /// Override whether non-anonymous simple bind is accepted before TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_cleartext_simple_bind: Option<bool>,
+
+    /// Override whether SASL PLAIN is accepted at all. TLS is still required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_sasl_plain: Option<bool>,
+
+    /// Override whether the Password Modify extended operation is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_password_modify: Option<bool>,
+
+    /// Override whether anonymous clients can read the Root DSE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_dse_requires_authentication: Option<bool>,
+}
+
 /// Performance tuning settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceSettings {
@@ -890,6 +922,10 @@ fn default_auth_metadata_overflow_policy() -> String {
     "fallback_sync".to_string()
 }
 
+fn default_security_profile() -> String {
+    "development".to_string()
+}
+
 fn default_cache_size() -> usize {
     1000
 }
@@ -1079,6 +1115,47 @@ impl Default for AccessControlSettings {
     }
 }
 
+impl Default for SecuritySettings {
+    fn default() -> Self {
+        Self {
+            profile: default_security_profile(),
+            allow_anonymous_bind: None,
+            allow_cleartext_simple_bind: None,
+            allow_sasl_plain: None,
+            allow_password_modify: None,
+            root_dse_requires_authentication: None,
+        }
+    }
+}
+
+impl SecuritySettings {
+    pub fn effective_policy(&self) -> crate::server::LegacySecurityPolicy {
+        let mut policy = if self.profile.eq_ignore_ascii_case("production") {
+            crate::server::LegacySecurityPolicy::production()
+        } else {
+            crate::server::LegacySecurityPolicy::development()
+        };
+
+        if let Some(value) = self.allow_anonymous_bind {
+            policy.allow_anonymous_bind = value;
+        }
+        if let Some(value) = self.allow_cleartext_simple_bind {
+            policy.allow_cleartext_simple_bind = value;
+        }
+        if let Some(value) = self.allow_sasl_plain {
+            policy.allow_sasl_plain = value;
+        }
+        if let Some(value) = self.allow_password_modify {
+            policy.allow_password_modify = value;
+        }
+        if let Some(value) = self.root_dse_requires_authentication {
+            policy.root_dse_requires_authentication = value;
+        }
+
+        policy
+    }
+}
+
 impl Default for PerformanceSettings {
     fn default() -> Self {
         Self {
@@ -1239,6 +1316,7 @@ impl fmt::Debug for ReplicationSettings {
 impl ServerConfig {
     fn normalize_compatibility_fields(&mut self) {
         self.replication.mode = self.replication.mode.to_lowercase();
+        self.security.profile = self.security.profile.to_lowercase();
     }
 
     fn normalize_secret_placeholders(&mut self) {
@@ -1744,6 +1822,18 @@ impl ServerConfig {
             )));
         }
 
+        if !["development", "production"].contains(&self.security.profile.as_str()) {
+            return Err(ConfigError::ValidationError(format!(
+                "security.profile must be one of: development, production (got {})",
+                self.security.profile
+            )));
+        }
+        if self.security.profile == "production" && !self.tls.enabled {
+            return Err(ConfigError::ValidationError(
+                "security.profile=production requires tls.enabled=true".to_string(),
+            ));
+        }
+
         // Validate replication settings
         if self.replication.enabled {
             if !["provider", "consumer", "both"].contains(&self.replication.mode.as_str()) {
@@ -1939,6 +2029,58 @@ mod tests {
         assert_eq!(config.server.replica_id, 1);
         assert!(config.rate_limit.enabled);
         assert!(config.monitoring.enabled);
+    }
+
+    #[test]
+    fn security_profiles_resolve_effective_policy() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+[security]
+profile = "Production"
+"#,
+        )
+        .unwrap();
+        let policy = config.security.effective_policy();
+
+        assert!(!policy.allow_anonymous_bind);
+        assert!(!policy.allow_cleartext_simple_bind);
+        assert!(policy.allow_sasl_plain);
+        assert!(policy.allow_password_modify);
+        assert!(!policy.root_dse_requires_authentication);
+
+        let config = ServerConfig::from_toml_str(
+            r#"
+[security]
+profile = "production"
+allow_anonymous_bind = true
+allow_cleartext_simple_bind = true
+allow_sasl_plain = false
+allow_password_modify = false
+root_dse_requires_authentication = true
+"#,
+        )
+        .unwrap();
+        let policy = config.security.effective_policy();
+
+        assert!(policy.allow_anonymous_bind);
+        assert!(policy.allow_cleartext_simple_bind);
+        assert!(!policy.allow_sasl_plain);
+        assert!(!policy.allow_password_modify);
+        assert!(policy.root_dse_requires_authentication);
+    }
+
+    #[test]
+    fn production_security_profile_requires_tls_enabled() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+[security]
+profile = "production"
+"#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("requires tls.enabled=true"));
     }
 
     #[test]

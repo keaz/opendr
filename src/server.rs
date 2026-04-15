@@ -450,12 +450,50 @@ impl Default for LegacyAuditConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacySecurityPolicy {
+    pub allow_anonymous_bind: bool,
+    pub allow_cleartext_simple_bind: bool,
+    pub allow_sasl_plain: bool,
+    pub allow_password_modify: bool,
+    pub root_dse_requires_authentication: bool,
+}
+
+impl LegacySecurityPolicy {
+    pub const fn development() -> Self {
+        Self {
+            allow_anonymous_bind: true,
+            allow_cleartext_simple_bind: true,
+            allow_sasl_plain: true,
+            allow_password_modify: true,
+            root_dse_requires_authentication: false,
+        }
+    }
+
+    pub const fn production() -> Self {
+        Self {
+            allow_anonymous_bind: false,
+            allow_cleartext_simple_bind: false,
+            allow_sasl_plain: true,
+            allow_password_modify: true,
+            root_dse_requires_authentication: false,
+        }
+    }
+}
+
+impl Default for LegacySecurityPolicy {
+    fn default() -> Self {
+        Self::development()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LegacySecurityConfig {
     pub audit_logger: Option<Arc<AuditLogger>>,
     pub audit_config: LegacyAuditConfig,
     pub access_control: Option<Arc<AciEngine>>,
     pub root_dn: Option<String>,
+    pub security_policy: LegacySecurityPolicy,
 }
 
 #[derive(Clone, Default)]
@@ -490,6 +528,14 @@ impl RequestContext {
         self.auth_metadata = auth_metadata;
         self
     }
+}
+
+pub(crate) fn security_policy(request_context: &RequestContext) -> LegacySecurityPolicy {
+    request_context
+        .security
+        .as_ref()
+        .map(|security| security.security_policy)
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Copy)]
@@ -2879,9 +2925,46 @@ async fn handle_bind_request_with_session_and_context(
         AuthenticationChoice::Simple(password) => {
             let dn = request.name.0.as_ref().trim().to_owned();
             if dn.is_empty() && password.as_ref().is_empty() {
+                if !security_policy(request_context).allow_anonymous_bind {
+                    session.clear();
+                    log_simple_bind_failure(
+                        request_context,
+                        "anonymous",
+                        "anonymous bind is disabled by security policy",
+                    )
+                    .await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::InappropriateAuthentication,
+                        "anonymous bind is disabled by security policy",
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 session.clear();
                 log_anonymous_bind(request_context).await;
                 send_bind_success(socket, message_id).await?;
+                return Ok(());
+            }
+
+            if !connection_is_secure
+                && !security_policy(request_context).allow_cleartext_simple_bind
+            {
+                session.clear();
+                log_simple_bind_failure(
+                    request_context,
+                    &dn,
+                    "simple bind requires TLS by security policy",
+                )
+                .await;
+                send_bind_response(
+                    socket,
+                    message_id,
+                    ResultCode::ConfidentialityRequired,
+                    "simple bind requires TLS",
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -2949,6 +3032,26 @@ async fn handle_bind_request_with_session_and_context(
                     message_id,
                     ResultCode::AuthMethodNotSupported,
                     "only SASL PLAIN is supported",
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if !security_policy(request_context).allow_sasl_plain {
+                session.clear();
+                log_sasl_bind(
+                    request_context,
+                    request.name.0.as_ref().trim(),
+                    "PLAIN",
+                    false,
+                    Some("SASL PLAIN is disabled by security policy"),
+                )
+                .await;
+                send_bind_response(
+                    socket,
+                    message_id,
+                    ResultCode::AuthMethodNotSupported,
+                    "SASL PLAIN is disabled by security policy",
                 )
                 .await?;
                 return Ok(());
@@ -3331,6 +3434,8 @@ async fn try_handle_virtual_search_request(
     message_id: u32,
     base_dn: &str,
     scope: ldap_parser::ldap::SearchScope,
+    session: &ConnectionSession,
+    request_context: &RequestContext,
     requested_attributes: &[String],
     types_only: bool,
     result_controls: &[LdapControl],
@@ -3342,6 +3447,21 @@ async fn try_handle_virtual_search_request(
     }
 
     if base_dn.is_empty() {
+        if security_policy(request_context).root_dse_requires_authentication
+            && !session.is_authenticated()
+        {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                ResultCode::InsufficientAccessRights,
+                "",
+                "Root DSE requires authentication",
+            )
+            .await?;
+            return Ok(true);
+        }
+
         let supported_control_oids =
             active_runtime_control_registry().root_dse_supported_control_oids();
         let supported_sasl_mechanisms =
@@ -3731,6 +3851,8 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         message_id,
         &base_dn,
         request.scope,
+        session,
+        request_context,
         &attribute_selection,
         request.types_only,
         &virtual_result_controls,
@@ -7357,6 +7479,28 @@ async fn handle_extended_request_with_session_and_registry(
     }
 
     if oid == PASSWORD_MODIFY_OID {
+        if !security_policy(request_context).allow_password_modify {
+            log_password_modify_audit_event(
+                request_context,
+                session,
+                session.bound_dn(),
+                "unknown",
+                false,
+                false,
+                Some("Password Modify is disabled by security policy"),
+            )
+            .await;
+            return send_result(
+                socket,
+                message_id,
+                ResponseOp::Extended,
+                ResultCode::UnwillingToPerform,
+                "",
+                "Password Modify is disabled by security policy",
+            )
+            .await;
+        }
+
         if !socket.is_secure() {
             log_password_modify_audit_event(
                 request_context,
@@ -8507,6 +8651,7 @@ mod tests {
                 audit_config: LegacyAuditConfig::default(),
                 access_control: None,
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
+                security_policy: LegacySecurityPolicy::default(),
             })),
             metrics: None,
             auth_metadata: None,
@@ -8566,6 +8711,7 @@ mod tests {
                 audit_config: LegacyAuditConfig::default(),
                 access_control: Some(Arc::new(AciEngine::restrictive())),
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
+                security_policy: LegacySecurityPolicy::default(),
             })),
             metrics: None,
             auth_metadata: None,

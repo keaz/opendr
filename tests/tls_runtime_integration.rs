@@ -39,6 +39,16 @@ struct TestBinaryServer {
     cert_pem: String,
 }
 
+struct TlsFixtureConfig<'a> {
+    runtime: &'a str,
+    ldap_port: u16,
+    ldaps_port: u16,
+    tls_enabled: bool,
+    cert_pem: &'a str,
+    key_pem: &'a str,
+    security_profile: Option<&'a str>,
+}
+
 impl Drop for TestBinaryServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -74,15 +84,7 @@ fn generate_test_certificate() -> (String, String) {
     (cert_pem, key_pem)
 }
 
-fn write_tls_fixture(
-    tempdir: &TempDir,
-    runtime: &str,
-    ldap_port: u16,
-    ldaps_port: u16,
-    tls_enabled: bool,
-    cert_pem: &str,
-    key_pem: &str,
-) {
+fn write_tls_fixture(tempdir: &TempDir, fixture: &TlsFixtureConfig<'_>) {
     let config_dir = tempdir.path().join("config");
     let cert_dir = tempdir.path().join("certs");
     let data_dir = tempdir.path().join("data");
@@ -91,8 +93,20 @@ fn write_tls_fixture(
     fs::create_dir_all(&cert_dir).unwrap();
     fs::create_dir_all(&data_dir).unwrap();
 
-    fs::write(cert_dir.join("server.crt"), cert_pem).unwrap();
-    fs::write(cert_dir.join("server.key"), key_pem).unwrap();
+    fs::write(cert_dir.join("server.crt"), fixture.cert_pem).unwrap();
+    fs::write(cert_dir.join("server.key"), fixture.key_pem).unwrap();
+
+    let security_toml = fixture
+        .security_profile
+        .map(|profile| {
+            format!(
+                r#"
+[security]
+profile = "{profile}"
+"#
+            )
+        })
+        .unwrap_or_default();
 
     let server_toml = format!(
         r#"
@@ -115,6 +129,7 @@ cert_file = "certs/server.crt"
 key_file = "certs/server.key"
 require_client_cert = false
 min_tls_version = "1.2"
+{security_toml}
 
 [monitoring]
 enabled = false
@@ -124,7 +139,12 @@ enabled = false
 
 [rate_limit]
 enabled = false
-"#
+"#,
+        runtime = fixture.runtime,
+        ldap_port = fixture.ldap_port,
+        ldaps_port = fixture.ldaps_port,
+        tls_enabled = fixture.tls_enabled,
+        security_toml = security_toml,
     );
     fs::write(config_dir.join("server.toml"), server_toml).unwrap();
 
@@ -169,12 +189,35 @@ fn tls_runtime_fixture(runtime: &str, tls_enabled: bool) -> TestBinaryServer {
     let (cert_pem, key_pem) = generate_test_certificate();
     write_tls_fixture(
         &tempdir,
-        runtime,
-        ldap_port,
-        ldaps_port,
-        tls_enabled,
-        &cert_pem,
-        &key_pem,
+        &TlsFixtureConfig {
+            runtime,
+            ldap_port,
+            ldaps_port,
+            tls_enabled,
+            cert_pem: &cert_pem,
+            key_pem: &key_pem,
+            security_profile: None,
+        },
+    );
+    spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem)
+}
+
+fn tls_runtime_fixture_with_security_profile(runtime: &str, profile: &str) -> TestBinaryServer {
+    let tempdir = tempfile::tempdir().unwrap();
+    let ldap_port = reserve_port();
+    let ldaps_port = reserve_port();
+    let (cert_pem, key_pem) = generate_test_certificate();
+    write_tls_fixture(
+        &tempdir,
+        &TlsFixtureConfig {
+            runtime,
+            ldap_port,
+            ldaps_port,
+            tls_enabled: true,
+            cert_pem: &cert_pem,
+            key_pem: &key_pem,
+            security_profile: Some(profile),
+        },
     );
     spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem)
 }
@@ -224,6 +267,23 @@ where
         3,
         b"cn=admin,dc=example,dc=org".to_vec().into(),
         RasnAuthChoice::Simple(b"secret".to_vec().into()),
+    );
+    let bind_message =
+        rasn_ldap::LdapMessage::new(message_id, rasn_ldap::ProtocolOp::BindRequest(bind_request));
+    let bind_message = der::encode(&bind_message).unwrap();
+
+    stream.write_all(&bind_message).await.unwrap();
+    read_response_bytes(stream).await
+}
+
+async fn send_anonymous_bind_request<S>(stream: &mut S, message_id: u32) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let bind_request = RasnBindRequest::new(
+        3,
+        Vec::<u8>::new().into(),
+        RasnAuthChoice::Simple(Vec::<u8>::new().into()),
     );
     let bind_message =
         rasn_ldap::LdapMessage::new(message_id, rasn_ldap::ProtocolOp::BindRequest(bind_request));
@@ -462,6 +522,29 @@ async fn assert_root_dse_transport_capabilities(runtime: &str) {
     assert_root_dse_capabilities(&response, true, false);
 }
 
+async fn assert_production_security_profile(runtime: &str) {
+    let server = tls_runtime_fixture_with_security_profile(runtime, "production");
+
+    let mut stream = connect_with_retry(server.ldap_port).await;
+    let response = send_anonymous_bind_request(&mut stream, 1).await;
+    assert_bind_result(&response, ParserResultCode::InappropriateAuthentication);
+
+    let mut stream = connect_with_retry(server.ldap_port).await;
+    let response = send_bind_request(&mut stream, 2).await;
+    assert_bind_result(&response, ParserResultCode::ConfidentialityRequired);
+
+    let mut stream = connect_with_retry(server.ldap_port).await;
+    let starttls_response = send_starttls_request(&mut stream, 3).await;
+    assert_starttls_success(&starttls_response);
+    let connector = trusted_tls_connector(&server.cert_pem);
+    let mut tls_stream = connector
+        .connect(localhost_server_name(), stream)
+        .await
+        .expect("StartTLS upgrade should complete with trusted server certificate");
+    let response = send_bind_request(&mut tls_stream, 4).await;
+    assert_bind_success(&response);
+}
+
 fn trusted_tls_connector(cert_pem: &str) -> TlsConnector {
     let mut roots = RootCertStore::empty();
     let mut reader = Cursor::new(cert_pem.as_bytes());
@@ -487,14 +570,15 @@ fn localhost_server_name() -> ServerName<'static> {
 }
 
 fn assert_bind_success(response: &[u8]) {
+    assert_bind_result(response, ldap_parser::ldap::ResultCode::Success);
+}
+
+fn assert_bind_result(response: &[u8], expected: ldap_parser::ldap::ResultCode) {
     let (_, messages) = parse_ldap_messages(response).unwrap();
     assert_eq!(messages.len(), 1);
     match &messages[0].protocol_op {
         ProtocolOp::BindResponse(bind_response) => {
-            assert_eq!(
-                bind_response.result.result_code,
-                ldap_parser::ldap::ResultCode::Success
-            );
+            assert_eq!(bind_response.result.result_code, expected);
         }
         other => panic!("unexpected bind response: {:?}", other),
     }
@@ -547,6 +631,16 @@ async fn legacy_root_dse_advertises_capabilities_by_transport_state() {
 #[tokio::test]
 async fn fsm_root_dse_advertises_capabilities_by_transport_state() {
     assert_root_dse_transport_capabilities("fsm").await;
+}
+
+#[tokio::test]
+async fn legacy_production_profile_denies_unsafe_binds_until_starttls() {
+    assert_production_security_profile("legacy").await;
+}
+
+#[tokio::test]
+async fn fsm_production_profile_denies_unsafe_binds_until_starttls() {
+    assert_production_security_profile("fsm").await;
 }
 
 #[tokio::test]

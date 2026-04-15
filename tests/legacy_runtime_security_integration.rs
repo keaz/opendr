@@ -13,7 +13,8 @@ use opendr::extended_ops::{
     encode_password_modify_request_value, oids,
 };
 use opendr::server::{
-    self, LegacyAuditConfig, LegacySecurityConfig, LegacyServerConfig, ServerError,
+    self, LegacyAuditConfig, LegacySecurityConfig, LegacySecurityPolicy, LegacyServerConfig,
+    ServerError,
 };
 use opendr::tls::{RustlsTlsHandler, TlsConfig, TlsVersion};
 use rasn::der;
@@ -94,10 +95,11 @@ fn build_tls_handler(cert_path: &Path, key_path: &Path) -> Arc<RustlsTlsHandler>
     Arc::new(RustlsTlsHandler::new(&config).unwrap())
 }
 
-async fn build_security_config(
+async fn build_security_config_with_policy(
     audit_log_path: &Path,
     access_control: Option<Arc<AciEngine>>,
     root_dn: Option<String>,
+    security_policy: LegacySecurityPolicy,
 ) -> Arc<LegacySecurityConfig> {
     let audit_logger = AuditLogger::new(audit_log_path, AuditLevel::Debug);
     audit_logger.initialize().await.unwrap();
@@ -106,6 +108,7 @@ async fn build_security_config(
         audit_config: LegacyAuditConfig::default(),
         access_control,
         root_dn,
+        security_policy,
     })
 }
 
@@ -123,9 +126,30 @@ async fn spawn_plain_runtime_server_with_backend(
     access_control: Option<Arc<AciEngine>>,
     root_dn: Option<String>,
 ) -> RuntimeServer {
+    spawn_plain_runtime_server_with_backend_and_policy(
+        backend,
+        access_control,
+        root_dn,
+        LegacySecurityPolicy::default(),
+    )
+    .await
+}
+
+async fn spawn_plain_runtime_server_with_backend_and_policy(
+    backend: Arc<dyn DirectoryBackend>,
+    access_control: Option<Arc<AciEngine>>,
+    root_dn: Option<String>,
+    security_policy: LegacySecurityPolicy,
+) -> RuntimeServer {
     let tempdir = tempfile::tempdir().unwrap();
     let audit_log_path = tempdir.path().join("audit.log");
-    let security = build_security_config(&audit_log_path, access_control, root_dn).await;
+    let security = build_security_config_with_policy(
+        &audit_log_path,
+        access_control,
+        root_dn,
+        security_policy,
+    )
+    .await;
     let port = reserve_port();
     let addr = format!("127.0.0.1:{port}");
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
@@ -180,6 +204,21 @@ async fn spawn_ldaps_runtime_server_with(
     access_control: Option<Arc<AciEngine>>,
     root_dn: Option<String>,
 ) -> RuntimeServer {
+    spawn_ldaps_runtime_server_with_policy(
+        credentials,
+        access_control,
+        root_dn,
+        LegacySecurityPolicy::default(),
+    )
+    .await
+}
+
+async fn spawn_ldaps_runtime_server_with_policy(
+    credentials: Vec<(String, Vec<u8>)>,
+    access_control: Option<Arc<AciEngine>>,
+    root_dn: Option<String>,
+    security_policy: LegacySecurityPolicy,
+) -> RuntimeServer {
     let tempdir = tempfile::tempdir().unwrap();
     let audit_log_path = tempdir.path().join("audit.log");
     let cert_path = tempdir.path().join("server.crt");
@@ -189,7 +228,13 @@ async fn spawn_ldaps_runtime_server_with(
     std::fs::write(&key_path, &key_pem).unwrap();
 
     let backend: Arc<dyn DirectoryBackend> = Arc::new(MockBackend::from_credentials(credentials));
-    let security = build_security_config(&audit_log_path, access_control, root_dn).await;
+    let security = build_security_config_with_policy(
+        &audit_log_path,
+        access_control,
+        root_dn,
+        security_policy,
+    )
+    .await;
     let tls_handler = build_tls_handler(&cert_path, &key_path);
     let port = reserve_port();
     let addr = format!("127.0.0.1:{port}");
@@ -359,10 +404,14 @@ where
 }
 
 fn assert_bind_success(response: &[u8]) {
+    assert_bind_result(response, ParserResultCode::Success);
+}
+
+fn assert_bind_result(response: &[u8], expected: ParserResultCode) {
     let (_, messages) = parse_ldap_messages(response).unwrap();
     match &messages[0].protocol_op {
         ProtocolOp::BindResponse(bind_result) => {
-            assert_eq!(bind_result.result.result_code, ParserResultCode::Success);
+            assert_eq!(bind_result.result.result_code, expected);
         }
         other => panic!("unexpected bind response: {:?}", other),
     }
@@ -432,6 +481,82 @@ async fn plaintext_runtime_rejects_sasl_plain_with_confidentiality_required() {
             "\"success\":false",
             "SASL PLAIN requires TLS",
             "PLAIN",
+        ],
+    )
+    .await;
+    assert!(audit.contains(ADMIN_DN));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn security_policy_rejects_anonymous_bind() {
+    let backend: Arc<dyn DirectoryBackend> = Arc::new(MockBackend::from_credentials([(
+        ADMIN_DN.to_string(),
+        ADMIN_PASSWORD.as_bytes().to_vec(),
+    )]));
+    let server = spawn_plain_runtime_server_with_backend_and_policy(
+        backend,
+        None,
+        Some(ADMIN_DN.to_string()),
+        LegacySecurityPolicy {
+            allow_anonymous_bind: false,
+            ..LegacySecurityPolicy::development()
+        },
+    )
+    .await;
+    let mut stream = connect_with_retry(server.port).await;
+
+    let response = send_message(&mut stream, &encode_simple_bind_request(1, "", "")).await;
+    assert_bind_result(&response, ParserResultCode::InappropriateAuthentication);
+
+    drop(stream);
+    let audit = wait_for_audit_content(
+        &server.audit_log_path,
+        &[
+            "\"action\":\"simple_bind\"",
+            "\"success\":false",
+            "anonymous bind is disabled by security policy",
+        ],
+    )
+    .await;
+    assert!(audit.contains("anonymous"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn security_policy_rejects_cleartext_simple_bind() {
+    let backend: Arc<dyn DirectoryBackend> = Arc::new(MockBackend::from_credentials([(
+        ADMIN_DN.to_string(),
+        ADMIN_PASSWORD.as_bytes().to_vec(),
+    )]));
+    let server = spawn_plain_runtime_server_with_backend_and_policy(
+        backend,
+        None,
+        Some(ADMIN_DN.to_string()),
+        LegacySecurityPolicy {
+            allow_cleartext_simple_bind: false,
+            ..LegacySecurityPolicy::development()
+        },
+    )
+    .await;
+    let mut stream = connect_with_retry(server.port).await;
+
+    let response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, ADMIN_DN, ADMIN_PASSWORD),
+    )
+    .await;
+    assert_bind_result(&response, ParserResultCode::ConfidentialityRequired);
+
+    drop(stream);
+    let audit = wait_for_audit_content(
+        &server.audit_log_path,
+        &[
+            "\"action\":\"simple_bind\"",
+            "\"success\":false",
+            "simple bind requires TLS by security policy",
         ],
     )
     .await;
@@ -546,6 +671,72 @@ async fn plaintext_runtime_rejects_password_modify_without_confidentiality() {
             "\"action\":\"password_modify\"",
             "\"success\":false",
             "Password Modify requires confidentiality protection",
+        ],
+    )
+    .await;
+    assert!(!audit.contains(USER_PASSWORD));
+    assert!(!audit.contains("updated-secret"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn security_policy_can_disable_password_modify_over_ldaps() {
+    let server = spawn_ldaps_runtime_server_with_policy(
+        vec![(USER_DN.to_string(), USER_PASSWORD.as_bytes().to_vec())],
+        None,
+        Some(ADMIN_DN.to_string()),
+        LegacySecurityPolicy {
+            allow_password_modify: false,
+            ..LegacySecurityPolicy::development()
+        },
+    )
+    .await;
+    let cert_pem = server.cert_pem.clone().unwrap();
+
+    let tcp_stream = connect_with_retry(server.port).await;
+    let connector = trusted_tls_connector(&cert_pem);
+    let mut stream = connector
+        .connect(localhost_server_name(), tcp_stream)
+        .await
+        .unwrap();
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, USER_DN, USER_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let response = send_message(
+        &mut stream,
+        &encode_password_modify_request(2, None, Some(USER_PASSWORD), Some("updated-secret")),
+    )
+    .await;
+    let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+    assert_eq!(messages.len(), 1);
+    match &messages[0].protocol_op {
+        ProtocolOp::ExtendedResponse(result) => {
+            assert_eq!(
+                result.result.result_code,
+                ParserResultCode::UnwillingToPerform
+            );
+            assert_eq!(
+                result.result.diagnostic_message.0.as_ref(),
+                "Password Modify is disabled by security policy"
+            );
+        }
+        other => panic!("unexpected password modify response: {:?}", other),
+    }
+
+    drop(stream);
+    let audit = wait_for_audit_content(
+        &server.audit_log_path,
+        &[
+            "\"action\":\"password_modify\"",
+            "\"success\":false",
+            "Password Modify is disabled by security policy",
         ],
     )
     .await;

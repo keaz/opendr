@@ -132,6 +132,30 @@ min_tls_version = "1.2"
 | `require_client_cert` | `false` | Enables mutual TLS |
 | `min_tls_version` | `1.2` | `1.2` or `1.3` |
 
+## Security
+
+```toml
+[security]
+profile = "development"
+allow_anonymous_bind = true
+allow_cleartext_simple_bind = true
+allow_sasl_plain = true
+allow_password_modify = true
+root_dse_requires_authentication = false
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `profile` | `development` | `development` or `production`; production requires `tls.enabled = true` |
+| `allow_anonymous_bind` | profile default | Production default is `false` |
+| `allow_cleartext_simple_bind` | profile default | Production default is `false`; rejected binds return `confidentialityRequired` |
+| `allow_sasl_plain` | profile default | Still requires LDAPS or StartTLS |
+| `allow_password_modify` | profile default | Password Modify still requires confidentiality when enabled |
+| `root_dse_requires_authentication` | profile default | Controls anonymous Root DSE visibility |
+
+See [PRODUCTION_SECURITY_PROFILE.md](PRODUCTION_SECURITY_PROFILE.md) for the
+RFC 4513 production checklist.
+
 ## Resources
 
 ```toml

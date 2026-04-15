@@ -95,6 +95,8 @@ Current runtime caveats:
 - FSM bind supports simple bind, anonymous bind, and SASL PLAIN over
   confidential transport.
 - SASL DIGEST-MD5 and CRAM-MD5 are not production-enabled.
+- Runtime authentication gates are centralized in the RFC 4513
+  [production security profile](PRODUCTION_SECURITY_PROFILE.md).
 - Both runtimes share backend, TLS, metrics, audit, and many protocol helper
   modules.
 

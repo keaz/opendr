@@ -3570,6 +3570,20 @@ async fn try_handle_virtual_search_request_with_fsm_runtime(
         .collect();
 
     let available_attributes = if base_dn.is_empty() {
+        if crate::server::security_policy(request_context).root_dse_requires_authentication
+            && !session.is_authenticated()
+        {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::InsufficientAccessRights,
+                "Root DSE requires authentication",
+            )
+            .await?;
+            return Ok(true);
+        }
+
         let supported_control_oids =
             crate::fsm_request::active_fsm_control_registry().root_dse_supported_control_oids();
         match crate::search_protocol::build_root_dse_attributes(
@@ -5145,6 +5159,26 @@ async fn handle_extended_request_with_fsm_runtime(
     }
 
     if oid == oids::PASSWORD_MODIFY {
+        if !crate::server::security_policy(request_context).allow_password_modify {
+            audit_password_modify_failure(
+                request_context,
+                &session,
+                "Password Modify is disabled by security policy",
+                None,
+                "self-service",
+                false,
+            )
+            .await;
+            return send_request_result_response(
+                fsm_set,
+                message_id,
+                FsmResponseKind::Result(ResponseOp::Extended),
+                ResultCode::UnwillingToPerform,
+                "Password Modify is disabled by security policy",
+            )
+            .await;
+        }
+
         if !fsm_set.connection().is_secure() {
             audit_password_modify_failure(
                 request_context,
@@ -5456,6 +5490,45 @@ async fn handle_bind_with_fsm(
         AuthenticationChoice::Simple(password) => {
             let dn = bind_name;
             let is_anonymous_bind = dn.is_empty() && password.as_ref().is_empty();
+            let security_policy = crate::server::security_policy(request_context);
+            if is_anonymous_bind && !security_policy.allow_anonymous_bind {
+                reset_auth_state(fsm_set).await?;
+                log_simple_bind_failure(
+                    request_context,
+                    "anonymous",
+                    "anonymous bind is disabled by security policy",
+                )
+                .await;
+                send_bind_result(
+                    fsm_set,
+                    message_id as u32,
+                    ResultCode::InappropriateAuthentication,
+                    "anonymous bind is disabled by security policy",
+                )
+                .await?;
+                return Ok(());
+            }
+            if !is_anonymous_bind
+                && !connection_is_secure
+                && !security_policy.allow_cleartext_simple_bind
+            {
+                reset_auth_state(fsm_set).await?;
+                log_simple_bind_failure(
+                    request_context,
+                    &dn,
+                    "simple bind requires TLS by security policy",
+                )
+                .await;
+                send_bind_result(
+                    fsm_set,
+                    message_id as u32,
+                    ResultCode::ConfidentialityRequired,
+                    "simple bind requires TLS",
+                )
+                .await?;
+                return Ok(());
+            }
+
             let backend = fsm_set.backend().clone();
             let auth_event = AuthEvent::BindRequest {
                 dn: dn.clone(),
@@ -5580,6 +5653,28 @@ async fn handle_sasl_bind_with_fsm(
             message_id,
             ResultCode::AuthMethodNotSupported,
             "only SASL PLAIN is supported",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !crate::server::security_policy(request_context).allow_sasl_plain {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_disabled");
+        }
+        log_sasl_bind(
+            request_context,
+            request_name.as_str(),
+            "PLAIN",
+            false,
+            Some("SASL PLAIN is disabled by security policy"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::AuthMethodNotSupported,
+            "SASL PLAIN is disabled by security policy",
         )
         .await?;
         return Ok(());
@@ -7230,6 +7325,7 @@ mod tests {
                 audit_config: crate::server::LegacyAuditConfig::default(),
                 access_control: Some(aci_engine),
                 root_dn: Some("cn=directory manager,dc=example,dc=org".to_string()),
+                security_policy: crate::server::LegacySecurityPolicy::default(),
             })),
             ..FsmServerRuntimeContext::default()
         };
