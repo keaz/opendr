@@ -1543,13 +1543,14 @@ async fn handle_search_request_with_fsm_runtime(
         "plain_search load candidates base={effective_base_dn} scope={} hint={search_hint:?}",
         search_req.scope.0
     ));
-    let can_stream_index_covered_plain_search = paged_results.is_none()
+    let can_stream_plain_search = paged_results.is_none()
         && backend.supports_search_entry_streaming()
         && requested_sort.is_none()
-        && exact_index_hint.as_ref() == search_hint.as_ref()
-        && search_hint.is_some()
         && !matches!(search_req.deref_aliases.0, 1 | 3)
         && can_skip_search_post_filter(&session, request_context);
+    let can_stream_index_covered_plain_search = can_stream_plain_search
+        && exact_index_hint.as_ref() == search_hint.as_ref()
+        && search_hint.is_some();
     if can_stream_index_covered_plain_search
         && matches!(search_hint, Some(SearchCandidateHint::Equality { .. }))
     {
@@ -1598,7 +1599,7 @@ async fn handle_search_request_with_fsm_runtime(
         }
     }
 
-    if can_stream_index_covered_plain_search {
+    if can_stream_plain_search {
         let stream_report = match backend
             .stream_search_entries_with_hint_report(
                 &effective_base_dn,
@@ -1623,6 +1624,7 @@ async fn handle_search_request_with_fsm_runtime(
 
         let index_covers_filter = stream_report.hint_covers_filter
             && !matches!(search_req.deref_aliases.0, 1 | 3)
+            && exact_index_hint.as_ref() == search_hint.as_ref()
             && can_skip_search_post_filter(&session, request_context);
         if index_covers_filter {
             emit_index_covered_plain_search_stream(
@@ -1642,6 +1644,24 @@ async fn handle_search_request_with_fsm_runtime(
             .await?;
             return Ok(());
         }
+
+        emit_filtering_plain_search_stream(
+            fsm_set,
+            request,
+            request_context,
+            runtime_context.metrics.as_deref(),
+            stream_report.entries,
+            manage_dsa_it,
+            search_req.scope,
+            &attribute_selection,
+            search_req.types_only,
+            search_started_at,
+            search_req.time_limit,
+            search_req.size_limit,
+            &prepared_filter,
+        )
+        .await?;
+        return Ok(());
     }
 
     let search_report = match backend
@@ -3066,6 +3086,161 @@ async fn emit_index_covered_plain_search_stream(
             }
 
             search_references.push(referrals);
+            continue;
+        }
+
+        if effective_size_limit.is_some_and(|limit| emitted_entries >= limit) {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+            record_direct_search_complete(metrics, emitted_entries, started_at, false);
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::SizeLimitExceeded,
+                "size limit exceeded",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let selected_attributes = projection.project_entry(&entry);
+        let encoded_entry = encode_search_entry_parts_with_controls(
+            request.message_id as u32,
+            &entry.dn,
+            &selected_attributes,
+            types_only,
+            &[],
+        )
+        .map_err(|err| format!("failed to encode search entry: {err:?}"))?;
+        pending_entry_bytes.extend(encoded_entry);
+        emitted_entries += 1;
+
+        if pending_entry_bytes.len() >= FSM_SEARCH_ENTRY_WRITE_BATCH_BYTES {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+        }
+    }
+
+    flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+    emit_plain_search_references(fsm_set, request, request_context, &search_references).await?;
+    let response_controls = native_search_done_controls(None, ResultCode::Success)?;
+    record_direct_search_complete(metrics, emitted_entries, started_at, true);
+    send_request_result_response_with_controls(
+        fsm_set,
+        request.message_id as u32,
+        request.response_kind,
+        ResultCode::Success,
+        "",
+        "",
+        &response_controls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_filtering_plain_search_stream(
+    fsm_set: &mut ConnectionFsmSet,
+    request: &FsmRequestContext,
+    request_context: &RequestContext,
+    metrics: Option<&MetricsCollector>,
+    mut entries: SearchEntryStreamReceiver,
+    manage_dsa_it: bool,
+    scope: ldap_parser::ldap::SearchScope,
+    requested_attributes: &[String],
+    types_only: bool,
+    started_at: Instant,
+    time_limit: u32,
+    size_limit: u32,
+    prepared_filter: &PreparedLdapFilter,
+) -> Result<(), String> {
+    let projection = DirectoryAttributeProjection::new(requested_attributes);
+    let effective_size_limit = (size_limit != 0).then_some(size_limit as usize);
+    let mut pending_entry_bytes = Vec::with_capacity(FSM_SEARCH_ENTRY_WRITE_BATCH_BYTES);
+    let mut emitted_entries = 0usize;
+    let mut returned_dns = HashSet::new();
+    let mut search_references = Vec::new();
+
+    record_streaming_direct_search_start(metrics);
+
+    while let Some(entry_result) = entries.recv().await {
+        if search_time_limit_exceeded(started_at, time_limit) {
+            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+            record_direct_search_complete(metrics, emitted_entries, started_at, false);
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::TimeLimitExceeded,
+                "time limit exceeded",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                record_direct_search_complete(metrics, emitted_entries, started_at, false);
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        if !manage_dsa_it && directory_entry_is_referral(&entry) {
+            let referrals = match referral_urls_for_entry(&entry) {
+                Ok(referrals) => referrals,
+                Err(diagnostic) => {
+                    flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                    record_direct_search_complete(metrics, emitted_entries, started_at, false);
+                    send_request_result_response(
+                        fsm_set,
+                        request.message_id as u32,
+                        request.response_kind,
+                        ResultCode::OperationsError,
+                        &diagnostic,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            if scope == ldap_parser::ldap::SearchScope::BaseObject {
+                flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                increment_control_counter(request_context, "ldap_referral_results_total", 1);
+                record_direct_search_complete(metrics, emitted_entries, started_at, true);
+                send_request_result_response_with_referrals(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    ResultCode::Referral,
+                    &entry.dn,
+                    "search base is a referral",
+                    &referrals,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            search_references.push(referrals);
+            continue;
+        }
+
+        let search_entry = directory_entry_to_search_entry(&entry);
+        if !prepared_filter
+            .matches_search_entry(&search_entry)
+            .map_err(|err| err.to_string())?
+        {
+            continue;
+        }
+
+        if !returned_dns.insert(normalize_search_dn(&entry.dn)) {
             continue;
         }
 
@@ -7234,6 +7409,68 @@ mod tests {
                 value: "alice".to_string(),
             })]
         );
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_streams_and_filters_uncovered_plain_search_when_supported() {
+        let backend = Arc::new(HintTrackingBackend::new_streaming());
+        backend
+            .insert_entry(DirectoryEntry::new(
+                "cn=alice,dc=example,dc=org",
+                HashMap::from([
+                    ("objectClass".to_string(), vec!["person".to_string()]),
+                    ("cn".to_string(), vec!["Alice".to_string()]),
+                ]),
+            ))
+            .await;
+        backend
+            .insert_entry(DirectoryEntry::new(
+                "cn=bob,dc=example,dc=org",
+                HashMap::from([
+                    ("objectClass".to_string(), vec!["person".to_string()]),
+                    ("cn".to_string(), vec!["Bob".to_string()]),
+                ]),
+            ))
+            .await;
+
+        let backend_for_server: Arc<dyn DirectoryBackend> = backend.clone();
+        let (server_task, mut client_stream) = spawn_test_connection(backend_for_server).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                125,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::ExtensibleMatch(rasn_ldap::MatchingRuleAssertion::new(
+                    Some(b"caseIgnoreMatch".to_vec().into()),
+                    Some(b"cn".to_vec().into()),
+                    b"alice".to_vec().into(),
+                    false,
+                )),
+                &["cn"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=alice,dc=example,dc=org".to_string()]
+        );
+        assert!(matches!(
+            messages.last().map(|message| &message.protocol_op),
+            Some(ProtocolOp::SearchResultDone(done)) if done.result_code == ParserResultCode::Success
+        ));
+        assert_eq!(backend.direct_search_calls(), 0);
+        assert_eq!(backend.hinted_search_calls(), 0);
+        assert_eq!(backend.stream_search_calls(), 1);
+        assert_eq!(backend.projected_stream_search_calls(), 0);
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();
