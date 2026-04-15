@@ -98,6 +98,74 @@ async fn test_lmdb_basic_crud() {
 }
 
 #[tokio::test]
+async fn test_lmdb_modify_increment_is_atomic() {
+    let dir = tempdir().unwrap();
+    let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+    backend
+        .add_entry(
+            DirectoryEntry::new(
+                "cn=Counter,dc=example,dc=org",
+                HashMap::from([
+                    ("cn".to_string(), vec!["Counter".to_string()]),
+                    (
+                        "objectclass".to_string(),
+                        vec!["extensibleObject".to_string()],
+                    ),
+                    ("examplecounter".to_string(), vec!["10".to_string()]),
+                ]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    backend
+        .modify_entry(
+            "cn=Counter,dc=example,dc=org",
+            vec![Modification {
+                operation: ModifyOperation::Increment,
+                attribute: "exampleCounter".to_string(),
+                values: vec!["5".to_string()],
+            }],
+        )
+        .await
+        .unwrap();
+
+    let updated = backend
+        .get_entry("cn=Counter,dc=example,dc=org")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        updated.attributes.get("examplecounter").unwrap(),
+        &vec!["15".to_string()]
+    );
+
+    let malformed = backend
+        .modify_entry(
+            "cn=Counter,dc=example,dc=org",
+            vec![Modification {
+                operation: ModifyOperation::Increment,
+                attribute: "exampleCounter".to_string(),
+                values: vec!["1".to_string(), "2".to_string()],
+            }],
+        )
+        .await;
+    assert!(malformed.is_err());
+
+    let unchanged = backend
+        .get_entry("cn=Counter,dc=example,dc=org")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.attributes.get("examplecounter").unwrap(),
+        &vec!["15".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn test_lmdb_indexes_use_schema_matching_rule_normalization() {
     let dir = tempdir().unwrap();
     let schema = LdapSchema::default();

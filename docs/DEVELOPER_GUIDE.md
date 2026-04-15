@@ -313,6 +313,8 @@ Controls:
 - Referral, alias dereference, LDAP URL, and ManageDsaIT support boundaries are
   defined in
   [LDAP_REFERRAL_ALIAS_SUPPORT.md](LDAP_REFERRAL_ALIAS_SUPPORT.md).
+- Common LDAP controls and extension compatibility decisions are defined in
+  [LDAP_CONTROL_EXTENSION_COMPATIBILITY.md](LDAP_CONTROL_EXTENSION_COMPATIBILITY.md).
 - Root DSE capability advertising is summarized in
   [ROOT_DSE_CAPABILITIES.md](ROOT_DSE_CAPABILITIES.md).
 

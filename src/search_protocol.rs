@@ -5,6 +5,7 @@ const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
 const CANCEL_OID: &str = "1.3.6.1.1.8";
 const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
 const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
+pub const MODIFY_INCREMENT_FEATURE_OID: &str = "1.3.6.1.1.14";
 
 pub async fn build_root_dse_attributes(
     backend: &dyn DirectoryBackend,
@@ -43,6 +44,11 @@ pub async fn build_root_dse_attributes(
             "supportedSASLMechanisms".to_string(),
             supported_sasl_mechanisms.to_vec(),
         ));
+    }
+
+    let supported_features = supported_features();
+    if !supported_features.is_empty() {
+        attributes.push(("supportedFeatures".to_string(), supported_features));
     }
 
     if let Some(context_csn) = backend.get_context_csn().await? {
@@ -147,6 +153,10 @@ pub fn supported_extensions(connection_is_secure: bool, starttls_available: bool
     supported
 }
 
+pub fn supported_features() -> Vec<String> {
+    vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
+}
+
 pub fn supported_sasl_mechanisms() -> Vec<String> {
     supported_sasl_mechanisms_for_context(true)
 }
@@ -219,6 +229,14 @@ mod tests {
     }
 
     #[test]
+    fn supported_features_include_modify_increment() {
+        assert_eq!(
+            supported_features(),
+            vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
+        );
+    }
+
+    #[test]
     fn supported_sasl_mechanisms_are_explicit() {
         assert_eq!(
             supported_legacy_sasl_mechanisms(),
@@ -276,6 +294,10 @@ mod tests {
             &vec!["PLAIN".to_string()]
         );
         assert_eq!(
+            as_map.get("supportedFeatures").unwrap(),
+            &vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
+        );
+        assert_eq!(
             as_map.get("contextCSN").unwrap(),
             &vec!["1696680896789012#001#000001#000000".to_string()]
         );
@@ -306,6 +328,10 @@ mod tests {
         assert_eq!(
             as_map.get("supportedLDAPVersion").unwrap(),
             &vec!["3".to_string()]
+        );
+        assert_eq!(
+            as_map.get("supportedFeatures").unwrap(),
+            &vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
         );
         assert_eq!(
             as_map.get("subschemaSubentry").unwrap(),

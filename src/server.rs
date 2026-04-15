@@ -6181,7 +6181,21 @@ async fn handle_online_schema_modify_request_with_context(
     request_context: &RequestContext,
 ) -> Result<(), ServerError> {
     let dn = request.object.0.as_ref().trim().to_owned();
-    let modifications = convert_ldap_changes_to_modifications(&request.changes);
+    let modifications = match convert_ldap_changes_to_modifications(&request.changes) {
+        Ok(modifications) => modifications,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let modified_attributes = modifications
         .iter()
         .map(|modification| modification.attribute.clone())
@@ -6338,6 +6352,12 @@ pub(crate) async fn apply_online_schema_modify(
                     proposed_store.insert(canonical_name.to_string(), modification.values.clone());
                 }
             }
+            ModifyOperation::Increment => {
+                return Err(OnlineSchemaUpdateError::Unsafe(format!(
+                    "Modify-Increment is not supported for online schema attribute {}",
+                    canonical_name
+                )));
+            }
         }
     }
 
@@ -6474,7 +6494,21 @@ pub(crate) async fn handle_modify_request_with_context(
     _request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.object.0.as_ref().trim().to_owned();
-    let modifications = convert_modifications(request.changes);
+    let modifications = match convert_modifications(request.changes) {
+        Ok(modifications) => modifications,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let modified_attributes: Vec<String> = modifications
         .iter()
         .map(|modification| modification.attribute.clone())
@@ -6562,6 +6596,48 @@ pub(crate) async fn handle_modify_request_with_context(
                 ResultCode::Success,
                 &dn,
                 "",
+            )
+            .await?;
+        }
+        Err(NativeModifyError::Protocol(diagnostic)) => {
+            error!("Malformed modify request for {}: {}", dn, diagnostic);
+            log_modify_audit_event(
+                request_context,
+                session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(&diagnostic),
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ProtocolError,
+                &dn,
+                &diagnostic,
+            )
+            .await?;
+        }
+        Err(NativeModifyError::Constraint(diagnostic)) => {
+            error!("Modify constraint violation for {}: {}", dn, diagnostic);
+            log_modify_audit_event(
+                request_context,
+                session,
+                &dn,
+                false,
+                &modified_attributes,
+                Some(&diagnostic),
+            )
+            .await;
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ConstraintViolation,
+                &dn,
+                &diagnostic,
             )
             .await?;
         }
@@ -7924,7 +8000,32 @@ fn entry_matches_filter_with_schema(
     matches_search_filter_with_schema(entry, filter, schema)
 }
 
-pub(crate) fn convert_ldap_changes_to_modifications(changes: &[Change<'_>]) -> Vec<Modification> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModifyRequestDecodeError {
+    message: String,
+}
+
+impl ModifyRequestDecodeError {
+    fn unsupported_operation(operation: u32) -> Self {
+        Self {
+            message: format!(
+                "unsupported modify operation {operation}; expected add(0), delete(1), replace(2), or increment(3)"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ModifyRequestDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModifyRequestDecodeError {}
+
+pub(crate) fn convert_ldap_changes_to_modifications(
+    changes: &[Change<'_>],
+) -> Result<Vec<Modification>, ModifyRequestDecodeError> {
     changes
         .iter()
         .map(|change| {
@@ -7932,7 +8033,10 @@ pub(crate) fn convert_ldap_changes_to_modifications(changes: &[Change<'_>]) -> V
                 0 => ModifyOperation::Add,
                 1 => ModifyOperation::Delete,
                 2 => ModifyOperation::Replace,
-                _ => ModifyOperation::Replace,
+                3 => ModifyOperation::Increment,
+                operation => {
+                    return Err(ModifyRequestDecodeError::unsupported_operation(operation));
+                }
             };
 
             let attribute = change.modification.attr_type.0.to_lowercase();
@@ -7944,16 +8048,18 @@ pub(crate) fn convert_ldap_changes_to_modifications(changes: &[Change<'_>]) -> V
                 .map(|value| bytes_to_string(value.0.as_ref()))
                 .collect();
 
-            Modification {
+            Ok(Modification {
                 operation,
                 attribute,
                 values,
-            }
+            })
         })
         .collect()
 }
 
-fn convert_modifications(changes: Vec<Change<'_>>) -> Vec<Modification> {
+fn convert_modifications(
+    changes: Vec<Change<'_>>,
+) -> Result<Vec<Modification>, ModifyRequestDecodeError> {
     convert_ldap_changes_to_modifications(&changes)
 }
 
@@ -8164,6 +8270,37 @@ mod tests {
             message.controls = Some(controls.into_iter().collect());
         }
         der::encode(&message).unwrap()
+    }
+
+    async fn bind_result_code_for_control(
+        oid: &str,
+        criticality: bool,
+        value: Option<&[u8]>,
+    ) -> ParserResultCode {
+        let backend = Arc::new(MockBackend::from_credentials([(
+            String::from("cn=admin,dc=example,dc=org"),
+            b"secret".to_vec(),
+        )]));
+        let schema = Arc::new(LdapSchema::with_core_schema());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+
+        let server_task = tokio::spawn(async move {
+            handle_client(server_stream, backend, schema).await;
+        });
+
+        let encoded = bind_request_with_controls(11, vec![rasn_control(oid, criticality, value)]);
+        client_stream.write_all(&encoded).await.unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        let result_code = match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => bind_response.result.result_code,
+            other => panic!("unexpected response: {:?}", other),
+        };
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+        result_code
     }
 
     fn cancel_extended_request(target_message_id: i32) -> ExtendedRequest<'static> {
@@ -8469,10 +8606,17 @@ mod tests {
                     attr_vals: vec![AttributeValue(Cow::Owned(b"alice@example.org".to_vec()))],
                 },
             },
+            Change {
+                operation: Operation(3),
+                modification: PartialAttribute {
+                    attr_type: LdapString(Cow::Owned("exampleCounter".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"5".to_vec()))],
+                },
+            },
         ];
 
-        let modifications = convert_modifications(changes);
-        assert_eq!(modifications.len(), 3);
+        let modifications = convert_modifications(changes).unwrap();
+        assert_eq!(modifications.len(), 4);
         assert_eq!(modifications[0].operation, ModifyOperation::Add);
         assert_eq!(modifications[0].attribute, "cn");
         assert_eq!(modifications[0].values, vec!["Alice".to_string()]);
@@ -8485,6 +8629,23 @@ mod tests {
             modifications[2].values,
             vec!["alice@example.org".to_string()]
         );
+        assert_eq!(modifications[3].operation, ModifyOperation::Increment);
+        assert_eq!(modifications[3].attribute, "examplecounter");
+        assert_eq!(modifications[3].values, vec!["5".to_string()]);
+    }
+
+    #[test]
+    fn convert_modifications_rejects_unknown_operation() {
+        let changes = vec![Change {
+            operation: Operation(4),
+            modification: PartialAttribute {
+                attr_type: LdapString(Cow::Owned("cn".to_string())),
+                attr_vals: vec![AttributeValue(Cow::Owned(b"Alice".to_vec()))],
+            },
+        }];
+
+        let err = convert_modifications(changes).unwrap_err();
+        assert!(err.to_string().contains("unsupported modify operation 4"));
     }
 
     #[test]
@@ -9166,6 +9327,147 @@ mod tests {
         );
     }
 
+    fn modify_increment_test_schema() -> LdapSchema {
+        let mut schema = LdapSchema::with_core_schema();
+        schema
+            .load_ldif_str(
+                "
+dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.152.1 NAME 'exampleCounter' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUXILIARY MAY exampleCounter )
+",
+            )
+            .unwrap();
+        schema
+    }
+
+    fn modify_increment_request(increment_values: Vec<&[u8]>) -> ModifyRequest<'static> {
+        ModifyRequest {
+            object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            changes: vec![Change {
+                operation: Operation(3),
+                modification: PartialAttribute {
+                    attr_type: LdapString(Cow::Owned("exampleCounter".to_string())),
+                    attr_vals: increment_values
+                        .into_iter()
+                        .map(|value| AttributeValue(Cow::Owned(value.to_vec())))
+                        .collect(),
+                },
+            }],
+        }
+    }
+
+    async fn add_counter_entry(backend: &MockBackend, counter: &str) {
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=Alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Alice".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        (
+                            "objectclass".to_string(),
+                            vec!["person".to_string(), "exampleCounterObject".to_string()],
+                        ),
+                        ("examplecounter".to_string(), vec![counter.to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn modify_increment_updates_integer_attribute_atomically() {
+        let backend = MockBackend::new();
+        add_counter_entry(&backend, "41").await;
+        let schema = modify_increment_test_schema();
+        let session = bound_schema_session();
+        let request_controls = RequestControls::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_modify_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            10,
+            modify_increment_request(vec![b"1"]),
+            &session,
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::ModifyResponse(modify_response) => {
+                assert_eq!(
+                    modify_response.result.result_code,
+                    ParserResultCode::Success
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let stored = backend
+            .get_entry("cn=Alice,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.attributes.get("examplecounter").unwrap(),
+            &vec!["42".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_increment_rejects_malformed_increment_without_mutating_entry() {
+        let backend = MockBackend::new();
+        add_counter_entry(&backend, "41").await;
+        let schema = modify_increment_test_schema();
+        let session = bound_schema_session();
+        let request_controls = RequestControls::default();
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_modify_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            11,
+            modify_increment_request(vec![b"1", b"2"]),
+            &session,
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::ModifyResponse(modify_response) => {
+                assert_eq!(
+                    modify_response.result.result_code,
+                    ParserResultCode::ProtocolError
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let stored = backend
+            .get_entry("cn=Alice,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.attributes.get("examplecounter").unwrap(),
+            &vec!["41".to_string()]
+        );
+    }
+
     const ONLINE_TEST_ATTRIBUTE: &str = "( 1.3.6.1.4.1.55555.1.1 NAME 'openDRTestCode' DESC 'OpenDR online schema test attribute' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )";
     const ONLINE_TEST_OBJECT_CLASS: &str = "( 1.3.6.1.4.1.55555.2.1 NAME 'openDRTestObject' DESC 'OpenDR online schema test object class' SUP top STRUCTURAL MUST cn MAY openDRTestCode )";
 
@@ -9520,6 +9822,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_expected_controls_follow_generic_criticality_semantics() {
+        const ASSERTION_CONTROL_OID: &str = "1.3.6.1.1.12";
+        const PRE_READ_CONTROL_OID: &str = "1.3.6.1.1.13.1";
+        const POST_READ_CONTROL_OID: &str = "1.3.6.1.1.13.2";
+
+        for oid in [
+            ASSERTION_CONTROL_OID,
+            PRE_READ_CONTROL_OID,
+            POST_READ_CONTROL_OID,
+        ] {
+            assert_eq!(
+                bind_result_code_for_control(oid, true, None).await,
+                ParserResultCode::UnavailableCriticalExtension
+            );
+            assert_eq!(
+                bind_result_code_for_control(oid, false, Some(b"ignored")).await,
+                ParserResultCode::Success
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn send_result_with_controls_emits_response_controls() {
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
 
@@ -9613,6 +9937,10 @@ mod tests {
         assert_eq!(
             attributes.get("contextCSN").unwrap(),
             &vec!["1696680896789012#001#000001#000000".to_string()]
+        );
+        assert_eq!(
+            attributes.get("supportedFeatures").unwrap(),
+            &vec![crate::search_protocol::MODIFY_INCREMENT_FEATURE_OID.to_string()]
         );
         let mut supported_extensions = attributes.get("supportedExtension").unwrap().clone();
         supported_extensions.sort();

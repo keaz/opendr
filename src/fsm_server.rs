@@ -3979,7 +3979,20 @@ async fn handle_online_schema_modify_with_fsm_runtime(
     let session = legacy_session_from_fsm(fsm_set);
     let backend = fsm_set.backend().clone();
     let dn = modify_req.object.0.as_ref().trim().to_owned();
-    let modifications = convert_ldap_changes_to_modifications(&modify_req.changes);
+    let modifications = match convert_ldap_changes_to_modifications(&modify_req.changes) {
+        Ok(modifications) => modifications,
+        Err(err) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                &err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let modified_attributes = modifications
         .iter()
         .map(|modification| modification.attribute.clone())
@@ -4097,7 +4110,20 @@ async fn handle_modify_request_with_fsm_runtime(
     let session = legacy_session_from_fsm(fsm_set);
     let backend = fsm_set.backend().clone();
     let dn = modify_req.object.0.as_ref().trim().to_owned();
-    let modifications = convert_ldap_changes_to_modifications(&modify_req.changes);
+    let modifications = match convert_ldap_changes_to_modifications(&modify_req.changes) {
+        Ok(modifications) => modifications,
+        Err(err) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                &err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let modified_attributes: Vec<String> = modifications
         .iter()
         .map(|modification| modification.attribute.clone())
@@ -4212,6 +4238,48 @@ async fn handle_modify_request_with_fsm_runtime(
     };
     if let Err(err) = modify_result {
         match err {
+            NativeModifyError::Protocol(diagnostic) => {
+                error!("Malformed modify request for {}: {}", dn, diagnostic);
+                log_modify_audit_event(
+                    request_context,
+                    &session,
+                    &dn,
+                    false,
+                    &modified_attributes,
+                    Some(&diagnostic),
+                )
+                .await;
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    ResultCode::ProtocolError,
+                    &diagnostic,
+                )
+                .await?;
+                return Ok(());
+            }
+            NativeModifyError::Constraint(diagnostic) => {
+                error!("Modify constraint violation for {}: {}", dn, diagnostic);
+                log_modify_audit_event(
+                    request_context,
+                    &session,
+                    &dn,
+                    false,
+                    &modified_attributes,
+                    Some(&diagnostic),
+                )
+                .await;
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    ResultCode::ConstraintViolation,
+                    &diagnostic,
+                )
+                .await?;
+                return Ok(());
+            }
             NativeModifyError::Schema(diagnostic) => {
                 error!("Schema validation failed for modify {}: {}", dn, diagnostic);
                 log_modify_audit_event(

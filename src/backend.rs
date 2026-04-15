@@ -368,6 +368,8 @@ pub enum BackendError {
 pub enum NativeModifyError {
     Backend(BackendError),
     Schema(String),
+    Protocol(String),
+    Constraint(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,10 +411,20 @@ impl NativeModifyError {
         Self::Schema(message.into())
     }
 
+    pub fn protocol_error(message: impl Into<String>) -> Self {
+        Self::Protocol(message.into())
+    }
+
+    pub fn constraint_violation(message: impl Into<String>) -> Self {
+        Self::Constraint(message.into())
+    }
+
     pub fn into_backend_error(self) -> BackendError {
         match self {
             Self::Backend(err) => err,
-            Self::Schema(message) => BackendError::Storage(message),
+            Self::Schema(message) | Self::Protocol(message) | Self::Constraint(message) => {
+                BackendError::Storage(message)
+            }
         }
     }
 }
@@ -421,7 +433,9 @@ impl fmt::Display for NativeModifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(err) => write!(f, "{}", err),
-            Self::Schema(message) => write!(f, "{}", message),
+            Self::Schema(message) | Self::Protocol(message) | Self::Constraint(message) => {
+                write!(f, "{}", message)
+            }
         }
     }
 }
@@ -540,7 +554,7 @@ pub trait DirectoryBackend: Send + Sync {
             .await?
             .ok_or(NativeModifyError::Backend(BackendError::NotFound))?;
         let mut candidate_attributes = existing_entry.attributes.clone();
-        apply_modifications_to_attributes(&mut candidate_attributes, &modifications);
+        apply_modifications_to_attributes(&mut candidate_attributes, &modifications)?;
         schema
             .validate_modified_entry(&existing_entry.attributes, &candidate_attributes)
             .map_err(|err| {
@@ -749,6 +763,7 @@ pub enum ModifyOperation {
     Add,
     Delete,
     Replace,
+    Increment,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -854,7 +869,7 @@ pub struct Modification {
 pub fn apply_modifications_to_attributes(
     attributes: &mut HashMap<String, Vec<String>>,
     modifications: &[Modification],
-) {
+) -> Result<(), NativeModifyError> {
     for modification in modifications {
         let attribute = modification.attribute.to_lowercase();
         match modification.operation {
@@ -883,8 +898,80 @@ pub fn apply_modifications_to_attributes(
                     attributes.insert(attribute, modification.values.clone());
                 }
             }
+            ModifyOperation::Increment => {
+                increment_attribute_values(attributes, &attribute, &modification.values)?;
+            }
         }
     }
+
+    Ok(())
+}
+
+fn increment_attribute_values(
+    attributes: &mut HashMap<String, Vec<String>>,
+    attribute: &str,
+    increment_values: &[String],
+) -> Result<(), NativeModifyError> {
+    if increment_values.len() != 1 {
+        return Err(NativeModifyError::protocol_error(format!(
+            "Modify-Increment for {attribute} requires exactly one integer value"
+        )));
+    }
+    let increment = parse_modify_increment_integer(&increment_values[0]).map_err(|reason| {
+        NativeModifyError::constraint_violation(format!(
+            "Modify-Increment value for {attribute} is invalid: {reason}"
+        ))
+    })?;
+
+    let current_values = attributes.get(attribute).ok_or_else(|| {
+        NativeModifyError::constraint_violation(format!(
+            "Modify-Increment target attribute {attribute} does not exist"
+        ))
+    })?;
+    if current_values.is_empty() {
+        return Err(NativeModifyError::constraint_violation(format!(
+            "Modify-Increment target attribute {attribute} has no values"
+        )));
+    }
+
+    let mut incremented_values = Vec::with_capacity(current_values.len());
+    for current_value in current_values {
+        let current = parse_modify_increment_integer(current_value).map_err(|reason| {
+            NativeModifyError::constraint_violation(format!(
+                "Modify-Increment current value for {attribute} is invalid: {reason}"
+            ))
+        })?;
+        let incremented = current.checked_add(increment).ok_or_else(|| {
+            NativeModifyError::constraint_violation(format!(
+                "Modify-Increment for {attribute} overflows supported integer range"
+            ))
+        })?;
+        incremented_values.push(incremented.to_string());
+    }
+
+    attributes.insert(attribute.to_string(), incremented_values);
+    Ok(())
+}
+
+fn parse_modify_increment_integer(value: &str) -> Result<i128, &'static str> {
+    if value.is_empty() {
+        return Err("integer value is empty");
+    }
+
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty() {
+        return Err("integer value is missing digits");
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return Err("integer values must not contain leading zeroes");
+    }
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("value is not a valid integer");
+    }
+
+    value
+        .parse::<i128>()
+        .map_err(|_| "integer value is outside the supported i128 range")
 }
 
 struct StoredEntry {
@@ -986,6 +1073,9 @@ impl MockBackend {
         let mut entries = self.entries.write().await;
         let dn_key = normalize_dn_key(dn)?;
         let stored = entries.get_mut(&dn_key).ok_or(BackendError::NotFound)?;
+        let mut candidate_attributes = stored.entry.attributes.clone();
+        apply_modifications_to_attributes(&mut candidate_attributes, &modifications)
+            .map_err(NativeModifyError::into_backend_error)?;
 
         let csn = self.csn_generator.generate();
         stored
@@ -993,9 +1083,15 @@ impl MockBackend {
             .operational_attributes
             .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
 
-        for modification in modifications {
-            apply_modification(&mut stored.entry, &mut stored.password, &modification);
-        }
+        let password_touched = modifications
+            .iter()
+            .any(|modification| modification.attribute.eq_ignore_ascii_case("userpassword"));
+        stored.entry.attributes = candidate_attributes;
+        update_password_from_attributes(
+            &stored.entry.attributes,
+            &mut stored.password,
+            password_touched,
+        );
 
         let mut context_csn = self.context_csn.write().await;
         *context_csn = Some(csn);
@@ -1189,7 +1285,7 @@ impl DirectoryBackend for MockBackend {
         let dn_key = normalize_dn_key(dn).map_err(NativeModifyError::Backend)?;
         let stored = entries.get_mut(&dn_key).ok_or(BackendError::NotFound)?;
         let mut candidate_attributes = stored.entry.attributes.clone();
-        apply_modifications_to_attributes(&mut candidate_attributes, &modifications);
+        apply_modifications_to_attributes(&mut candidate_attributes, &modifications)?;
         schema
             .validate_modified_entry(&stored.entry.attributes, &candidate_attributes)
             .map_err(|err| {
@@ -1202,9 +1298,15 @@ impl DirectoryBackend for MockBackend {
             .operational_attributes
             .for_modified_entry(csn.clone(), actor_dn.as_deref().map(str::to_string));
 
-        for modification in &modifications {
-            apply_modification(&mut stored.entry, &mut stored.password, modification);
-        }
+        let password_touched = modifications
+            .iter()
+            .any(|modification| modification.attribute.eq_ignore_ascii_case("userpassword"));
+        stored.entry.attributes = candidate_attributes;
+        update_password_from_attributes(
+            &stored.entry.attributes,
+            &mut stored.password,
+            password_touched,
+        );
 
         let mut context_csn = self.context_csn.write().await;
         *context_csn = Some(csn);
@@ -1323,52 +1425,19 @@ impl DirectoryBackend for MockBackend {
     }
 }
 
-fn apply_modification(
-    entry: &mut DirectoryEntry,
+fn update_password_from_attributes(
+    attributes: &HashMap<String, Vec<String>>,
     password: &mut Vec<u8>,
-    modification: &Modification,
+    password_touched: bool,
 ) {
-    let attribute = modification.attribute.to_lowercase();
-    let values = modification.values.clone();
-
-    match modification.operation {
-        ModifyOperation::Add => {
-            let existing = entry.attributes.entry(attribute.clone()).or_default();
-            for value in values {
-                if !existing.contains(&value) {
-                    existing.push(value.clone());
-                }
-            }
-        }
-        ModifyOperation::Delete => {
-            if values.is_empty() {
-                entry.attributes.remove(&attribute);
-            } else if let Some(existing) = entry.attributes.get_mut(&attribute) {
-                existing.retain(|candidate| !values.contains(candidate));
-                if existing.is_empty() {
-                    entry.attributes.remove(&attribute);
-                }
-            }
-        }
-        ModifyOperation::Replace => {
-            if values.is_empty() {
-                entry.attributes.remove(&attribute);
-            } else {
-                entry.attributes.insert(attribute.clone(), values);
-            }
-        }
+    if !password_touched {
+        return;
     }
 
-    if attribute == "userpassword" {
-        if let Some(current) = entry
-            .attributes
-            .get(&attribute)
-            .and_then(|vals| vals.first())
-        {
-            *password = current.as_bytes().to_vec();
-        } else {
-            password.clear();
-        }
+    if let Some(current) = attributes.get("userpassword").and_then(|vals| vals.first()) {
+        *password = current.as_bytes().to_vec();
+    } else {
+        password.clear();
     }
 }
 

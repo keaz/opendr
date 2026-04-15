@@ -1777,7 +1777,7 @@ impl LmdbBackend {
             ldap_attribute_key(&modification.attribute).as_ref() == "userpassword"
         });
 
-        apply_modifications_to_attributes(&mut entry.attributes, &modifications);
+        apply_modifications_to_attributes(&mut entry.attributes, &modifications)?;
 
         if let Some(schema) = schema {
             let original_attributes = old_attributes
