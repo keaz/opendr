@@ -18,8 +18,8 @@ operation behavior.
 | Python client interoperability | `scripts/ldap_interop_gate.sh` | Python `ldap3` binds over StartTLS and reads Root DSE/schema data. | Script log |
 | Rust client interoperability | `scripts/ldap_interop_gate.sh` | `ldap_ops_client` completes Bind, Root DSE, Search, Add, Modify, Delete, ModifyDN, Compare, WhoAmI, and Password Modify. | Script log |
 | Referral and alias interoperability | `scripts/referral_alias_interop.sh` | `ldapsearch` and optional Python `ldap3` cover referral URL, ManageDsaIT, and alias dereference behavior against a prepared fixture. | Script log |
-| BER fuzzing | `cargo +nightly fuzz run ber_decoder -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth. | Fuzz corpus and log |
-| Request-handler fuzzing | `cargo +nightly fuzz run ldap_request_handler -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth in parser/server request handling. | Fuzz corpus and log |
+| BER fuzzing | `cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth. | Fuzz corpus and log |
+| Request-handler fuzzing | `cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth in parser/server request handling. | Fuzz corpus and log |
 | Load and soak | `scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate` | Exit code 0 and baseline validation within the documented threshold. | `target/perf/regression-candidate` |
 
 ## Release Decision Rules
@@ -44,3 +44,7 @@ the release gate. It runs the CI-friendly subset directly and prints the longer
 fuzz/load commands when those are not run in the same job. For tagged releases,
 retain the workflow run, fuzz logs, and performance artifacts with the release
 candidate.
+
+The fuzz commands pin `nightly-2026-03-01` because the current `rasn` dependency
+tree does not build with later nightly pointer-metadata checks. Revisit the pin
+when the ASN.1 dependency stack is upgraded.

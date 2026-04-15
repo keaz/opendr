@@ -54,8 +54,9 @@ jobs:
         run: |
           cat <<'EOF'
           Run these before a production-ready release and retain artifacts:
-          cargo +nightly fuzz run ber_decoder -- -runs=10000
-          cargo +nightly fuzz run ldap_request_handler -- -runs=10000
+          rustup toolchain install nightly-2026-03-01 --profile minimal
+          cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000
+          cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000
           ./scripts/referral_alias_interop.sh
           ./scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate
           EOF

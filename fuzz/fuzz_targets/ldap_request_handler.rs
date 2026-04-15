@@ -19,6 +19,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = parse_ldap_messages(data);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .build()
         .expect("tokio runtime");

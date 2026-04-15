@@ -62,8 +62,8 @@ these gates pass and their artifacts are retained:
 4. `cargo test --doc --quiet`
 5. `scripts/ldap_interop_gate.sh`
 6. `scripts/referral_alias_interop.sh` against a fixture with referral and alias entries
-7. `cargo +nightly fuzz run ber_decoder -- -runs=10000`
-8. `cargo +nightly fuzz run ldap_request_handler -- -runs=10000`
+7. `cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000`
+8. `cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000`
 9. `scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate`
 
 The manual GitHub workflow `Production Readiness Gate` runs the CI-friendly
