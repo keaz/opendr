@@ -308,6 +308,37 @@ fn bench_lmdb_indexed_search_hints(c: &mut Criterion) {
         });
     });
 
+    let projected_attributes = vec![
+        "uid".to_string(),
+        "cn".to_string(),
+        "sn".to_string(),
+        "mail".to_string(),
+    ];
+    group.bench_function("projected_equality_uid", |b| {
+        b.iter(|| {
+            let backend = backend.clone();
+            let hint = equality_hint.clone();
+            let requested_attributes = projected_attributes.clone();
+            rt.block_on(async move {
+                let mut report = backend
+                    .stream_projected_search_entries_with_hint_report(
+                        black_box(base_dn),
+                        black_box(scope),
+                        hint,
+                        requested_attributes,
+                    )
+                    .await
+                    .unwrap();
+                let mut entries = 0usize;
+                while let Some(entry) = report.entries.recv().await {
+                    black_box(entry.unwrap());
+                    entries += 1;
+                }
+                black_box(entries);
+            })
+        });
+    });
+
     let presence_hint = Some(SearchCandidateHint::Present {
         attribute: "mail".to_string(),
     });

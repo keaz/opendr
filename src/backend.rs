@@ -231,6 +231,126 @@ impl DirectoryEntry {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectedDirectoryEntry {
+    pub dn: String,
+    pub attributes: Vec<(String, Vec<String>)>,
+    pub referral_urls: Option<Vec<String>>,
+}
+
+impl ProjectedDirectoryEntry {
+    pub fn from_entry(entry: &DirectoryEntry, projection: &DirectoryAttributeProjection) -> Self {
+        Self {
+            dn: entry.dn.clone(),
+            attributes: projection.project_attributes(
+                &entry.dn,
+                &entry.attributes,
+                &entry.operational_attributes,
+            ),
+            referral_urls: referral_urls_from_attributes(&entry.attributes),
+        }
+    }
+
+    pub fn is_referral(&self) -> bool {
+        self.referral_urls.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DirectoryAttributeProjection {
+    requested_lower: Vec<String>,
+    include_user: bool,
+    include_all_user: bool,
+    include_all_operational: bool,
+    specific_operational: Vec<String>,
+}
+
+impl DirectoryAttributeProjection {
+    pub fn new(requested_attributes: &[String]) -> Self {
+        let (include_user, include_all_operational, specific_operational) =
+            crate::operational_attrs::parse_attribute_request(requested_attributes);
+        let requested_lower = requested_attributes
+            .iter()
+            .map(|attribute| attribute.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let include_all_user = requested_attributes.is_empty()
+            || requested_lower.iter().any(|attribute| attribute == "*");
+
+        Self {
+            requested_lower,
+            include_user,
+            include_all_user,
+            include_all_operational,
+            specific_operational,
+        }
+    }
+
+    pub fn project_entry(&self, entry: &DirectoryEntry) -> Vec<(String, Vec<String>)> {
+        self.project_attributes(&entry.dn, &entry.attributes, &entry.operational_attributes)
+    }
+
+    pub fn project_attributes(
+        &self,
+        _dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+        operational_attributes: &OperationalAttributes,
+    ) -> Vec<(String, Vec<String>)> {
+        let mut selected = Vec::with_capacity(attributes.len());
+
+        if self.include_user {
+            for (name, values) in attributes {
+                if OperationalAttributes::is_operational(name) {
+                    continue;
+                }
+                if self.include_all_user
+                    || self
+                        .requested_lower
+                        .iter()
+                        .any(|requested| requested.eq_ignore_ascii_case(name))
+                {
+                    selected.push((name.clone(), values.clone()));
+                }
+            }
+        }
+
+        if self.include_all_operational || !self.specific_operational.is_empty() {
+            for (name, values) in operational_attributes.to_attributes() {
+                if self.include_all_operational
+                    || self
+                        .specific_operational
+                        .iter()
+                        .any(|requested| requested.eq_ignore_ascii_case(&name))
+                {
+                    selected.push((name, values));
+                }
+            }
+        }
+
+        selected
+    }
+}
+
+pub fn referral_urls_from_attributes(
+    attributes: &HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    let is_referral = attributes
+        .get("objectclass")
+        .map(|values| {
+            values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case("referral"))
+        })
+        .unwrap_or(false);
+    if !is_referral {
+        return None;
+    }
+
+    attributes
+        .get("ref")
+        .filter(|values| !values.is_empty())
+        .cloned()
+}
+
 /// Errors that can be emitted by [`DirectoryBackend`] implementations.
 #[derive(Debug)]
 pub enum BackendError {
@@ -512,6 +632,35 @@ pub trait DirectoryBackend: Send + Sync {
         })
     }
 
+    async fn stream_projected_search_entries_with_hint_report(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        hint: Option<SearchCandidateHint>,
+        requested_attributes: Vec<String>,
+    ) -> Result<ProjectedSearchEntriesStreamReport, BackendError> {
+        let report = self
+            .stream_search_entries_with_hint_report(base_dn, scope, hint)
+            .await?;
+        let (sender, entries) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let projection = DirectoryAttributeProjection::new(&requested_attributes);
+            let mut source = report.entries;
+            while let Some(entry) = source.recv().await {
+                let projected =
+                    entry.map(|entry| ProjectedDirectoryEntry::from_entry(&entry, &projection));
+                if sender.send(projected).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(ProjectedSearchEntriesStreamReport {
+            entries,
+            hint_covers_filter: report.hint_covers_filter,
+        })
+    }
+
     async fn search_entries_paginated(
         &self,
         base_dn: &str,
@@ -619,6 +768,14 @@ pub type SearchEntryStreamReceiver = mpsc::Receiver<Result<DirectoryEntry, Backe
 
 pub struct SearchEntriesStreamReport {
     pub entries: SearchEntryStreamReceiver,
+    pub hint_covers_filter: bool,
+}
+
+pub type ProjectedSearchEntryStreamReceiver =
+    mpsc::Receiver<Result<ProjectedDirectoryEntry, BackendError>>;
+
+pub struct ProjectedSearchEntriesStreamReport {
+    pub entries: ProjectedSearchEntryStreamReceiver,
     pub hint_covers_filter: bool,
 }
 

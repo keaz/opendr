@@ -38,10 +38,12 @@ use sha2::{Digest, Sha512};
 use tokio::sync::RwLock;
 
 use crate::backend::{
-    AuthenticationMetadataUpdate, AuthenticationOutcome, BackendError, DirectoryBackend,
-    DirectoryEntry, Modification, NativeModifyError, OperationalAttributes, SearchCandidateHint,
-    SearchEntriesStreamReport, SearchEntriesWithHintReport, SearchSubstringPart,
-    apply_modifications_to_attributes,
+    AuthenticationMetadataUpdate, AuthenticationOutcome, BackendError,
+    DirectoryAttributeProjection, DirectoryBackend, DirectoryEntry, Modification,
+    NativeModifyError, OperationalAttributes, ProjectedDirectoryEntry,
+    ProjectedSearchEntriesStreamReport, SearchCandidateHint, SearchEntriesStreamReport,
+    SearchEntriesWithHintReport, SearchSubstringPart, apply_modifications_to_attributes,
+    referral_urls_from_attributes,
 };
 use crate::csn::{Csn, CsnGenerator};
 use crate::metrics::MetricsCollector;
@@ -3064,6 +3066,38 @@ impl LmdbBackend {
         }
     }
 
+    fn stream_projected_search_entries_plan<F>(
+        &self,
+        plan: SearchStreamPlan,
+        requested_attributes: &[String],
+        mut send_entry: F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(ProjectedDirectoryEntry) -> bool,
+    {
+        match plan {
+            SearchStreamPlan::Equality {
+                base_dn,
+                scope,
+                attribute,
+                value,
+            } => self.stream_projected_equality_index_entries(
+                &base_dn,
+                scope,
+                &attribute,
+                &value,
+                requested_attributes,
+                &mut send_entry,
+            ),
+            other => {
+                let projection = DirectoryAttributeProjection::new(requested_attributes);
+                self.stream_search_entries_plan(other, |entry| {
+                    send_entry(ProjectedDirectoryEntry::from_entry(&entry, &projection))
+                })
+            }
+        }
+    }
+
     fn stream_uncovered_entries<F>(
         &self,
         base_dn: &str,
@@ -3144,6 +3178,86 @@ impl LmdbBackend {
             Self::include_all_stored_entry,
             send_entry,
         )
+    }
+
+    fn stream_projected_equality_index_entries<F>(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        attribute: &str,
+        value: &str,
+        requested_attributes: &[String],
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(ProjectedDirectoryEntry) -> bool,
+    {
+        let txn = self
+            .env
+            .begin_ro_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let attr_lower = ldap_attribute_key(attribute);
+        let Some(plan) = self
+            .index_plan
+            .attribute_plan_normalized(attr_lower.as_ref())
+        else {
+            return self.stream_projected_entries_via_directory_entries(
+                SearchStreamPlan::Uncovered {
+                    base_dn: base_dn.to_string(),
+                    scope,
+                },
+                requested_attributes,
+                send_entry,
+            );
+        };
+        if !plan.index_types.contains(&IndexType::Equality) {
+            return self.stream_projected_entries_via_directory_entries(
+                SearchStreamPlan::Uncovered {
+                    base_dn: base_dn.to_string(),
+                    scope,
+                },
+                requested_attributes,
+                send_entry,
+            );
+        }
+        let normalized_value = plan.normalize_equality_value(value)?;
+        let Some(index_db) = self.index_db_for_attribute(attr_lower.as_ref())? else {
+            return self.stream_projected_entries_via_directory_entries(
+                SearchStreamPlan::Uncovered {
+                    base_dn: base_dn.to_string(),
+                    scope,
+                },
+                requested_attributes,
+                send_entry,
+            );
+        };
+
+        let projection = DirectoryAttributeProjection::new(requested_attributes);
+        let search_prefix = Self::equality_index_prefix(&normalized_value);
+        self.stream_projected_entries_by_index_prefix_in_txn(
+            &txn,
+            index_db,
+            search_prefix.as_bytes(),
+            base_dn,
+            scope,
+            &projection,
+            send_entry,
+        )
+    }
+
+    fn stream_projected_entries_via_directory_entries<F>(
+        &self,
+        plan: SearchStreamPlan,
+        requested_attributes: &[String],
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(ProjectedDirectoryEntry) -> bool,
+    {
+        let projection = DirectoryAttributeProjection::new(requested_attributes);
+        self.stream_search_entries_plan(plan, |entry| {
+            send_entry(ProjectedDirectoryEntry::from_entry(&entry, &projection))
+        })
     }
 
     fn stream_presence_index_entries<F>(
@@ -3377,6 +3491,143 @@ impl LmdbBackend {
 
     fn include_all_stored_entry(_: &StoredEntry) -> Result<bool, BackendError> {
         Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_projected_entries_by_index_prefix_in_txn<F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        index_db: Database,
+        prefix: &[u8],
+        base_dn: &str,
+        scope: SearchScope,
+        projection: &DirectoryAttributeProjection,
+        send_entry: &mut F,
+    ) -> Result<(), BackendError>
+    where
+        F: FnMut(ProjectedDirectoryEntry) -> bool,
+    {
+        let mut cursor = txn
+            .open_ro_cursor(index_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
+        let prefix_bytes = prefix;
+        let first_key = match cursor.get(Some(prefix), None, LMDB_SET_RANGE_OP) {
+            Ok((Some(key), _)) => key,
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(()),
+            Err(e) => {
+                return Err(BackendError::Storage(format!(
+                    "Failed to seek attribute index cursor: {}",
+                    e
+                )));
+            }
+        };
+        if !first_key.starts_with(prefix_bytes) {
+            return Ok(());
+        }
+
+        let prefix = std::str::from_utf8(prefix)
+            .map_err(|e| BackendError::Storage(format!("Invalid index prefix encoding: {}", e)))?;
+        let base_components =
+            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
+        let mut keep_streaming = self.stream_projected_index_key_entry(
+            txn,
+            first_key,
+            prefix,
+            base_dn,
+            base_components.as_deref(),
+            scope,
+            projection,
+            send_entry,
+        )?;
+
+        if keep_streaming {
+            for (key, _value) in cursor.iter() {
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                keep_streaming = self.stream_projected_index_key_entry(
+                    txn,
+                    key,
+                    prefix,
+                    base_dn,
+                    base_components.as_deref(),
+                    scope,
+                    projection,
+                    send_entry,
+                )?;
+                if !keep_streaming {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_projected_index_key_entry<F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        key: &[u8],
+        prefix: &str,
+        base_dn: &str,
+        base_components: Option<&[&str]>,
+        scope: SearchScope,
+        projection: &DirectoryAttributeProjection,
+        send_entry: &mut F,
+    ) -> Result<bool, BackendError>
+    where
+        F: FnMut(ProjectedDirectoryEntry) -> bool,
+    {
+        let key = std::str::from_utf8(key)
+            .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
+        let Some(dn) = key.strip_prefix(prefix) else {
+            return Ok(true);
+        };
+        self.stream_projected_entry_by_dn_in_txn(
+            txn,
+            dn,
+            base_dn,
+            base_components,
+            scope,
+            projection,
+            send_entry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_projected_entry_by_dn_in_txn<F>(
+        &self,
+        txn: &lmdb::RoTransaction<'_>,
+        dn: &str,
+        base_dn: &str,
+        base_components: Option<&[&str]>,
+        scope: SearchScope,
+        projection: &DirectoryAttributeProjection,
+        send_entry: &mut F,
+    ) -> Result<bool, BackendError>
+    where
+        F: FnMut(ProjectedDirectoryEntry) -> bool,
+    {
+        if !Self::entry_in_scope_with_prepared_base(dn, base_dn, base_components, scope) {
+            return Ok(true);
+        }
+        let entry_bytes = match txn.get(self.entries_db, &dn.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(lmdb::Error::NotFound) => return Ok(true),
+            Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
+        };
+        let entry = Self::deserialize_stored_entry(entry_bytes)?;
+        let projected = ProjectedDirectoryEntry {
+            dn: entry.dn.clone(),
+            attributes: projection.project_attributes(
+                &entry.dn,
+                &entry.attributes,
+                &entry.operational_attributes,
+            ),
+            referral_urls: referral_urls_from_attributes(&entry.attributes),
+        };
+        Ok(send_entry(projected))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4252,6 +4503,35 @@ impl DirectoryBackend for LmdbBackend {
         })
     }
 
+    async fn stream_projected_search_entries_with_hint_report(
+        &self,
+        base_dn: &str,
+        scope: SearchScope,
+        hint: Option<SearchCandidateHint>,
+        requested_attributes: Vec<String>,
+    ) -> Result<ProjectedSearchEntriesStreamReport, BackendError> {
+        let plan = self.search_stream_plan(base_dn, scope, hint)?;
+        let hint_covers_filter = plan.hint_covers_filter();
+        let backend = self.clone();
+        let (sender, entries) = tokio::sync::mpsc::channel(128);
+
+        tokio::task::spawn_blocking(move || {
+            let result = backend.stream_projected_search_entries_plan(
+                plan,
+                &requested_attributes,
+                |entry| sender.blocking_send(Ok(entry)).is_ok(),
+            );
+            if let Err(err) = result {
+                let _ = sender.blocking_send(Err(err));
+            }
+        });
+
+        Ok(ProjectedSearchEntriesStreamReport {
+            entries,
+            hint_covers_filter,
+        })
+    }
+
     async fn get_context_csn(&self) -> Result<Option<crate::csn::Csn>, BackendError> {
         let txn = self.env.begin_ro_txn().map_err(|e| {
             BackendError::Storage(format!("Failed to begin read transaction: {}", e))
@@ -4315,6 +4595,16 @@ mod tests {
             dns.push(entry?.dn);
         }
         Ok(dns)
+    }
+
+    async fn collect_projected_stream(
+        mut report: ProjectedSearchEntriesStreamReport,
+    ) -> Result<Vec<ProjectedDirectoryEntry>, BackendError> {
+        let mut entries = Vec::new();
+        while let Some(entry) = report.entries.recv().await {
+            entries.push(entry?);
+        }
+        Ok(entries)
     }
 
     fn schema_with_matching_rule_attrs() -> LdapSchema {
@@ -5758,6 +6048,113 @@ attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseEx
         let stream_dns = collect_stream_dns(stream_report).await.unwrap();
         assert_eq!(stream_dns, vector_dns);
         assert_eq!(stream_dns, vec!["uid=alice,dc=example,dc=org".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_projected_search_entry_stream_matches_generic_projection_for_exact_equality() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+        let requested_attributes = vec!["uid".to_string(), "mail".to_string()];
+
+        for (dn, uid, mail, object_class) in [
+            (
+                "uid=alice,dc=example,dc=org",
+                "alice",
+                "alice@example.org",
+                "inetOrgPerson",
+            ),
+            (
+                "uid=bob,dc=example,dc=org",
+                "bob",
+                "bob@example.org",
+                "inetOrgPerson",
+            ),
+            (
+                "cn=ref,dc=example,dc=org",
+                "ref",
+                "ref@example.org",
+                "referral",
+            ),
+        ] {
+            let mut attributes = HashMap::new();
+            attributes.insert("objectClass".to_string(), vec![object_class.to_string()]);
+            attributes.insert("uid".to_string(), vec![uid.to_string()]);
+            attributes.insert("cn".to_string(), vec![uid.to_string()]);
+            attributes.insert("mail".to_string(), vec![mail.to_string()]);
+            attributes.insert("description".to_string(), vec!["not requested".repeat(16)]);
+            if object_class == "referral" {
+                attributes.insert(
+                    "ref".to_string(),
+                    vec!["ldap://ldap.example.org/dc=example,dc=org".to_string()],
+                );
+            }
+            backend
+                .add_entry(DirectoryEntry::new(dn, attributes), vec![])
+                .await
+                .unwrap();
+        }
+
+        for hint in [
+            SearchCandidateHint::Equality {
+                attribute: "uid".to_string(),
+                value: "alice".to_string(),
+            },
+            SearchCandidateHint::Equality {
+                attribute: "mail".to_string(),
+                value: "bob@example.org".to_string(),
+            },
+            SearchCandidateHint::Equality {
+                attribute: "objectClass".to_string(),
+                value: "inetOrgPerson".to_string(),
+            },
+        ] {
+            let vector_report = backend
+                .search_entries_with_hint_report(
+                    "dc=example,dc=org",
+                    SearchScope(2),
+                    Some(hint.clone()),
+                )
+                .await
+                .unwrap();
+            let projection = DirectoryAttributeProjection::new(&requested_attributes);
+            let expected = vector_report
+                .entries
+                .iter()
+                .map(|entry| {
+                    let projected = ProjectedDirectoryEntry::from_entry(entry, &projection);
+                    (
+                        projected.dn,
+                        projected.attributes.into_iter().collect::<BTreeMap<_, _>>(),
+                        projected.referral_urls,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let projected_report = backend
+                .stream_projected_search_entries_with_hint_report(
+                    "dc=example,dc=org",
+                    SearchScope(2),
+                    Some(hint),
+                    requested_attributes.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(projected_report.hint_covers_filter);
+            let actual = collect_projected_stream(projected_report)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.dn,
+                        entry.attributes.into_iter().collect::<BTreeMap<_, _>>(),
+                        entry.referral_urls,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(actual, expected);
+        }
     }
 
     #[tokio::test]
