@@ -38,7 +38,6 @@ use crate::extended_ops::{
     encode_password_modify_response_value, oids, parse_cancel_request_value,
     parse_password_modify_request_value,
 };
-use crate::fsm::{BerDecoderEvent, BerDecoderFsm, StateMachine};
 use crate::ldap_controls::{ControlRegistry, ControlValidationError, LdapControl, RequestControls};
 use crate::ldap_filter_eval::{
     FilterSchemaError, PreparedLdapFilter, compare_attribute_with_schema,
@@ -1174,32 +1173,32 @@ async fn handle_client_with_metrics_and_tls(
                     accounted_read_bytes = true;
                 }
 
-                let decoded_messages =
-                    match decode_messages(&mut decoder, read_buffer[..n].to_vec()).await {
-                        Ok(messages) => messages,
-                        Err(err) => {
-                            if let Some(controls) = controls.as_ref()
-                                && accounted_read_bytes
-                            {
-                                controls
-                                    .pool
-                                    .update_memory_usage(controls.conn_id, -(n as isize))
-                                    .await;
-                            }
-                            error!("Failed to decode BER message: {}", err);
-                            if let Err(write_err) = send_bind_response(
-                                &mut socket,
-                                0,
-                                ResultCode::ProtocolError,
-                                "invalid message",
-                            )
-                            .await
-                            {
-                                error!("Failed to write error response: {}", write_err);
-                            }
-                            return;
+                let decoded_messages = match decode_messages(&mut decoder, &read_buffer[..n]).await
+                {
+                    Ok(messages) => messages,
+                    Err(err) => {
+                        if let Some(controls) = controls.as_ref()
+                            && accounted_read_bytes
+                        {
+                            controls
+                                .pool
+                                .update_memory_usage(controls.conn_id, -(n as isize))
+                                .await;
                         }
-                    };
+                        error!("Failed to decode BER message: {}", err);
+                        if let Err(write_err) = send_bind_response(
+                            &mut socket,
+                            0,
+                            ResultCode::ProtocolError,
+                            "invalid message",
+                        )
+                        .await
+                        {
+                            error!("Failed to write error response: {}", write_err);
+                        }
+                        return;
+                    }
+                };
 
                 if let Some(controls) = controls.as_ref()
                     && accounted_read_bytes
@@ -1510,34 +1509,9 @@ async fn send_rejection_response(
 
 async fn decode_messages(
     decoder: &mut BerDecoderFsmImpl,
-    input: Vec<u8>,
+    input: &[u8],
 ) -> Result<Vec<Vec<u8>>, crate::ber_decoder_fsm::BerDecoderError> {
-    let mut messages = Vec::new();
-    let mut pending_input = Some(input);
-
-    loop {
-        let mut made_progress = false;
-        let next_input = pending_input.take().unwrap_or_default();
-
-        if let Some(message) = decoder
-            .handle_event(BerDecoderEvent::DataReceived(next_input))
-            .await?
-        {
-            messages.push(message);
-            made_progress = true;
-        }
-
-        while let Some(message) = decoder.extract_message() {
-            messages.push(message);
-            made_progress = true;
-        }
-
-        if !made_progress {
-            break;
-        }
-    }
-
-    Ok(messages)
+    decoder.decode_available_messages(input).await
 }
 
 fn parse_abandon_message_fallback(
@@ -5539,8 +5513,7 @@ async fn receive_stream_control_event(
         return Ok(StreamControlEvent::ClientClosed);
     }
 
-    let decoded_messages = match decode_messages(decoder, read_buffer[..bytes_read].to_vec()).await
-    {
+    let decoded_messages = match decode_messages(decoder, &read_buffer[..bytes_read]).await {
         Ok(messages) => messages,
         Err(err) => {
             error!("Failed to decode stream control message: {}", err);

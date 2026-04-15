@@ -261,7 +261,31 @@ impl BerDecoderFsmImpl {
     /// This is the core method that handles incremental data processing.
     /// It parses BER tags, lengths, and accumulates value bytes based on
     /// the current FSM state.
+    pub async fn decode_available_messages(
+        &mut self,
+        data: &[u8],
+    ) -> Result<Vec<Vec<u8>>, BerDecoderError> {
+        let mut messages = Vec::new();
+
+        if let Some(message) = self.process_data_slice(data).await? {
+            messages.push(message);
+        }
+
+        while let Some(message) = self.process_data_slice(&[]).await? {
+            messages.push(message);
+        }
+
+        Ok(messages)
+    }
+
     async fn process_data(&mut self, data: Vec<u8>) -> Result<Option<Vec<u8>>, BerDecoderError> {
+        self.process_data_slice(&data).await
+    }
+
+    async fn process_data_slice(
+        &mut self,
+        data: &[u8],
+    ) -> Result<Option<Vec<u8>>, BerDecoderError> {
         // Update statistics
         self.bytes_processed += data.len() as u64;
 
@@ -276,7 +300,7 @@ impl BerDecoderFsmImpl {
         }
 
         // Append data to buffer
-        self.buffer.extend_from_slice(&data);
+        self.buffer.extend_from_slice(data);
 
         // Process based on current state
         loop {
@@ -1103,6 +1127,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second_result, Some(second_frame));
+        assert_eq!(fsm.current_state(), &BerDecoderState::WaitingTag);
+    }
+
+    #[tokio::test]
+    async fn decode_available_messages_drains_coalesced_frames_from_slice() {
+        let mut fsm = BerDecoderFsmImpl::new();
+        let first_frame = vec![0x04, 0x03, b'o', b'n', b'e'];
+        let second_frame = vec![0x04, 0x03, b't', b'w', b'o'];
+        let mut combined = first_frame.clone();
+        combined.extend_from_slice(&second_frame);
+
+        let messages = fsm.decode_available_messages(&combined).await.unwrap();
+
+        assert_eq!(messages, vec![first_frame, second_frame]);
+        assert_eq!(fsm.stats().bytes_processed, combined.len() as u64);
+        assert_eq!(fsm.current_state(), &BerDecoderState::WaitingTag);
+    }
+
+    #[tokio::test]
+    async fn decode_available_messages_preserves_fragmented_frame_state() {
+        let mut fsm = BerDecoderFsmImpl::new();
+        let payload = patterned_payload(300);
+        let frame = build_frame(0x30, &[0x82, 0x01, 0x2C], &payload);
+
+        let messages = fsm.decode_available_messages(&frame[..3]).await.unwrap();
+        assert!(messages.is_empty());
+        assert!(matches!(
+            fsm.current_state(),
+            BerDecoderState::WaitingLength | BerDecoderState::WaitingValue { .. }
+        ));
+
+        let messages = fsm.decode_available_messages(&frame[3..]).await.unwrap();
+
+        assert_eq!(messages, vec![frame]);
         assert_eq!(fsm.current_state(), &BerDecoderState::WaitingTag);
     }
 

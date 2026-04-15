@@ -42,8 +42,8 @@ use crate::extended_ops::{
     parse_password_modify_request_value,
 };
 use crate::fsm::{
-    BerDecoderEvent, CompareEvent, CompareFsm, ConnectionEvent, ConnectionFsm, SearchEvent,
-    StateMachine, WriteEvent, WriteOperation,
+    CompareEvent, CompareFsm, ConnectionEvent, ConnectionFsm, SearchEvent, StateMachine,
+    WriteEvent, WriteOperation,
 };
 use crate::fsm_request::{FsmRequestContext, FsmRequestRejection, FsmResponseKind};
 use crate::fsm_runtime::{AuthenticationFsm, ConnectionFsmSet};
@@ -696,15 +696,14 @@ async fn handle_connection_with_transport(
                     );
                 }
 
-                let decoded_messages =
-                    match decode_ready_messages(&mut fsm_set, data.to_vec()).await {
-                        Ok(messages) => messages,
-                        Err(err) => {
-                            pool.update_memory_usage(conn_id, -(data.len() as isize))
-                                .await;
-                            return Err(std::io::Error::other(err).into());
-                        }
-                    };
+                let decoded_messages = match decode_ready_messages(&mut fsm_set, data).await {
+                    Ok(messages) => messages,
+                    Err(err) => {
+                        pool.update_memory_usage(conn_id, -(data.len() as isize))
+                            .await;
+                        return Err(std::io::Error::other(err).into());
+                    }
+                };
 
                 pool.update_memory_usage(conn_id, -(data.len() as isize))
                     .await;
@@ -763,19 +762,13 @@ async fn handle_connection_with_transport(
 
 async fn decode_ready_messages(
     fsm_set: &mut ConnectionFsmSet,
-    initial_data: Vec<u8>,
+    initial_data: &[u8],
 ) -> Result<Vec<Vec<u8>>, String> {
-    let mut messages = Vec::new();
-    let mut next_chunk = Some(initial_data);
-
-    loop {
-        let decoder_event = BerDecoderEvent::DataReceived(next_chunk.take().unwrap_or_default());
-        match fsm_set.decoder_mut().handle_event(decoder_event).await {
-            Ok(Some(message)) => messages.push(message),
-            Ok(None) => return Ok(messages),
-            Err(err) => return Err(err.to_string()),
-        }
-    }
+    fsm_set
+        .decoder_mut()
+        .decode_available_messages(initial_data)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
