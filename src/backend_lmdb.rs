@@ -47,6 +47,7 @@ use crate::backend::{
 };
 use crate::csn::{Csn, CsnGenerator};
 use crate::metrics::MetricsCollector;
+use crate::perf_profile::PerfPhase;
 use crate::schema::{LdapSchema, ResolvedMatchingRule};
 
 const LMDB_SET_RANGE_OP: u32 = 17;
@@ -1965,37 +1966,48 @@ impl LmdbBackend {
 
     /// Get entry by DN with read transaction (optimized for concurrency)
     fn get_entry_internal(&self, dn: &str) -> Result<Option<Arc<StoredEntry>>, BackendError> {
+        let _profile_total = PerfPhase::start("lmdb_get_entry", "total", None);
         let normalized_dn = Self::normalize_dn(dn);
         if let Some(entry) = self.entry_cache.get(&normalized_dn) {
             return Ok(Some(entry));
         }
 
-        let txn = self
-            .env
-            .begin_ro_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let txn = {
+            let _profile_phase = PerfPhase::start("lmdb_get_entry", "read_txn", None);
+            self.env
+                .begin_ro_txn()
+                .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?
+        };
 
         // Check DN index for actual DN
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Ok(None),
-            Err(e) => {
-                return Err(BackendError::Storage(format!(
-                    "DN index lookup failed: {}",
-                    e
-                )));
+        let actual_dn = {
+            let _profile_phase = PerfPhase::start("lmdb_get_entry", "dn_index_lookup", None);
+            match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                Err(lmdb::Error::NotFound) => return Ok(None),
+                Err(e) => {
+                    return Err(BackendError::Storage(format!(
+                        "DN index lookup failed: {}",
+                        e
+                    )));
+                }
             }
         };
 
         // Get entry data
-        match txn.get(self.entries_db, &actual_dn.as_bytes()) {
-            Ok(bytes) => {
-                let entry = Arc::new(Self::deserialize_stored_entry(bytes)?);
-                self.entry_cache.insert(&normalized_dn, Arc::clone(&entry));
-                Ok(Some(entry))
+        let entry_bytes = {
+            let _profile_phase = PerfPhase::start("lmdb_get_entry", "entry_load", None);
+            match txn.get(self.entries_db, &actual_dn.as_bytes()) {
+                Ok(bytes) => bytes,
+                Err(lmdb::Error::NotFound) => return Ok(None),
+                Err(e) => return Err(BackendError::Storage(format!("Entry lookup failed: {}", e))),
             }
-            Err(lmdb::Error::NotFound) => Ok(None),
-            Err(e) => Err(BackendError::Storage(format!("Entry lookup failed: {}", e))),
+        };
+        {
+            let _profile_phase = PerfPhase::start("lmdb_get_entry", "deserialize", None);
+            let entry = Arc::new(Self::deserialize_stored_entry(entry_bytes)?);
+            self.entry_cache.insert(&normalized_dn, Arc::clone(&entry));
+            Ok(Some(entry))
         }
     }
 
@@ -4215,56 +4227,72 @@ impl LmdbBackend {
 #[async_trait]
 impl DirectoryBackend for LmdbBackend {
     async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError> {
+        let _profile_total = PerfPhase::start("lmdb_authenticate", "total", None);
         let normalized_dn = Self::normalize_dn(dn);
 
         if let Some(record) = self.auth_cache.get(&normalized_dn) {
-            let result = Self::verify_ssha512_record(password, &record);
+            let result = {
+                let _profile_phase = PerfPhase::start("lmdb_authenticate", "verify_hash", None);
+                Self::verify_ssha512_record(password, &record)
+            };
             self.record_auth_cache_metrics();
             return Ok(result);
         }
 
-        let txn = self
-            .env
-            .begin_ro_txn()
-            .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
+        let txn = {
+            let _profile_phase = PerfPhase::start("lmdb_authenticate", "read_txn", None);
+            self.env
+                .begin_ro_txn()
+                .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?
+        };
 
         log::debug!("Authentication cache miss - DN: {dn}, Normalized: {normalized_dn}");
 
         // Get actual DN from index
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => {
-                log::debug!("DN not found in index: {}", normalized_dn);
-                self.record_auth_cache_metrics();
-                return Ok(false);
+        let actual_dn = {
+            let _profile_phase = PerfPhase::start("lmdb_authenticate", "dn_index_lookup", None);
+            match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                Err(lmdb::Error::NotFound) => {
+                    log::debug!("DN not found in index: {}", normalized_dn);
+                    self.record_auth_cache_metrics();
+                    return Ok(false);
+                }
+                Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
             }
-            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
         };
 
         // Get password hash
-        match txn.get(self.passwords_db, &actual_dn.as_bytes()) {
-            Ok(stored_password_bytes) => {
-                let stored_password_str = String::from_utf8_lossy(stored_password_bytes);
-                let Some(record) = Self::decode_ssha512_hash(&stored_password_str) else {
-                    log::debug!("Unsupported password hash format for DN: {}", actual_dn);
+        let stored_password_bytes = {
+            let _profile_phase = PerfPhase::start("lmdb_authenticate", "password_lookup", None);
+            match txn.get(self.passwords_db, &actual_dn.as_bytes()) {
+                Ok(stored_password_bytes) => stored_password_bytes,
+                Err(lmdb::Error::NotFound) => {
+                    log::debug!("Password not found for DN: {}", actual_dn);
                     self.record_auth_cache_metrics();
                     return Ok(false);
-                };
-                let record = Arc::new(record);
-                self.auth_cache.insert(&normalized_dn, Arc::clone(&record));
-                let result = Self::verify_ssha512_record(password, &record);
-                self.record_auth_cache_metrics();
-                Ok(result)
+                }
+                Err(e) => {
+                    return Err(BackendError::Storage(format!(
+                        "Password lookup failed: {}",
+                        e
+                    )));
+                }
             }
-            Err(lmdb::Error::NotFound) => {
-                log::debug!("Password not found for DN: {}", actual_dn);
+        };
+        {
+            let _profile_phase = PerfPhase::start("lmdb_authenticate", "verify_hash", None);
+            let stored_password_str = String::from_utf8_lossy(stored_password_bytes);
+            let Some(record) = Self::decode_ssha512_hash(&stored_password_str) else {
+                log::debug!("Unsupported password hash format for DN: {}", actual_dn);
                 self.record_auth_cache_metrics();
-                Ok(false)
-            }
-            Err(e) => Err(BackendError::Storage(format!(
-                "Password lookup failed: {}",
-                e
-            ))),
+                return Ok(false);
+            };
+            let record = Arc::new(record);
+            self.auth_cache.insert(&normalized_dn, Arc::clone(&record));
+            let result = Self::verify_ssha512_record(password, &record);
+            self.record_auth_cache_metrics();
+            Ok(result)
         }
     }
 

@@ -59,6 +59,7 @@ use crate::parser::{
     encode_result_response_with_referrals, encode_search_entry_parts_with_controls,
     encode_search_reference_with_controls,
 };
+use crate::perf_profile::PerfPhase;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::referral::LdapReferralResolver;
 use crate::referral_fsm::ReferralResolver;
@@ -1187,6 +1188,7 @@ async fn handle_search_request_with_fsm_runtime(
     runtime_context: &FsmServerRuntimeContext,
     legacy_operation_registry: &mut ConnectionOperationRegistry,
 ) -> Result<(), String> {
+    let _profile_total = PerfPhase::start("search", "total", Some(request.message_id as u32));
     if try_handle_virtual_search_request_with_fsm_runtime(
         fsm_set,
         request,
@@ -3907,6 +3909,7 @@ async fn handle_modify_request_with_fsm_runtime(
     request_context: &RequestContext,
     _runtime_context: &FsmServerRuntimeContext,
 ) -> Result<(), String> {
+    let _profile_total = PerfPhase::start("modify", "total", Some(request.message_id as u32));
     let session = legacy_session_from_fsm(fsm_set);
     let backend = fsm_set.backend().clone();
     let dn = modify_req.object.0.as_ref().trim().to_owned();
@@ -4011,15 +4014,19 @@ async fn handle_modify_request_with_fsm_runtime(
         }
     }
 
-    if let Err(err) = backend
-        .modify_entry_validated_with_actor(
-            &dn,
-            modifications,
-            session.bound_dn().map(str::to_string),
-            schema,
-        )
-        .await
-    {
+    let modify_result = {
+        let _profile_phase =
+            PerfPhase::start("modify", "backend_write", Some(request.message_id as u32));
+        backend
+            .modify_entry_validated_with_actor(
+                &dn,
+                modifications,
+                session.bound_dn().map(str::to_string),
+                schema,
+            )
+            .await
+    };
+    if let Err(err) = modify_result {
         match err {
             NativeModifyError::Schema(diagnostic) => {
                 error!("Schema validation failed for modify {}: {}", dn, diagnostic);
@@ -5247,6 +5254,7 @@ async fn handle_bind_with_fsm(
     use crate::fsm::{AuthEvent, StateMachine};
     use ldap_parser::ldap::AuthenticationChoice;
 
+    let _profile_total = PerfPhase::start("bind", "total", Some(message_id as u32));
     if bind_req.version != 3 {
         send_bind_result(
             fsm_set,
@@ -5271,7 +5279,12 @@ async fn handle_bind_with_fsm(
 
             match fsm_set.auth_mut() {
                 AuthenticationFsm::Simple(auth_fsm) => {
-                    match auth_fsm.handle_event(auth_event).await {
+                    let auth_result = {
+                        let _profile_phase =
+                            PerfPhase::start("bind", "auth", Some(message_id as u32));
+                        auth_fsm.handle_event(auth_event).await
+                    };
+                    match auth_result {
                         Ok(_) => {
                             if is_anonymous_bind {
                                 if let Some(metrics) = metrics {

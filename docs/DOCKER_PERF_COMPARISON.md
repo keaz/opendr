@@ -57,6 +57,8 @@ RUSTFLAGS="-C target-cpu=native" cargo build --profile perf \
   --bin ldap_perf_client \
   --bin opendr_perf_fixture_loader
 
+OPENDR_PERF_PROFILE_PHASES=1 \
+RUST_LOG=opendr::perf_profile=info \
 target/perf/opendr --config config/server.toml --log-config config/log4rs.yml
 
 target/perf/ldap_perf_client \
@@ -70,6 +72,13 @@ target/perf/ldap_perf_client \
   --concurrent-bind-clients 8,32,128 \
   --json-out target/perf/local-regression.json
 ```
+
+`OPENDR_PERF_PROFILE_PHASES=1` enables low-overhead phase timing logs on the
+server. The flag is disabled by default; when enabled, the server writes
+`opendr::perf_profile` log rows such as `operation=bind phase=auth`,
+`operation=search phase=total`, `operation=modify phase=backend_write`,
+`operation=lmdb_get_entry phase=deserialize`, and
+`operation=lmdb_authenticate phase=password_lookup`.
 
 Run the full 10M profile manually only when validating a completed perf issue or
 release candidate. The expected resource envelope is 8 CPU cores, 30 GiB memory,

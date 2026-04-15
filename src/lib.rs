@@ -33,6 +33,7 @@ pub mod metrics;
 pub mod monitoring_runtime;
 pub mod operational_attrs;
 pub mod parser;
+mod perf_profile;
 pub mod persistent_connection;
 pub mod provider_push_integration;
 pub mod push_manager;
