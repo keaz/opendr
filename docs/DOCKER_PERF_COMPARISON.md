@@ -13,8 +13,31 @@ This document records the current Dockerized OpenDR and OpenDJ benchmark baselin
 - Cache hit/miss metrics were not captured for these artifacts because the Docker perf harness disables the monitoring endpoint and samples container CPU/memory only.
 - The 1M-user OpenDR run used a `16 GiB` LMDB map. The default `1 GiB` Docker map filled around 300k users.
 - The 1M-user concurrency artifact covers simple-bind and SASL PLAIN auth concurrency. It does not include index-concurrency probes because the preserved 1M fixture was loaded without benchmark ordering attributes.
-- A completed OpenDR-only 10M-user LDAPCon-style artifact is recorded below. The original synchronous-auth-metadata run is the historical 10M baseline; the async-auth-metadata run is the current targeted result for issue #131.
+- Completed OpenDR-only 10M-user LDAPCon-style artifacts are recorded below. The latest OpenLDAP-shaped run is the current public comparison snapshot; the original synchronous-auth-metadata run remains the historical 10M baseline.
 - There is still no completed 10M-user OpenDR-vs-OpenDJ benchmark artifact in this repository.
+
+## Latest 10M Result Snapshot
+
+The latest completed 10M OpenDR run is the OpenLDAP-shaped LDAPCon-style run at:
+
+`target/perf/opendr-ldapcon-openldap-10m-12cpu-30g-20260415-150810/`
+
+This run used a clean 10M fixture, `12` CPU cores, `30g` memory, `12`
+OpenDR worker threads, `12` fixture preload workers, `cache_size = 10000000`,
+and the optimized `perf` build profile with `-C target-cpu=native`. It used
+the public LDAPCon 2013 OpenLDAP LMDB load-generator shape where published:
+search `96` effective clients, auth `84`, modify `8`, and mixed `96`.
+
+| Operation | OpenDR success ops/s | OpenLDAP LMDB 2013 ops/s | Difference | Failures |
+|---|---:|---:|---:|---:|
+| Search | 39,281.55 | 31,674.02 | +24.0% | 0 |
+| Auth | 41,680.21 | 16,941.98 | +146.0% | 0 |
+| Modify | 1,852.72 | 5,760.04 | -67.8% | 0 |
+| Mixed search | 4,332.81 | 25,399.99 | -82.9% | 0 |
+| Mixed modify | 1,083.20 | 1,652.35 | -34.4% | 0 |
+
+Search and auth are now above the public single-server OpenLDAP LMDB rows.
+Modify and mixed workloads remain the active throughput gaps.
 
 ## Profiling And Regression Workflow
 
