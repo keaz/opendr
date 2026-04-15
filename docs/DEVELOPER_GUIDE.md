@@ -469,6 +469,9 @@ Operational notes:
   consumer service.
 - Stale cookies require a full refresh. Delete the consumer cookie to force one
   or increase `changelog_capacity`.
+- The production support contract, health fields, backup/restore behavior, and
+  rolling-upgrade guidance are defined in
+  [`REPLICATION_PRODUCTION_GUARANTEES.md`](REPLICATION_PRODUCTION_GUARANTEES.md).
 - `both` mode starts provider and consumer roles in the same process. General
   multi-master conflict resolution is not implemented; deploy an external
   conflict strategy if more than one node accepts writes.

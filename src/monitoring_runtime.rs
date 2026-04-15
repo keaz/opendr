@@ -950,6 +950,14 @@ const MANAGEMENT_CONSOLE_HTML: &str = r##"<!doctype html>
         <div>Consumer: ${replication.consumer.enabled ? (replication.consumer.listening ? "listening" : (replication.consumer.running ? "running" : "stopped")) : "disabled"}</div>
         <div>Provider URL: <code>${replication.consumer.provider_url || "none"}</code></div>
         <div>Cookie persisted: ${replication.consumer.persisted_cookie === undefined ? "n/a" : replication.consumer.persisted_cookie}</div>
+        <div>Last applied CSN: <code>${replication.consumer.last_applied_csn || "none"}</code></div>
+        <div>Sync lag: ${replication.consumer.seconds_since_last_successful_sync === undefined ? "n/a" : seconds(replication.consumer.seconds_since_last_successful_sync)}</div>
+        <div>Failed sessions: ${replication.consumer.failed_sessions}</div>
+        <div>Replay gaps: ${replication.consumer.replay_gap_errors}</div>
+        <div>Full refresh required: ${replication.consumer.full_refresh_required}</div>
+        <div>Latest provider CSN: <code>${replication.provider.latest_context_csn || "none"}</code></div>
+        <div>Provider changelog entries: ${replication.provider.retained_changelog_entries === undefined ? "n/a" : replication.provider.retained_changelog_entries}</div>
+        <div>Last replication error: ${replication.consumer.last_error || replication.provider.last_error || "none"}</div>
       ` : "No status";
     }
 

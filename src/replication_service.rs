@@ -41,7 +41,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -156,6 +156,11 @@ pub struct ProviderReplicationStatus {
     pub heartbeat_interval_secs: Option<u64>,
     pub max_concurrent_consumers: Option<usize>,
     pub consumer_timeout_secs: Option<u64>,
+    pub retained_changelog_entries: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_retained_csn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_context_csn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -175,12 +180,27 @@ pub struct ConsumerReplicationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persisted_cookie: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_applied_cookie: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_applied_csn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_successful_sync_unix_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds_since_last_successful_sync: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync_entries: Option<usize>,
+    pub failed_sessions: u64,
+    pub full_refreshes: u64,
+    pub full_refresh_required: u64,
+    pub replay_gap_errors: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
 pub struct ReplicationStatusRegistry {
     snapshot: StdRwLock<ReplicationStatusSnapshot>,
     provider_lifecycle: StdRwLock<Option<Arc<ReplicationProviderLifecycle>>>,
+    provider_changelog: StdRwLock<Option<Arc<ChangelogTracker>>>,
     consumer_cookie_path: StdRwLock<Option<PathBuf>>,
 }
 
@@ -212,6 +232,9 @@ impl ReplicationStatusRegistry {
                     max_concurrent_consumers: provider
                         .map(|settings| settings.max_concurrent_consumers),
                     consumer_timeout_secs: provider.map(|settings| settings.consumer_timeout_secs),
+                    retained_changelog_entries: provider.map(|_| 0),
+                    oldest_retained_csn: None,
+                    latest_context_csn: None,
                     last_error: None,
                 },
                 consumer: ConsumerReplicationStatus {
@@ -226,10 +249,20 @@ impl ReplicationStatusRegistry {
                         .map(|settings| settings.heartbeat_interval_secs),
                     change_buffer_size: consumer.map(|settings| settings.change_buffer_size),
                     persisted_cookie: consumer.map(|_| false),
+                    last_applied_cookie: None,
+                    last_applied_csn: None,
+                    last_successful_sync_unix_secs: None,
+                    seconds_since_last_successful_sync: None,
+                    last_sync_entries: None,
+                    failed_sessions: 0,
+                    full_refreshes: 0,
+                    full_refresh_required: 0,
+                    replay_gap_errors: 0,
                     last_error: None,
                 },
             }),
             provider_lifecycle: StdRwLock::new(None),
+            provider_changelog: StdRwLock::new(None),
             consumer_cookie_path: StdRwLock::new(consumer.map(|settings| {
                 PathBuf::from(&settings.state_storage_path).join("replication_cookie.txt")
             })),
@@ -250,6 +283,14 @@ impl ReplicationStatusRegistry {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *provider_lifecycle = lifecycle;
+    }
+
+    fn set_provider_changelog(&self, changelog: Option<Arc<ChangelogTracker>>) {
+        let mut provider_changelog = self
+            .provider_changelog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *provider_changelog = changelog;
     }
 
     fn set_provider_running(&self, running: bool) {
@@ -286,21 +327,46 @@ impl ReplicationStatusRegistry {
         });
     }
 
-    fn set_consumer_listening(&self, listening: bool) {
+    fn set_consumer_error(&self, error: impl Into<String>) {
+        let error = error.into();
         self.update(|snapshot| {
-            snapshot.consumer.listening = listening;
-            if listening {
-                snapshot.consumer.running = true;
-                snapshot.consumer.last_error = None;
+            snapshot.consumer.listening = false;
+            snapshot.consumer.failed_sessions += 1;
+            if Self::requires_full_refresh(&error) {
+                snapshot.consumer.full_refresh_required += 1;
+                snapshot.consumer.replay_gap_errors += 1;
+            }
+            snapshot.consumer.last_error = Some(error);
+        });
+    }
+
+    fn record_consumer_success(
+        &self,
+        cookie: Option<&str>,
+        entries_processed: usize,
+        full_refresh: bool,
+    ) {
+        let now = current_unix_secs();
+        self.update(|snapshot| {
+            snapshot.consumer.running = true;
+            snapshot.consumer.listening = true;
+            snapshot.consumer.last_successful_sync_unix_secs = Some(now);
+            snapshot.consumer.seconds_since_last_successful_sync = Some(0);
+            snapshot.consumer.last_sync_entries = Some(entries_processed);
+            snapshot.consumer.last_applied_cookie = cookie.map(str::to_string);
+            snapshot.consumer.last_applied_csn = cookie.and_then(cookie_to_csn);
+            snapshot.consumer.last_error = None;
+            if full_refresh {
+                snapshot.consumer.full_refreshes += 1;
             }
         });
     }
 
-    fn set_consumer_error(&self, error: impl Into<String>) {
-        self.update(|snapshot| {
-            snapshot.consumer.listening = false;
-            snapshot.consumer.last_error = Some(error.into());
-        });
+    fn requires_full_refresh(error: &str) -> bool {
+        error.contains("FullRefreshRequired")
+            || error.contains("Stale replication cookie")
+            || error.contains("requires a full refresh")
+            || error.contains("full refresh required")
     }
 
     pub fn snapshot(&self) -> ReplicationStatusSnapshot {
@@ -320,6 +386,19 @@ impl ReplicationStatusRegistry {
             snapshot.provider.draining = lifecycle.is_draining();
         }
 
+        if let Some(changelog) = self
+            .provider_changelog
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            snapshot.provider.retained_changelog_entries = Some(changelog.count_all());
+            snapshot.provider.oldest_retained_csn =
+                changelog.get_oldest_csn().map(|csn| csn.to_string());
+            snapshot.provider.latest_context_csn =
+                changelog.get_context_csn().map(|csn| csn.to_string());
+        }
+
         if let Some(cookie_path) = self
             .consumer_cookie_path
             .read()
@@ -329,8 +408,27 @@ impl ReplicationStatusRegistry {
             snapshot.consumer.persisted_cookie = Some(cookie_path.exists());
         }
 
+        if let Some(last_sync) = snapshot.consumer.last_successful_sync_unix_secs {
+            snapshot.consumer.seconds_since_last_successful_sync =
+                Some(current_unix_secs().saturating_sub(last_sync));
+        }
+
         snapshot
     }
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cookie_to_csn(cookie: &str) -> Option<String> {
+    cookie
+        .strip_prefix("csn-")
+        .filter(|csn| !csn.is_empty() && *csn != "empty")
+        .map(str::to_string)
 }
 
 impl fmt::Debug for ConsumerServiceConfig {
@@ -412,6 +510,7 @@ impl ReplicationService {
         } else {
             None
         };
+        status.set_provider_changelog(changelog.clone());
 
         // Wrap backend with changelog tracking if provider mode
         let wrapped_backend = if should_track_changelog {
@@ -732,7 +831,7 @@ impl ReplicationService {
         let handle = tokio::spawn(async move {
             info!("Replication consumer service started");
 
-            use crate::fsm::{ReplicationConsumerEvent, StateMachine};
+            use crate::fsm::{ReplicationConsumerEvent, ReplicationConsumerFsm, StateMachine};
 
             loop {
                 if let Err(e) = consumer_fsm.reset().await {
@@ -751,15 +850,21 @@ impl ReplicationService {
                     continue;
                 }
 
+                let started_without_cookie =
+                    !status.snapshot().consumer.persisted_cookie.unwrap_or(false);
                 let event = ReplicationConsumerEvent::StartConsumption {
                     provider_url: provider_url.clone(),
                     cookie: None,
                 };
 
                 match consumer_fsm.handle_event(event).await {
-                    Ok(_) if consumer_fsm.is_listening_state() => {
+                    Ok(entries_processed) if consumer_fsm.is_listening_state() => {
                         info!("Replication consumer entered listening mode");
-                        status.set_consumer_listening(true);
+                        status.record_consumer_success(
+                            consumer_fsm.current_cookie(),
+                            entries_processed.unwrap_or(0),
+                            started_without_cookie,
+                        );
                     }
                     Ok(_) => {
                         error!("Replication consumer completed without entering listening mode");
@@ -807,11 +912,20 @@ impl ReplicationService {
                         change = consumer_fsm.next_live_change() => {
                             match change {
                                 Ok(Some(change)) => {
-                                    if let Err(e) = consumer_fsm.handle_event(ReplicationConsumerEvent::ChangeReceived(change)).await {
-                                        error!("Failed to process live replication change: {:?}", e);
-                                        status.set_consumer_error(format!("live replication change failed: {e:?}"));
-                                        let _ = consumer_fsm.stop_live_listening().await;
-                                        break;
+                                    match consumer_fsm.handle_event(ReplicationConsumerEvent::ChangeReceived(change)).await {
+                                        Ok(entries_processed) => {
+                                            status.record_consumer_success(
+                                                consumer_fsm.current_cookie(),
+                                                entries_processed.unwrap_or(0),
+                                                false,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to process live replication change: {:?}", e);
+                                            status.set_consumer_error(format!("live replication change failed: {e:?}"));
+                                            let _ = consumer_fsm.stop_live_listening().await;
+                                            break;
+                                        }
                                     }
                                 }
                                 Ok(None) => {
@@ -1031,6 +1145,60 @@ mod tests {
 
         drop(guard);
         assert_eq!(service.status().snapshot().provider.active_sessions, 0);
+    }
+
+    #[test]
+    fn test_replication_status_snapshot_tracks_consumer_health() {
+        let state_dir = tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.replication.enabled = true;
+        config.replication.mode = "consumer".to_string();
+        config.replication.provider_url = Some("ldap://provider.example.org:1389".to_string());
+        config.replication.state_storage_path = state_dir.path().to_path_buf();
+        let backend = Arc::new(MockBackend::new());
+
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        service.status().record_consumer_success(
+            Some("csn-20251007123456789012#001#000001#000000"),
+            3,
+            true,
+        );
+
+        let snapshot = service.status().snapshot();
+        assert!(snapshot.consumer.enabled);
+        assert!(snapshot.consumer.running);
+        assert!(snapshot.consumer.listening);
+        assert_eq!(
+            snapshot.consumer.last_applied_csn.as_deref(),
+            Some("20251007123456789012#001#000001#000000")
+        );
+        assert_eq!(snapshot.consumer.last_sync_entries, Some(3));
+        assert_eq!(snapshot.consumer.full_refreshes, 1);
+        assert_eq!(snapshot.consumer.failed_sessions, 0);
+        assert!(
+            snapshot
+                .consumer
+                .seconds_since_last_successful_sync
+                .unwrap()
+                <= 1
+        );
+
+        service
+            .status()
+            .set_consumer_error("Stale replication cookie: csn-old");
+        let snapshot = service.status().snapshot();
+        assert!(!snapshot.consumer.listening);
+        assert_eq!(snapshot.consumer.failed_sessions, 1);
+        assert_eq!(snapshot.consumer.full_refresh_required, 1);
+        assert_eq!(snapshot.consumer.replay_gap_errors, 1);
+        assert!(
+            snapshot
+                .consumer
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("Stale replication cookie")
+        );
     }
 
     #[test]

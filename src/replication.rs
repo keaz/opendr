@@ -824,6 +824,43 @@ impl ChangelogProviderImpl {
     pub fn new(tracker: ChangelogTracker, backend: Arc<dyn DirectoryBackend>) -> Self {
         Self { tracker, backend }
     }
+
+    async fn classify_cookie(&self, cookie: &str) -> Result<ChangelogCookieStatus, String> {
+        let status = self.tracker.classify_cookie(cookie);
+        let ChangelogCookieStatus::Valid(Some(cookie_csn)) = status else {
+            return Ok(status);
+        };
+
+        let backend_context = self
+            .backend
+            .get_context_csn()
+            .await
+            .map_err(|err| format!("Backend contextCSN lookup failed: {:?}", err))?;
+
+        let Some(backend_context) = backend_context else {
+            return Ok(ChangelogCookieStatus::Valid(Some(cookie_csn)));
+        };
+
+        let tracker_context = self.tracker.get_context_csn();
+
+        if cookie_csn > backend_context
+            && tracker_context
+                .as_ref()
+                .is_none_or(|latest| &cookie_csn > latest)
+        {
+            return Ok(ChangelogCookieStatus::Invalid);
+        }
+
+        if cookie_csn < backend_context
+            && tracker_context
+                .as_ref()
+                .is_none_or(|latest| latest < &backend_context)
+        {
+            return Ok(ChangelogCookieStatus::Stale);
+        }
+
+        Ok(ChangelogCookieStatus::Valid(Some(cookie_csn)))
+    }
 }
 
 #[async_trait]
@@ -856,7 +893,7 @@ impl ChangelogProvider for ChangelogProviderImpl {
         limit: usize,
     ) -> Result<Vec<ChangelogEntry>, String> {
         let entries = if let Some(cookie_str) = cookie {
-            match self.tracker.classify_cookie(cookie_str) {
+            match self.classify_cookie(cookie_str).await? {
                 ChangelogCookieStatus::Valid(None) => self.tracker.get_all(),
                 ChangelogCookieStatus::Valid(Some(csn)) => self.tracker.get_since_csn(&csn),
                 ChangelogCookieStatus::Stale => {
@@ -911,7 +948,7 @@ impl ChangelogProvider for ChangelogProviderImpl {
 
     async fn count_changelog_since(&self, cookie: Option<&str>) -> Result<usize, String> {
         let count = if let Some(cookie_str) = cookie {
-            match self.tracker.classify_cookie(cookie_str) {
+            match self.classify_cookie(cookie_str).await? {
                 ChangelogCookieStatus::Valid(None) => self.tracker.count_all(),
                 ChangelogCookieStatus::Valid(Some(csn)) => self.tracker.count_since_csn(&csn),
                 ChangelogCookieStatus::Stale => {
@@ -935,7 +972,7 @@ impl ChangelogProvider for ChangelogProviderImpl {
         limit: usize,
     ) -> Result<Vec<ChangelogEntry>, String> {
         let entries = if let Some(cookie_str) = cookie {
-            match self.tracker.classify_cookie(cookie_str) {
+            match self.classify_cookie(cookie_str).await? {
                 ChangelogCookieStatus::Valid(None) => self.tracker.get_all_batch(offset, limit),
                 ChangelogCookieStatus::Valid(Some(csn)) => {
                     self.tracker.get_since_csn_batch(&csn, offset, limit)
@@ -963,7 +1000,7 @@ impl ChangelogProvider for ChangelogProviderImpl {
     }
 
     async fn validate_cookie(&self, cookie: &str) -> Result<bool, String> {
-        match self.tracker.classify_cookie(cookie) {
+        match self.classify_cookie(cookie).await? {
             ChangelogCookieStatus::Valid(_) => Ok(true),
             ChangelogCookieStatus::Stale => Err(format!("Stale replication cookie: {}", cookie)),
             ChangelogCookieStatus::Invalid => Ok(false),

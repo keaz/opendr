@@ -177,6 +177,9 @@ Consumer state is persisted in:
 
 Poll-based consumer replication has been removed. Consumer and both modes
 require `enable_change_listening = true`.
+The production support contract, topology limits, replay-gap behavior, and
+health fields are documented in
+[`REPLICATION_PRODUCTION_GUARANTEES.md`](REPLICATION_PRODUCTION_GUARANTEES.md).
 
 ```mermaid
 sequenceDiagram

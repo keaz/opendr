@@ -323,6 +323,86 @@ async fn test_changelog_provider_get_changelog_since() {
 }
 
 #[tokio::test]
+async fn test_changelog_provider_requires_full_refresh_when_backend_context_ahead_of_changelog() {
+    let backend = Arc::new(create_test_backend().await);
+    let old_context = backend.get_context_csn().await.unwrap().unwrap();
+    let old_cookie = format!("csn-{old_context}");
+
+    backend
+        .add_entry(
+            DirectoryEntry::new(
+                "cn=post-restore,dc=example,dc=org",
+                HashMap::from([
+                    ("cn".to_string(), vec!["post-restore".to_string()]),
+                    ("sn".to_string(), vec!["Restore".to_string()]),
+                    ("objectclass".to_string(), vec!["person".to_string()]),
+                ]),
+            ),
+            b"password".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let provider = ChangelogProviderImpl::new(ChangelogTracker::new(), backend.clone());
+
+    let validation_error = provider.validate_cookie(&old_cookie).await.unwrap_err();
+    assert!(validation_error.contains("Stale replication cookie"));
+
+    let replay_error = provider
+        .get_changelog_since(Some(&old_cookie), 100)
+        .await
+        .unwrap_err();
+    assert!(replay_error.contains("Stale replication cookie"));
+
+    let current_cookie = format!("csn-{}", backend.get_context_csn().await.unwrap().unwrap());
+    assert!(provider.validate_cookie(&current_cookie).await.unwrap());
+    assert!(
+        provider
+            .get_changelog_since(Some(&current_cookie), 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_provider_refresh_scope_excludes_schema_and_config_entries_outside_base_dn() {
+    let backend = Arc::new(create_test_backend().await);
+    for dn in ["cn=schema", "cn=config"] {
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    dn,
+                    HashMap::from([
+                        (
+                            "cn".to_string(),
+                            vec![dn.trim_start_matches("cn=").to_string()],
+                        ),
+                        ("objectclass".to_string(), vec!["top".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let provider = ChangelogProviderImpl::new(ChangelogTracker::new(), backend);
+    let entries = provider
+        .get_all_entries("dc=example,dc=org", None)
+        .await
+        .unwrap();
+    let dns = entries
+        .iter()
+        .map(|entry| entry.dn.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(dns.contains(&"cn=user1,dc=example,dc=org"));
+    assert!(!dns.contains(&"cn=schema"));
+    assert!(!dns.contains(&"cn=config"));
+}
+
+#[tokio::test]
 async fn test_provider_fsm_start_sync_replication() {
     let backend = Arc::new(create_test_backend().await);
     let mut fsm = create_provider_fsm(backend);

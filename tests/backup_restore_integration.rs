@@ -10,7 +10,8 @@ use opendr::backup::{
     restore_backup_chain, verify_manifest_files,
 };
 use opendr::config::ServerConfig;
-use opendr::replication::ChangelogTracker;
+use opendr::replication::{ChangelogProviderImpl, ChangelogTracker};
+use opendr::replication_provider_fsm::ChangelogProvider;
 use tempfile::tempdir;
 
 fn test_config(data_dir: &Path, state_dir: &Path) -> ServerConfig {
@@ -151,4 +152,81 @@ async fn incremental_backup_restores_changelog_entries_after_full_backup() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn replicated_restore_requires_full_refresh_when_changelog_window_is_not_restored() {
+    let root = tempdir().unwrap();
+    let source_data = root.path().join("source-data");
+    let state_dir = root.path().join("provider-state");
+    let config = test_config(&source_data, &state_dir);
+    let raw_backend = Arc::new(LmdbBackend::new(&source_data, 64, 1).unwrap());
+    let changelog = Arc::new(ChangelogTracker::with_capacity_replica_and_storage(
+        100,
+        1,
+        state_dir.clone(),
+    ));
+    let backend = ChangelogBackendWrapper::new(raw_backend, Some(changelog));
+
+    backend
+        .add_entry(person_entry("before-restore"), b"secret".to_vec())
+        .await
+        .unwrap();
+
+    let full_dir = root.path().join("full-backup");
+    let full_manifest = create_full_backup(&config, &full_dir, false).unwrap();
+    let pre_restore_cookie = format!(
+        "csn-{}",
+        full_manifest
+            .checkpoint
+            .end_context_csn
+            .as_ref()
+            .expect("full backup should checkpoint provider contextCSN")
+    );
+
+    backend
+        .add_entry(person_entry("after-restore"), b"secret".to_vec())
+        .await
+        .unwrap();
+
+    let incremental_dir = root.path().join("incremental-backup");
+    create_incremental_backup(&config, &full_dir, &incremental_dir).unwrap();
+
+    let restore_dir = root.path().join("restore-data");
+    restore_backup_chain(
+        &full_dir,
+        std::slice::from_ref(&incremental_dir),
+        &restore_dir,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let restored_backend = Arc::new(LmdbBackend::new(&restore_dir, 64, 1).unwrap());
+    let restored_provider = ChangelogProviderImpl::new(
+        ChangelogTracker::with_capacity_replica_and_storage(
+            100,
+            1,
+            root.path().join("restored-provider-state"),
+        ),
+        restored_backend,
+    );
+
+    let replay_error = restored_provider
+        .get_changelog_since(Some(&pre_restore_cookie), 100)
+        .await
+        .unwrap_err();
+    assert!(replay_error.contains("Stale replication cookie"));
+
+    let refresh_entries = restored_provider
+        .get_all_entries("dc=example,dc=org", None)
+        .await
+        .unwrap();
+    let restored_dns = refresh_entries
+        .iter()
+        .map(|entry| entry.dn.as_str())
+        .collect::<Vec<_>>();
+    assert!(restored_dns.contains(&"cn=before-restore,dc=example,dc=org"));
+    assert!(restored_dns.contains(&"cn=after-restore,dc=example,dc=org"));
 }

@@ -4,6 +4,10 @@ OpenDR replication is listener-based provider-consumer replication over LDAP. A 
 
 Poll-based consumer replication has been removed. `enable_change_listening = false` is invalid for `consumer` and `both` modes.
 
+For the production support contract, topology limits, recovery rules, and
+observable health fields, see
+[`REPLICATION_PRODUCTION_GUARANTEES.md`](REPLICATION_PRODUCTION_GUARANTEES.md).
+
 ## Runtime Layout
 
 Run each OpenDR instance from its own working directory because the server loads `config/server.toml` and `config/log4rs.yml` relative to the current directory:
