@@ -34,7 +34,10 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -77,7 +80,7 @@ impl Default for ResourceLimits {
 }
 
 /// Connection metadata
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ConnectionInfo {
     /// Unique connection ID
     id: ConnectionId,
@@ -86,13 +89,38 @@ struct ConnectionInfo {
     addr: SocketAddr,
 
     /// Last activity time
-    last_activity: Instant,
+    last_activity: Mutex<Instant>,
 
     /// Current number of operations
-    operation_count: usize,
+    operation_count: AtomicUsize,
 
     /// Estimated memory usage (in bytes)
-    memory_usage: usize,
+    memory_usage: Mutex<usize>,
+}
+
+#[derive(Debug)]
+struct PoolCounters {
+    total_connections: AtomicU64,
+    active_connections: AtomicUsize,
+    total_operations: AtomicUsize,
+    total_memory_usage: AtomicUsize,
+    rejected_connections: AtomicU64,
+    rejected_operations: AtomicU64,
+    rejected_memory_updates: AtomicU64,
+}
+
+impl PoolCounters {
+    fn new() -> Self {
+        Self {
+            total_connections: AtomicU64::new(0),
+            active_connections: AtomicUsize::new(0),
+            total_operations: AtomicUsize::new(0),
+            total_memory_usage: AtomicUsize::new(0),
+            rejected_connections: AtomicU64::new(0),
+            rejected_operations: AtomicU64::new(0),
+            rejected_memory_updates: AtomicU64::new(0),
+        }
+    }
 }
 
 /// Connection pool statistics
@@ -141,16 +169,16 @@ pub struct ConnectionPool {
     limits: ResourceLimits,
 
     /// Active connections
-    connections: Arc<RwLock<HashMap<ConnectionId, ConnectionInfo>>>,
+    connections: Arc<RwLock<HashMap<ConnectionId, Arc<ConnectionInfo>>>>,
 
     /// Connections grouped by IP address
     connections_by_ip: Arc<RwLock<HashMap<String, Vec<ConnectionId>>>>,
 
     /// Next connection ID
-    next_id: Arc<RwLock<u64>>,
+    next_id: AtomicU64,
 
     /// Statistics
-    stats: Arc<RwLock<PoolStatistics>>,
+    counters: PoolCounters,
 }
 
 impl ConnectionPool {
@@ -160,17 +188,49 @@ impl ConnectionPool {
             limits,
             connections: Arc::new(RwLock::new(HashMap::new())),
             connections_by_ip: Arc::new(RwLock::new(HashMap::new())),
-            next_id: Arc::new(RwLock::new(0)),
-            stats: Arc::new(RwLock::new(PoolStatistics {
-                total_connections: 0,
-                active_connections: 0,
-                total_operations: 0,
-                total_memory_usage: 0,
-                rejected_connections: 0,
-                rejected_operations: 0,
-                rejected_memory_updates: 0,
-                connections_by_ip: HashMap::new(),
-            })),
+            next_id: AtomicU64::new(0),
+            counters: PoolCounters::new(),
+        }
+    }
+
+    async fn connection_info(&self, conn_id: ConnectionId) -> Option<Arc<ConnectionInfo>> {
+        self.connections.read().await.get(&conn_id).cloned()
+    }
+
+    fn atomic_saturating_sub(counter: &AtomicUsize, value: usize) {
+        if value == 0 {
+            return;
+        }
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(value))
+            })
+            .ok();
+    }
+
+    fn try_reserve_total_memory(&self, delta: usize) -> bool {
+        if delta == 0 {
+            return true;
+        }
+
+        let mut current = self.counters.total_memory_usage.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(delta) else {
+                return false;
+            };
+            if next > self.limits.max_total_memory {
+                return false;
+            }
+
+            match self.counters.total_memory_usage.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
         }
     }
 
@@ -181,11 +241,12 @@ impl ConnectionPool {
     pub async fn acquire_connection(&self, addr: SocketAddr) -> Option<ConnectionId> {
         let mut connections = self.connections.write().await;
         let mut connections_by_ip = self.connections_by_ip.write().await;
-        let mut stats = self.stats.write().await;
 
         // Check total connection limit
         if connections.len() >= self.limits.max_connections {
-            stats.rejected_connections += 1;
+            self.counters
+                .rejected_connections
+                .fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
@@ -193,23 +254,23 @@ impl ConnectionPool {
         let ip_str = addr.ip().to_string();
         let ip_count = connections_by_ip.get(&ip_str).map(|v| v.len()).unwrap_or(0);
         if ip_count >= self.limits.max_connections_per_ip {
-            stats.rejected_connections += 1;
+            self.counters
+                .rejected_connections
+                .fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
         // Allocate connection ID
-        let mut next_id = self.next_id.write().await;
-        let conn_id = *next_id;
-        *next_id += 1;
+        let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // Create connection info
-        let conn_info = ConnectionInfo {
+        let conn_info = Arc::new(ConnectionInfo {
             id: conn_id,
             addr,
-            last_activity: Instant::now(),
-            operation_count: 0,
-            memory_usage: 0,
-        };
+            last_activity: Mutex::new(Instant::now()),
+            operation_count: AtomicUsize::new(0),
+            memory_usage: Mutex::new(0),
+        });
 
         // Register connection
         connections.insert(conn_id, conn_info);
@@ -219,9 +280,12 @@ impl ConnectionPool {
             .push(conn_id);
 
         // Update statistics
-        stats.total_connections += 1;
-        stats.active_connections = connections.len();
-        *stats.connections_by_ip.entry(ip_str).or_insert(0) += 1;
+        self.counters
+            .total_connections
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .active_connections
+            .store(connections.len(), Ordering::Release);
 
         Some(conn_id)
     }
@@ -230,7 +294,6 @@ impl ConnectionPool {
     pub async fn release_connection(&self, conn_id: ConnectionId) {
         let mut connections = self.connections.write().await;
         let mut connections_by_ip = self.connections_by_ip.write().await;
-        let mut stats = self.stats.write().await;
 
         if let Some(conn_info) = connections.remove(&conn_id) {
             let ip_str = conn_info.addr.ip().to_string();
@@ -244,20 +307,20 @@ impl ConnectionPool {
             }
 
             // Update statistics
-            stats.active_connections = connections.len();
-            stats.total_operations = stats
-                .total_operations
-                .saturating_sub(conn_info.operation_count);
-            stats.total_memory_usage = stats
-                .total_memory_usage
-                .saturating_sub(conn_info.memory_usage);
-
-            if let Some(count) = stats.connections_by_ip.get_mut(&ip_str) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    stats.connections_by_ip.remove(&ip_str);
-                }
-            }
+            self.counters
+                .active_connections
+                .store(connections.len(), Ordering::Release);
+            Self::atomic_saturating_sub(
+                &self.counters.total_operations,
+                conn_info.operation_count.load(Ordering::Acquire),
+            );
+            Self::atomic_saturating_sub(
+                &self.counters.total_memory_usage,
+                *conn_info
+                    .memory_usage
+                    .lock()
+                    .expect("connection memory lock poisoned"),
+            );
         }
     }
 
@@ -265,92 +328,120 @@ impl ConnectionPool {
     ///
     /// Returns `true` if the operation is allowed, `false` if limits are exceeded.
     pub async fn start_operation(&self, conn_id: ConnectionId) -> bool {
-        let mut connections = self.connections.write().await;
-        let mut stats = self.stats.write().await;
+        let Some(conn_info) = self.connection_info(conn_id).await else {
+            return false;
+        };
 
-        if let Some(conn_info) = connections.get_mut(&conn_id) {
-            // Check operation limit
-            if conn_info.operation_count >= self.limits.max_operations_per_connection {
-                stats.rejected_operations += 1;
+        let limit = self.limits.max_operations_per_connection;
+        let mut current = conn_info.operation_count.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                self.counters
+                    .rejected_operations
+                    .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
 
-            // Update connection
-            conn_info.operation_count += 1;
-            conn_info.last_activity = Instant::now();
-
-            // Update statistics
-            stats.total_operations += 1;
-
-            true
-        } else {
-            false
+            match conn_info.operation_count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    *conn_info
+                        .last_activity
+                        .lock()
+                        .expect("connection activity lock poisoned") = Instant::now();
+                    self.counters
+                        .total_operations
+                        .fetch_add(1, Ordering::AcqRel);
+                    return true;
+                }
+                Err(actual) => current = actual,
+            }
         }
     }
 
     /// Complete an operation on a connection
     pub async fn end_operation(&self, conn_id: ConnectionId) {
-        let mut connections = self.connections.write().await;
-        let mut stats = self.stats.write().await;
+        let Some(conn_info) = self.connection_info(conn_id).await else {
+            return;
+        };
 
-        if let Some(conn_info) = connections.get_mut(&conn_id) {
-            conn_info.operation_count = conn_info.operation_count.saturating_sub(1);
-            conn_info.last_activity = Instant::now();
-            stats.total_operations = stats.total_operations.saturating_sub(1);
+        let previous = conn_info
+            .operation_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count > 0).then_some(count - 1)
+            })
+            .unwrap_or(0);
+
+        if previous > 0 {
+            *conn_info
+                .last_activity
+                .lock()
+                .expect("connection activity lock poisoned") = Instant::now();
+            self.counters
+                .total_operations
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count > 0).then_some(count - 1)
+                })
+                .ok();
         }
     }
 
     /// Update memory usage for a connection
     pub async fn update_memory_usage(&self, conn_id: ConnectionId, memory_delta: isize) -> bool {
-        let mut connections = self.connections.write().await;
-        let mut stats = self.stats.write().await;
+        let Some(conn_info) = self.connection_info(conn_id).await else {
+            return false;
+        };
 
-        if let Some(conn_info) = connections.get_mut(&conn_id) {
-            let new_usage = if memory_delta >= 0 {
-                conn_info.memory_usage.saturating_add(memory_delta as usize)
-            } else {
-                conn_info
-                    .memory_usage
-                    .saturating_sub((-memory_delta) as usize)
-            };
+        let mut memory_usage = conn_info
+            .memory_usage
+            .lock()
+            .expect("connection memory lock poisoned");
 
+        let current_usage = *memory_usage;
+        let new_usage = if memory_delta >= 0 {
+            current_usage.saturating_add(memory_delta as usize)
+        } else {
+            current_usage.saturating_sub((-memory_delta) as usize)
+        };
+
+        if memory_delta >= 0 {
             // Check per-connection limit
             if new_usage > self.limits.max_memory_per_connection {
-                stats.rejected_memory_updates += 1;
+                self.counters
+                    .rejected_memory_updates
+                    .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
 
             // Check total memory limit
-            let new_total = if memory_delta >= 0 {
-                stats
-                    .total_memory_usage
-                    .saturating_add(memory_delta as usize)
-            } else {
-                stats
-                    .total_memory_usage
-                    .saturating_sub((-memory_delta) as usize)
-            };
-
-            if new_total > self.limits.max_total_memory {
-                stats.rejected_memory_updates += 1;
+            let delta = memory_delta as usize;
+            if !self.try_reserve_total_memory(delta) {
+                self.counters
+                    .rejected_memory_updates
+                    .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
-
-            // Update memory usage
-            conn_info.memory_usage = new_usage;
-            stats.total_memory_usage = new_total;
-
-            true
+            *memory_usage = new_usage;
         } else {
-            false
+            let released = current_usage.saturating_sub(new_usage);
+            *memory_usage = new_usage;
+            Self::atomic_saturating_sub(&self.counters.total_memory_usage, released);
         }
+
+        true
     }
 
     /// Update last activity time for a connection
     pub async fn update_activity(&self, conn_id: ConnectionId) {
-        let mut connections = self.connections.write().await;
-        if let Some(conn_info) = connections.get_mut(&conn_id) {
-            conn_info.last_activity = Instant::now();
+        if let Some(conn_info) = self.connection_info(conn_id).await {
+            *conn_info
+                .last_activity
+                .lock()
+                .expect("connection activity lock poisoned") = Instant::now();
         }
     }
 
@@ -362,7 +453,13 @@ impl ConnectionPool {
 
         connections
             .values()
-            .filter(|conn| now.duration_since(conn.last_activity) > timeout)
+            .filter(|conn| {
+                let last_activity = *conn
+                    .last_activity
+                    .lock()
+                    .expect("connection activity lock poisoned");
+                now.duration_since(last_activity) > timeout
+            })
             .map(|conn| conn.id)
             .collect()
     }
@@ -381,7 +478,27 @@ impl ConnectionPool {
 
     /// Get current pool statistics
     pub async fn get_statistics(&self) -> PoolStatistics {
-        self.stats.read().await.clone()
+        let connections_by_ip = self
+            .connections_by_ip
+            .read()
+            .await
+            .iter()
+            .map(|(ip, connections)| (ip.clone(), connections.len()))
+            .collect();
+
+        PoolStatistics {
+            total_connections: self.counters.total_connections.load(Ordering::Acquire),
+            active_connections: self.counters.active_connections.load(Ordering::Acquire),
+            total_operations: self.counters.total_operations.load(Ordering::Acquire),
+            total_memory_usage: self.counters.total_memory_usage.load(Ordering::Acquire),
+            rejected_connections: self.counters.rejected_connections.load(Ordering::Acquire),
+            rejected_operations: self.counters.rejected_operations.load(Ordering::Acquire),
+            rejected_memory_updates: self
+                .counters
+                .rejected_memory_updates
+                .load(Ordering::Acquire),
+            connections_by_ip,
+        }
     }
 
     /// Get a point-in-time resource snapshot including current limits and utilization.
@@ -541,6 +658,50 @@ mod tests {
 
         // Now we should be able to start another
         assert!(pool.start_operation(conn_id).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_operation_limit_remains_enforced() {
+        let limits = ResourceLimits {
+            max_operations_per_connection: 64,
+            ..Default::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(limits));
+        let conn_id = pool.acquire_connection(test_addr(1234)).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..256 {
+            let pool = Arc::clone(&pool);
+            handles.push(tokio::spawn(
+                async move { pool.start_operation(conn_id).await },
+            ));
+        }
+
+        let mut started = 0;
+        for handle in handles {
+            if handle.await.unwrap() {
+                started += 1;
+            }
+        }
+
+        assert_eq!(started, 64);
+        let stats = pool.get_statistics().await;
+        assert_eq!(stats.total_operations, 64);
+        assert_eq!(stats.rejected_operations, 192);
+
+        let mut handles = Vec::new();
+        for _ in 0..started {
+            let pool = Arc::clone(&pool);
+            handles.push(tokio::spawn(async move {
+                pool.end_operation(conn_id).await;
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let stats = pool.get_statistics().await;
+        assert_eq!(stats.total_operations, 0);
     }
 
     #[tokio::test]

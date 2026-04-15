@@ -4,9 +4,11 @@
 //! through the full server request/response pipeline.
 
 use std::hint::black_box;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
+use opendr::connection_pool::{ConnectionPool, ResourceLimits};
 use opendr::schema::LdapSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -437,6 +439,92 @@ fn bench_memory_efficiency(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_connection_pool_accounting(c: &mut Criterion) {
+    let mut group = c.benchmark_group("connection_pool_accounting");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    for clients in [8usize, 128, 256, 1000] {
+        group.bench_with_input(
+            BenchmarkId::new("start_end_operation", clients),
+            &clients,
+            |b, &clients| {
+                b.iter_batched(
+                    || {
+                        rt.block_on(async {
+                            let limits = ResourceLimits {
+                                max_connections: clients + 1,
+                                max_connections_per_ip: clients + 1,
+                                max_operations_per_connection: 4,
+                                ..Default::default()
+                            };
+                            let pool = Arc::new(ConnectionPool::new(limits));
+                            let mut ids = Vec::with_capacity(clients);
+                            for idx in 0..clients {
+                                let addr = SocketAddr::new(
+                                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                                    idx as u16,
+                                );
+                                ids.push(pool.acquire_connection(addr).await.unwrap());
+                            }
+                            (pool, ids)
+                        })
+                    },
+                    |(pool, ids)| {
+                        rt.block_on(async {
+                            for conn_id in ids {
+                                black_box(pool.start_operation(conn_id).await);
+                                pool.end_operation(conn_id).await;
+                            }
+                        })
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("read_memory_accounting", clients),
+            &clients,
+            |b, &clients| {
+                b.iter_batched(
+                    || {
+                        rt.block_on(async {
+                            let limits = ResourceLimits {
+                                max_connections: clients + 1,
+                                max_connections_per_ip: clients + 1,
+                                max_memory_per_connection: 64 * 1024,
+                                max_total_memory: clients * 64 * 1024,
+                                ..Default::default()
+                            };
+                            let pool = Arc::new(ConnectionPool::new(limits));
+                            let mut ids = Vec::with_capacity(clients);
+                            for idx in 0..clients {
+                                let addr = SocketAddr::new(
+                                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                                    idx as u16,
+                                );
+                                ids.push(pool.acquire_connection(addr).await.unwrap());
+                            }
+                            (pool, ids)
+                        })
+                    },
+                    |(pool, ids)| {
+                        rt.block_on(async {
+                            for conn_id in ids {
+                                black_box(pool.update_memory_usage(conn_id, 4096).await);
+                                black_box(pool.update_memory_usage(conn_id, -4096).await);
+                            }
+                        })
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_backend_with_schema,
@@ -445,6 +533,7 @@ criterion_group!(
     bench_modify_operations,
     bench_delete_operations,
     bench_concurrent_operations,
-    bench_memory_efficiency
+    bench_memory_efficiency,
+    bench_connection_pool_accounting
 );
 criterion_main!(benches);
