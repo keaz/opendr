@@ -147,6 +147,18 @@ struct Args {
     #[arg(long, default_value = "")]
     ldapcon_clients: String,
 
+    #[arg(long, default_value = "")]
+    ldapcon_search_clients: String,
+
+    #[arg(long, default_value = "")]
+    ldapcon_auth_clients: String,
+
+    #[arg(long, default_value = "")]
+    ldapcon_modify_clients: String,
+
+    #[arg(long, default_value = "")]
+    ldapcon_mixed_clients: String,
+
     #[arg(long, default_value_t = 100)]
     ldapcon_iterations: usize,
 
@@ -301,7 +313,17 @@ async fn run(args: Args) -> AppResult<()> {
     let concurrent_bind_clients = parse_concurrent_bind_clients(&args.concurrent_bind_clients)?;
     let concurrent_index_search_clients =
         parse_concurrent_index_search_clients(&args.concurrent_index_search_clients)?;
-    let ldapcon_clients = parse_ldapcon_clients(&args.ldapcon_clients)?;
+    let ldapcon_client_plan = if args.ldapcon_style_benchmark {
+        Some(build_ldapcon_client_plan(
+            &args.ldapcon_clients,
+            &args.ldapcon_search_clients,
+            &args.ldapcon_auth_clients,
+            &args.ldapcon_modify_clients,
+            &args.ldapcon_mixed_clients,
+        )?)
+    } else {
+        None
+    };
     let run_index_benchmarks = args.index_benchmark || !concurrent_index_search_clients.is_empty();
     let sasl_plain_authcid_format =
         parse_sasl_plain_authcid_format(&args.sasl_plain_authcid_format)?;
@@ -350,10 +372,6 @@ async fn run(args: Args) -> AppResult<()> {
         )?;
     }
     if args.ldapcon_style_benchmark {
-        ensure(
-            !ldapcon_clients.is_empty(),
-            "--ldapcon-clients must be set when --ldapcon-style-benchmark is enabled",
-        )?;
         ensure(
             args.ldapcon_iterations > 0,
             "--ldapcon-iterations must be greater than zero",
@@ -425,16 +443,25 @@ async fn run(args: Args) -> AppResult<()> {
 
     if args.ldapcon_style_benchmark {
         progress("benchmark.ldapcon_style");
-        for concurrency in &ldapcon_clients {
+        let client_plan = ldapcon_client_plan
+            .as_ref()
+            .expect("ldapcon client plan is validated when benchmark is enabled");
+        for concurrency in &client_plan.search {
             progress(&format!("benchmark.ldapcon_search.c{concurrency}"));
             benchmarks.push(run_ldapcon_search_benchmark(&args, &dns, *concurrency).await?);
+        }
 
+        for concurrency in &client_plan.auth {
             progress(&format!("benchmark.ldapcon_auth.c{concurrency}"));
             benchmarks.push(run_ldapcon_auth_benchmark(&args, &dns, *concurrency).await?);
+        }
 
+        for concurrency in &client_plan.modify {
             progress(&format!("benchmark.ldapcon_modify.c{concurrency}"));
             benchmarks.push(run_ldapcon_modify_benchmark(&args, &dns, *concurrency).await?);
+        }
 
+        for concurrency in &client_plan.mixed {
             progress(&format!("benchmark.ldapcon_mixed.c{concurrency}"));
             benchmarks.extend(run_ldapcon_mixed_benchmark(&args, &dns, *concurrency).await?);
         }
@@ -1819,6 +1846,14 @@ impl LdapConOperation {
             Self::Modify => "ldapcon_modify",
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LdapConClientPlan {
+    search: Vec<usize>,
+    auth: Vec<usize>,
+    modify: Vec<usize>,
+    mixed: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -3463,6 +3498,58 @@ fn parse_ldapcon_clients(raw: &str) -> AppResult<Vec<usize>> {
     parse_concurrent_client_list(raw, "--ldapcon-clients")
 }
 
+fn parse_ldapcon_operation_clients(raw: &str, argument_name: &str) -> AppResult<Vec<usize>> {
+    parse_concurrent_client_list(raw, argument_name)
+}
+
+fn build_ldapcon_client_plan(
+    default_clients_raw: &str,
+    search_clients_raw: &str,
+    auth_clients_raw: &str,
+    modify_clients_raw: &str,
+    mixed_clients_raw: &str,
+) -> AppResult<LdapConClientPlan> {
+    let default_clients = parse_ldapcon_clients(default_clients_raw)?;
+    Ok(LdapConClientPlan {
+        search: resolve_ldapcon_operation_clients(
+            &default_clients,
+            parse_ldapcon_operation_clients(search_clients_raw, "--ldapcon-search-clients")?,
+            "--ldapcon-search-clients",
+        )?,
+        auth: resolve_ldapcon_operation_clients(
+            &default_clients,
+            parse_ldapcon_operation_clients(auth_clients_raw, "--ldapcon-auth-clients")?,
+            "--ldapcon-auth-clients",
+        )?,
+        modify: resolve_ldapcon_operation_clients(
+            &default_clients,
+            parse_ldapcon_operation_clients(modify_clients_raw, "--ldapcon-modify-clients")?,
+            "--ldapcon-modify-clients",
+        )?,
+        mixed: resolve_ldapcon_operation_clients(
+            &default_clients,
+            parse_ldapcon_operation_clients(mixed_clients_raw, "--ldapcon-mixed-clients")?,
+            "--ldapcon-mixed-clients",
+        )?,
+    })
+}
+
+fn resolve_ldapcon_operation_clients(
+    default_clients: &[usize],
+    operation_clients: Vec<usize>,
+    argument_name: &str,
+) -> AppResult<Vec<usize>> {
+    if operation_clients.is_empty() {
+        ensure(
+            !default_clients.is_empty(),
+            format!("{argument_name} must be set when --ldapcon-clients is empty"),
+        )?;
+        Ok(default_clients.to_vec())
+    } else {
+        Ok(operation_clients)
+    }
+}
+
 fn parse_sasl_plain_authcid_format(raw: &str) -> AppResult<SaslPlainAuthcidFormat> {
     match raw {
         "dn" => Ok(SaslPlainAuthcidFormat::Dn),
@@ -3608,6 +3695,48 @@ mod tests {
         assert_eq!(ldapcon_mixed_expected_counts(100, 20), (80, 20));
         assert_eq!(ldapcon_mixed_expected_counts(100, 0), (100, 0));
         assert_eq!(ldapcon_mixed_expected_counts(100, 100), (0, 100));
+    }
+
+    #[test]
+    fn ldapcon_client_plan_uses_shared_clients_by_default() {
+        let plan = build_ldapcon_client_plan("128,8", "", "", "", "").unwrap();
+
+        assert_eq!(
+            plan,
+            LdapConClientPlan {
+                search: vec![8, 128],
+                auth: vec![8, 128],
+                modify: vec![8, 128],
+                mixed: vec![8, 128],
+            }
+        );
+    }
+
+    #[test]
+    fn ldapcon_client_plan_allows_operation_specific_clients() {
+        let plan = build_ldapcon_client_plan("", "96", "84", "8", "96").unwrap();
+
+        assert_eq!(
+            plan,
+            LdapConClientPlan {
+                search: vec![96],
+                auth: vec![84],
+                modify: vec![8],
+                mixed: vec![96],
+            }
+        );
+    }
+
+    #[test]
+    fn ldapcon_client_plan_requires_default_or_specific_clients() {
+        let error = build_ldapcon_client_plan("", "96", "", "8", "96")
+            .expect_err("missing auth clients should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--ldapcon-auth-clients must be set")
+        );
     }
 
     #[test]

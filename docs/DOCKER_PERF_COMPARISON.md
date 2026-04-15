@@ -240,6 +240,78 @@ Interpretation:
   capacities, cache prewarming or lazy allocation strategy, and profiling the
   remaining TLS/client/server phases around simple bind.
 
+## OpenLDAP-Like 10M LDAPCon-Style Run
+
+Artifact root:
+`target/perf/opendr-ldapcon-openldap-10m-12cpu-30g-20260415-150810/`
+
+This run uses a clean 10M fixture and matches the public LDAPCon 2013
+OpenLDAP LMDB concurrency shape where the slides publish it: search uses 8
+SLAMD clients x 12 threads (`96` effective clients), auth uses 6 clients x 14
+threads (`84` effective clients), and modify uses 8 clients x 1 thread (`8`
+effective clients). The public mixed row does not publish a client/thread
+split, so this OpenDR profile uses the search concurrency (`96`) for the mixed
+read/write probe.
+
+The OpenLDAP LMDB 2013 rows are single OpenLDAP server-instance results. The
+published clients and threads are SLAMD load-generator settings, not multiple
+LDAP server instances.
+
+Configuration deltas from the general 10M profile:
+
+| Setting | Value |
+|---|---:|
+| Profile set | `ldapcon-openldap-ten-million` |
+| Fixture users | `10000000` |
+| CPU limit | `12` |
+| Memory limit | `30g` |
+| OpenDR cache size | `10000000` |
+| Build profile | `perf` |
+| Build RUSTFLAGS | `-C target-cpu=native` |
+| OpenDR worker threads | `12` |
+| Fixture preload workers | `12` |
+| LDAPCon search clients | `96` |
+| LDAPCon auth clients | `84` |
+| LDAPCon modify clients | `8` |
+| LDAPCon mixed clients | `96` |
+| Operations per client and operation family | `100` |
+| Warmup operations per client | `5` |
+| Mixed workload write share | `20%` modifies, `80%` searches |
+
+OpenDR result:
+
+| Operation | Concurrency | Attempts | Failures | Success ops/s | Mean ms | P95 ms | P99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Search | 96 | 9,600 | 0 | 39,281.55 | 2.352 | 4.060 | 10.141 |
+| Auth | 84 | 8,400 | 0 | 41,680.21 | 1.945 | 6.129 | 9.200 |
+| Modify | 8 | 800 | 0 | 1,852.72 | 4.300 | 4.579 | 4.986 |
+| Mixed search | 96 | 7,680 | 0 | 4,332.81 | 0.420 | 0.822 | 1.180 |
+| Mixed modify | 96 | 1,920 | 0 | 1,083.20 | 84.697 | 104.622 | 118.531 |
+
+Comparison against the public LDAPCon 2013 OpenLDAP LMDB rows:
+
+| Operation | OpenDR row | OpenDR success ops/s | OpenLDAP LMDB public ops/s | Difference |
+|---|---|---:|---:|---:|
+| Search | `ldapcon_search_c96` | 39,281.55 | 31,674.02 | +24.0% |
+| Auth | `ldapcon_auth_c84` | 41,680.21 | 16,941.98 | +146.0% |
+| Modify | `ldapcon_modify_c8` | 1,852.72 | 5,760.04 | -67.8% |
+| Mixed search | `ldapcon_mixed_search_c96` | 4,332.81 | 25,399.99 | -82.9% |
+| Mixed modify | `ldapcon_mixed_modify_c96` | 1,083.20 | 1,652.35 | -34.4% |
+
+Interpretation:
+
+- With operation-specific concurrency, OpenDR is above the public single-server
+  OpenLDAP LMDB search and auth rows while staying at 0 failures.
+- Increasing the CPU and worker-thread envelope to 12 improved auth over the
+  earlier 10-core run, but search, modify, and mixed throughput regressed. The
+  12-core setting is therefore not a broad throughput win for this workload.
+- Modify and mixed workloads remain behind OpenLDAP LMDB. The modify gap is
+  the clearest remaining single-operation target for this benchmark shape.
+- The in-process cache was sized for 10M entries, but the sampled server memory
+  remained far below the LMDB footprint. This validates the large cache
+  capacity setting, not full resident cache coverage of all 10M entries during
+  the measured probe.
+
 ## Completed 10M LDAPCon-Style OpenDR Run
 
 Artifact root: `target/perf/opendr-ldapcon-10m-8cpu-30g-20260415-000605/`

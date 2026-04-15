@@ -522,6 +522,22 @@ const millionOpenDrRows = [
   ["Sampled peak server memory", "3.75 GiB"],
 ];
 
+const ldapConTenMillionRows = [
+  ["Search", "96", "39,281.55", "31,674.02", "+24.0%", "0"],
+  ["Auth", "84", "41,680.21", "16,941.98", "+146.0%", "0"],
+  ["Modify", "8", "1,852.72", "5,760.04", "-67.8%", "0"],
+  ["Mixed search", "96", "4,332.81", "25,399.99", "-82.9%", "0"],
+  ["Mixed modify", "96", "1,083.20", "1,652.35", "-34.4%", "0"],
+];
+
+const ldapConTenMillionThroughput = {
+  labels: ["Search", "Auth", "Modify", "Mixed search", "Mixed modify"],
+  series: [
+    { label: "OpenDR 12 CPU", values: [39281.55, 41680.21, 1852.72, 4332.81, 1083.2], color: "#7ce8c8" },
+    { label: "OpenLDAP LMDB 2013", values: [31674.02, 16941.98, 5760.04, 25399.99, 1652.35], color: "#f2b26d" },
+  ],
+};
+
 const millionConcurrentThroughput: BarChartDatum[] = [
   { label: "Simple bind", value: 17008.19, color: "#7ce8c8" },
   { label: "SASL PLAIN", value: 48469.7, color: "#f2b26d" },
@@ -921,9 +937,11 @@ cargo build --release`}</code></pre>
               <h2 id="performance-title">Performance Results</h2>
               <p>
                 The site includes the complete Docker benchmark report from{" "}
-                <code>docs/DOCKER_PERF_COMPARISON.md</code>. The results are
-                bounded Docker regression profiles plus the OpenDR 1M-user
-                baseline, not a completed 10M-user benchmark.
+                <code>docs/DOCKER_PERF_COMPARISON.md</code>. The current
+                results include bounded Docker regression profiles, the OpenDR
+                1M-user baseline, and a completed 10M-user LDAPCon-style
+                OpenDR run shaped like the public LDAPCon 2013 OpenLDAP LMDB
+                single-server benchmark.
               </p>
 
               <h3>Run the performance matrix</h3>
@@ -992,15 +1010,74 @@ cargo build --release`}</code></pre>
   --perf-client-image opendr:docker-perf-client \\
   --output-dir target/perf/opendr-million-16g-20260414-103048`}</code></pre>
                 </section>
+                <section>
+                  <h3>10M LDAPCon OpenLDAP-like run</h3>
+                  <pre><code>{`./scripts/perf_docker_matrix.sh \\
+  --products opendr \\
+  --profile-set ldapcon-openldap-ten-million \\
+  --output-dir target/perf/opendr-ldapcon-openldap-10m-12cpu-30g \\
+  --cpu 12 \\
+  --memory 30g \\
+  --benchmark-timeout 7200 \\
+  --preload-workers 12 \\
+  --opendr-lmdb-max-size 343597383680 \\
+  --opendr-lmdb-max-readers 4096 \\
+  --opendr-max-connections 4096 \\
+  --opendr-max-connections-per-ip 4096 \\
+  --opendr-worker-threads 12 \\
+  --opendr-cache-size 10000000 \\
+  --opendr-auth-metadata-update-mode async_coalesced \\
+  --opendr-auth-metadata-queue-capacity 2000000 \\
+  --opendr-auth-metadata-flush-interval-ms 50 \\
+  --opendr-auth-metadata-batch-size 5000 \\
+  --opendr-build-profile perf \\
+  --opendr-build-rustflags "-C target-cpu=native" \\
+  --opendr-bulk-fixture-load \\
+  --sample-interval 5`}</code></pre>
+                </section>
               </div>
 
               <div className="callout warning">
                 Run the matrix from the repository root with Docker available.
-                The documented runs use bounded 2 CPU and 4 GiB container
-                limits, StartTLS enabled, generated benchmark fixtures, and
-                the Docker entrypoint default <code>performance.cache_size = 1000</code>.
-                Cache hit/miss metrics were not captured in these artifacts
-                because the perf harness samples container CPU and memory only.
+                The compact comparison profiles use bounded 2 CPU and 4 GiB
+                container limits. The 10M LDAPCon-style profile uses a larger
+                30 GiB envelope, an optimized <code>perf</code> build, and a
+                generated 10M LMDB fixture.
+              </div>
+
+              <h3>10M LDAPCon OpenLDAP-like result</h3>
+              <p>
+                The public OpenLDAP LMDB rows are single-server results. Their
+                published clients and threads are SLAMD load-generator settings:
+                search uses 96 effective workers, auth uses 84, and modify
+                uses 8. OpenDR uses the same operation-specific concurrency
+                shape for the comparison below.
+              </p>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Operation</th>
+                      <th>Concurrency</th>
+                      <th>OpenDR ops/s</th>
+                      <th>OpenLDAP LMDB ops/s</th>
+                      <th>Gap</th>
+                      <th>Failures</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ldapConTenMillionRows.map(([operation, concurrency, opendr, openldap, gap, failures]) => (
+                      <tr key={operation}>
+                        <td>{operation}</td>
+                        <td>{concurrency}</td>
+                        <td>{opendr}</td>
+                        <td>{openldap}</td>
+                        <td>{gap}</td>
+                        <td>{failures}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
 
               <h3>1M OpenDR baseline</h3>
@@ -1025,6 +1102,21 @@ cargo build --release`}</code></pre>
 
               <h3>Performance charts</h3>
               <div className="chart-grid">
+                <GroupedBarChart
+                  title="10M LDAPCon throughput"
+                  description="Higher is better. OpenDR 12 CPU run compared with the public single-server OpenLDAP LMDB LDAPCon 2013 rows."
+                  labels={ldapConTenMillionThroughput.labels}
+                  series={ldapConTenMillionThroughput.series}
+                  unit="ops/s"
+                  onExpand={() => setExpandedChart({
+                    kind: "grouped",
+                    title: "10M LDAPCon throughput",
+                    description: "Higher is better. OpenDR 12 CPU run compared with the public single-server OpenLDAP LMDB LDAPCon 2013 rows.",
+                    labels: ldapConTenMillionThroughput.labels,
+                    series: ldapConTenMillionThroughput.series,
+                    unit: "ops/s",
+                  })}
+                />
                 <GroupedBarChart
                   title="Total runtime"
                   description="Lower is better. Measured in milliseconds across the full Docker profile run."

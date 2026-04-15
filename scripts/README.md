@@ -196,6 +196,8 @@ If tests fail:
 - `index`: single `index` profile for equality, presence, substring, ordering, and concurrent mixed index-search probes
 - `sasl`: single `sasl-auth` profile for SASL PLAIN fixture-user bind latency and concurrent throughput/failure probes
 - `regression`: single `regression-100k` profile for OpenDR perf gates with a 100k fixture, indexed probes, and moderate concurrent bind/index-search levels
+- `ldapcon-ten-million`: OpenDR 10M LDAPCon-style profile with shared client levels `8,128,256,1000`
+- `ldapcon-openldap-ten-million`: OpenDR 10M LDAPCon-style profile shaped like the public LDAPCon 2013 OpenLDAP LMDB rows, using search `96`, auth `84`, modify `8`, and mixed `96` clients
 
 **Key options**:
 - `--cpu`: container CPU limit, default `2`
@@ -212,6 +214,8 @@ If tests fail:
 - `--sasl-plain-benchmark`: enable serial and, when concurrent bind clients are configured, concurrent SASL PLAIN fixture-user bind probes
 - `--sasl-plain-authcid-format`: SASL PLAIN authcid format, `dn` or `rdn-value`; use `rdn-value` for the OpenDJ fixture-user comparison
 - `--skip-sasl-plain-admin-benchmark`: skip the admin/root SASL PLAIN probe for products that do not accept SASL PLAIN for the directory-manager account
+- `--ldapcon-clients`: shared LDAPCon-style client levels used for search, auth, modify, and mixed probes
+- `--ldapcon-search-clients`, `--ldapcon-auth-clients`, `--ldapcon-modify-clients`, `--ldapcon-mixed-clients`: operation-specific LDAPCon-style client levels; unset operations fall back to `--ldapcon-clients`
 - `--products`: comma-separated subset of `opendr,opendj`
 
 **Artifacts**:

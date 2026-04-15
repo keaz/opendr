@@ -33,6 +33,10 @@ CONCURRENT_BIND_HOT_USER_PERCENT="80"
 CONCURRENT_BIND_HOT_USER_COUNT="1"
 LDAPCON_STYLE_BENCHMARK="false"
 LDAPCON_CLIENTS=""
+LDAPCON_SEARCH_CLIENTS=""
+LDAPCON_AUTH_CLIENTS=""
+LDAPCON_MODIFY_CLIENTS=""
+LDAPCON_MIXED_CLIENTS=""
 LDAPCON_ITERATIONS="100"
 LDAPCON_WARMUP_ITERATIONS="5"
 LDAPCON_OPERATION_TIMEOUT_MS="10000"
@@ -84,7 +88,7 @@ Usage: scripts/perf_docker_matrix.sh [options]
 
 Options:
   --output-dir PATH         Output directory for the matrix run
-  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl, regression, million, ten-million, ldapcon-ten-million (default: full)
+  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl, regression, million, ten-million, ldapcon-ten-million, ldapcon-openldap-ten-million (default: full)
   --products LIST          Comma-separated subset of: opendr,opendj
   --sample-interval SEC    Container stats sample interval (default: 0.25)
   --cpu VALUE              Docker CPU limit for each server container (default: 2)
@@ -129,6 +133,14 @@ Options:
   --ldapcon-style-benchmark
                           Run LDAPCon-style search/auth/modify/mixed operation probes
   --ldapcon-clients LIST  Comma-separated LDAPCon-style client levels
+  --ldapcon-search-clients LIST
+                          Search-specific LDAPCon-style client levels
+  --ldapcon-auth-clients LIST
+                          Auth-specific LDAPCon-style client levels
+  --ldapcon-modify-clients LIST
+                          Modify-specific LDAPCon-style client levels
+  --ldapcon-mixed-clients LIST
+                          Mixed read/write-specific LDAPCon-style client levels
   --ldapcon-iterations N LDAPCon-style operations per client and operation family (default: 100)
   --ldapcon-warmup-iterations N
                           LDAPCon-style warmup operations per client (default: 5)
@@ -311,6 +323,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ldapcon-clients)
       LDAPCON_CLIENTS="$2"
+      shift 2
+      ;;
+    --ldapcon-search-clients)
+      LDAPCON_SEARCH_CLIENTS="$2"
+      shift 2
+      ;;
+    --ldapcon-auth-clients)
+      LDAPCON_AUTH_CLIENTS="$2"
+      shift 2
+      ;;
+    --ldapcon-modify-clients)
+      LDAPCON_MODIFY_CLIENTS="$2"
+      shift 2
+      ;;
+    --ldapcon-mixed-clients)
+      LDAPCON_MIXED_CLIENTS="$2"
       shift 2
       ;;
     --ldapcon-iterations)
@@ -660,8 +688,64 @@ case "${PROFILE_SET}" in
       DOCKER_ULIMIT_NOFILE="1048576"
     fi
     ;;
+  ldapcon-openldap-ten-million)
+    LOAD_PROFILES=(
+      "ldapcon-openldap-ten-million:10000000:3:3:1"
+    )
+    SKIP_FULL_COUNTS="true"
+    SKIP_SUBTREE_SEARCH_BENCHMARK="true"
+    SKIP_SERIAL_INDEX_BENCHMARKS="true"
+    LDAPCON_STYLE_BENCHMARK="true"
+    INDEX_BENCHMARK="false"
+    SASL_PLAIN_BENCHMARK="false"
+    CONCURRENT_INDEX_SEARCH_CLIENTS=""
+    CONCURRENT_BIND_CLIENTS=""
+    # LDAPCon 2013 reported OpenLDAP LMDB search as 8 clients x 12 threads,
+    # auth as 6 clients x 14 threads, and modify as 8 clients x 1 thread.
+    # The mixed row did not publish a client/thread split, so this profile uses
+    # the search concurrency for the mixed read/write probe.
+    if [[ -z "${LDAPCON_SEARCH_CLIENTS}" ]]; then
+      LDAPCON_SEARCH_CLIENTS="96"
+    fi
+    if [[ -z "${LDAPCON_AUTH_CLIENTS}" ]]; then
+      LDAPCON_AUTH_CLIENTS="84"
+    fi
+    if [[ -z "${LDAPCON_MODIFY_CLIENTS}" ]]; then
+      LDAPCON_MODIFY_CLIENTS="8"
+    fi
+    if [[ -z "${LDAPCON_MIXED_CLIENTS}" ]]; then
+      LDAPCON_MIXED_CLIENTS="96"
+    fi
+    if [[ "${OPENDR_BUILD_CARGO_PROFILE}" == "release" ]]; then
+      OPENDR_BUILD_CARGO_PROFILE="perf"
+    fi
+    if [[ -z "${OPENDR_BUILD_RUSTFLAGS}" ]]; then
+      OPENDR_BUILD_RUSTFLAGS="-C target-cpu=native"
+    fi
+    if [[ "${OPENDR_WORKER_THREADS}" == "0" ]]; then
+      OPENDR_WORKER_THREADS="8"
+    fi
+    if [[ "${OPENDR_BULK_FIXTURE_LOAD}" == "false" ]]; then
+      OPENDR_BULK_FIXTURE_LOAD="true"
+    fi
+    if [[ "${PRELOAD_WORKERS}" == "1" ]]; then
+      PRELOAD_WORKERS="8"
+    fi
+    if [[ "${OPENDR_LMDB_MAX_SIZE}" == "1073741824" ]]; then
+      OPENDR_LMDB_MAX_SIZE="343597383680"
+    fi
+    if [[ "${OPENDR_CACHE_SIZE}" == "1000" ]]; then
+      OPENDR_CACHE_SIZE="50000"
+    fi
+    if [[ "${OPENDR_LOG_LEVEL}" == "info" ]]; then
+      OPENDR_LOG_LEVEL="warn"
+    fi
+    if [[ -z "${DOCKER_ULIMIT_NOFILE}" ]]; then
+      DOCKER_ULIMIT_NOFILE="1048576"
+    fi
+    ;;
   *)
-    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl, regression, million, ten-million, ldapcon-ten-million" >&2
+    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl, regression, million, ten-million, ldapcon-ten-million, ldapcon-openldap-ten-million" >&2
     exit 1
     ;;
 esac
@@ -999,6 +1083,10 @@ write_run_metadata() {
   "concurrent_bind_hot_user_count": ${CONCURRENT_BIND_HOT_USER_COUNT},
   "ldapcon_style_benchmark": ${LDAPCON_STYLE_BENCHMARK},
   "ldapcon_clients": "${LDAPCON_CLIENTS}",
+  "ldapcon_search_clients": "${LDAPCON_SEARCH_CLIENTS}",
+  "ldapcon_auth_clients": "${LDAPCON_AUTH_CLIENTS}",
+  "ldapcon_modify_clients": "${LDAPCON_MODIFY_CLIENTS}",
+  "ldapcon_mixed_clients": "${LDAPCON_MIXED_CLIENTS}",
   "ldapcon_iterations": ${LDAPCON_ITERATIONS},
   "ldapcon_warmup_iterations": ${LDAPCON_WARMUP_ITERATIONS},
   "ldapcon_operation_timeout_ms": ${LDAPCON_OPERATION_TIMEOUT_MS},
@@ -1509,6 +1597,10 @@ EOF
     benchmark_cmd+=(
       --ldapcon-style-benchmark
       --ldapcon-clients "${LDAPCON_CLIENTS}"
+      --ldapcon-search-clients "${LDAPCON_SEARCH_CLIENTS}"
+      --ldapcon-auth-clients "${LDAPCON_AUTH_CLIENTS}"
+      --ldapcon-modify-clients "${LDAPCON_MODIFY_CLIENTS}"
+      --ldapcon-mixed-clients "${LDAPCON_MIXED_CLIENTS}"
       --ldapcon-iterations "${LDAPCON_ITERATIONS}"
       --ldapcon-warmup-iterations "${LDAPCON_WARMUP_ITERATIONS}"
       --ldapcon-operation-timeout-ms "${LDAPCON_OPERATION_TIMEOUT_MS}"
@@ -1808,6 +1900,15 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "concurrent_bind_wrong_password_percent": metadata.get("concurrent_bind_wrong_password_percent", 0),
             "concurrent_bind_hot_user_percent": metadata.get("concurrent_bind_hot_user_percent", 0),
             "concurrent_bind_hot_user_count": metadata.get("concurrent_bind_hot_user_count", 0),
+            "ldapcon_clients": metadata.get("ldapcon_clients", ""),
+            "ldapcon_search_clients": metadata.get("ldapcon_search_clients", ""),
+            "ldapcon_auth_clients": metadata.get("ldapcon_auth_clients", ""),
+            "ldapcon_modify_clients": metadata.get("ldapcon_modify_clients", ""),
+            "ldapcon_mixed_clients": metadata.get("ldapcon_mixed_clients", ""),
+            "ldapcon_iterations": metadata.get("ldapcon_iterations", 0),
+            "ldapcon_warmup_iterations": metadata.get("ldapcon_warmup_iterations", 0),
+            "ldapcon_operation_timeout_ms": metadata.get("ldapcon_operation_timeout_ms", 0),
+            "ldapcon_mixed_write_percent": metadata.get("ldapcon_mixed_write_percent", 0),
             "cpu_limit": metadata["cpu_limit"],
             "memory_limit": metadata["memory_limit"],
             "opendr_lmdb_max_size": metadata.get("opendr_lmdb_max_size", 0),
@@ -2045,6 +2146,15 @@ if runs:
             f"- Concurrent bind auth mix: valid `{reference.get('concurrent_bind_valid_percent', 100)}%`, wrong password `{reference.get('concurrent_bind_wrong_password_percent', 0)}%`, unknown DN `{100 - int(reference.get('concurrent_bind_valid_percent', 100)) - int(reference.get('concurrent_bind_wrong_password_percent', 0))}%`",
             f"- Concurrent bind hot-user mix: `{reference.get('concurrent_bind_hot_user_percent', 0)}%` across `{reference.get('concurrent_bind_hot_user_count', 0)}` users",
             f"- Concurrent bind operation timeout: `{reference.get('concurrent_bind_operation_timeout_ms', 0)}` ms",
+            f"- LDAPCon-style shared clients: `{reference.get('ldapcon_clients', '') or 'disabled'}`",
+            f"- LDAPCon-style search clients: `{reference.get('ldapcon_search_clients', '') or 'shared'}`",
+            f"- LDAPCon-style auth clients: `{reference.get('ldapcon_auth_clients', '') or 'shared'}`",
+            f"- LDAPCon-style modify clients: `{reference.get('ldapcon_modify_clients', '') or 'shared'}`",
+            f"- LDAPCon-style mixed clients: `{reference.get('ldapcon_mixed_clients', '') or 'shared'}`",
+            f"- LDAPCon-style iterations per client: `{reference.get('ldapcon_iterations', 0)}`",
+            f"- LDAPCon-style warmup iterations per client: `{reference.get('ldapcon_warmup_iterations', 0)}`",
+            f"- LDAPCon-style operation timeout: `{reference.get('ldapcon_operation_timeout_ms', 0)}` ms",
+            f"- LDAPCon-style mixed write percent: `{reference.get('ldapcon_mixed_write_percent', 0)}%`",
             "",
             "## Load Profiles",
             "",
