@@ -266,7 +266,20 @@ impl BerDecoderFsmImpl {
         data: &[u8],
     ) -> Result<Vec<Vec<u8>>, BerDecoderError> {
         let mut messages = Vec::new();
+        self.decode_available_messages_into(data, &mut messages)
+            .await?;
+        Ok(messages)
+    }
 
+    /// Process incoming data and append all complete BER messages to `messages`.
+    ///
+    /// Callers that run in a hot read loop can keep one output vector and reuse
+    /// its allocation across reads.
+    pub async fn decode_available_messages_into(
+        &mut self,
+        data: &[u8],
+        messages: &mut Vec<Vec<u8>>,
+    ) -> Result<(), BerDecoderError> {
         if let Some(message) = self.process_data_slice(data).await? {
             messages.push(message);
         }
@@ -275,7 +288,7 @@ impl BerDecoderFsmImpl {
             messages.push(message);
         }
 
-        Ok(messages)
+        Ok(())
     }
 
     async fn process_data(&mut self, data: Vec<u8>) -> Result<Option<Vec<u8>>, BerDecoderError> {
@@ -1143,6 +1156,29 @@ mod tests {
         assert_eq!(messages, vec![first_frame, second_frame]);
         assert_eq!(fsm.stats().bytes_processed, combined.len() as u64);
         assert_eq!(fsm.current_state(), &BerDecoderState::WaitingTag);
+    }
+
+    #[tokio::test]
+    async fn decode_available_messages_into_reuses_output_vector() {
+        let mut fsm = BerDecoderFsmImpl::new();
+        let first_frame = vec![0x04, 0x03, b'o', b'n', b'e'];
+        let second_frame = vec![0x04, 0x03, b't', b'w', b'o'];
+        let mut combined = first_frame.clone();
+        combined.extend_from_slice(&second_frame);
+        let mut messages = Vec::with_capacity(8);
+        let original_capacity = messages.capacity();
+
+        fsm.decode_available_messages_into(&combined, &mut messages)
+            .await
+            .unwrap();
+
+        assert_eq!(messages, vec![first_frame, second_frame]);
+        assert_eq!(messages.capacity(), original_capacity);
+        messages.clear();
+        fsm.decode_available_messages_into(&[], &mut messages)
+            .await
+            .unwrap();
+        assert!(messages.is_empty());
     }
 
     #[tokio::test]

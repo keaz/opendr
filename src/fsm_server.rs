@@ -651,6 +651,7 @@ async fn handle_connection_with_transport(
     let request_context = runtime_context.request_context(client_ip, conn_id);
     let mut legacy_operation_registry = ConnectionOperationRegistry::default();
     let mut read_buffer = vec![0u8; config.read_buffer_size];
+    let mut decoded_messages = Vec::new();
     let cleanup_interval = config.cleanup_interval;
     let operation_timeout = config.operation_timeout;
 
@@ -696,19 +697,19 @@ async fn handle_connection_with_transport(
                     );
                 }
 
-                let decoded_messages = match decode_ready_messages(&mut fsm_set, data).await {
-                    Ok(messages) => messages,
-                    Err(err) => {
-                        pool.update_memory_usage(conn_id, -(data.len() as isize))
-                            .await;
-                        return Err(std::io::Error::other(err).into());
-                    }
-                };
+                decoded_messages.clear();
+                if let Err(err) =
+                    decode_ready_messages_into(&mut fsm_set, data, &mut decoded_messages).await
+                {
+                    pool.update_memory_usage(conn_id, -(data.len() as isize))
+                        .await;
+                    return Err(std::io::Error::other(err).into());
+                }
 
                 pool.update_memory_usage(conn_id, -(data.len() as isize))
                     .await;
 
-                for message_bytes in decoded_messages {
+                for message_bytes in decoded_messages.drain(..) {
                     let parsed_messages = parse_ldap_messages(&message_bytes)
                         .map(|(_, messages)| messages)
                         .map_err(|err| std::io::Error::other(format!("{:?}", err)))?;
@@ -760,13 +761,14 @@ async fn handle_connection_with_transport(
     Ok(())
 }
 
-async fn decode_ready_messages(
+async fn decode_ready_messages_into(
     fsm_set: &mut ConnectionFsmSet,
     initial_data: &[u8],
-) -> Result<Vec<Vec<u8>>, String> {
+    messages: &mut Vec<Vec<u8>>,
+) -> Result<(), String> {
     fsm_set
         .decoder_mut()
-        .decode_available_messages(initial_data)
+        .decode_available_messages_into(initial_data, messages)
         .await
         .map_err(|err| err.to_string())
 }

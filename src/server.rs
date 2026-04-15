@@ -1127,6 +1127,7 @@ async fn handle_client_with_metrics_and_tls(
 ) {
     let mut read_buffer = vec![0; 8192];
     let mut decoder = BerDecoderFsmImpl::new();
+    let mut decoded_messages = Vec::new();
     let mut session = ConnectionSession::default();
     let mut operation_registry = ConnectionOperationRegistry::default();
 
@@ -1173,32 +1174,32 @@ async fn handle_client_with_metrics_and_tls(
                     accounted_read_bytes = true;
                 }
 
-                let decoded_messages = match decode_messages(&mut decoder, &read_buffer[..n]).await
-                {
-                    Ok(messages) => messages,
-                    Err(err) => {
-                        if let Some(controls) = controls.as_ref()
-                            && accounted_read_bytes
-                        {
-                            controls
-                                .pool
-                                .update_memory_usage(controls.conn_id, -(n as isize))
-                                .await;
-                        }
-                        error!("Failed to decode BER message: {}", err);
-                        if let Err(write_err) = send_bind_response(
-                            &mut socket,
-                            0,
-                            ResultCode::ProtocolError,
-                            "invalid message",
-                        )
+                decoded_messages.clear();
+                if let Err(err) =
+                    decode_messages_into(&mut decoder, &read_buffer[..n], &mut decoded_messages)
                         .await
-                        {
-                            error!("Failed to write error response: {}", write_err);
-                        }
-                        return;
+                {
+                    if let Some(controls) = controls.as_ref()
+                        && accounted_read_bytes
+                    {
+                        controls
+                            .pool
+                            .update_memory_usage(controls.conn_id, -(n as isize))
+                            .await;
                     }
-                };
+                    error!("Failed to decode BER message: {}", err);
+                    if let Err(write_err) = send_bind_response(
+                        &mut socket,
+                        0,
+                        ResultCode::ProtocolError,
+                        "invalid message",
+                    )
+                    .await
+                    {
+                        error!("Failed to write error response: {}", write_err);
+                    }
+                    return;
+                }
 
                 if let Some(controls) = controls.as_ref()
                     && accounted_read_bytes
@@ -1209,7 +1210,7 @@ async fn handle_client_with_metrics_and_tls(
                         .await;
                 }
 
-                for message_bytes in decoded_messages {
+                for message_bytes in decoded_messages.drain(..) {
                     let parsed_messages = match parse_ldap_messages(&message_bytes) {
                         Ok((_, messages)) => messages,
                         Err(err) => {
@@ -1512,6 +1513,16 @@ async fn decode_messages(
     input: &[u8],
 ) -> Result<Vec<Vec<u8>>, crate::ber_decoder_fsm::BerDecoderError> {
     decoder.decode_available_messages(input).await
+}
+
+async fn decode_messages_into(
+    decoder: &mut BerDecoderFsmImpl,
+    input: &[u8],
+    messages: &mut Vec<Vec<u8>>,
+) -> Result<(), crate::ber_decoder_fsm::BerDecoderError> {
+    decoder
+        .decode_available_messages_into(input, messages)
+        .await
 }
 
 fn parse_abandon_message_fallback(

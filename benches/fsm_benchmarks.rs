@@ -128,6 +128,30 @@ fn bench_ber_decode_read_path(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("borrowed_slice_decode_into_parse_8_binds", |b| {
+        b.iter_batched(
+            || (BerDecoderFsmImpl::new(), Vec::with_capacity(8)),
+            |(mut decoder, mut frames)| {
+                rt.block_on(async {
+                    decoder
+                        .decode_available_messages_into(
+                            black_box(coalesced_binds.as_slice()),
+                            &mut frames,
+                        )
+                        .await
+                        .expect("decode should succeed");
+                    for frame in frames.drain(..) {
+                        let (_, messages) =
+                            parse_ldap_messages(black_box(&frame)).expect("LDAP parse succeeds");
+                        black_box(messages);
+                    }
+                    black_box(frames.capacity());
+                })
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
