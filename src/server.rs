@@ -3692,6 +3692,19 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
     let deref_aliases = request.deref_aliases;
+    if let Err(diagnostic) = validate_search_deref_aliases(deref_aliases) {
+        send_result(
+            socket,
+            message_id,
+            ResponseOp::SearchDone,
+            ResultCode::ProtocolError,
+            &base_dn,
+            diagnostic,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let search_deadline = if request.time_limit == 0 {
         None
     } else {
@@ -4842,6 +4855,17 @@ fn should_deref_search_base(deref_aliases: ldap_parser::ldap::DerefAliases) -> b
 
 fn should_deref_search_candidates(deref_aliases: ldap_parser::ldap::DerefAliases) -> bool {
     matches!(deref_aliases.0, 1 | 3)
+}
+
+fn validate_search_deref_aliases(
+    deref_aliases: ldap_parser::ldap::DerefAliases,
+) -> Result<(), &'static str> {
+    match deref_aliases.0 {
+        0..=3 => Ok(()),
+        _ => Err(
+            "derefAliases must be one of neverDerefAliases(0), derefInSearching(1), derefFindingBaseObj(2), or derefAlways(3)",
+        ),
+    }
 }
 
 fn entry_is_alias(entry: &DirectoryEntry) -> bool {
@@ -10532,13 +10556,41 @@ mod tests {
             0
         );
 
+        let (mut searching_server, mut searching_client) = connected_stream_pair().await;
+        handle_search_request_with_context(
+            &mut searching_server,
+            &backend,
+            &schema,
+            &runtime_config,
+            63,
+            subtree_request(1),
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let searching_response = read_response(&mut searching_client).await;
+        let (_, searching_messages) = parse_ldap_messages(&searching_response).unwrap();
+        match &searching_messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(
+                    entry.object_name.0.as_ref(),
+                    "cn=target,ou=people,dc=example,dc=org"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
         let (mut always_server, mut always_client) = connected_stream_pair().await;
         handle_search_request_with_context(
             &mut always_server,
             &backend,
             &schema,
             &runtime_config,
-            63,
+            64,
             subtree_request(3),
             &ConnectionSession::default(),
             &RequestContext::default(),
@@ -10576,7 +10628,7 @@ mod tests {
             &backend,
             &schema,
             &runtime_config,
-            64,
+            65,
             cycle_request,
             &ConnectionSession::default(),
             &RequestContext::default(),
@@ -10591,6 +10643,59 @@ mod tests {
         match &cycle_messages[0].protocol_op {
             ProtocolOp::SearchResultDone(done) => {
                 assert_eq!(done.result_code, ParserResultCode::LoopDetect);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_rejects_unknown_deref_aliases_mode() {
+        let backend = MockBackend::new();
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+        let request_controls = RequestControls::default();
+        let request = SearchRequest {
+            base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
+            scope: SearchScope::BaseObject,
+            deref_aliases: DerefAliases(4),
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter: Filter::Present(LdapString(Cow::Owned("objectClass".to_string()))),
+            attributes: vec![LdapString(Cow::Owned("cn".to_string()))],
+        };
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_search_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            66,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &request_controls,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::ProtocolError);
+                assert!(
+                    done.diagnostic_message
+                        .0
+                        .as_ref()
+                        .contains("derefAliases must be one of")
+                );
             }
             other => panic!("unexpected response: {:?}", other),
         }
@@ -11243,7 +11348,7 @@ mod tests {
             "ou=remote,dc=example,dc=org",
             &[
                 "ldap://remote.example.org/dc=remote,dc=org",
-                "ldaps://backup.example.org/dc=remote,dc=org",
+                "ldaps://backup.example.org/ou=people,dc=remote,dc=org?cn,sn?sub?(objectClass=person)?!bindname=cn%3Dproxy%2Cdc%3Dremote%2Cdc%3Dorg",
             ],
         );
         backend.add_entry(entry, Vec::new()).await.unwrap();
@@ -11273,7 +11378,7 @@ mod tests {
                     urls,
                     vec![
                         "ldap://remote.example.org/dc=remote,dc=org".to_string(),
-                        "ldaps://backup.example.org/dc=remote,dc=org".to_string(),
+                        "ldaps://backup.example.org/ou=people,dc=remote,dc=org?cn,sn?sub?(objectClass=person)?!bindname=cn%3Dproxy%2Cdc%3Dremote%2Cdc%3Dorg".to_string(),
                     ]
                 );
             }

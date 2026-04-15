@@ -310,6 +310,9 @@ Controls:
 - Paged search cookies are scoped to the search sequence and cleaned on cancel
   or abandon.
 - Server-side sort rejects unsupported ordering rules.
+- Referral, alias dereference, LDAP URL, and ManageDsaIT support boundaries are
+  defined in
+  [LDAP_REFERRAL_ALIAS_SUPPORT.md](LDAP_REFERRAL_ALIAS_SUPPORT.md).
 - Root DSE capability advertising is summarized in
   [ROOT_DSE_CAPABILITIES.md](ROOT_DSE_CAPABILITIES.md).
 

@@ -21,6 +21,7 @@ deploys the site.
 - [Troubleshooting guide](./TROUBLESHOOTING.md)
 - [Backup and restore](./BACKUP_RESTORE.md)
 - [Replication guide](./REPLICATION_GUIDE.md)
+- [LDAP referral and alias support](./LDAP_REFERRAL_ALIAS_SUPPORT.md)
 
 ## Implementation References
 

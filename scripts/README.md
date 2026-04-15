@@ -4,6 +4,25 @@ This directory contains test scripts for validating the opendr LDAP server funct
 
 ## Available Scripts
 
+### referral_alias_interop.sh
+
+**Purpose**: Manual interoperability checks for LDAP referrals, aliases, and
+ManageDsaIT using `ldapsearch` plus Python `ldap3` when available.
+
+**Usage**:
+```bash
+OPENDR_LDAP_URL=ldap://127.0.0.1:1389 \
+OPENDR_BASE_DN=dc=example,dc=org \
+OPENDR_REFERRAL_DN=ou=remote,dc=example,dc=org \
+OPENDR_ALIAS_DN=cn=alias,dc=example,dc=org \
+./scripts/referral_alias_interop.sh
+```
+
+**Prerequisites**:
+- A running OpenDR server with referral and alias fixtures loaded.
+- `ldapsearch` from OpenLDAP client tools.
+- Optional: Python `ldap3` for SDK/client verification.
+
 ### test_schema_validation.sh
 
 **Purpose**: End-to-end test for LDAP schema validation

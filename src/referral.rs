@@ -4,6 +4,7 @@
 //! and validation. Server-side chaining and proxying remain helper-level building
 //! blocks and are not yet enabled in the active network runtime.
 
+use crate::ldap_url::LdapUrl;
 use crate::referral_fsm::{
     ChainHandler, NetworkClient, ProxyHandler, ReferralResolver, ResolvedEndpoint,
 };
@@ -12,7 +13,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use url::Url;
 
 /// Referral URL parser and resolver used by the active runtime.
 pub struct LdapReferralResolver {
@@ -43,29 +43,16 @@ impl LdapReferralResolver {
     ///
     /// Supports ldap:// and ldaps:// schemes
     fn parse_ldap_url(&self, url_str: &str) -> Result<ResolvedEndpoint, String> {
-        let url = Url::parse(url_str).map_err(|e| format!("Invalid URL: {}", e))?;
-
-        let scheme = url.scheme();
-        if scheme != "ldap" && scheme != "ldaps" {
-            return Err(format!(
-                "Invalid scheme '{}', expected 'ldap' or 'ldaps'",
-                scheme
-            ));
-        }
-
-        let use_tls = scheme == "ldaps";
-        let host = url.host_str().ok_or("Missing host in URL")?.to_string();
-
-        let port = url.port().unwrap_or(if use_tls {
+        let url = LdapUrl::parse(url_str).map_err(|err| err.to_string())?;
+        let use_tls = url.scheme.as_str() == "ldaps";
+        let host = url.host.ok_or_else(|| "Missing host in URL".to_string())?;
+        let port = url.port.unwrap_or(if use_tls {
             self.default_tls_port
         } else {
             self.default_port
         });
 
-        // Extract base DN from path (remove leading slash)
-        let base_dn = url.path().trim_start_matches('/').to_string();
-
-        Ok(ResolvedEndpoint::new(host, port, base_dn).with_tls(use_tls))
+        Ok(ResolvedEndpoint::new(host, port, url.dn).with_tls(use_tls))
     }
 }
 
@@ -101,7 +88,9 @@ impl ReferralResolver for LdapReferralResolver {
     }
 
     fn validate_referral_url(&self, url: &str) -> Result<(), String> {
-        self.parse_ldap_url(url).map(|_| ())
+        LdapUrl::parse(url)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
     }
 }
 
