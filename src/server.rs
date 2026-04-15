@@ -3342,8 +3342,12 @@ async fn try_handle_virtual_search_request(
     }
 
     if base_dn.is_empty() {
-        let supported_control_oids = active_runtime_control_registry().supported_control_oids();
-        let supported_sasl_mechanisms = crate::search_protocol::supported_legacy_sasl_mechanisms();
+        let supported_control_oids =
+            active_runtime_control_registry().root_dse_supported_control_oids();
+        let supported_sasl_mechanisms =
+            crate::search_protocol::supported_legacy_sasl_mechanisms_for_context(
+                connection_is_secure,
+            );
         let attributes = match crate::search_protocol::build_root_dse_attributes(
             backend,
             &runtime_config.naming_contexts,
@@ -9435,10 +9439,7 @@ mod tests {
             attributes.get("subschemaSubentry").unwrap(),
             &vec!["cn=Subschema".to_string()]
         );
-        assert_eq!(
-            attributes.get("supportedSASLMechanisms").unwrap(),
-            &vec!["PLAIN".to_string()]
-        );
+        assert!(!attributes.contains_key("supportedSASLMechanisms"));
         assert_eq!(
             attributes.get("contextCSN").unwrap(),
             &vec!["1696680896789012#001#000001#000000".to_string()]
@@ -9459,10 +9460,7 @@ mod tests {
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
-            SERVER_SIDE_SORT_RESPONSE_OID.to_string(),
             SYNC_REQUEST_OID.to_string(),
-            SYNC_STATE_OID.to_string(),
-            SYNC_DONE_OID.to_string(),
         ];
         expected_controls.sort();
         assert_eq!(supported_controls, expected_controls);
@@ -9484,7 +9482,8 @@ mod tests {
             ..LegacyServerConfig::default()
         };
         let request_controls = RequestControls::default();
-        let request = search_request_for_base("", &["supportedExtension"]);
+        let request =
+            search_request_for_base("", &["supportedExtension", "supportedSASLMechanisms"]);
         let (mut server_stream, mut client_stream) = connected_stream_pair().await;
 
         handle_search_request_with_context(
@@ -9519,6 +9518,10 @@ mod tests {
         ];
         expected_extensions.sort();
         assert_eq!(supported_extensions, expected_extensions);
+        assert_eq!(
+            attributes.get("supportedSASLMechanisms").unwrap(),
+            &vec!["PLAIN".to_string()]
+        );
     }
 
     #[tokio::test]

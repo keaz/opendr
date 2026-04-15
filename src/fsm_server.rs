@@ -3571,7 +3571,7 @@ async fn try_handle_virtual_search_request_with_fsm_runtime(
 
     let available_attributes = if base_dn.is_empty() {
         let supported_control_oids =
-            crate::fsm_request::active_fsm_control_registry().supported_control_oids();
+            crate::fsm_request::active_fsm_control_registry().root_dse_supported_control_oids();
         match crate::search_protocol::build_root_dse_attributes(
             fsm_set.backend().as_ref(),
             &runtime_context.legacy_runtime_config.naming_contexts,
@@ -3579,7 +3579,7 @@ async fn try_handle_virtual_search_request_with_fsm_runtime(
             request.is_secure,
             runtime_context.tls_handler.is_some(),
             &supported_control_oids,
-            &crate::search_protocol::supported_fsm_sasl_mechanisms(),
+            &crate::search_protocol::supported_fsm_sasl_mechanisms_for_context(request.is_secure),
         )
         .await
         {

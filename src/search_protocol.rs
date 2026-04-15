@@ -148,15 +148,31 @@ pub fn supported_extensions(connection_is_secure: bool, starttls_available: bool
 }
 
 pub fn supported_sasl_mechanisms() -> Vec<String> {
-    supported_legacy_sasl_mechanisms()
+    supported_sasl_mechanisms_for_context(true)
 }
 
 pub fn supported_legacy_sasl_mechanisms() -> Vec<String> {
-    vec!["PLAIN".to_string()]
+    supported_sasl_mechanisms_for_context(true)
 }
 
 pub fn supported_fsm_sasl_mechanisms() -> Vec<String> {
-    vec!["PLAIN".to_string()]
+    supported_sasl_mechanisms_for_context(true)
+}
+
+pub fn supported_legacy_sasl_mechanisms_for_context(connection_is_secure: bool) -> Vec<String> {
+    supported_sasl_mechanisms_for_context(connection_is_secure)
+}
+
+pub fn supported_fsm_sasl_mechanisms_for_context(connection_is_secure: bool) -> Vec<String> {
+    supported_sasl_mechanisms_for_context(connection_is_secure)
+}
+
+fn supported_sasl_mechanisms_for_context(connection_is_secure: bool) -> Vec<String> {
+    if connection_is_secure {
+        vec!["PLAIN".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +225,11 @@ mod tests {
             vec!["PLAIN".to_string()]
         );
         assert_eq!(supported_fsm_sasl_mechanisms(), vec!["PLAIN".to_string()]);
+        assert!(supported_legacy_sasl_mechanisms_for_context(false).is_empty());
+        assert_eq!(
+            supported_fsm_sasl_mechanisms_for_context(true),
+            vec!["PLAIN".to_string()]
+        );
     }
 
     #[tokio::test]

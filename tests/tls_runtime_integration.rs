@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -5,13 +6,19 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ldap_parser::ldap::ProtocolOp;
+use ldap_parser::ldap::{ProtocolOp, ResultCode as ParserResultCode};
 use ldap_parser::parse_ldap_messages;
 use opendr::extended_ops::oids;
+use opendr::search_controls::{
+    PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
+};
+use opendr::sync_controls::{SYNC_DONE_OID, SYNC_REQUEST_OID, SYNC_STATE_OID};
 use rasn::der;
 use rasn_ldap::{
     AuthenticationChoice as RasnAuthChoice, BindRequest as RasnBindRequest,
-    ExtendedRequest as RasnExtendedRequest, SaslCredentials as RasnSaslCredentials,
+    ExtendedRequest as RasnExtendedRequest, Filter as RasnFilter, LdapMessage as RasnLdapMessage,
+    ProtocolOp as RasnProtocolOp, SaslCredentials as RasnSaslCredentials,
+    SearchRequest as RasnSearchRequest, SearchRequestDerefAliases, SearchRequestScope,
 };
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::ServerName;
@@ -21,6 +28,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
+
+const MANAGE_DSA_IT_OID: &str = "2.16.840.1.113730.3.4.2";
 
 struct TestBinaryServer {
     _tempdir: TempDir,
@@ -275,6 +284,184 @@ where
     read_response_bytes(stream).await
 }
 
+fn root_dse_search_message(message_id: u32) -> Vec<u8> {
+    let search_request = RasnSearchRequest::new(
+        b"".to_vec().into(),
+        SearchRequestScope::BaseObject,
+        SearchRequestDerefAliases::NeverDerefAliases,
+        0,
+        0,
+        false,
+        RasnFilter::Present(b"objectClass".to_vec().into()),
+        [
+            "supportedLDAPVersion",
+            "namingContexts",
+            "supportedExtension",
+            "supportedControl",
+            "supportedSASLMechanisms",
+        ]
+        .into_iter()
+        .map(|attribute| attribute.as_bytes().to_vec().into())
+        .collect(),
+    );
+    let message = RasnLdapMessage::new(message_id, RasnProtocolOp::SearchRequest(search_request));
+    der::encode(&message).unwrap()
+}
+
+async fn read_search_response_bytes<S>(stream: &mut S) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut response = Vec::new();
+    let mut buf = vec![0_u8; 4096];
+
+    loop {
+        match timeout(Duration::from_millis(750), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(bytes_read)) => {
+                response.extend_from_slice(&buf[..bytes_read]);
+                match parse_ldap_messages(&response) {
+                    Ok((_, messages))
+                        if messages.iter().any(|message| {
+                            matches!(message.protocol_op, ProtocolOp::SearchResultDone(_))
+                        }) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Err(err)) => panic!("failed to read LDAP search response: {err}"),
+            Err(_) if !response.is_empty() => break,
+            Err(_) => panic!("timed out waiting for LDAP search response"),
+        }
+    }
+
+    response
+}
+
+async fn send_root_dse_search_request<S>(stream: &mut S, message_id: u32) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(&root_dse_search_message(message_id))
+        .await
+        .unwrap();
+    read_search_response_bytes(stream).await
+}
+
+fn search_entry_attribute_map(
+    entry: &ldap_parser::ldap::SearchResultEntry<'_>,
+) -> HashMap<String, Vec<String>> {
+    entry
+        .attributes
+        .iter()
+        .map(|attribute| {
+            (
+                attribute.attr_type.0.as_ref().to_string(),
+                attribute
+                    .attr_vals
+                    .iter()
+                    .map(|value| String::from_utf8(value.0.as_ref().to_vec()).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+fn assert_root_dse_capabilities(response: &[u8], secure_connection: bool, expect_starttls: bool) {
+    let (_, messages) = parse_ldap_messages(response).unwrap();
+    let attributes = messages
+        .iter()
+        .find_map(|message| match &message.protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => Some(search_entry_attribute_map(entry)),
+            _ => None,
+        })
+        .expect("Root DSE search entry");
+
+    let done = messages
+        .iter()
+        .find_map(|message| match &message.protocol_op {
+            ProtocolOp::SearchResultDone(done) => Some(done),
+            _ => None,
+        })
+        .expect("Root DSE search done");
+    assert_eq!(done.result_code, ParserResultCode::Success);
+
+    assert_eq!(
+        attributes.get("supportedLDAPVersion").unwrap(),
+        &vec!["3".to_string()]
+    );
+    assert_eq!(
+        attributes.get("namingContexts").unwrap(),
+        &vec!["dc=example,dc=org".to_string()]
+    );
+
+    let mut supported_controls = attributes.get("supportedControl").unwrap().clone();
+    supported_controls.sort();
+    let mut expected_controls = vec![
+        MANAGE_DSA_IT_OID.to_string(),
+        PAGED_RESULTS_OID.to_string(),
+        SERVER_SIDE_SORT_REQUEST_OID.to_string(),
+        SYNC_REQUEST_OID.to_string(),
+    ];
+    expected_controls.sort();
+    assert_eq!(supported_controls, expected_controls);
+    assert!(!supported_controls.contains(&SERVER_SIDE_SORT_RESPONSE_OID.to_string()));
+    assert!(!supported_controls.contains(&SYNC_STATE_OID.to_string()));
+    assert!(!supported_controls.contains(&SYNC_DONE_OID.to_string()));
+
+    let supported_extensions = attributes.get("supportedExtension").unwrap();
+    assert!(supported_extensions.contains(&oids::CANCEL.to_string()));
+    assert!(supported_extensions.contains(&oids::PASSWORD_MODIFY.to_string()));
+    assert!(supported_extensions.contains(&oids::WHO_AM_I.to_string()));
+    assert_eq!(
+        supported_extensions.contains(&oids::START_TLS.to_string()),
+        expect_starttls
+    );
+
+    if secure_connection {
+        assert_eq!(
+            attributes.get("supportedSASLMechanisms").unwrap(),
+            &vec!["PLAIN".to_string()]
+        );
+    } else {
+        assert!(
+            !attributes.contains_key("supportedSASLMechanisms"),
+            "SASL PLAIN must not be advertised before transport confidentiality is established"
+        );
+    }
+}
+
+async fn assert_root_dse_transport_capabilities(runtime: &str) {
+    let server = tls_runtime_fixture(runtime, true);
+
+    let mut stream = connect_with_retry(server.ldap_port).await;
+    let response = send_root_dse_search_request(&mut stream, 1).await;
+    assert_root_dse_capabilities(&response, false, true);
+
+    let mut stream = connect_with_retry(server.ldap_port).await;
+    let starttls_response = send_starttls_request(&mut stream, 2).await;
+    assert_starttls_success(&starttls_response);
+    let connector = trusted_tls_connector(&server.cert_pem);
+    let mut tls_stream = connector
+        .connect(localhost_server_name(), stream)
+        .await
+        .expect("StartTLS upgrade should complete with trusted server certificate");
+    let response = send_root_dse_search_request(&mut tls_stream, 3).await;
+    assert_root_dse_capabilities(&response, true, false);
+
+    let stream = connect_with_retry(server.ldaps_port).await;
+    let connector = trusted_tls_connector(&server.cert_pem);
+    let mut tls_stream = connector
+        .connect(localhost_server_name(), stream)
+        .await
+        .expect("LDAPS handshake should succeed with trusted server certificate");
+    let response = send_root_dse_search_request(&mut tls_stream, 4).await;
+    assert_root_dse_capabilities(&response, true, false);
+}
+
 fn trusted_tls_connector(cert_pem: &str) -> TlsConnector {
     let mut roots = RootCertStore::empty();
     let mut reader = Cursor::new(cert_pem.as_bytes());
@@ -350,6 +537,16 @@ fn assert_whoami_bound_admin(response: &[u8]) {
         }
         other => panic!("unexpected WhoAmI response: {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn legacy_root_dse_advertises_capabilities_by_transport_state() {
+    assert_root_dse_transport_capabilities("legacy").await;
+}
+
+#[tokio::test]
+async fn fsm_root_dse_advertises_capabilities_by_transport_state() {
+    assert_root_dse_transport_capabilities("fsm").await;
 }
 
 #[tokio::test]

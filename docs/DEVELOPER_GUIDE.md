@@ -308,6 +308,8 @@ Controls:
 - Paged search cookies are scoped to the search sequence and cleaned on cancel
   or abandon.
 - Server-side sort rejects unsupported ordering rules.
+- Root DSE capability advertising is summarized in
+  [ROOT_DSE_CAPABILITIES.md](ROOT_DSE_CAPABILITIES.md).
 
 Schema validation:
 

@@ -180,19 +180,24 @@ impl ControlRegistry {
         self.request_controls.contains_key(oid)
     }
 
+    pub fn supports_response_control(&self, oid: &str) -> bool {
+        self.response_controls.contains_key(oid)
+    }
+
+    pub fn supported_request_control_oids(&self) -> Vec<String> {
+        sorted_registered_oids(&self.request_controls)
+    }
+
+    pub fn supported_response_control_oids(&self) -> Vec<String> {
+        sorted_registered_oids(&self.response_controls)
+    }
+
+    pub fn root_dse_supported_control_oids(&self) -> Vec<String> {
+        self.supported_request_control_oids()
+    }
+
     pub fn supported_control_oids(&self) -> Vec<String> {
-        let mut oids = BTreeSet::new();
-        oids.extend(
-            self.request_controls
-                .values()
-                .map(|control| control.oid.clone()),
-        );
-        oids.extend(
-            self.response_controls
-                .values()
-                .map(|control| control.oid.clone()),
-        );
-        oids.into_iter().collect()
+        self.supported_request_control_oids()
     }
 
     pub fn validate_request_controls<'a>(
@@ -224,6 +229,15 @@ impl ControlRegistry {
             ignored,
         })
     }
+}
+
+fn sorted_registered_oids(controls: &BTreeMap<String, RegisteredControl>) -> Vec<String> {
+    controls
+        .values()
+        .map(|control| control.oid.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -293,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_control_oids_merge_request_and_response_registrations() {
+    fn registry_exposes_request_response_and_root_dse_control_sets_separately() {
         let mut registry = ControlRegistry::default();
         registry
             .register_request_control("1.2.3")
@@ -301,8 +315,35 @@ mod tests {
             .register_response_control("1.2.3");
 
         assert_eq!(
-            registry.supported_control_oids(),
+            registry.supported_request_control_oids(),
+            vec!["1.2.3".to_string()]
+        );
+        assert_eq!(
+            registry.supported_response_control_oids(),
             vec!["1.2.3".to_string(), "1.2.4".to_string()]
+        );
+        assert_eq!(
+            registry.root_dse_supported_control_oids(),
+            vec!["1.2.3".to_string()]
+        );
+        assert!(registry.supports_response_control("1.2.4"));
+    }
+
+    #[test]
+    fn response_only_controls_are_not_accepted_as_request_controls() {
+        let mut registry = ControlRegistry::default();
+        registry.register_response_control("1.2.4");
+        let controls = [parsed_control("1.2.4", true, None)];
+
+        let err = registry
+            .validate_request_controls(Some(&controls))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            ControlValidationError::UnknownCritical {
+                oid: "1.2.4".to_string(),
+            }
         );
     }
 }
