@@ -23,6 +23,45 @@ OPENDR_ALIAS_DN=cn=alias,dc=example,dc=org \
 - `ldapsearch` from OpenLDAP client tools.
 - Optional: Python `ldap3` for SDK/client verification.
 
+### ldap_interop_gate.sh
+
+**Purpose**: Production-readiness interoperability gate for the advertised LDAP
+surface. The script can start an isolated OpenDR server, then runs OpenLDAP CLI,
+Python `ldap3`, and the Rust `ldap_ops_client` against the same StartTLS
+endpoint.
+
+**What it covers**:
+1. OpenLDAP CLI Bind, StartTLS, Root DSE, Search, Add, Modify, Delete,
+   ModifyDN, Compare, paged results, server-side sort, subschema, and
+   operational attribute reads.
+2. Python `ldap3` Bind, StartTLS, Root DSE, and subschema reads.
+3. Rust `ldap_ops_client` Bind, Root DSE, Search, Add, Modify, Delete,
+   ModifyDN, Compare, WhoAmI, and Password Modify.
+
+**Usage**:
+```bash
+python3 -m pip install ldap3
+./scripts/ldap_interop_gate.sh
+```
+
+To run against an already running server:
+
+```bash
+OPENDR_INTEROP_START_SERVER=0 \
+OPENDR_LDAP_URL=ldap://127.0.0.1:1389 \
+OPENDR_BASE_DN=dc=example,dc=org \
+OPENDR_BIND_DN=cn=admin,dc=example,dc=org \
+OPENDR_BIND_PW=secret \
+./scripts/ldap_interop_gate.sh
+```
+
+**Prerequisites**:
+- Rust and Cargo.
+- OpenLDAP command-line tools: `ldapsearch`, `ldapadd`, `ldapmodify`,
+  `ldapdelete`, `ldapcompare`, and `ldapmodrdn`.
+- Python 3 with the `ldap3` package.
+- `openssl` when the script starts its own temporary server.
+
 ### test_schema_validation.sh
 
 **Purpose**: End-to-end test for LDAP schema validation

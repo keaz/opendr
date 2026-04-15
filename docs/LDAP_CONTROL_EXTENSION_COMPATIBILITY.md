@@ -4,6 +4,9 @@ This matrix records the OpenDR compatibility decision for commonly expected
 LDAP controls and extensions from RFC 4525, RFC 4527, RFC 4528, RFC 4529, RFC
 4511, and RFC 4512.
 
+The broader production release matrix is
+[LDAP_RFC_COMPLIANCE_MATRIX.md](LDAP_RFC_COMPLIANCE_MATRIX.md).
+
 ## Compatibility Matrix
 
 | RFC | Capability | OID | Root DSE attribute | Status | Behavior | Coverage |

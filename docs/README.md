@@ -23,6 +23,8 @@ deploys the site.
 - [Replication guide](./REPLICATION_GUIDE.md)
 - [LDAP referral and alias support](./LDAP_REFERRAL_ALIAS_SUPPORT.md)
 - [LDAP control and extension compatibility](./LDAP_CONTROL_EXTENSION_COMPATIBILITY.md)
+- [LDAP RFC compliance matrix](./LDAP_RFC_COMPLIANCE_MATRIX.md)
+- [Production readiness checklist](./PRODUCTION_READINESS_CHECKLIST.md)
 
 ## Implementation References
 

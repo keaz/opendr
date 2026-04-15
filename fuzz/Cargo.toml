@@ -1,0 +1,28 @@
+[package]
+name = "opendr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ldap-parser = "0.5.0"
+libfuzzer-sys = "0.4"
+opendr = { path = ".." }
+tokio = { version = "1.51.1", features = ["io-util", "net", "rt", "time"] }
+
+[[bin]]
+name = "ber_decoder"
+path = "fuzz_targets/ber_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ldap_request_handler"
+path = "fuzz_targets/ldap_request_handler.rs"
+test = false
+doc = false
+bench = false

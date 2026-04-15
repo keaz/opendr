@@ -317,6 +317,9 @@ Controls:
   [LDAP_CONTROL_EXTENSION_COMPATIBILITY.md](LDAP_CONTROL_EXTENSION_COMPATIBILITY.md).
 - Root DSE capability advertising is summarized in
   [ROOT_DSE_CAPABILITIES.md](ROOT_DSE_CAPABILITIES.md).
+- Release claims for RFC support and production readiness are gated by
+  [LDAP_RFC_COMPLIANCE_MATRIX.md](LDAP_RFC_COMPLIANCE_MATRIX.md) and
+  [PRODUCTION_READINESS_CHECKLIST.md](PRODUCTION_READINESS_CHECKLIST.md).
 
 Schema validation:
 

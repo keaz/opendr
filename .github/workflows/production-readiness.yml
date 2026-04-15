@@ -1,0 +1,61 @@
+name: Production Readiness Gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/production-readiness.yml"
+      - "docs/LDAP_RFC_COMPLIANCE_MATRIX.md"
+      - "docs/PRODUCTION_READINESS_CHECKLIST.md"
+      - "fuzz/**"
+      - "scripts/ldap_interop_gate.sh"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  readiness-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install external LDAP clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ldap-utils openssl python3-pip
+          python3 -m pip install ldap3
+
+      - name: Validate shell scripts
+        run: |
+          bash -n scripts/ldap_interop_gate.sh
+          bash -n scripts/referral_alias_interop.sh
+
+      - name: Core quality gate
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --no-fail-fast
+          cargo test --doc --quiet
+
+      - name: External interoperability gate
+        run: ./scripts/ldap_interop_gate.sh
+
+      - name: Fuzz target compile gate
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins
+
+      - name: Release-only long gates
+        run: |
+          cat <<'EOF'
+          Run these before a production-ready release and retain artifacts:
+          cargo +nightly fuzz run ber_decoder -- -runs=10000
+          cargo +nightly fuzz run ldap_request_handler -- -runs=10000
+          ./scripts/referral_alias_interop.sh
+          ./scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate
+          EOF
