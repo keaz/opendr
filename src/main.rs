@@ -139,7 +139,17 @@ async fn build_legacy_security_config(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    tokio::runtime::Runtime::new()?.block_on(run(args))
+    let config_path = args.config.to_string_lossy();
+    let config = ServerConfig::from_file(&config_path)?;
+    let runtime = if config.performance.worker_threads > 0 {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(config.performance.worker_threads)
+            .build()?
+    } else {
+        tokio::runtime::Runtime::new()?
+    };
+    runtime.block_on(run(args, config))
 }
 
 fn run_cli_command(mut config: ServerConfig, command: Command) -> Result<(), Box<dyn Error>> {
@@ -199,12 +209,8 @@ fn run_cli_command(mut config: ServerConfig, command: Command) -> Result<(), Box
     Ok(())
 }
 
-async fn run(args: Args) -> Result<(), Box<dyn Error>> {
+async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
     log4rs::init_file(&args.log_config, Default::default()).unwrap();
-
-    // Load configuration from server.toml
-    let config_path = args.config.to_string_lossy();
-    let config = ServerConfig::from_file(&config_path)?;
 
     if let Some(command) = args.command {
         return run_cli_command(config, command);

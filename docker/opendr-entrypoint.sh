@@ -25,6 +25,12 @@ mkdir -p "${CONFIG_DIR}" "${CERT_DIR}" "${DATA_DIR}"
 : "${OPENDR_MAX_MEMORY_PER_CONNECTION:=10485760}"
 : "${OPENDR_MAX_TOTAL_MEMORY:=2147483648}"
 : "${OPENDR_CONNECTION_IDLE_TIMEOUT_SECS:=600}"
+: "${OPENDR_WORKER_THREADS:=0}"
+: "${OPENDR_SCHEMA_VALIDATION:=true}"
+: "${OPENDR_INDEXING_ENABLED:=true}"
+: "${OPENDR_CACHE_SIZE:=1000}"
+: "${OPENDR_QUERY_OPTIMIZATION:=true}"
+: "${OPENDR_LOG_LEVEL:=info}"
 : "${OPENDR_BACKEND_INDEXES_TOML:=}"
 : "${OPENDR_SCHEMA_LDIF:=}"
 
@@ -88,6 +94,13 @@ enabled = false
 
 [rate_limit]
 enabled = false
+
+[performance]
+worker_threads = ${OPENDR_WORKER_THREADS}
+schema_validation = ${OPENDR_SCHEMA_VALIDATION}
+indexing_enabled = ${OPENDR_INDEXING_ENABLED}
+cache_size = ${OPENDR_CACHE_SIZE}
+query_optimization = ${OPENDR_QUERY_OPTIMIZATION}
 EOF
 
 if [[ -n "${OPENDR_BACKEND_INDEXES_TOML}" ]]; then
@@ -99,12 +112,12 @@ if [[ -n "${OPENDR_SCHEMA_LDIF}" ]]; then
   printf '%s\n' "${OPENDR_SCHEMA_LDIF}" > "${CONFIG_DIR}/schema/99-env-schema.ldif"
 fi
 
-cat > "${CONFIG_DIR}/log4rs.yml" <<'EOF'
+cat > "${CONFIG_DIR}/log4rs.yml" <<EOF
 appenders:
   stdout:
     kind: console
 root:
-  level: info
+  level: ${OPENDR_LOG_LEVEL}
   appenders:
     - stdout
 EOF

@@ -16,6 +16,9 @@ SASL_PLAIN_BENCHMARK="false"
 SASL_PLAIN_AUTHCID_FORMAT="dn"
 SKIP_SASL_PLAIN_ADMIN_BENCHMARK="false"
 SKIP_FULL_COUNTS="false"
+SKIP_SUBTREE_SEARCH_BENCHMARK="false"
+SKIP_SERIAL_INDEX_BENCHMARKS="false"
+PRELOAD_WORKERS="${PRELOAD_WORKERS:-1}"
 CONCURRENT_INDEX_SEARCH_CLIENTS=""
 CONCURRENT_INDEX_SEARCH_ITERATIONS="20"
 CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS="1"
@@ -28,6 +31,12 @@ CONCURRENT_BIND_VALID_PERCENT="100"
 CONCURRENT_BIND_WRONG_PASSWORD_PERCENT="0"
 CONCURRENT_BIND_HOT_USER_PERCENT="80"
 CONCURRENT_BIND_HOT_USER_COUNT="1"
+LDAPCON_STYLE_BENCHMARK="false"
+LDAPCON_CLIENTS=""
+LDAPCON_ITERATIONS="100"
+LDAPCON_WARMUP_ITERATIONS="5"
+LDAPCON_OPERATION_TIMEOUT_MS="10000"
+LDAPCON_MIXED_WRITE_PERCENT="20"
 BASE_DN="dc=example,dc=com"
 ROOT_PASSWORD="PerfRootSecret123!"
 OPENDR_IMAGE="opendr:docker-perf"
@@ -39,6 +48,17 @@ OPENDR_LMDB_MAX_READERS="${OPENDR_LMDB_MAX_READERS:-256}"
 OPENDR_MAX_CONNECTIONS="${OPENDR_MAX_CONNECTIONS:-512}"
 OPENDR_MAX_CONNECTIONS_PER_IP="${OPENDR_MAX_CONNECTIONS_PER_IP:-256}"
 OPENDR_MAX_OPERATIONS_PER_CONNECTION="${OPENDR_MAX_OPERATIONS_PER_CONNECTION:-200}"
+OPENDR_MAX_MEMORY_PER_CONNECTION="${OPENDR_MAX_MEMORY_PER_CONNECTION:-10485760}"
+OPENDR_MAX_TOTAL_MEMORY="${OPENDR_MAX_TOTAL_MEMORY:-2147483648}"
+OPENDR_WORKER_THREADS="${OPENDR_WORKER_THREADS:-0}"
+OPENDR_CACHE_SIZE="${OPENDR_CACHE_SIZE:-1000}"
+OPENDR_LOG_LEVEL="${OPENDR_LOG_LEVEL:-info}"
+OPENDR_BUILD_CARGO_PROFILE="${OPENDR_BUILD_CARGO_PROFILE:-release}"
+OPENDR_BUILD_RUSTFLAGS="${OPENDR_BUILD_RUSTFLAGS:-}"
+OPENDR_BULK_FIXTURE_LOAD="${OPENDR_BULK_FIXTURE_LOAD:-false}"
+OPENDR_SKIP_BULK_FIXTURE_LOAD="${OPENDR_SKIP_BULK_FIXTURE_LOAD:-false}"
+OPENDR_BULK_FIXTURE_BATCH_SIZE="${OPENDR_BULK_FIXTURE_BATCH_SIZE:-10000}"
+DOCKER_ULIMIT_NOFILE="${DOCKER_ULIMIT_NOFILE:-}"
 DEFAULT_OPENDR_INDEX_BENCHMARK_TOML=$'[[backend.indexes]]\nattribute = "description"\ntypes = ["substring"]\n\n[[backend.indexes]]\nattribute = "benchmarkOrder"\ntypes = ["ordering"]'
 DEFAULT_OPENDR_INDEX_BENCHMARK_SCHEMA_LDIF=$'dn: cn=schema\nattributeTypes: ( 1.3.6.1.4.1.55555.200.1 NAME \'benchmarkOrder\' DESC \'Benchmark integer ordering key\' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )\nobjectClasses: ( 1.3.6.1.4.1.55555.200.2 NAME \'benchmarkIndexedObject\' DESC \'Benchmark auxiliary object class for index probes\' SUP top AUXILIARY MAY benchmarkOrder )'
 OPENDR_BACKEND_INDEXES_TOML=""
@@ -59,7 +79,7 @@ Usage: scripts/perf_docker_matrix.sh [options]
 
 Options:
   --output-dir PATH         Output directory for the matrix run
-  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl, million (default: full)
+  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl, million, ten-million, ldapcon-ten-million (default: full)
   --products LIST          Comma-separated subset of: opendr,opendj
   --sample-interval SEC    Container stats sample interval (default: 0.25)
   --cpu VALUE              Docker CPU limit for each server container (default: 2)
@@ -72,6 +92,11 @@ Options:
   --skip-sasl-plain-admin-benchmark
                           Skip the admin/root SASL PLAIN bind probe; useful for OpenDJ fixture-user comparisons
   --skip-full-counts      Skip full-subtree setup/final count verification in the perf client
+  --skip-subtree-search-benchmark
+                          Skip the serial full-result subtree search probe
+  --skip-serial-index-benchmarks
+                          Skip serial index probes and keep only concurrent index-search probes
+  --preload-workers N     Parallel fixture preload connections used by ldap_perf_client (default: 1)
   --concurrent-index-search-clients LIST
                           Comma-separated concurrent index-search client levels; empty disables (default: disabled)
   --concurrent-index-search-iterations N
@@ -96,12 +121,52 @@ Options:
                           Percent of auth-concurrency attempts targeting the hot-user set (default: 80)
   --concurrent-bind-hot-user-count N
                           Number of hot users in the auth-concurrency distribution (default: 1)
+  --ldapcon-style-benchmark
+                          Run LDAPCon-style search/auth/modify/mixed operation probes
+  --ldapcon-clients LIST  Comma-separated LDAPCon-style client levels
+  --ldapcon-iterations N LDAPCon-style operations per client and operation family (default: 100)
+  --ldapcon-warmup-iterations N
+                          LDAPCon-style warmup operations per client (default: 5)
+  --ldapcon-operation-timeout-ms N
+                          LDAPCon-style per-operation timeout (default: 10000)
+  --ldapcon-mixed-write-percent N
+                          Percent of mixed LDAPCon-style operations that are modifies (default: 20)
   --base-dn DN             Benchmark base DN (default: dc=example,dc=com)
   --root-password VALUE    Root password used for both products
   --opendr-image TAG       Local OpenDR image tag (default: opendr:docker-perf)
   --opendr-runtime VALUE   OpenDR server runtime: legacy or fsm (default: fsm)
   --opendr-lmdb-max-size BYTES
                           OpenDR Docker LMDB map size in bytes (default: 1073741824)
+  --opendr-lmdb-max-readers N
+                          OpenDR Docker LMDB max reader slots
+  --opendr-max-connections N
+                          OpenDR maximum concurrent connections
+  --opendr-max-connections-per-ip N
+                          OpenDR maximum concurrent connections per client IP
+  --opendr-max-operations-per-connection N
+                          OpenDR maximum operations per connection
+  --opendr-max-memory-per-connection BYTES
+                          OpenDR per-connection memory budget
+  --opendr-max-total-memory BYTES
+                          OpenDR total tracked connection memory budget
+  --opendr-worker-threads N
+                          OpenDR Tokio worker threads, 0 means runtime default
+  --opendr-cache-size N
+                          OpenDR exact DN and credential cache capacity
+  --opendr-log-level LEVEL
+                          OpenDR Docker log level (default: info)
+  --opendr-build-profile VALUE
+                          Cargo profile used for the OpenDR Docker image build
+  --opendr-build-rustflags VALUE
+                          RUSTFLAGS used for the OpenDR Docker image build
+  --opendr-bulk-fixture-load
+                          Bulk-load OpenDR fixture data into LMDB before starting the server
+  --opendr-skip-bulk-fixture-load
+                          Reuse an existing OpenDR bulk fixture in the run directory
+  --opendr-bulk-fixture-batch-size N
+                          Entries per LMDB write transaction for OpenDR bulk fixture load (default: 10000)
+  --docker-ulimit-nofile N
+                          Docker nofile soft/hard limit for benchmark containers
   --opendr-backend-indexes-toml VALUE
                           TOML snippet appended to OpenDR Docker server.toml for typed backend indexes
   --opendr-schema-ldif VALUE
@@ -165,6 +230,18 @@ while [[ $# -gt 0 ]]; do
       SKIP_FULL_COUNTS="true"
       shift
       ;;
+    --skip-subtree-search-benchmark)
+      SKIP_SUBTREE_SEARCH_BENCHMARK="true"
+      shift
+      ;;
+    --skip-serial-index-benchmarks)
+      SKIP_SERIAL_INDEX_BENCHMARKS="true"
+      shift
+      ;;
+    --preload-workers)
+      PRELOAD_WORKERS="$2"
+      shift 2
+      ;;
     --concurrent-index-search-clients)
       CONCURRENT_INDEX_SEARCH_CLIENTS="$2"
       shift 2
@@ -213,6 +290,30 @@ while [[ $# -gt 0 ]]; do
       CONCURRENT_BIND_HOT_USER_COUNT="$2"
       shift 2
       ;;
+    --ldapcon-style-benchmark)
+      LDAPCON_STYLE_BENCHMARK="true"
+      shift
+      ;;
+    --ldapcon-clients)
+      LDAPCON_CLIENTS="$2"
+      shift 2
+      ;;
+    --ldapcon-iterations)
+      LDAPCON_ITERATIONS="$2"
+      shift 2
+      ;;
+    --ldapcon-warmup-iterations)
+      LDAPCON_WARMUP_ITERATIONS="$2"
+      shift 2
+      ;;
+    --ldapcon-operation-timeout-ms)
+      LDAPCON_OPERATION_TIMEOUT_MS="$2"
+      shift 2
+      ;;
+    --ldapcon-mixed-write-percent)
+      LDAPCON_MIXED_WRITE_PERCENT="$2"
+      shift 2
+      ;;
     --base-dn)
       BASE_DN="$2"
       shift 2
@@ -231,6 +332,66 @@ while [[ $# -gt 0 ]]; do
       ;;
     --opendr-lmdb-max-size)
       OPENDR_LMDB_MAX_SIZE="$2"
+      shift 2
+      ;;
+    --opendr-lmdb-max-readers)
+      OPENDR_LMDB_MAX_READERS="$2"
+      shift 2
+      ;;
+    --opendr-max-connections)
+      OPENDR_MAX_CONNECTIONS="$2"
+      shift 2
+      ;;
+    --opendr-max-connections-per-ip)
+      OPENDR_MAX_CONNECTIONS_PER_IP="$2"
+      shift 2
+      ;;
+    --opendr-max-operations-per-connection)
+      OPENDR_MAX_OPERATIONS_PER_CONNECTION="$2"
+      shift 2
+      ;;
+    --opendr-max-memory-per-connection)
+      OPENDR_MAX_MEMORY_PER_CONNECTION="$2"
+      shift 2
+      ;;
+    --opendr-max-total-memory)
+      OPENDR_MAX_TOTAL_MEMORY="$2"
+      shift 2
+      ;;
+    --opendr-worker-threads)
+      OPENDR_WORKER_THREADS="$2"
+      shift 2
+      ;;
+    --opendr-cache-size)
+      OPENDR_CACHE_SIZE="$2"
+      shift 2
+      ;;
+    --opendr-log-level)
+      OPENDR_LOG_LEVEL="$2"
+      shift 2
+      ;;
+    --opendr-build-profile)
+      OPENDR_BUILD_CARGO_PROFILE="$2"
+      shift 2
+      ;;
+    --opendr-build-rustflags)
+      OPENDR_BUILD_RUSTFLAGS="$2"
+      shift 2
+      ;;
+    --opendr-bulk-fixture-load)
+      OPENDR_BULK_FIXTURE_LOAD="true"
+      shift
+      ;;
+    --opendr-skip-bulk-fixture-load)
+      OPENDR_SKIP_BULK_FIXTURE_LOAD="true"
+      shift
+      ;;
+    --opendr-bulk-fixture-batch-size)
+      OPENDR_BULK_FIXTURE_BATCH_SIZE="$2"
+      shift 2
+      ;;
+    --docker-ulimit-nofile)
+      DOCKER_ULIMIT_NOFILE="$2"
       shift 2
       ;;
     --opendr-backend-indexes-toml)
@@ -354,11 +515,111 @@ case "${PROFILE_SET}" in
     )
     SKIP_FULL_COUNTS="true"
     ;;
+  ten-million)
+    LOAD_PROFILES=(
+      "ten-million:10000000:3:3:1"
+    )
+    SKIP_FULL_COUNTS="true"
+    SKIP_SUBTREE_SEARCH_BENCHMARK="true"
+    SKIP_SERIAL_INDEX_BENCHMARKS="true"
+    INDEX_BENCHMARK="true"
+    if [[ -z "${CONCURRENT_INDEX_SEARCH_CLIENTS}" ]]; then
+      CONCURRENT_INDEX_SEARCH_CLIENTS="128,256,1000"
+    fi
+    if [[ -z "${CONCURRENT_BIND_CLIENTS}" ]]; then
+      CONCURRENT_BIND_CLIENTS="128,256,1000"
+    fi
+    if [[ -z "${OPENDR_BACKEND_INDEXES_TOML}" ]]; then
+      OPENDR_BACKEND_INDEXES_TOML="${DEFAULT_OPENDR_INDEX_BENCHMARK_TOML}"
+    fi
+    if [[ -z "${OPENDR_SCHEMA_LDIF}" ]]; then
+      OPENDR_SCHEMA_LDIF="${DEFAULT_OPENDR_INDEX_BENCHMARK_SCHEMA_LDIF}"
+    fi
+    if [[ "${OPENDR_BUILD_CARGO_PROFILE}" == "release" ]]; then
+      OPENDR_BUILD_CARGO_PROFILE="perf"
+    fi
+    if [[ -z "${OPENDR_BUILD_RUSTFLAGS}" ]]; then
+      OPENDR_BUILD_RUSTFLAGS="-C target-cpu=native"
+    fi
+    if [[ "${OPENDR_WORKER_THREADS}" == "0" ]]; then
+      OPENDR_WORKER_THREADS="8"
+    fi
+    if [[ "${OPENDR_BULK_FIXTURE_LOAD}" == "false" ]]; then
+      OPENDR_BULK_FIXTURE_LOAD="true"
+    fi
+    if [[ "${PRELOAD_WORKERS}" == "1" ]]; then
+      PRELOAD_WORKERS="8"
+    fi
+    if [[ "${OPENDR_LMDB_MAX_SIZE}" == "1073741824" ]]; then
+      OPENDR_LMDB_MAX_SIZE="343597383680"
+    fi
+    if [[ "${OPENDR_CACHE_SIZE}" == "1000" ]]; then
+      OPENDR_CACHE_SIZE="50000"
+    fi
+    if [[ "${OPENDR_LOG_LEVEL}" == "info" ]]; then
+      OPENDR_LOG_LEVEL="warn"
+    fi
+    if [[ -z "${DOCKER_ULIMIT_NOFILE}" ]]; then
+      DOCKER_ULIMIT_NOFILE="1048576"
+    fi
+    ;;
+  ldapcon-ten-million)
+    LOAD_PROFILES=(
+      "ldapcon-ten-million:10000000:3:3:1"
+    )
+    SKIP_FULL_COUNTS="true"
+    SKIP_SUBTREE_SEARCH_BENCHMARK="true"
+    SKIP_SERIAL_INDEX_BENCHMARKS="true"
+    LDAPCON_STYLE_BENCHMARK="true"
+    INDEX_BENCHMARK="false"
+    SASL_PLAIN_BENCHMARK="false"
+    CONCURRENT_INDEX_SEARCH_CLIENTS=""
+    CONCURRENT_BIND_CLIENTS=""
+    if [[ -z "${LDAPCON_CLIENTS}" ]]; then
+      LDAPCON_CLIENTS="8,128,256,1000"
+    fi
+    if [[ "${OPENDR_BUILD_CARGO_PROFILE}" == "release" ]]; then
+      OPENDR_BUILD_CARGO_PROFILE="perf"
+    fi
+    if [[ -z "${OPENDR_BUILD_RUSTFLAGS}" ]]; then
+      OPENDR_BUILD_RUSTFLAGS="-C target-cpu=native"
+    fi
+    if [[ "${OPENDR_WORKER_THREADS}" == "0" ]]; then
+      OPENDR_WORKER_THREADS="8"
+    fi
+    if [[ "${OPENDR_BULK_FIXTURE_LOAD}" == "false" ]]; then
+      OPENDR_BULK_FIXTURE_LOAD="true"
+    fi
+    if [[ "${PRELOAD_WORKERS}" == "1" ]]; then
+      PRELOAD_WORKERS="8"
+    fi
+    if [[ "${OPENDR_LMDB_MAX_SIZE}" == "1073741824" ]]; then
+      OPENDR_LMDB_MAX_SIZE="343597383680"
+    fi
+    if [[ "${OPENDR_CACHE_SIZE}" == "1000" ]]; then
+      OPENDR_CACHE_SIZE="50000"
+    fi
+    if [[ "${OPENDR_LOG_LEVEL}" == "info" ]]; then
+      OPENDR_LOG_LEVEL="warn"
+    fi
+    if [[ -z "${DOCKER_ULIMIT_NOFILE}" ]]; then
+      DOCKER_ULIMIT_NOFILE="1048576"
+    fi
+    ;;
   *)
-    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl, million" >&2
+    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl, million, ten-million, ldapcon-ten-million" >&2
     exit 1
     ;;
 esac
+
+if [[ "${INDEX_BENCHMARK}" == "true" ]]; then
+  if [[ -z "${OPENDR_BACKEND_INDEXES_TOML}" ]]; then
+    OPENDR_BACKEND_INDEXES_TOML="${DEFAULT_OPENDR_INDEX_BENCHMARK_TOML}"
+  fi
+  if [[ -z "${OPENDR_SCHEMA_LDIF}" ]]; then
+    OPENDR_SCHEMA_LDIF="${DEFAULT_OPENDR_INDEX_BENCHMARK_SCHEMA_LDIF}"
+  fi
+fi
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -570,20 +831,22 @@ wait_for_container_ready() {
       return 1
     fi
 
-    if nc -z 127.0.0.1 "${port}" >/dev/null 2>&1; then
-      case "${product}" in
-        opendr)
+    case "${product}" in
+      opendr)
+        if docker exec "${container}" bash -lc ": </dev/tcp/127.0.0.1/1389" >/dev/null 2>&1; then
           sleep 2
           return 0
-          ;;
-        opendj)
+        fi
+        ;;
+      opendj)
+        if nc -z 127.0.0.1 "${port}" >/dev/null 2>&1; then
           if docker logs "${container}" 2>&1 | rg -q 'Starting Directory Server \.* Done\.'; then
             sleep 8
             return 0
           fi
-          ;;
-      esac
-    fi
+        fi
+        ;;
+    esac
 
     attempts=$((attempts + 1))
     sleep 1
@@ -599,12 +862,21 @@ build_dependencies() {
 
   if [[ -n "${PERF_CLIENT_IMAGE}" ]]; then
     echo "Building perf client Docker image ${PERF_CLIENT_IMAGE}..."
-    docker build --target perf-client -t "${PERF_CLIENT_IMAGE}" "${REPO_ROOT}"
+    docker build \
+      --target perf-client \
+      --build-arg "CARGO_PROFILE=${OPENDR_BUILD_CARGO_PROFILE}" \
+      --build-arg "RUSTFLAGS=${OPENDR_BUILD_RUSTFLAGS}" \
+      -t "${PERF_CLIENT_IMAGE}" \
+      "${REPO_ROOT}"
   fi
 
   if contains_product "opendr"; then
     echo "Building OpenDR Docker image ${OPENDR_IMAGE}..."
-    docker build -t "${OPENDR_IMAGE}" "${REPO_ROOT}"
+    docker build \
+      --build-arg "CARGO_PROFILE=${OPENDR_BUILD_CARGO_PROFILE}" \
+      --build-arg "RUSTFLAGS=${OPENDR_BUILD_RUSTFLAGS}" \
+      -t "${OPENDR_IMAGE}" \
+      "${REPO_ROOT}"
   fi
 
   if contains_product "opendj"; then
@@ -649,6 +921,7 @@ write_run_metadata() {
   "bind_dn": "${bind_dn}",
   "admin_whoami_expected": "${admin_whoami_expected}",
   "preloaded_users": ${preloaded_users},
+  "preload_workers": ${PRELOAD_WORKERS},
   "read_iterations": ${read_iterations},
   "write_iterations": ${write_iterations},
   "warmup_iterations": ${warmup_iterations},
@@ -656,6 +929,8 @@ write_run_metadata() {
   "sasl_plain_benchmark": ${SASL_PLAIN_BENCHMARK},
   "sasl_plain_authcid_format": "${SASL_PLAIN_AUTHCID_FORMAT}",
   "skip_sasl_plain_admin_benchmark": ${SKIP_SASL_PLAIN_ADMIN_BENCHMARK},
+  "skip_subtree_search_benchmark": ${SKIP_SUBTREE_SEARCH_BENCHMARK},
+  "skip_serial_index_benchmarks": ${SKIP_SERIAL_INDEX_BENCHMARKS},
   "concurrent_index_search_clients": "${CONCURRENT_INDEX_SEARCH_CLIENTS}",
   "concurrent_index_search_iterations": ${CONCURRENT_INDEX_SEARCH_ITERATIONS},
   "concurrent_index_search_warmup_iterations": ${CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS},
@@ -668,6 +943,12 @@ write_run_metadata() {
   "concurrent_bind_wrong_password_percent": ${CONCURRENT_BIND_WRONG_PASSWORD_PERCENT},
   "concurrent_bind_hot_user_percent": ${CONCURRENT_BIND_HOT_USER_PERCENT},
   "concurrent_bind_hot_user_count": ${CONCURRENT_BIND_HOT_USER_COUNT},
+  "ldapcon_style_benchmark": ${LDAPCON_STYLE_BENCHMARK},
+  "ldapcon_clients": "${LDAPCON_CLIENTS}",
+  "ldapcon_iterations": ${LDAPCON_ITERATIONS},
+  "ldapcon_warmup_iterations": ${LDAPCON_WARMUP_ITERATIONS},
+  "ldapcon_operation_timeout_ms": ${LDAPCON_OPERATION_TIMEOUT_MS},
+  "ldapcon_mixed_write_percent": ${LDAPCON_MIXED_WRITE_PERCENT},
   "cpu_limit": "${CPU_LIMIT}",
   "memory_limit": "${MEMORY_LIMIT}",
   "opendr_runtime": "${OPENDR_RUNTIME}",
@@ -676,6 +957,16 @@ write_run_metadata() {
   "opendr_max_connections": ${OPENDR_MAX_CONNECTIONS},
   "opendr_max_connections_per_ip": ${OPENDR_MAX_CONNECTIONS_PER_IP},
   "opendr_max_operations_per_connection": ${OPENDR_MAX_OPERATIONS_PER_CONNECTION},
+  "opendr_max_memory_per_connection": ${OPENDR_MAX_MEMORY_PER_CONNECTION},
+  "opendr_max_total_memory": ${OPENDR_MAX_TOTAL_MEMORY},
+  "opendr_worker_threads": ${OPENDR_WORKER_THREADS},
+  "opendr_cache_size": ${OPENDR_CACHE_SIZE},
+  "opendr_log_level": "${OPENDR_LOG_LEVEL}",
+  "opendr_build_cargo_profile": "${OPENDR_BUILD_CARGO_PROFILE}",
+  "opendr_build_rustflags": "${OPENDR_BUILD_RUSTFLAGS}",
+  "opendr_bulk_fixture_load": ${OPENDR_BULK_FIXTURE_LOAD},
+  "opendr_bulk_fixture_batch_size": ${OPENDR_BULK_FIXTURE_BATCH_SIZE},
+  "docker_ulimit_nofile": "${DOCKER_ULIMIT_NOFILE}",
   "benchmark_client": "${benchmark_client}",
   "benchmark_client_host": "${benchmark_client_host}",
   "benchmark_client_network": "${benchmark_client_network}",
@@ -862,6 +1153,11 @@ run_profile() {
   local watchdog_pid=""
   local client_container=""
   local timeout_flag="${run_dir}/benchmark-timeout.flag"
+  local docker_ulimit_args=()
+
+  if [[ -n "${DOCKER_ULIMIT_NOFILE}" ]]; then
+    docker_ulimit_args=(--ulimit "nofile=${DOCKER_ULIMIT_NOFILE}:${DOCKER_ULIMIT_NOFILE}")
+  fi
 
   mkdir -p "${run_dir}" "${data_dir}"
   chmod 0777 "${data_dir}"
@@ -877,8 +1173,65 @@ run_profile() {
       image="${OPENDR_IMAGE}"
       bind_dn="cn=admin,${BASE_DN}"
       admin_whoami_expected="dn:${bind_dn}"
+      if [[ "${OPENDR_BULK_FIXTURE_LOAD}" == "true" ]]; then
+        if [[ "${OPENDR_SKIP_BULK_FIXTURE_LOAD}" == "true" ]]; then
+          if [[ ! -f "${data_dir}/data.mdb" ]]; then
+            echo "Cannot reuse OpenDR bulk fixture: ${data_dir}/data.mdb does not exist" >&2
+            exit 1
+          fi
+          echo "Reusing existing OpenDR bulk fixture for ${profile_name}..."
+        else
+          local loader_container="perf-loader-${product}-${profile_name}-$$"
+          local loader_cmd=(
+            docker run --rm
+            --name "${loader_container}"
+            ${docker_ulimit_args[@]+"${docker_ulimit_args[@]}"}
+            --cpus="${CPU_LIMIT}"
+            --memory="${MEMORY_LIMIT}"
+            -v "${data_dir}:/var/lib/opendr/data"
+          )
+          if [[ -n "${LDAP_PERF_PROGRESS:-}" ]]; then
+            loader_cmd+=(-e "LDAP_PERF_PROGRESS=${LDAP_PERF_PROGRESS}")
+          fi
+          loader_cmd+=(
+            --entrypoint /usr/local/bin/opendr_perf_fixture_loader
+            "${image}"
+            --data-dir /var/lib/opendr/data
+            --base-dn "${BASE_DN}"
+            --root-dn "${bind_dn}"
+            --root-password "${ROOT_PASSWORD}"
+            --name-prefix "${product}-${profile_name}"
+            --preloaded-users "${preloaded_users}"
+            --lmdb-max-size-bytes "${OPENDR_LMDB_MAX_SIZE}"
+            --lmdb-max-readers "${OPENDR_LMDB_MAX_READERS}"
+            --cache-size "${OPENDR_CACHE_SIZE}"
+            --batch-size "${OPENDR_BULK_FIXTURE_BATCH_SIZE}"
+          )
+          if [[ "${INDEX_BENCHMARK}" == "true" ]]; then
+            loader_cmd+=(--index-benchmark)
+          fi
+
+          echo "Bulk-loading OpenDR fixture for ${profile_name}..."
+          CURRENT_CLIENT_CONTAINER="${loader_container}"
+          local loader_start_seconds="${SECONDS}"
+          "${loader_cmd[@]}" \
+            > "${run_dir}/bulk-fixture-loader.stdout.log" \
+            2> "${run_dir}/bulk-fixture-loader.stderr.log"
+          local loader_elapsed_seconds=$((SECONDS - loader_start_seconds))
+          cat > "${run_dir}/bulk-fixture-loader-status.json" <<EOF
+{
+  "status": "success",
+  "elapsed_seconds": ${loader_elapsed_seconds},
+  "batch_size": ${OPENDR_BULK_FIXTURE_BATCH_SIZE},
+  "preloaded_users": ${preloaded_users}
+}
+EOF
+          CURRENT_CLIENT_CONTAINER=""
+        fi
+      fi
       docker run -d --rm \
         --name "${CURRENT_CONTAINER}" \
+        ${docker_ulimit_args[@]+"${docker_ulimit_args[@]}"} \
         --cpus="${CPU_LIMIT}" \
         --memory="${MEMORY_LIMIT}" \
         -p "127.0.0.1:${ldap_port}:1389" \
@@ -892,6 +1245,11 @@ run_profile() {
         -e OPENDR_MAX_CONNECTIONS="${OPENDR_MAX_CONNECTIONS}" \
         -e OPENDR_MAX_CONNECTIONS_PER_IP="${OPENDR_MAX_CONNECTIONS_PER_IP}" \
         -e OPENDR_MAX_OPERATIONS_PER_CONNECTION="${OPENDR_MAX_OPERATIONS_PER_CONNECTION}" \
+        -e OPENDR_MAX_MEMORY_PER_CONNECTION="${OPENDR_MAX_MEMORY_PER_CONNECTION}" \
+        -e OPENDR_MAX_TOTAL_MEMORY="${OPENDR_MAX_TOTAL_MEMORY}" \
+        -e OPENDR_WORKER_THREADS="${OPENDR_WORKER_THREADS}" \
+        -e OPENDR_CACHE_SIZE="${OPENDR_CACHE_SIZE}" \
+        -e OPENDR_LOG_LEVEL="${OPENDR_LOG_LEVEL}" \
         -e OPENDR_BACKEND_INDEXES_TOML="${OPENDR_BACKEND_INDEXES_TOML}" \
         -e OPENDR_SCHEMA_LDIF="${OPENDR_SCHEMA_LDIF}" \
         "${image}" \
@@ -903,6 +1261,7 @@ run_profile() {
       admin_whoami_expected="dn:cn=Directory Manager,cn=Root DNs,cn=config"
       docker run -d --rm \
         --name "${CURRENT_CONTAINER}" \
+        ${docker_ulimit_args[@]+"${docker_ulimit_args[@]}"} \
         --cpus="${CPU_LIMIT}" \
         --memory="${MEMORY_LIMIT}" \
         -p "127.0.0.1:${ldap_port}:1389" \
@@ -1001,6 +1360,7 @@ run_profile() {
     benchmark_cmd=(
       docker run --rm
       --name "${client_container}"
+      ${docker_ulimit_args[@]+"${docker_ulimit_args[@]}"}
       -v "${run_dir}:${run_dir}"
     )
     if [[ "${PERF_CLIENT_NETWORK}" == "server" ]]; then
@@ -1030,6 +1390,7 @@ run_profile() {
     --password "${ROOT_PASSWORD}"
     --base-dn "${BASE_DN}"
     --preloaded-users "${preloaded_users}"
+    --preload-workers "${PRELOAD_WORKERS}"
     --read-iterations "${read_iterations}"
     --write-iterations "${write_iterations}"
     --warmup-iterations "${warmup_iterations}"
@@ -1063,12 +1424,31 @@ run_profile() {
   if [[ "${SKIP_FULL_COUNTS}" == "true" ]]; then
     benchmark_cmd+=(--skip-full-counts)
   fi
+  if [[ "${product}" == "opendr" && "${OPENDR_BULK_FIXTURE_LOAD}" == "true" ]]; then
+    benchmark_cmd+=(--reuse-fixture)
+  fi
+  if [[ "${SKIP_SUBTREE_SEARCH_BENCHMARK}" == "true" ]]; then
+    benchmark_cmd+=(--skip-subtree-search-benchmark)
+  fi
+  if [[ "${SKIP_SERIAL_INDEX_BENCHMARKS}" == "true" ]]; then
+    benchmark_cmd+=(--skip-serial-index-benchmarks)
+  fi
   if [[ -n "${CONCURRENT_INDEX_SEARCH_CLIENTS}" ]]; then
     benchmark_cmd+=(
       --concurrent-index-search-clients "${CONCURRENT_INDEX_SEARCH_CLIENTS}"
       --concurrent-index-search-iterations "${CONCURRENT_INDEX_SEARCH_ITERATIONS}"
       --concurrent-index-search-warmup-iterations "${CONCURRENT_INDEX_SEARCH_WARMUP_ITERATIONS}"
       --concurrent-index-search-operation-timeout-ms "${CONCURRENT_INDEX_SEARCH_OPERATION_TIMEOUT_MS}"
+    )
+  fi
+  if [[ "${LDAPCON_STYLE_BENCHMARK}" == "true" ]]; then
+    benchmark_cmd+=(
+      --ldapcon-style-benchmark
+      --ldapcon-clients "${LDAPCON_CLIENTS}"
+      --ldapcon-iterations "${LDAPCON_ITERATIONS}"
+      --ldapcon-warmup-iterations "${LDAPCON_WARMUP_ITERATIONS}"
+      --ldapcon-operation-timeout-ms "${LDAPCON_OPERATION_TIMEOUT_MS}"
+      --ldapcon-mixed-write-percent "${LDAPCON_MIXED_WRITE_PERCENT}"
     )
   fi
 
@@ -1342,6 +1722,7 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "exit_code": status["exit_code"],
             "timeout_seconds": status["timeout_seconds"],
             "preloaded_users": metadata["preloaded_users"],
+            "preload_workers": metadata.get("preload_workers", 1),
             "read_iterations": metadata["read_iterations"],
             "write_iterations": metadata["write_iterations"],
             "warmup_iterations": metadata["warmup_iterations"],
@@ -1349,6 +1730,8 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "sasl_plain_benchmark": metadata.get("sasl_plain_benchmark", False),
             "sasl_plain_authcid_format": metadata.get("sasl_plain_authcid_format", "dn"),
             "skip_sasl_plain_admin_benchmark": metadata.get("skip_sasl_plain_admin_benchmark", False),
+            "skip_subtree_search_benchmark": metadata.get("skip_subtree_search_benchmark", False),
+            "skip_serial_index_benchmarks": metadata.get("skip_serial_index_benchmarks", False),
             "concurrent_index_search_clients": metadata.get("concurrent_index_search_clients", ""),
             "concurrent_index_search_iterations": metadata.get("concurrent_index_search_iterations", 0),
             "concurrent_index_search_warmup_iterations": metadata.get("concurrent_index_search_warmup_iterations", 0),
@@ -1364,6 +1747,20 @@ for metadata_file in sorted(root.glob("*/*/run-metadata.json")):
             "cpu_limit": metadata["cpu_limit"],
             "memory_limit": metadata["memory_limit"],
             "opendr_lmdb_max_size": metadata.get("opendr_lmdb_max_size", 0),
+            "opendr_lmdb_max_readers": metadata.get("opendr_lmdb_max_readers", 0),
+            "opendr_max_connections": metadata.get("opendr_max_connections", 0),
+            "opendr_max_connections_per_ip": metadata.get("opendr_max_connections_per_ip", 0),
+            "opendr_max_operations_per_connection": metadata.get("opendr_max_operations_per_connection", 0),
+            "opendr_max_memory_per_connection": metadata.get("opendr_max_memory_per_connection", 0),
+            "opendr_max_total_memory": metadata.get("opendr_max_total_memory", 0),
+            "opendr_worker_threads": metadata.get("opendr_worker_threads", 0),
+            "opendr_cache_size": metadata.get("opendr_cache_size", 0),
+            "opendr_log_level": metadata.get("opendr_log_level", ""),
+            "opendr_build_cargo_profile": metadata.get("opendr_build_cargo_profile", ""),
+            "opendr_build_rustflags": metadata.get("opendr_build_rustflags", ""),
+            "opendr_bulk_fixture_load": metadata.get("opendr_bulk_fixture_load", False),
+            "opendr_bulk_fixture_batch_size": metadata.get("opendr_bulk_fixture_batch_size", 0),
+            "docker_ulimit_nofile": metadata.get("docker_ulimit_nofile", ""),
             "benchmark_client": metadata.get("benchmark_client", "target/release/ldap_perf_client"),
             "benchmark_client_host": metadata.get("benchmark_client_host", "127.0.0.1"),
             "benchmark_client_network": metadata.get("benchmark_client_network", "host"),
@@ -1453,7 +1850,7 @@ summary_md = root / "comparison-summary.md"
 summary_csv = root / "comparison-summary.csv"
 
 csv_lines = [
-    "product,profile,status,exit_code,timeout_seconds,preloaded_users,read_iterations,write_iterations,index_benchmark,sasl_plain_benchmark,sasl_plain_authcid_format,skip_sasl_plain_admin_benchmark,concurrent_index_search_clients,concurrent_index_search_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,sasl_plain_bind_admin_mean_ms,sasl_plain_bind_fixture_user_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,index_equality_uid_mean_ms,index_equality_uid_throughput,index_presence_mail_mean_ms,index_presence_mail_throughput,index_substring_description_mean_ms,index_substring_description_throughput,index_ordering_benchmark_order_ge_mean_ms,index_ordering_benchmark_order_ge_throughput,index_ordering_benchmark_order_le_mean_ms,index_ordering_benchmark_order_le_throughput,max_concurrent_index_search_clients_tested,max_concurrent_index_search_clients_zero_failure,max_concurrent_index_search_failure_rate_percent,peak_concurrent_index_search_success_throughput,peak_concurrent_index_search_attempt_throughput,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput,max_concurrent_sasl_plain_bind_clients_tested,max_concurrent_sasl_plain_bind_clients_zero_failure,max_concurrent_sasl_plain_bind_failure_rate_percent,peak_concurrent_sasl_plain_bind_success_throughput,peak_concurrent_sasl_plain_bind_attempt_throughput"
+    "product,profile,status,exit_code,timeout_seconds,preloaded_users,preload_workers,read_iterations,write_iterations,index_benchmark,sasl_plain_benchmark,sasl_plain_authcid_format,skip_sasl_plain_admin_benchmark,concurrent_index_search_clients,concurrent_index_search_iterations,concurrent_bind_clients,concurrent_bind_iterations,concurrent_bind_valid_percent,concurrent_bind_wrong_password_percent,concurrent_bind_hot_user_percent,concurrent_bind_hot_user_count,records_before_setup,records_after_setup,records_after_benchmark,total_elapsed_ms,cpu_avg_percent,cpu_max_percent,memory_avg_bytes,memory_max_bytes,db_before_bytes,db_after_bytes,data_before_bytes,data_after_bytes,root_dse_mean_ms,bind_admin_mean_ms,sasl_plain_bind_admin_mean_ms,sasl_plain_bind_fixture_user_mean_ms,search_subtree_mean_ms,search_subtree_throughput,search_subtree_failure_rate_percent,add_mean_ms,add_failure_rate_percent,modify_mean_ms,modify_failure_rate_percent,modifydn_mean_ms,modifydn_failure_rate_percent,delete_mean_ms,delete_failure_rate_percent,password_modify_mean_ms,password_modify_failure_rate_percent,index_equality_uid_mean_ms,index_equality_uid_throughput,index_presence_mail_mean_ms,index_presence_mail_throughput,index_substring_description_mean_ms,index_substring_description_throughput,index_ordering_benchmark_order_ge_mean_ms,index_ordering_benchmark_order_ge_throughput,index_ordering_benchmark_order_le_mean_ms,index_ordering_benchmark_order_le_throughput,max_concurrent_index_search_clients_tested,max_concurrent_index_search_clients_zero_failure,max_concurrent_index_search_failure_rate_percent,peak_concurrent_index_search_success_throughput,peak_concurrent_index_search_attempt_throughput,max_concurrent_bind_clients_tested,max_concurrent_bind_clients_zero_failure,max_concurrent_bind_failure_rate_percent,peak_concurrent_bind_success_throughput,peak_concurrent_bind_attempt_throughput,max_concurrent_sasl_plain_bind_clients_tested,max_concurrent_sasl_plain_bind_clients_zero_failure,max_concurrent_sasl_plain_bind_failure_rate_percent,peak_concurrent_sasl_plain_bind_success_throughput,peak_concurrent_sasl_plain_bind_attempt_throughput"
 ]
 for run in runs:
     csv_lines.append(
@@ -1465,6 +1862,7 @@ for run in runs:
                 str(run["exit_code"]),
                 str(run["timeout_seconds"]),
                 str(run["preloaded_users"]),
+                str(run["preload_workers"]),
                 str(run["read_iterations"]),
                 str(run["write_iterations"]),
                 str(run["index_benchmark"]).lower(),
@@ -1556,8 +1954,22 @@ if runs:
             f"- Benchmark client host: `{reference.get('benchmark_client_host', '127.0.0.1')}`",
             f"- Benchmark client network: `{reference.get('benchmark_client_network', 'host')}`",
             f"- OpenDR LMDB map size: `{reference.get('opendr_lmdb_max_size', 0)}` bytes",
+            f"- OpenDR LMDB max readers: `{reference.get('opendr_lmdb_max_readers', 0)}`",
+            f"- OpenDR max connections: `{reference.get('opendr_max_connections', 0)}`",
+            f"- OpenDR max connections per IP: `{reference.get('opendr_max_connections_per_ip', 0)}`",
+            f"- OpenDR worker threads: `{reference.get('opendr_worker_threads', 0)}`",
+            f"- OpenDR cache size: `{reference.get('opendr_cache_size', 0)}`",
+            f"- OpenDR log level: `{reference.get('opendr_log_level', '')}`",
+            f"- OpenDR build profile: `{reference.get('opendr_build_cargo_profile', '')}`",
+            f"- OpenDR build RUSTFLAGS: `{reference.get('opendr_build_rustflags', '')}`",
+            f"- OpenDR bulk fixture load: `{str(reference.get('opendr_bulk_fixture_load', False)).lower()}`",
+            f"- OpenDR bulk fixture batch size: `{reference.get('opendr_bulk_fixture_batch_size', 0)}`",
+            f"- Docker nofile ulimit: `{reference.get('docker_ulimit_nofile', '') or 'default'}`",
+            f"- Fixture preload workers: `{reference.get('preload_workers', 1)}`",
             f"- Timeout budget per profile: `{reference['timeout_seconds']}` seconds",
             f"- Index benchmark probes: `{str(reference.get('index_benchmark', False)).lower()}`",
+            f"- Skip full-result subtree search benchmark: `{str(reference.get('skip_subtree_search_benchmark', False)).lower()}`",
+            f"- Skip serial index benchmarks: `{str(reference.get('skip_serial_index_benchmarks', False)).lower()}`",
             f"- SASL PLAIN bind probes: `{str(reference.get('sasl_plain_benchmark', False)).lower()}`",
             f"- SASL PLAIN authcid format: `{reference.get('sasl_plain_authcid_format', 'dn')}`",
             f"- Skip SASL PLAIN admin probe: `{str(reference.get('skip_sasl_plain_admin_benchmark', False)).lower()}`",
@@ -1572,8 +1984,8 @@ if runs:
             "",
             "## Load Profiles",
             "",
-            "| Profile | Preloaded Users | Read Iterations | Write Iterations | SASL PLAIN | SASL Authcid Format | Skip SASL Admin | Concurrent Index Search Clients | Concurrent Index Search Iterations/Client | Concurrent Bind Clients | Concurrent Bind Iterations/Client |",
-            "|---|---:|---:|---:|---|---|---|---|---:|---|---:|",
+            "| Profile | Preloaded Users | Preload Workers | Read Iterations | Write Iterations | SASL PLAIN | SASL Authcid Format | Skip SASL Admin | Concurrent Index Search Clients | Concurrent Index Search Iterations/Client | Concurrent Bind Clients | Concurrent Bind Iterations/Client |",
+            "|---|---:|---:|---:|---:|---|---|---|---|---:|---|---:|",
         ]
     )
     seen_profiles = set()
@@ -1582,7 +1994,7 @@ if runs:
             continue
         seen_profiles.add(run["profile"])
         lines.append(
-            f"| {run['profile']} | {run['preloaded_users']} | {run['read_iterations']} | {run['write_iterations']} | {str(run.get('sasl_plain_benchmark', False)).lower()} | {run.get('sasl_plain_authcid_format', 'dn')} | {str(run.get('skip_sasl_plain_admin_benchmark', False)).lower()} | {run.get('concurrent_index_search_clients', '') or 'disabled'} | {run.get('concurrent_index_search_iterations', 0)} | {run.get('concurrent_bind_clients', '') or 'disabled'} | {run.get('concurrent_bind_iterations', 0)} |"
+            f"| {run['profile']} | {run['preloaded_users']} | {run.get('preload_workers', 1)} | {run['read_iterations']} | {run['write_iterations']} | {str(run.get('sasl_plain_benchmark', False)).lower()} | {run.get('sasl_plain_authcid_format', 'dn')} | {str(run.get('skip_sasl_plain_admin_benchmark', False)).lower()} | {run.get('concurrent_index_search_clients', '') or 'disabled'} | {run.get('concurrent_index_search_iterations', 0)} | {run.get('concurrent_bind_clients', '') or 'disabled'} | {run.get('concurrent_bind_iterations', 0)} |"
         )
 
     lines.extend(

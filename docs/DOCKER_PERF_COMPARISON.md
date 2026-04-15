@@ -13,7 +13,182 @@ This document records the current Dockerized OpenDR and OpenDJ benchmark baselin
 - Cache hit/miss metrics were not captured for these artifacts because the Docker perf harness disables the monitoring endpoint and samples container CPU/memory only.
 - The 1M-user OpenDR run used a `16 GiB` LMDB map. The default `1 GiB` Docker map filled around 300k users.
 - The 1M-user concurrency artifact covers simple-bind and SASL PLAIN auth concurrency. It does not include index-concurrency probes because the preserved 1M fixture was loaded without benchmark ordering attributes.
-- There is still no completed 10M-user OpenDR-vs-OpenDJ benchmark artifact.
+- A completed OpenDR-only 10M-user LDAPCon-style artifact is recorded below. It is the current 10M OpenDR baseline for public LDAPCon comparisons.
+- There is still no completed 10M-user OpenDR-vs-OpenDJ benchmark artifact in this repository.
+
+## Completed 10M LDAPCon-Style OpenDR Run
+
+Artifact root: `target/perf/opendr-ldapcon-10m-8cpu-30g-20260415-000605/`
+
+This run used a 10M-user fixture shaped like the public LDAPCon 2013 benchmark data set: one base DN, benchmark organizational units, and generated `inetOrgPerson` users with unique `uid`, `cn`, `sn`, `mail`, `description`, and `userPassword` values. The LDAPCon-style probes cover indexed user search, user authorization/simple bind, modify, and mixed read/write operation families.
+
+Configuration:
+
+| Setting | Value |
+|---|---:|
+| Fixture users | `10000000` |
+| Benchmark-record count after setup | `10000005` |
+| CPU limit | `8` |
+| Memory limit | `30g` |
+| LMDB map size | `343597383680` bytes |
+| LMDB max readers | `4096` |
+| OpenDR runtime | `fsm` |
+| Tokio worker threads | `8` |
+| OpenDR cache size | `50000` |
+| Max connections | `2000` |
+| Max connections per IP | `2000` |
+| Max operations per connection | `2000` |
+| Max memory per connection | `67108864` bytes |
+| Max total tracked connection memory | `26843545600` bytes |
+| Build profile | `perf` |
+| Build RUSTFLAGS | `-C target-cpu=native` |
+| Build profile flags | `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`, `debug = false`, `incremental = false` |
+| Docker nofile ulimit | `1048576` |
+| LDAPCon-style client levels | `8,128,256,1000` |
+| Operations per client and operation family | `100` |
+| Warmup operations per client | `5` |
+| Per-operation timeout | `10000` ms |
+| Mixed workload write share | `20%` modifies, `80%` searches |
+
+Load and footprint:
+
+| Metric | Result |
+|---|---:|
+| Bulk fixture load time | `222` seconds |
+| LMDB data footprint before benchmark | `47.62 GiB` |
+| LMDB data footprint after benchmark | `47.62 GiB` |
+| Total benchmark client runtime | `481,968.921` ms |
+| Server CPU avg / max | `5.73%` / `44.33%` |
+| Server memory avg / max | `262.18 MiB` / `454.60 MiB` |
+
+Important caveat: only the `c8` LDAPCon-style level completed with 0 failures. The requested `c128`, `c256`, and `c1000` levels are still useful saturation data, but they should be read as success-throughput plus failure-rate results, not as clean sustained-capacity results.
+
+OpenDR per-level success throughput:
+
+| Operation | c8 success ops/s / fail % | c128 success ops/s / fail % | c256 success ops/s / fail % | c1000 success ops/s / fail % |
+|---|---:|---:|---:|---:|
+| Search | 41,401.35 / 0.00% | 45,068.67 / 17.19% | 46,864.97 / 12.11% | 29,625.57 / 79.80% |
+| Auth | 1,605.49 / 0.00% | 1,596.99 / 10.94% | 1,284.70 / 67.97% | 1,200.05 / 88.50% |
+| Modify | 1,915.83 / 0.00% | 1,407.97 / 12.50% | 1,250.33 / 60.16% | 1,309.21 / 93.30% |
+| Mixed search | 6,562.54 / 0.00% | 5,078.51 / 12.50% | 4,879.92 / 60.94% | 4,162.47 / 86.10% |
+| Mixed modify | 1,640.63 / 0.00% | 1,269.63 / 12.50% | 1,219.98 / 60.94% | 1,040.62 / 86.10% |
+
+OpenDR c8 0-failure latency baseline:
+
+| Operation | Success ops/s | Mean ms | P95 ms | P99 ms | Failures |
+|---|---:|---:|---:|---:|---:|
+| Search | 41,401.35 | 0.164 | 0.261 | 2.437 | 0 / 800 |
+| Auth | 1,605.49 | 4.950 | 15.319 | 21.232 | 0 / 800 |
+| Modify | 1,915.83 | 4.148 | 5.782 | 23.501 | 0 / 800 |
+| Mixed search | 6,562.54 | 0.091 | 0.110 | 0.431 | 0 / 640 |
+| Mixed modify | 1,640.63 | 4.419 | 6.386 | 7.071 | 0 / 160 |
+
+Comparison against the public LDAPCon 2013 10M results:
+
+- Public source: [LDAPCon 2013 benchmark slides](https://www.slideshare.net/slideshow/benchmarks-on-ldap-directories/28486722).
+- Public setup: 10M-entry directory, 32GB RAM, 512GB SSD, SLAMD 2.0.1.
+- Public load-time comparisons are not apples-to-apples because this OpenDR run used an offline LMDB bulk loader, while LDAPCon load results were product ingestion runs.
+- Throughput comparisons use OpenDR `c8`, because it is the only OpenDR level in this run with 0 failures.
+- Search, auth, modify, and mixed throughput are higher-is-better. Load-time ratio is OpenDR/public, so lower is better. Disk ratio is OpenDR/public, so lower is smaller.
+
+| Public LDAPCon 2013 product | Search | Auth | Modify | Mixed search | Mixed modify | Load time ratio | Disk ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| OpenLDAP LMDB | 41,401 vs 31,674 (+30.7%) | 1,605 vs 16,942 (-90.5%) | 1,916 vs 5,760 (-66.7%) | 6,563 vs 25,400 (-74.2%) | 1,641 vs 1,652 (-0.7%) | 0.10x | 2.83x |
+| OpenDJ 2.4.6 | 41,401 vs 13,249 (+212.5%) | 1,605 vs 7,668 (-79.1%) | 1,916 vs 6,350 (-69.8%) | 6,563 vs 6,248 (+5.0%) | 1,641 vs 3,525 (-53.5%) | 0.01x | 3.81x |
+| 389 DS 1.2.11.15 | 41,401 vs 11,182 (+270.3%) | 1,605 vs 3,763 (-57.3%) | 1,916 vs 823 (+132.7%) | 6,563 vs 2,311 (+183.9%) | 1,641 vs 719 (+128.2%) | 0.07x | 3.03x |
+| ApacheDS 2.0.0-M13 | 41,401 vs 688 (+5,917.8%) | 1,605 vs 210 (+663.7%) | 1,916 vs 55 (+3,413.5%) | 6,563 vs 44 (+14,916.2%) | 1,641 vs 44 (+3,656.5%) | 0.01x | 1.19x |
+
+Interpretation:
+
+- OpenDR search throughput is above the public LDAPCon OpenLDAP LMDB, OpenDJ, 389 DS, and ApacheDS search rows at the 0-failure `c8` level.
+- OpenDR auth throughput is materially below OpenLDAP LMDB, OpenDJ, and 389 DS in the LDAPCon table, but above ApacheDS.
+- OpenDR modify throughput is below OpenLDAP LMDB and OpenDJ, but above 389 DS and ApacheDS.
+- OpenDR mixed-search throughput is close to OpenDJ, above 389 DS and ApacheDS, and below OpenLDAP LMDB.
+- OpenDR mixed-modify throughput is effectively tied with OpenLDAP LMDB in this comparison, below OpenDJ, and above 389 DS and ApacheDS.
+- The high-concurrency `c128`, `c256`, and `c1000` levels show that OpenDR currently starts dropping whole worker batches under this harness. Before claiming sustained capacity at those levels, the server and/or harness need another pass on connection ramp-up, operation timeout behavior, and failure reason reporting.
+
+## Stopped 10M OpenDR Attempt
+
+This partial run was stopped on request on April 14, 2026 at 16:27:05 Asia/Colombo. It should not be used as a completed performance result because `ldap-benchmark-results.json` was not written before the stop.
+
+What did complete:
+
+- The OpenDR Docker image and perf-client image rebuilt successfully with Cargo profile `perf`.
+- The bulk fixture loader completed `10000006` total entries: base entry, admin entry, benchmark root/users/moved/writes organizational units, and `10000000` fixture users.
+- The LMDB `data.mdb` file reached about `102 GiB`.
+- The rerun reused that fixture with an 8-core CPU limit and `30g` memory limit.
+- The client reached `benchmark.concurrent_sasl_plain_bind_fixture_users.c1000`.
+
+What did not complete:
+
+- No final JSON metrics were emitted.
+- No per-level bind, SASL PLAIN, or index-search throughput/latency numbers are available from this stopped run.
+- The stopped run therefore cannot be compared numerically against LDAPCon, Oracle OID, OpenDJ, OpenLDAP, 389 DS, or ApacheDS public benchmarks.
+
+Stopped-run configuration:
+
+| Setting | Value |
+|---|---:|
+| Preloaded users | `10000000` |
+| CPU limit | `8` |
+| Memory limit | `30g` |
+| LMDB map size | `343597383680` bytes |
+| LMDB max readers | `4096` |
+| OpenDR runtime | `fsm` |
+| Tokio worker threads | `8` |
+| OpenDR cache size | `50000` |
+| Max connections | `2000` |
+| Max connections per IP | `2000` |
+| Max operations per connection | `2000` |
+| Max memory per connection | `67108864` bytes |
+| Max total tracked connection memory | `26843545600` bytes |
+| Build profile | `perf` |
+| Build RUSTFLAGS | `-C target-cpu=native` |
+| Build profile flags | `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`, `debug = false`, `incremental = false` |
+| Docker nofile ulimit | `1048576` |
+| Concurrent bind targets | `128,256,1000` |
+| Concurrent SASL PLAIN bind targets | `128,256,1000` |
+| Concurrent index-search targets | `128,256,1000` |
+| Iterations per concurrency level | `100` |
+| Warmup iterations per concurrency level | `5` |
+| Operation timeout | `10000` ms |
+
+Partial progress markers captured before stopping:
+
+```text
+progress: connect.setup
+progress: fixture.count.before_setup.skipped
+progress: fixture.reuse
+progress: fixture.count.after_setup.skipped
+progress: benchmark.concurrent_bind_fixture_users
+progress: benchmark.concurrent_bind_fixture_users.c128
+progress: benchmark.concurrent_bind_fixture_users.c256
+progress: benchmark.concurrent_bind_fixture_users.c1000
+progress: benchmark.concurrent_sasl_plain_bind_fixture_users
+progress: benchmark.concurrent_sasl_plain_bind_fixture_users.c128
+progress: benchmark.concurrent_sasl_plain_bind_fixture_users.c256
+progress: benchmark.concurrent_sasl_plain_bind_fixture_users.c1000
+```
+
+Partial sampled server container stats from the short rerun before stop:
+
+| Samples | Avg CPU % | Max CPU % | Avg memory | Max memory | Limit |
+|---:|---:|---:|---:|---:|---:|
+| 29 | 14.10 | 62.75 | 542.67 MiB | 1.04 GiB | 30.00 GiB |
+
+Notes from the stopped attempts:
+
+- The first completed fixture load exposed an expensive reused-fixture validation path: a base-scope control-user check used `(objectClass=inetOrgPerson)`, which could produce a 10M-candidate indexed scan before scope filtering. The client now uses the unique `uid` filter for that validation.
+- A concurrent 10M index-search probe using the substring filter `(description=*fixture user 000000*)` was too broad for this fixture because the selected substring tokens were common across many generated descriptions. The concurrent index-search mix now uses selective `uid` equality and one-entry ordering-boundary probes.
+- The harness now supports `--opendr-skip-bulk-fixture-load` to reuse a previously bulk-loaded LMDB fixture in the same run directory for interrupted 10M reruns.
+
+Useful public 10M comparison points, with caveats:
+
+| Source | Setup | Reported result |
+|---|---|---|
+| [LDAPCon 2013 benchmark slides](https://www.slideshare.net/slideshow/benchmarks-on-ldap-directories/28486722) | 10M-entry directory benchmarks on a VM with 32GB RAM and 512GB SSD. | Published read/auth tables include OpenLDAP mdb, 389 DS, OpenDJ, and ApacheDS. Example reported auth throughput: OpenLDAP mdb `16942/sec`, OpenDJ `7668/sec`, 389 DS `3763/sec`, ApacheDS `210/sec`. |
+| [Oracle Internet Directory 11g benchmark PDF](https://www.oracle.com/docs/tech/middleware/oid-11116-exalogic-perf.pdf) | Oracle Exalogic, 10M users, OID 11.1.1.6, 6 OID nodes for high-concurrency and 1 OID node for low-latency runs. | Reported high-concurrency results include `1,703,123` random 1-attribute searches/sec and `648,113` random auth operations/sec across 6 nodes. Single-node low-latency results include `275,599` random 1-attribute searches/sec and `102,356` auth operations/sec. |
+| [The HFT Guy OpenDJ 10M write-up](https://thehftguy.com/2015/10/23/10-millions-users-accounts-with-ldap-yes-we-can/) | OpenDJ 2.6 behind OpenAM, 4 directory nodes and 2 replication nodes, with OpenDJ JVM heap at 50GB and database cache at 80%. | Useful deployment context for OpenDJ at 10M scale, but it is not a direct LDAP-only single-node comparison to this stopped OpenDR run. |
 
 ## Reproduction
 

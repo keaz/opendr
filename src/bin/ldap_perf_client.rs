@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -68,11 +69,20 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     preloaded_users: usize,
 
+    #[arg(long, default_value_t = 1)]
+    preload_workers: usize,
+
     #[arg(long, default_value_t = false)]
     reuse_fixture: bool,
 
     #[arg(long, default_value_t = false)]
     skip_full_counts: bool,
+
+    #[arg(long, default_value_t = false)]
+    skip_subtree_search_benchmark: bool,
+
+    #[arg(long, default_value_t = false)]
+    skip_serial_index_benchmarks: bool,
 
     #[arg(long, default_value_t = 200)]
     read_iterations: usize,
@@ -130,6 +140,24 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     concurrent_bind_hot_user_count: usize,
+
+    #[arg(long, default_value_t = false)]
+    ldapcon_style_benchmark: bool,
+
+    #[arg(long, default_value = "")]
+    ldapcon_clients: String,
+
+    #[arg(long, default_value_t = 100)]
+    ldapcon_iterations: usize,
+
+    #[arg(long, default_value_t = 5)]
+    ldapcon_warmup_iterations: usize,
+
+    #[arg(long, default_value_t = 10000)]
+    ldapcon_operation_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 20)]
+    ldapcon_mixed_write_percent: u8,
 
     #[arg(long, default_value = "perfbench")]
     name_prefix: String,
@@ -218,6 +246,10 @@ async fn run(args: Args) -> AppResult<()> {
         "--preloaded-users must be greater than zero",
     )?;
     ensure(
+        args.preload_workers > 0,
+        "--preload-workers must be greater than zero",
+    )?;
+    ensure(
         args.read_iterations > 0,
         "--read-iterations must be greater than zero",
     )?;
@@ -228,6 +260,7 @@ async fn run(args: Args) -> AppResult<()> {
     let concurrent_bind_clients = parse_concurrent_bind_clients(&args.concurrent_bind_clients)?;
     let concurrent_index_search_clients =
         parse_concurrent_index_search_clients(&args.concurrent_index_search_clients)?;
+    let ldapcon_clients = parse_ldapcon_clients(&args.ldapcon_clients)?;
     let run_index_benchmarks = args.index_benchmark || !concurrent_index_search_clients.is_empty();
     let sasl_plain_authcid_format =
         parse_sasl_plain_authcid_format(&args.sasl_plain_authcid_format)?;
@@ -275,6 +308,24 @@ async fn run(args: Args) -> AppResult<()> {
             "--concurrent-index-search-operation-timeout-ms must be greater than zero when --concurrent-index-search-clients is set",
         )?;
     }
+    if args.ldapcon_style_benchmark {
+        ensure(
+            !ldapcon_clients.is_empty(),
+            "--ldapcon-clients must be set when --ldapcon-style-benchmark is enabled",
+        )?;
+        ensure(
+            args.ldapcon_iterations > 0,
+            "--ldapcon-iterations must be greater than zero",
+        )?;
+        ensure(
+            args.ldapcon_operation_timeout_ms > 0,
+            "--ldapcon-operation-timeout-ms must be greater than zero",
+        )?;
+        ensure(
+            args.ldapcon_mixed_write_percent <= 100,
+            "--ldapcon-mixed-write-percent must be <= 100",
+        )?;
+    }
 
     let total_start = Instant::now();
     progress("connect.setup");
@@ -318,15 +369,7 @@ async fn run(args: Args) -> AppResult<()> {
         progress("fixture.tree");
         create_benchmark_tree(&mut admin_setup, &dns).await?;
         progress("fixture.preload");
-        preload_users(
-            &mut admin_setup,
-            &dns,
-            args.preloaded_users,
-            &args.user_password,
-            &args.name_prefix,
-            run_index_benchmarks,
-        )
-        .await?;
+        preload_users(&mut admin_setup, &dns, &args, run_index_benchmarks).await?;
         if skip_full_counts {
             progress("fixture.count.after_setup.skipped");
             expected_fixture_record_count(args.preloaded_users)
@@ -338,6 +381,23 @@ async fn run(args: Args) -> AppResult<()> {
     admin_setup.unbind().await?;
 
     let mut benchmarks = Vec::new();
+
+    if args.ldapcon_style_benchmark {
+        progress("benchmark.ldapcon_style");
+        for concurrency in &ldapcon_clients {
+            progress(&format!("benchmark.ldapcon_search.c{concurrency}"));
+            benchmarks.push(run_ldapcon_search_benchmark(&args, &dns, *concurrency).await?);
+
+            progress(&format!("benchmark.ldapcon_auth.c{concurrency}"));
+            benchmarks.push(run_ldapcon_auth_benchmark(&args, &dns, *concurrency).await?);
+
+            progress(&format!("benchmark.ldapcon_modify.c{concurrency}"));
+            benchmarks.push(run_ldapcon_modify_benchmark(&args, &dns, *concurrency).await?);
+
+            progress(&format!("benchmark.ldapcon_mixed.c{concurrency}"));
+            benchmarks.extend(run_ldapcon_mixed_benchmark(&args, &dns, *concurrency).await?);
+        }
+    }
 
     if !concurrent_bind_clients.is_empty() {
         progress("benchmark.concurrent_bind_fixture_users");
@@ -516,7 +576,7 @@ async fn run(args: Args) -> AppResult<()> {
             &mut admin_ops,
             &dns.control_user_dn,
             Scope::Base,
-            "(objectClass=inetOrgPerson)",
+            &format!("(uid={})", dns.control_user_uid),
             vec!["uid", "cn", "sn", "mail", "description"],
         )
         .await?;
@@ -533,7 +593,7 @@ async fn run(args: Args) -> AppResult<()> {
             &mut admin_ops,
             &dns.control_user_dn,
             Scope::Base,
-            "(objectClass=inetOrgPerson)",
+            &format!("(uid={})", dns.control_user_uid),
             vec!["uid", "cn", "sn", "mail", "description"],
         )
         .await?;
@@ -549,56 +609,64 @@ async fn run(args: Args) -> AppResult<()> {
         base_search_started,
     ));
 
-    progress("benchmark.search_subtree_fixture_users");
-    for _ in 0..args.warmup_iterations {
-        let entries = search_entries(
-            &mut admin_ops,
-            &dns.users_ou_dn,
-            Scope::Subtree,
-            "(objectClass=inetOrgPerson)",
-            vec!["uid", "cn", "mail"],
-        )
-        .await?;
-        ensure(
-            entries.len() == args.preloaded_users,
-            format!(
-                "expected {} fixture users, got {}",
-                args.preloaded_users,
-                entries.len()
-            ),
-        )?;
+    if args.skip_subtree_search_benchmark {
+        progress("benchmark.search_subtree_fixture_users.skipped");
+    } else {
+        progress("benchmark.search_subtree_fixture_users");
+        for _ in 0..args.warmup_iterations {
+            let entries = search_entries(
+                &mut admin_ops,
+                &dns.users_ou_dn,
+                Scope::Subtree,
+                "(objectClass=inetOrgPerson)",
+                vec!["uid", "cn", "mail"],
+            )
+            .await?;
+            ensure(
+                entries.len() == args.preloaded_users,
+                format!(
+                    "expected {} fixture users, got {}",
+                    args.preloaded_users,
+                    entries.len()
+                ),
+            )?;
+        }
+        let mut subtree_search_latencies = Vec::with_capacity(args.read_iterations);
+        let subtree_search_started = Instant::now();
+        for _ in 0..args.read_iterations {
+            let started = Instant::now();
+            let entries = search_entries(
+                &mut admin_ops,
+                &dns.users_ou_dn,
+                Scope::Subtree,
+                "(objectClass=inetOrgPerson)",
+                vec!["uid", "cn", "mail"],
+            )
+            .await?;
+            ensure(
+                entries.len() == args.preloaded_users,
+                format!(
+                    "expected {} fixture users, got {}",
+                    args.preloaded_users,
+                    entries.len()
+                ),
+            )?;
+            subtree_search_latencies.push(elapsed_ms(started.elapsed().as_secs_f64()));
+        }
+        benchmarks.push(build_benchmark_stats(
+            "search_subtree_fixture_users",
+            subtree_search_latencies,
+            subtree_search_started,
+        ));
     }
-    let mut subtree_search_latencies = Vec::with_capacity(args.read_iterations);
-    let subtree_search_started = Instant::now();
-    for _ in 0..args.read_iterations {
-        let started = Instant::now();
-        let entries = search_entries(
-            &mut admin_ops,
-            &dns.users_ou_dn,
-            Scope::Subtree,
-            "(objectClass=inetOrgPerson)",
-            vec!["uid", "cn", "mail"],
-        )
-        .await?;
-        ensure(
-            entries.len() == args.preloaded_users,
-            format!(
-                "expected {} fixture users, got {}",
-                args.preloaded_users,
-                entries.len()
-            ),
-        )?;
-        subtree_search_latencies.push(elapsed_ms(started.elapsed().as_secs_f64()));
-    }
-    benchmarks.push(build_benchmark_stats(
-        "search_subtree_fixture_users",
-        subtree_search_latencies,
-        subtree_search_started,
-    ));
 
     if run_index_benchmarks {
-        progress("benchmark.index_searches");
-        benchmarks.extend(run_index_search_benchmarks(&mut admin_ops, &args, &dns).await?);
+        if args.skip_serial_index_benchmarks {
+            progress("benchmark.index_searches.serial.skipped");
+        } else {
+            progress("benchmark.index_searches");
+            benchmarks.extend(run_index_search_benchmarks(&mut admin_ops, &args, &dns).await?);
+        }
 
         for concurrency in &concurrent_index_search_clients {
             progress(&format!("benchmark.concurrent_index_search.c{concurrency}"));
@@ -1685,6 +1753,644 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
     ))
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LdapConOperation {
+    Search,
+    Auth,
+    Modify,
+}
+
+impl LdapConOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Search => "ldapcon_search",
+            Self::Auth => "ldapcon_auth",
+            Self::Modify => "ldapcon_modify",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LdapConWorkerResult {
+    latencies_ms: Vec<f64>,
+    successes: usize,
+    failures: usize,
+}
+
+async fn run_ldapcon_search_benchmark(
+    args: &Args,
+    dns: &ScenarioDns,
+    concurrency: usize,
+) -> AppResult<BenchmarkStats> {
+    run_ldapcon_single_operation_benchmark(args, dns, concurrency, LdapConOperation::Search).await
+}
+
+async fn run_ldapcon_auth_benchmark(
+    args: &Args,
+    dns: &ScenarioDns,
+    concurrency: usize,
+) -> AppResult<BenchmarkStats> {
+    run_ldapcon_single_operation_benchmark(args, dns, concurrency, LdapConOperation::Auth).await
+}
+
+async fn run_ldapcon_modify_benchmark(
+    args: &Args,
+    dns: &ScenarioDns,
+    concurrency: usize,
+) -> AppResult<BenchmarkStats> {
+    run_ldapcon_single_operation_benchmark(args, dns, concurrency, LdapConOperation::Modify).await
+}
+
+async fn run_ldapcon_single_operation_benchmark(
+    args: &Args,
+    dns: &ScenarioDns,
+    concurrency: usize,
+    operation: LdapConOperation,
+) -> AppResult<BenchmarkStats> {
+    ensure(
+        concurrency > 0,
+        "--ldapcon-clients values must be greater than zero",
+    )?;
+
+    let expected_attempts = concurrency * args.ldapcon_iterations;
+    let operation_timeout = Duration::from_millis(args.ldapcon_operation_timeout_ms);
+    let per_concurrency_timeout = operation_timeout
+        .saturating_mul((args.ldapcon_warmup_iterations + args.ldapcon_iterations + 3) as u32);
+    let (ready_tx, mut ready_rx) = mpsc::channel(concurrency);
+    let (start_tx, start_rx) = watch::channel(false);
+    let mut handles = Vec::with_capacity(concurrency);
+
+    for client_index in 0..concurrency {
+        let ready_tx = ready_tx.clone();
+        let mut start_rx = start_rx.clone();
+        let url = args.url.clone();
+        let starttls = args.starttls;
+        let insecure = args.insecure;
+        let bind_dn = args.bind_dn.clone();
+        let admin_password = args.password.clone();
+        let user_password = args.user_password.clone();
+        let name_prefix = args.name_prefix.clone();
+        let users_ou_dn = dns.users_ou_dn.clone();
+        let preloaded_users = args.preloaded_users;
+        let iterations = args.ldapcon_iterations;
+        let warmup_iterations = args.ldapcon_warmup_iterations;
+
+        handles.push(tokio::spawn(async move {
+            let mut ldap =
+                match connect_with_timeout(&url, starttls, insecure, operation_timeout).await {
+                    Ok(ldap) => ldap,
+                    Err(_) => {
+                        let _ = ready_tx.send(()).await;
+                        return LdapConWorkerResult {
+                            latencies_ms: Vec::new(),
+                            successes: 0,
+                            failures: iterations,
+                        };
+                    }
+                };
+
+            if !matches!(operation, LdapConOperation::Auth)
+                && simple_bind_with_timeout(&mut ldap, &bind_dn, &admin_password, operation_timeout)
+                    .await
+                    .is_err()
+            {
+                let _ = ready_tx.send(()).await;
+                let _ = ldap.unbind().await;
+                return LdapConWorkerResult {
+                    latencies_ms: Vec::new(),
+                    successes: 0,
+                    failures: iterations,
+                };
+            }
+
+            for warmup in 0..warmup_iterations {
+                let global_attempt = client_index * (iterations + warmup_iterations) + warmup;
+                if !run_ldapcon_operation_once(
+                    &mut ldap,
+                    operation,
+                    global_attempt,
+                    preloaded_users,
+                    &name_prefix,
+                    &users_ou_dn,
+                    &user_password,
+                    operation_timeout,
+                )
+                .await
+                {
+                    let _ = ready_tx.send(()).await;
+                    let _ = ldap.unbind().await;
+                    return LdapConWorkerResult {
+                        latencies_ms: Vec::new(),
+                        successes: 0,
+                        failures: iterations,
+                    };
+                }
+            }
+
+            let _ = ready_tx.send(()).await;
+            while !*start_rx.borrow() {
+                if start_rx.changed().await.is_err() {
+                    let _ = ldap.unbind().await;
+                    return LdapConWorkerResult {
+                        latencies_ms: Vec::new(),
+                        successes: 0,
+                        failures: iterations,
+                    };
+                }
+            }
+
+            let mut latencies_ms = Vec::with_capacity(iterations);
+            let mut successes = 0;
+            let mut failures = 0;
+            for iteration in 0..iterations {
+                let global_attempt = client_index * iterations + iteration;
+                let started = Instant::now();
+                if run_ldapcon_operation_once(
+                    &mut ldap,
+                    operation,
+                    global_attempt,
+                    preloaded_users,
+                    &name_prefix,
+                    &users_ou_dn,
+                    &user_password,
+                    operation_timeout,
+                )
+                .await
+                {
+                    successes += 1;
+                } else {
+                    failures += 1;
+                }
+                latencies_ms.push(elapsed_ms(started.elapsed().as_secs_f64()));
+            }
+
+            let _ = ldap.unbind().await;
+            LdapConWorkerResult {
+                latencies_ms,
+                successes,
+                failures,
+            }
+        }));
+    }
+
+    drop(ready_tx);
+    let timeout_started = Instant::now();
+    let ready_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
+    for _ in 0..concurrency {
+        match tokio::time::timeout_at(ready_deadline, ready_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => break,
+            Err(_) => {
+                for handle in &handles {
+                    handle.abort();
+                }
+                return Ok(build_benchmark_stats_with_counts(
+                    &format!("{}_c{concurrency}", operation.label()),
+                    Vec::new(),
+                    timeout_started,
+                    expected_attempts,
+                    0,
+                    expected_attempts,
+                    concurrency,
+                ));
+            }
+        }
+    }
+
+    let total_started = Instant::now();
+    let _ = start_tx.send(true);
+
+    let mut latencies_ms = Vec::with_capacity(expected_attempts);
+    let mut successes = 0;
+    let mut failures = 0;
+    let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
+    for handle_index in 0..handles.len() {
+        match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
+            Ok(Ok(result)) => {
+                latencies_ms.extend(result.latencies_ms);
+                successes += result.successes;
+                failures += result.failures;
+            }
+            Ok(Err(_)) => {
+                failures += args.ldapcon_iterations;
+            }
+            Err(_) => {
+                for handle in handles.iter().skip(handle_index) {
+                    handle.abort();
+                    failures += args.ldapcon_iterations;
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(build_benchmark_stats_with_counts(
+        &format!("{}_c{concurrency}", operation.label()),
+        latencies_ms,
+        total_started,
+        expected_attempts,
+        successes,
+        failures,
+        concurrency,
+    ))
+}
+
+#[derive(Debug)]
+struct LdapConMixedWorkerResult {
+    search_latencies_ms: Vec<f64>,
+    modify_latencies_ms: Vec<f64>,
+    search_successes: usize,
+    search_failures: usize,
+    modify_successes: usize,
+    modify_failures: usize,
+}
+
+async fn run_ldapcon_mixed_benchmark(
+    args: &Args,
+    dns: &ScenarioDns,
+    concurrency: usize,
+) -> AppResult<Vec<BenchmarkStats>> {
+    ensure(
+        concurrency > 0,
+        "--ldapcon-clients values must be greater than zero",
+    )?;
+
+    let operation_timeout = Duration::from_millis(args.ldapcon_operation_timeout_ms);
+    let per_concurrency_timeout = operation_timeout
+        .saturating_mul((args.ldapcon_warmup_iterations + args.ldapcon_iterations + 3) as u32);
+    let expected_attempts = concurrency * args.ldapcon_iterations;
+    let (expected_search_attempts, expected_modify_attempts) =
+        ldapcon_mixed_expected_counts(expected_attempts, args.ldapcon_mixed_write_percent);
+    let (ready_tx, mut ready_rx) = mpsc::channel(concurrency);
+    let (start_tx, start_rx) = watch::channel(false);
+    let mut handles = Vec::with_capacity(concurrency);
+
+    for client_index in 0..concurrency {
+        let ready_tx = ready_tx.clone();
+        let mut start_rx = start_rx.clone();
+        let url = args.url.clone();
+        let starttls = args.starttls;
+        let insecure = args.insecure;
+        let bind_dn = args.bind_dn.clone();
+        let admin_password = args.password.clone();
+        let name_prefix = args.name_prefix.clone();
+        let users_ou_dn = dns.users_ou_dn.clone();
+        let preloaded_users = args.preloaded_users;
+        let iterations = args.ldapcon_iterations;
+        let warmup_iterations = args.ldapcon_warmup_iterations;
+        let write_percent = args.ldapcon_mixed_write_percent;
+
+        handles.push(tokio::spawn(async move {
+            let mut ldap =
+                match connect_with_timeout(&url, starttls, insecure, operation_timeout).await {
+                    Ok(ldap) => ldap,
+                    Err(_) => {
+                        let _ = ready_tx.send(()).await;
+                        let (search_failures, modify_failures) =
+                            ldapcon_mixed_expected_counts(iterations, write_percent);
+                        return LdapConMixedWorkerResult {
+                            search_latencies_ms: Vec::new(),
+                            modify_latencies_ms: Vec::new(),
+                            search_successes: 0,
+                            search_failures,
+                            modify_successes: 0,
+                            modify_failures,
+                        };
+                    }
+                };
+
+            if simple_bind_with_timeout(&mut ldap, &bind_dn, &admin_password, operation_timeout)
+                .await
+                .is_err()
+            {
+                let _ = ready_tx.send(()).await;
+                let _ = ldap.unbind().await;
+                let (search_failures, modify_failures) =
+                    ldapcon_mixed_expected_counts(iterations, write_percent);
+                return LdapConMixedWorkerResult {
+                    search_latencies_ms: Vec::new(),
+                    modify_latencies_ms: Vec::new(),
+                    search_successes: 0,
+                    search_failures,
+                    modify_successes: 0,
+                    modify_failures,
+                };
+            }
+
+            for warmup in 0..warmup_iterations {
+                let global_attempt = client_index * (iterations + warmup_iterations) + warmup;
+                let operation = ldapcon_mixed_operation(global_attempt, write_percent);
+                if !run_ldapcon_operation_once(
+                    &mut ldap,
+                    operation,
+                    global_attempt,
+                    preloaded_users,
+                    &name_prefix,
+                    &users_ou_dn,
+                    "",
+                    operation_timeout,
+                )
+                .await
+                {
+                    let _ = ready_tx.send(()).await;
+                    let _ = ldap.unbind().await;
+                    let (search_failures, modify_failures) =
+                        ldapcon_mixed_expected_counts(iterations, write_percent);
+                    return LdapConMixedWorkerResult {
+                        search_latencies_ms: Vec::new(),
+                        modify_latencies_ms: Vec::new(),
+                        search_successes: 0,
+                        search_failures,
+                        modify_successes: 0,
+                        modify_failures,
+                    };
+                }
+            }
+
+            let _ = ready_tx.send(()).await;
+            while !*start_rx.borrow() {
+                if start_rx.changed().await.is_err() {
+                    let _ = ldap.unbind().await;
+                    let (search_failures, modify_failures) =
+                        ldapcon_mixed_expected_counts(iterations, write_percent);
+                    return LdapConMixedWorkerResult {
+                        search_latencies_ms: Vec::new(),
+                        modify_latencies_ms: Vec::new(),
+                        search_successes: 0,
+                        search_failures,
+                        modify_successes: 0,
+                        modify_failures,
+                    };
+                }
+            }
+
+            let mut search_latencies_ms = Vec::new();
+            let mut modify_latencies_ms = Vec::new();
+            let mut search_successes = 0;
+            let mut search_failures = 0;
+            let mut modify_successes = 0;
+            let mut modify_failures = 0;
+            for iteration in 0..iterations {
+                let global_attempt = client_index * iterations + iteration;
+                let operation = ldapcon_mixed_operation(global_attempt, write_percent);
+                let started = Instant::now();
+                let succeeded = run_ldapcon_operation_once(
+                    &mut ldap,
+                    operation,
+                    global_attempt,
+                    preloaded_users,
+                    &name_prefix,
+                    &users_ou_dn,
+                    "",
+                    operation_timeout,
+                )
+                .await;
+                let latency = elapsed_ms(started.elapsed().as_secs_f64());
+                match operation {
+                    LdapConOperation::Search => {
+                        search_latencies_ms.push(latency);
+                        if succeeded {
+                            search_successes += 1;
+                        } else {
+                            search_failures += 1;
+                        }
+                    }
+                    LdapConOperation::Modify => {
+                        modify_latencies_ms.push(latency);
+                        if succeeded {
+                            modify_successes += 1;
+                        } else {
+                            modify_failures += 1;
+                        }
+                    }
+                    LdapConOperation::Auth => {}
+                }
+            }
+
+            let _ = ldap.unbind().await;
+            LdapConMixedWorkerResult {
+                search_latencies_ms,
+                modify_latencies_ms,
+                search_successes,
+                search_failures,
+                modify_successes,
+                modify_failures,
+            }
+        }));
+    }
+
+    drop(ready_tx);
+    let timeout_started = Instant::now();
+    let ready_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
+    for _ in 0..concurrency {
+        match tokio::time::timeout_at(ready_deadline, ready_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => break,
+            Err(_) => {
+                for handle in &handles {
+                    handle.abort();
+                }
+                let elapsed = elapsed_ms(timeout_started.elapsed().as_secs_f64());
+                return Ok(vec![
+                    build_benchmark_stats_with_elapsed(
+                        &format!("ldapcon_mixed_search_c{concurrency}"),
+                        Vec::new(),
+                        elapsed,
+                        expected_search_attempts,
+                        0,
+                        expected_search_attempts,
+                        concurrency,
+                    ),
+                    build_benchmark_stats_with_elapsed(
+                        &format!("ldapcon_mixed_modify_c{concurrency}"),
+                        Vec::new(),
+                        elapsed,
+                        expected_modify_attempts,
+                        0,
+                        expected_modify_attempts,
+                        concurrency,
+                    ),
+                ]);
+            }
+        }
+    }
+
+    let total_started = Instant::now();
+    let _ = start_tx.send(true);
+
+    let mut search_latencies_ms = Vec::with_capacity(expected_search_attempts);
+    let mut modify_latencies_ms = Vec::with_capacity(expected_modify_attempts);
+    let mut search_successes = 0;
+    let mut search_failures = 0;
+    let mut modify_successes = 0;
+    let mut modify_failures = 0;
+    let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
+    for handle_index in 0..handles.len() {
+        match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
+            Ok(Ok(result)) => {
+                search_latencies_ms.extend(result.search_latencies_ms);
+                modify_latencies_ms.extend(result.modify_latencies_ms);
+                search_successes += result.search_successes;
+                search_failures += result.search_failures;
+                modify_successes += result.modify_successes;
+                modify_failures += result.modify_failures;
+            }
+            Ok(Err(_)) | Err(_) => {
+                if handle_index < handles.len() {
+                    for handle in handles.iter().skip(handle_index) {
+                        handle.abort();
+                    }
+                }
+                let remaining_workers = handles.len() - handle_index;
+                let remaining_attempts = remaining_workers * args.ldapcon_iterations;
+                let (remaining_search_failures, remaining_modify_failures) =
+                    ldapcon_mixed_expected_counts(
+                        remaining_attempts,
+                        args.ldapcon_mixed_write_percent,
+                    );
+                search_failures += remaining_search_failures;
+                modify_failures += remaining_modify_failures;
+                break;
+            }
+        }
+    }
+
+    let elapsed_ms_total = elapsed_ms(total_started.elapsed().as_secs_f64());
+    Ok(vec![
+        build_benchmark_stats_with_elapsed(
+            &format!("ldapcon_mixed_search_c{concurrency}"),
+            search_latencies_ms,
+            elapsed_ms_total,
+            search_successes + search_failures,
+            search_successes,
+            search_failures,
+            concurrency,
+        ),
+        build_benchmark_stats_with_elapsed(
+            &format!("ldapcon_mixed_modify_c{concurrency}"),
+            modify_latencies_ms,
+            elapsed_ms_total,
+            modify_successes + modify_failures,
+            modify_successes,
+            modify_failures,
+            concurrency,
+        ),
+    ])
+}
+
+async fn run_ldapcon_operation_once(
+    ldap: &mut Ldap,
+    operation: LdapConOperation,
+    global_attempt: usize,
+    preloaded_users: usize,
+    name_prefix: &str,
+    users_ou_dn: &str,
+    user_password: &str,
+    operation_timeout: Duration,
+) -> bool {
+    let user_index = global_attempt % preloaded_users;
+    let uid = ldapcon_user_uid(name_prefix, user_index);
+    let dn = ldapcon_user_dn(&uid, users_ou_dn);
+
+    match operation {
+        LdapConOperation::Search => {
+            ldapcon_search_matches_with_timeout(ldap, users_ou_dn, &uid, &dn, operation_timeout)
+                .await
+        }
+        LdapConOperation::Auth => {
+            simple_bind_with_timeout(ldap, &dn, user_password, operation_timeout)
+                .await
+                .is_ok()
+        }
+        LdapConOperation::Modify => {
+            ldapcon_modify_description_with_timeout(
+                ldap,
+                &dn,
+                &format!("LDAPCon modify attempt {global_attempt}"),
+                operation_timeout,
+            )
+            .await
+        }
+    }
+}
+
+async fn ldapcon_search_matches_with_timeout(
+    ldap: &mut Ldap,
+    users_ou_dn: &str,
+    uid: &str,
+    expected_dn: &str,
+    operation_timeout: Duration,
+) -> bool {
+    match tokio::time::timeout(
+        operation_timeout,
+        search_single_entry(
+            ldap,
+            users_ou_dn,
+            Scope::Subtree,
+            &format!("(uid={uid})"),
+            vec!["uid", "cn", "sn", "mail"],
+        ),
+    )
+    .await
+    {
+        Ok(Ok(entry)) => entry.dn.eq_ignore_ascii_case(expected_dn),
+        _ => false,
+    }
+}
+
+async fn ldapcon_modify_description_with_timeout(
+    ldap: &mut Ldap,
+    dn: &str,
+    description: &str,
+    operation_timeout: Duration,
+) -> bool {
+    match tokio::time::timeout(
+        operation_timeout,
+        ldap.modify(
+            dn,
+            vec![Mod::Replace(
+                "description".to_string(),
+                string_set([description.to_string()]),
+            )],
+        ),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result.success().is_ok(),
+        _ => false,
+    }
+}
+
+fn ldapcon_mixed_operation(global_attempt: usize, write_percent: u8) -> LdapConOperation {
+    let bucket = ((global_attempt % 100) * 37 + 17) % 100;
+    if bucket < usize::from(write_percent) {
+        LdapConOperation::Modify
+    } else {
+        LdapConOperation::Search
+    }
+}
+
+fn ldapcon_mixed_expected_counts(attempts: usize, write_percent: u8) -> (usize, usize) {
+    let mut search_attempts = 0;
+    let mut modify_attempts = 0;
+    for attempt in 0..attempts {
+        match ldapcon_mixed_operation(attempt, write_percent) {
+            LdapConOperation::Search => search_attempts += 1,
+            LdapConOperation::Modify => modify_attempts += 1,
+            LdapConOperation::Auth => {}
+        }
+    }
+    (search_attempts, modify_attempts)
+}
+
+fn ldapcon_user_uid(name_prefix: &str, user_index: usize) -> String {
+    format!("{name_prefix}-user-{user_index:06}")
+}
+
+fn ldapcon_user_dn(uid: &str, users_ou_dn: &str) -> String {
+    format!("uid={uid},{users_ou_dn}")
+}
+
 async fn run_index_search_benchmarks(
     ldap: &mut Ldap,
     args: &Args,
@@ -1938,6 +2644,9 @@ fn index_search_specs(args: &Args, dns: &ScenarioDns) -> Vec<IndexSearchSpec> {
 
 fn concurrent_index_search_specs(args: &Args, dns: &ScenarioDns) -> Vec<IndexSearchSpec> {
     let max_order = args.preloaded_users.saturating_sub(1).to_string();
+    let last_user_index = args.preloaded_users.saturating_sub(1);
+    let last_user_uid = format!("{}-user-{last_user_index:06}", args.name_prefix);
+    let last_user_dn = format!("uid={last_user_uid},{}", dns.users_ou_dn);
 
     vec![
         IndexSearchSpec {
@@ -1948,11 +2657,11 @@ fn concurrent_index_search_specs(args: &Args, dns: &ScenarioDns) -> Vec<IndexSea
             expected_dn: Some(dns.control_user_dn.clone()),
         },
         IndexSearchSpec {
-            operation: "index_substring_description",
+            operation: "index_equality_uid_tail",
             base_dn: dns.users_ou_dn.clone(),
-            filter: "(description=*fixture user 000000*)".to_string(),
+            filter: format!("(uid={last_user_uid})"),
             expected_count: 1,
-            expected_dn: Some(dns.control_user_dn.clone()),
+            expected_dn: Some(last_user_dn),
         },
         IndexSearchSpec {
             operation: "index_ordering_benchmark_order_ge",
@@ -2191,7 +2900,7 @@ async fn ensure_existing_fixture(
         ldap,
         &dns.control_user_dn,
         Scope::Base,
-        "(objectClass=inetOrgPerson)",
+        &format!("(uid={})", dns.control_user_uid),
         vec!["uid", "cn", "sn", "mail"],
     )
     .await?;
@@ -2207,58 +2916,143 @@ async fn ensure_existing_fixture(
 async fn preload_users(
     ldap: &mut Ldap,
     dns: &ScenarioDns,
-    count: usize,
-    password: &str,
-    name_prefix: &str,
+    args: &Args,
     include_index_attributes: bool,
 ) -> AppResult<()> {
-    for index in 0..count {
-        let uid = format!("{name_prefix}-user-{index:06}");
-        let dn = format!("uid={uid},{}", dns.users_ou_dn);
-        let mut object_classes =
-            string_set(["top", "person", "organizationalPerson", "inetOrgPerson"]);
-        if include_index_attributes {
-            object_classes.insert(BENCHMARK_INDEX_AUXILIARY_CLASS.to_string());
-        }
-        let mut attributes = vec![
-            ("objectClass".to_string(), object_classes),
-            ("uid".to_string(), string_set([uid.clone()])),
-            (
-                "cn".to_string(),
-                string_set([format!("Benchmark User {index}")]),
-            ),
-            (
-                "sn".to_string(),
-                string_set([format!("BenchmarkUser{index:06}")]),
-            ),
-            (
-                "description".to_string(),
-                string_set([format!("Benchmark fixture user {index:06}")]),
-            ),
-            (
-                "mail".to_string(),
-                string_set([format!("{uid}@example.com")]),
-            ),
-            ("userPassword".to_string(), string_set([password])),
-        ];
-        if include_index_attributes {
-            attributes.push((
-                BENCHMARK_ORDER_ATTRIBUTE.to_string(),
-                string_set([index.to_string()]),
-            ));
-        }
-        ldap.add(&dn, attributes).await?.success()?;
-        let loaded = index + 1;
-        if count >= 100_000 && (loaded % 100_000 == 0 || loaded == count) {
-            progress(&format!("fixture.preload.{loaded}of{count}"));
+    let count = args.preloaded_users;
+    if args.preload_workers > 1 && count > 1 {
+        preload_users_parallel(dns, args, include_index_attributes).await?;
+    } else {
+        for index in 0..count {
+            add_preloaded_user(
+                ldap,
+                dns,
+                index,
+                &args.user_password,
+                &args.name_prefix,
+                include_index_attributes,
+            )
+            .await?;
+            report_preload_progress(index + 1, count);
         }
     }
 
     ensure(
-        dns.control_user_uid == format!("{name_prefix}-user-000000"),
+        dns.control_user_uid == format!("{}-user-000000", args.name_prefix),
         "control user UID does not match preload naming pattern",
     )?;
     Ok(())
+}
+
+async fn preload_users_parallel(
+    dns: &ScenarioDns,
+    args: &Args,
+    include_index_attributes: bool,
+) -> AppResult<()> {
+    let count = args.preloaded_users;
+    let worker_count = args.preload_workers.min(count);
+    let chunk_size = count.div_ceil(worker_count);
+    let loaded = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(worker_count);
+
+    for worker_index in 0..worker_count {
+        let start = worker_index * chunk_size;
+        let end = (start + chunk_size).min(count);
+        if start >= end {
+            continue;
+        }
+
+        let dns = dns.clone();
+        let url = args.url.clone();
+        let bind_dn = args.bind_dn.clone();
+        let password = args.password.clone();
+        let user_password = args.user_password.clone();
+        let name_prefix = args.name_prefix.clone();
+        let starttls = args.starttls;
+        let insecure = args.insecure;
+        let loaded = Arc::clone(&loaded);
+
+        handles.push(tokio::spawn(async move {
+            let mut ldap = connect(&url, starttls, insecure).await?;
+            simple_bind(&mut ldap, &bind_dn, &password).await?;
+
+            for index in start..end {
+                add_preloaded_user(
+                    &mut ldap,
+                    &dns,
+                    index,
+                    &user_password,
+                    &name_prefix,
+                    include_index_attributes,
+                )
+                .await?;
+                let total_loaded = loaded.fetch_add(1, Ordering::Relaxed) + 1;
+                report_preload_progress(total_loaded, count);
+            }
+
+            best_effort_unbind("preload_worker", ldap).await;
+            AppResult::Ok(())
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .await
+            .map_err(|err| other_error(format!("preload worker task failed: {err}")))??;
+    }
+
+    Ok(())
+}
+
+async fn add_preloaded_user(
+    ldap: &mut Ldap,
+    dns: &ScenarioDns,
+    index: usize,
+    password: &str,
+    name_prefix: &str,
+    include_index_attributes: bool,
+) -> AppResult<()> {
+    let uid = format!("{name_prefix}-user-{index:06}");
+    let dn = format!("uid={uid},{}", dns.users_ou_dn);
+    let mut object_classes = string_set(["top", "person", "organizationalPerson", "inetOrgPerson"]);
+    if include_index_attributes {
+        object_classes.insert(BENCHMARK_INDEX_AUXILIARY_CLASS.to_string());
+    }
+    let mut attributes = vec![
+        ("objectClass".to_string(), object_classes),
+        ("uid".to_string(), string_set([uid.clone()])),
+        (
+            "cn".to_string(),
+            string_set([format!("Benchmark User {index}")]),
+        ),
+        (
+            "sn".to_string(),
+            string_set([format!("BenchmarkUser{index:06}")]),
+        ),
+        (
+            "description".to_string(),
+            string_set([format!("Benchmark fixture user {index:06}")]),
+        ),
+        (
+            "mail".to_string(),
+            string_set([format!("{uid}@example.com")]),
+        ),
+        ("userPassword".to_string(), string_set([password])),
+    ];
+    if include_index_attributes {
+        attributes.push((
+            BENCHMARK_ORDER_ATTRIBUTE.to_string(),
+            string_set([index.to_string()]),
+        ));
+    }
+    ldap.add(&dn, attributes).await?.success()?;
+    Ok(())
+}
+
+fn report_preload_progress(loaded: usize, count: usize) {
+    if count >= 100_000 && (loaded % 100_000 == 0 || loaded == count) {
+        progress(&format!("fixture.preload.{loaded}of{count}"));
+    }
 }
 
 async fn add_organizational_unit(ldap: &mut Ldap, dn: &str) -> AppResult<()> {
@@ -2405,6 +3199,26 @@ fn build_benchmark_stats_with_counts(
     concurrency: usize,
 ) -> BenchmarkStats {
     let elapsed_ms_total = elapsed_ms(total_start.elapsed().as_secs_f64());
+    build_benchmark_stats_with_elapsed(
+        operation,
+        latencies_ms,
+        elapsed_ms_total,
+        attempts,
+        successes,
+        failures,
+        concurrency,
+    )
+}
+
+fn build_benchmark_stats_with_elapsed(
+    operation: &str,
+    latencies_ms: Vec<f64>,
+    elapsed_ms_total: f64,
+    attempts: usize,
+    successes: usize,
+    failures: usize,
+    concurrency: usize,
+) -> BenchmarkStats {
     let throughput_ops_per_sec = if elapsed_ms_total > 0.0 {
         attempts as f64 / (elapsed_ms_total / 1000.0)
     } else {
@@ -2503,6 +3317,10 @@ fn parse_concurrent_bind_clients(raw: &str) -> AppResult<Vec<usize>> {
 
 fn parse_concurrent_index_search_clients(raw: &str) -> AppResult<Vec<usize>> {
     parse_concurrent_client_list(raw, "--concurrent-index-search-clients")
+}
+
+fn parse_ldapcon_clients(raw: &str) -> AppResult<Vec<usize>> {
+    parse_concurrent_client_list(raw, "--ldapcon-clients")
 }
 
 fn parse_sasl_plain_authcid_format(raw: &str) -> AppResult<SaslPlainAuthcidFormat> {
@@ -2642,6 +3460,14 @@ mod tests {
     #[test]
     fn parse_concurrent_index_search_clients_rejects_zero() {
         assert!(parse_concurrent_index_search_clients("1,0,4").is_err());
+    }
+
+    #[test]
+    fn ldapcon_mixed_counts_are_spread_across_small_runs() {
+        assert_eq!(ldapcon_mixed_expected_counts(6, 20), (4, 2));
+        assert_eq!(ldapcon_mixed_expected_counts(100, 20), (80, 20));
+        assert_eq!(ldapcon_mixed_expected_counts(100, 0), (100, 0));
+        assert_eq!(ldapcon_mixed_expected_counts(100, 100), (0, 100));
     }
 
     #[test]

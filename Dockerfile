@@ -17,6 +17,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 WORKDIR /build
+ARG CARGO_PROFILE=release
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS=${RUSTFLAGS}
 
 COPY --from=planner /build/recipe.json ./recipe.json
 
@@ -32,10 +35,11 @@ COPY benches ./benches
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target-cache \
-    cargo build --release --target-dir /build/target-cache --bin opendr --bin opendr-setup --bin ldap_perf_client \
-    && install -D /build/target-cache/release/opendr /build/target/release/opendr \
-    && install -D /build/target-cache/release/opendr-setup /build/target/release/opendr-setup \
-    && install -D /build/target-cache/release/ldap_perf_client /build/target/release/ldap_perf_client
+    cargo build --profile "${CARGO_PROFILE}" --target-dir /build/target-cache --bin opendr --bin opendr-setup --bin ldap_perf_client --bin opendr_perf_fixture_loader \
+    && install -D "/build/target-cache/${CARGO_PROFILE}/opendr" /build/target/release/opendr \
+    && install -D "/build/target-cache/${CARGO_PROFILE}/opendr-setup" /build/target/release/opendr-setup \
+    && install -D "/build/target-cache/${CARGO_PROFILE}/ldap_perf_client" /build/target/release/ldap_perf_client \
+    && install -D "/build/target-cache/${CARGO_PROFILE}/opendr_perf_fixture_loader" /build/target/release/opendr_perf_fixture_loader
 
 FROM debian:bookworm-slim AS perf-client
 
@@ -59,6 +63,7 @@ WORKDIR /var/lib/opendr
 
 COPY --from=builder /build/target/release/opendr /usr/local/bin/opendr
 COPY --from=builder /build/target/release/opendr-setup /usr/local/bin/opendr-setup
+COPY --from=builder /build/target/release/opendr_perf_fixture_loader /usr/local/bin/opendr_perf_fixture_loader
 COPY docker/opendr-entrypoint.sh /usr/local/bin/opendr-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/opendr-entrypoint.sh \

@@ -1084,6 +1084,179 @@ impl LmdbBackend {
         Ok(())
     }
 
+    /// Create an SSHA512 password hash suitable for direct storage in the password database.
+    pub fn create_ssha512_password_hash(password: &[u8]) -> String {
+        Self::create_ssha512(password)
+    }
+
+    /// Add many entries using batched LMDB write transactions.
+    ///
+    /// This is intended for offline fixture/import workflows. It preserves the same stored entry,
+    /// DN index, password database, attribute-index, and contextCSN formats used by normal adds,
+    /// while avoiding one LMDB transaction per entry.
+    pub async fn bulk_add_entries<I, F>(
+        &self,
+        entries: I,
+        batch_size: usize,
+        actor_dn: Option<&str>,
+        mut on_progress: F,
+    ) -> Result<usize, BackendError>
+    where
+        I: IntoIterator<Item = (DirectoryEntry, Vec<u8>)>,
+        F: FnMut(usize),
+    {
+        let _lock = self.write_lock.write().await;
+        let mut entries = entries.into_iter();
+        let batch_size = batch_size.max(1);
+        let mut total_added = 0_usize;
+
+        loop {
+            let mut txn = self
+                .env
+                .begin_rw_txn()
+                .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+            let mut batch_added = 0_usize;
+            let mut last_csn = None;
+
+            while batch_added < batch_size {
+                let Some((mut entry, password)) = entries.next() else {
+                    break;
+                };
+
+                let normalized_dn = Self::normalize_dn(&entry.dn);
+                if txn.get(self.dn_index_db, &normalized_dn.as_bytes()).is_ok() {
+                    return Err(BackendError::AlreadyExists);
+                }
+
+                let csn = self.csn_generator.generate();
+                entry.operational_attributes = crate::backend::OperationalAttributes::for_new_entry(
+                    csn.clone(),
+                    actor_dn.map(str::to_string),
+                );
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                let stored_entry = StoredEntry {
+                    dn: entry.dn.clone(),
+                    attributes: entry.attributes,
+                    created_at: now,
+                    modified_at: now,
+                    operational_attributes: entry.operational_attributes.clone(),
+                };
+
+                let entry_bytes = bincode::serialize(&stored_entry).map_err(|e| {
+                    BackendError::Storage(format!("Failed to serialize entry: {}", e))
+                })?;
+
+                txn.put(
+                    self.entries_db,
+                    &entry.dn.as_bytes(),
+                    &entry_bytes,
+                    WriteFlags::empty(),
+                )
+                .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+
+                if let Some(password_hash) = Self::password_hash_from_bytes(&password) {
+                    txn.put(
+                        self.passwords_db,
+                        &entry.dn.as_bytes(),
+                        &password_hash.as_bytes(),
+                        WriteFlags::empty(),
+                    )
+                    .map_err(|e| {
+                        BackendError::Storage(format!("Failed to write password: {}", e))
+                    })?;
+                }
+
+                txn.put(
+                    self.dn_index_db,
+                    &normalized_dn.as_bytes(),
+                    &entry.dn.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
+
+                self.update_attribute_indexes(&mut txn, &entry.dn, &stored_entry.attributes)?;
+
+                last_csn = Some(csn.to_ldap_string());
+                total_added += 1;
+                batch_added += 1;
+                on_progress(total_added);
+            }
+
+            if batch_added == 0 {
+                break;
+            }
+
+            if let Some(csn_string) = last_csn {
+                txn.put(
+                    self.metadata_db,
+                    &b"context_csn",
+                    &csn_string.as_bytes(),
+                    WriteFlags::empty(),
+                )
+                .map_err(|e| {
+                    BackendError::Storage(format!("Failed to update contextCSN: {}", e))
+                })?;
+            }
+
+            txn.commit()
+                .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
+        }
+
+        self.mark_attribute_indexes_ready()?;
+        self.record_auth_cache_metrics();
+        Ok(total_added)
+    }
+
+    fn mark_attribute_indexes_ready(&self) -> Result<(), BackendError> {
+        let mut txn = self.env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin attribute index metadata write txn: {}",
+                e
+            ))
+        })?;
+
+        for attribute in self.index_plan.attributes.keys() {
+            let metadata_key = Self::attribute_index_metadata_key(attribute);
+            txn.put(
+                self.metadata_db,
+                &metadata_key.as_bytes(),
+                &ATTRIBUTE_INDEX_VERSION,
+                WriteFlags::empty(),
+            )
+            .map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to mark attribute index ready for {}: {}",
+                    attribute, e
+                ))
+            })?;
+        }
+
+        let configured_attributes = self.index_plan.config_value();
+        txn.put(
+            self.metadata_db,
+            &ATTRIBUTE_INDEX_CONFIG_METADATA_KEY.as_bytes(),
+            &configured_attributes.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to mark attribute index config metadata: {}",
+                e
+            ))
+        })?;
+
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!("Failed to commit attribute index metadata: {}", e))
+        })?;
+
+        Ok(())
+    }
+
     async fn modify_entry_internal(
         &self,
         dn: &str,
@@ -4246,6 +4419,62 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
             vec![IndexType::Equality, IndexType::Ordering]
         );
         assert!(readiness[0].ready);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_add_entries_marks_attribute_indexes_ready() {
+        let dir = tempdir().unwrap();
+        let schema = schema_with_matching_rule_attrs();
+        let index_config = IndexConfig {
+            indexed_attributes: Vec::new(),
+            attribute_indexes: vec![AttributeIndexConfig {
+                attribute: "exampleNumber".to_string(),
+                index_types: vec![IndexType::Equality],
+            }],
+        };
+
+        {
+            let backend = LmdbBackend::new_with_schema_config(
+                dir.path(),
+                100,
+                1,
+                index_config.clone(),
+                &schema,
+            )
+            .unwrap();
+            let mut attributes = HashMap::new();
+            attributes.insert("cn".to_string(), vec!["bulk".to_string()]);
+            attributes.insert("exampleNumber".to_string(), vec!["7".to_string()]);
+            let entry = DirectoryEntry::new("cn=bulk,dc=example,dc=org", attributes);
+
+            let added = backend
+                .bulk_add_entries(vec![(entry, Vec::new())], 100, None, |_| {})
+                .await
+                .unwrap();
+
+            assert_eq!(added, 1);
+            assert!(
+                backend
+                    .attribute_index_readiness()
+                    .unwrap()
+                    .into_iter()
+                    .all(|index| index.ready)
+            );
+        }
+
+        let reopened =
+            LmdbBackend::new_with_schema_config(dir.path(), 100, 1, index_config, &schema).unwrap();
+        assert_eq!(
+            reopened.search_by_index("exampleNumber", "7").unwrap(),
+            vec!["cn=bulk,dc=example,dc=org".to_string()]
+        );
+        assert!(
+            reopened
+                .attribute_index_readiness()
+                .unwrap()
+                .into_iter()
+                .all(|index| index.ready)
+        );
     }
 
     #[tokio::test]
