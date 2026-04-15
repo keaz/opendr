@@ -91,7 +91,7 @@ jobs:
       - name: Validate against documented baseline
         run: |
           python3 scripts/validate_docker_perf_baseline.py \
-            --baseline-doc docs/DOCKER_PERF_COMPARISON.md \
+            --baseline-doc docs/PERFORMANCE_COMPARISON.md \
             --summary-csv target/perf/release/full/comparison-summary.csv \
             --summary-csv target/perf/release/concurrency/comparison-summary.csv \
             --summary-csv target/perf/release/index/comparison-summary.csv \

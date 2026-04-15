@@ -1,43 +1,169 @@
-# Docker LDAP Performance Comparison
+# LDAP Performance Comparison
 
-This document records the current Dockerized OpenDR and OpenDJ benchmark baseline. The runs use the local OpenDR Docker image built from this repository and OpenDJ `openidentityplatform/opendj:5.0.4`.
+This document records the current OpenDR performance baseline and historical
+Dockerized OpenDR/OpenDJ comparison runs. Container runs use the local OpenDR
+Docker image built from this repository and OpenDJ
+`openidentityplatform/opendj:5.0.4`. Host runs use the same generated OpenDR
+server configuration values as the Docker perf entrypoint, but execute the
+optimized binaries directly on the physical machine.
 
 ## Scope
 
 - OpenDR was built from the local `Dockerfile` with `rust:1.94-bookworm` and configured for the `fsm` runtime with the LMDB backend.
 - OpenDJ was run from `openidentityplatform/opendj:5.0.4`.
-- Both servers were capped at `2` CPU cores and `4 GiB` memory.
 - StartTLS was enabled for both products.
 - The current baseline rows are from the April 14, 2026 artifacts listed below.
 - OpenDR used the Docker entrypoint default `performance.cache_size = 1000`, which currently sizes both the exact-DN entry cache and the authentication credential cache.
 - Cache hit/miss metrics were not captured for these artifacts because the Docker perf harness disables the monitoring endpoint and samples container CPU/memory only.
 - The 1M-user OpenDR run used a `16 GiB` LMDB map. The default `1 GiB` Docker map filled around 300k users.
 - The 1M-user concurrency artifact covers simple-bind and SASL PLAIN auth concurrency. It does not include index-concurrency probes because the preserved 1M fixture was loaded without benchmark ordering attributes.
-- Completed OpenDR-only 10M-user LDAPCon-style artifacts are recorded below. The latest OpenLDAP-shaped run is the current public comparison snapshot; the original synchronous-auth-metadata run remains the historical 10M baseline.
+- Completed OpenDR-only 10M-user LDAPCon-style artifacts are recorded below. The latest host OpenLDAP-shaped run is the current public comparison snapshot; the original synchronous-auth-metadata run remains the historical 10M baseline.
 - There is still no completed 10M-user OpenDR-vs-OpenDJ benchmark artifact in this repository.
 
 ## Latest 10M Result Snapshot
 
-The latest completed 10M OpenDR run is the OpenLDAP-shaped LDAPCon-style run at:
+The latest completed 10M OpenDR snapshot is the physical-machine
+OpenLDAP-shaped LDAPCon-style run at:
 
-`target/perf/opendr-ldapcon-openldap-10m-12cpu-30g-20260415-150810/`
+`target/perf/opendr-local-dockerconfig-ldapcon-openldap-10m-idkey-20260415-212046/opendr/ldapcon-openldap-ten-million/ldapcon-iterations-10000-sampled-20260415-213007/`
 
-This run used a clean 10M fixture, `12` CPU cores, `30g` memory, `12`
-OpenDR worker threads, `12` fixture preload workers, `cache_size = 10000000`,
-and the optimized `perf` build profile with `-C target-cpu=native`. It used
-the public LDAPCon 2013 OpenLDAP LMDB load-generator shape where published:
-search `96` effective clients, auth `84`, modify `8`, and mixed `96`.
+This run reused a clean 10M fixture loaded on the host, executed OpenDR directly
+on the physical machine with `12` OpenDR worker threads, `12` fixture preload
+workers, `cache_size = 10000000`, `lmdb_max_readers = 4096`, async coalesced
+auth metadata, and the optimized `perf` build profile with
+`-C target-cpu=native`. It used the public LDAPCon 2013 OpenLDAP LMDB
+load-generator shape where published: search `96` effective clients, auth `84`,
+modify `8`, and mixed `96`. The benchmark used `10000` LDAPCon operations per
+client and completed with `0` failures.
 
 | Operation | OpenDR success ops/s | OpenLDAP LMDB 2013 ops/s | Difference | Failures |
 |---|---:|---:|---:|---:|
-| Search | 39,281.55 | 31,674.02 | +24.0% | 0 |
-| Auth | 41,680.21 | 16,941.98 | +146.0% | 0 |
-| Modify | 1,852.72 | 5,760.04 | -67.8% | 0 |
-| Mixed search | 4,332.81 | 25,399.99 | -82.9% | 0 |
-| Mixed modify | 1,083.20 | 1,652.35 | -34.4% | 0 |
+| Search | 118,520.69 | 31,674.02 | +274.2% | 0 |
+| Auth | 172,020.69 | 16,941.98 | +915.3% | 0 |
+| Modify | 8,100.10 | 5,760.04 | +40.6% | 0 |
+| Mixed search | 33,248.74 | 25,399.99 | +30.9% | 0 |
+| Mixed modify | 8,312.19 | 1,652.35 | +403.0% | 0 |
 
-Search and auth are now above the public single-server OpenLDAP LMDB rows.
-Modify and mixed workloads remain the active throughput gaps.
+All OpenLDAP-shaped operation families are now above the public single-server
+OpenLDAP LMDB rows on the physical-machine hot-cache run. The same fixture was
+also used for a higher-concurrency diagnostic run at search `192`, auth `168`,
+modify `8`, and mixed `192`; that run stayed at `0` failures but reduced
+throughput for search, modify, and mixed operations while raising mixed-write
+tail latency, pointing to contention before full 12-core saturation.
+
+## Physical-Machine 10M LDAPCon Runs
+
+Artifact root:
+`target/perf/opendr-local-dockerconfig-ldapcon-openldap-10m-idkey-20260415-212046/opendr/ldapcon-openldap-ten-million/`
+
+These runs used the same OpenDR server configuration shape and values as the
+Docker perf entrypoint for the latest 10M profile, but ran the optimized host
+binaries directly on `Kasuns-MacBook-Pro.local`. The host reports `14` logical
+CPUs; OpenDR was configured with `performance.worker_threads = 12`. The 10M
+LMDB fixture was prewarmed through the host page cache before each benchmark.
+
+Shared server configuration:
+
+| Setting | Value |
+|---|---:|
+| Runtime | `fsm` |
+| Fixture users | `10000000` |
+| LMDB map size | `343597383680` bytes |
+| LMDB max readers | `4096` |
+| OpenDR worker threads | `12` |
+| Fixture preload workers | `12` |
+| OpenDR cache size | `10000000` |
+| Max connections | `4096` |
+| Max connections per IP | `4096` |
+| Max operations per connection | `200` |
+| Max memory per connection | `10485760` bytes |
+| Max total tracked connection memory | `2147483648` bytes |
+| Auth metadata mode | `async_coalesced` |
+| Auth metadata queue capacity | `2000000` |
+| Auth metadata flush interval | `50` ms |
+| Auth metadata batch size | `5000` |
+| Auth metadata overflow policy | `fallback_sync` |
+| Build profile | `perf` |
+| Build RUSTFLAGS | `-C target-cpu=native` |
+
+Load and storage:
+
+| Metric | Result |
+|---|---:|
+| Bulk fixture load time | `115` seconds |
+| Clean `data.mdb` before first host benchmark | `17,739,038,720` bytes |
+| `data.mdb` after high-concurrency run | `17,753,178,112` bytes |
+| LMDB page size on host | `16,384` bytes |
+
+The host LMDB footprint is smaller than the earlier Linux/Docker artifact
+because this macOS LMDB build uses a `16 KiB` page size. The earlier Linux
+Docker optimized layout generated about `20.68 GB` after the benchmark.
+
+### OpenLDAP-Shaped Sustained Run
+
+Artifact:
+`target/perf/opendr-local-dockerconfig-ldapcon-openldap-10m-idkey-20260415-212046/opendr/ldapcon-openldap-ten-million/ldapcon-iterations-10000-sampled-20260415-213007/`
+
+This run used the LDAPCon OpenLDAP-shaped concurrency values: search `96`, auth
+`84`, modify `8`, and mixed `96`, with `10000` operations per client.
+
+| Operation | Concurrency | Attempts | Failures | Success ops/s | Mean ms | P95 ms | P99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Search | 96 | 960,000 | 0 | 118,520.69 | 0.807 | 1.435 | 1.882 |
+| Auth | 84 | 840,000 | 0 | 172,020.69 | 0.488 | 0.749 | 0.898 |
+| Modify | 8 | 80,000 | 0 | 8,100.10 | 0.988 | 0.980 | 1.105 |
+| Mixed search | 96 | 768,000 | 0 | 33,248.74 | 0.076 | 0.100 | 0.116 |
+| Mixed modify | 96 | 192,000 | 0 | 8,312.19 | 11.239 | 12.486 | 12.935 |
+
+Resource summary:
+
+| Metric | Result |
+|---|---:|
+| Benchmark runtime | `46.34` seconds |
+| Resource samples | `178` |
+| OpenDR CPU avg / max | `370.10%` / `857.90%` |
+| OpenDR RSS avg / max | `6.49 GiB` / `7.51 GiB` |
+| `data.mdb` growth during run | about `754 KiB` |
+
+### Higher-Concurrency Diagnostic Run
+
+Artifact:
+`target/perf/opendr-local-dockerconfig-ldapcon-openldap-10m-idkey-20260415-212046/opendr/ldapcon-openldap-ten-million/ldapcon-high-concurrency-iter10000-sampled-20260415-213457/`
+
+This run doubled the search, auth, and mixed client counts while keeping modify
+at `8`: search `192`, auth `168`, modify `8`, mixed `192`, with `10000`
+operations per client.
+
+| Operation | Concurrency | Attempts | Failures | Success ops/s | Mean ms | P95 ms | P99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Search | 192 | 1,920,000 | 0 | 114,359.60 | 1.674 | 3.341 | 4.418 |
+| Auth | 168 | 1,680,000 | 0 | 172,343.45 | 0.973 | 1.477 | 1.784 |
+| Modify | 8 | 80,000 | 0 | 5,793.40 | 1.381 | 0.982 | 36.623 |
+| Mixed search | 192 | 1,536,000 | 0 | 22,171.45 | 0.076 | 0.101 | 0.118 |
+| Mixed modify | 192 | 384,000 | 0 | 5,542.86 | 34.326 | 115.917 | 142.131 |
+
+Resource summary:
+
+| Metric | Result |
+|---|---:|
+| Benchmark runtime | `110.37` seconds |
+| Resource samples | `421` |
+| OpenDR CPU avg / max | `300.81%` / `854.50%` |
+| OpenDR RSS avg / max | `8.67 GiB` / `9.87 GiB` |
+| `data.mdb` growth during run | about `4.28 MiB` |
+
+Interpretation:
+
+- The `10000`-iteration OpenLDAP-shaped host run is the cleanest current 10M
+  comparison row because its concurrency matches the published OpenLDAP LMDB
+  load-generator shape and all operation families complete with `0` failures.
+- Doubling search/auth/mixed concurrency did not increase sustained throughput.
+  Auth stayed flat, search dipped slightly, and modify/mixed write latency
+  worsened materially.
+- The high-concurrency run peaked near `8.5` cores but averaged about `3`
+  cores. The current bottleneck is therefore not simply the 12-worker-thread
+  envelope; write-path lock contention, LMDB write serialization, or client
+  scheduling overhead should be profiled next.
 
 ## Profiling And Regression Workflow
 
@@ -233,11 +359,11 @@ Artifact roots:
 - `target/perf/opendr-credential-index-10m-c8-cache50k-rerun-8cpu-30g-20260415-132251/`
 - `target/perf/opendr-credential-index-10m-c8-8cpu-30g-20260415-131632/`
 
-This run targeted issue #139 after adding the LMDB
-`credentials_by_normalized_dn` database. The database is keyed by normalized DN
-and stores compact decoded SSHA512 hash/salt records, while the legacy
-`passwords` database still stores the original `{SSHA512}` strings. Existing
-fixtures are backfilled on open in 10k-row LMDB write batches.
+This run targeted issue #139 after adding the first compact LMDB credential
+index. The current storage layout supersedes that result with
+`credentials_by_entry_id`, which is keyed by compact entry ID and stores decoded
+SSHA512 hash/salt records. Fresh stores no longer populate the legacy
+`passwords` or `credentials_by_normalized_dn` databases.
 
 Both rows reused the existing 10M LDAPCon-style fixture after credential-index
 backfill, used the `perf` profile with `-C target-cpu=native`, 8 CPUs, 30 GiB

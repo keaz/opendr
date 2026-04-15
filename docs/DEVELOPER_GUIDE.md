@@ -352,17 +352,24 @@ The in-memory backend is useful for tests and local experiments only.
 
 LMDB databases include:
 
-- `entries`: primary serialized directory entries
-- `passwords`: password hashes
-- `credentials_by_normalized_dn`: normalized DN to compact credential record for bind cache misses
-- `dn_index`: case-insensitive DN lookup
+- `entries_by_entry_id`: primary serialized directory entries keyed by compact entry ID
+- `credentials_by_entry_id`: compact credential records keyed by compact entry ID for bind cache misses
+- `entry_id_by_normalized_dn`: normalized DN to compact entry ID
+- `dn_by_entry_id`: compact entry ID to original DN
 - `metadata`: contextCSN and index metadata
-- `idx_<attribute>`: per-attribute indexes
+- `idx3_<attribute>`: per-attribute indexes using normalized index keys and fixed-width duplicate compact entry IDs
 
-The credential index is derived from `passwords` on startup when missing or stale.
-It avoids the extra normalized-DN lookup and repeated SSHA512 base64 decoding on
-the bind hot path while preserving the existing `{SSHA512}` password-hash format
-and the legacy `passwords` database.
+The credential index stores decoded SSHA512 hash and salt bytes so bind cache
+misses avoid repeated base64 decoding. The legacy `passwords` and
+`credentials_by_normalized_dn` databases are not populated for fresh stores and
+are cleared during startup cleanup when present.
+
+Attribute indexes are derived from `entries_by_entry_id` on startup when missing or stale.
+They use LMDB duplicate values so repeated equality, presence, substring, and
+ordering keys store 8-byte entry IDs rather than repeating full DNs in each index
+record. Legacy DN-key `idx_<attribute>` and compact `idx2_<attribute>` databases
+are cleared during rebuild so LMDB can reuse those pages for the fixed-duplicate
+indexes.
 
 Legacy `indexed_attributes` entries get equality and presence indexes. Typed
 indexes add explicit LDAP search categories:

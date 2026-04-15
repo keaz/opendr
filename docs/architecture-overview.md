@@ -143,10 +143,12 @@ shipped binary rejects non-default `rate_limit.burst_size` when using `legacy`.
 
 ## Storage
 
-The production backend is LMDB. It stores entries, password hashes, normalized
-DN lookup, context metadata, and configured attribute indexes in separate LMDB
-databases. Reads use LMDB multi-reader behavior and exact-DN entry/auth
-credential caches. Writes use a backend write lock.
+The production backend is LMDB. It stores primary entries and credential records
+behind compact entry IDs, with normalized-DN and entry-ID maps for lookup,
+context metadata, and configured attribute indexes in separate LMDB databases.
+Attribute indexes reference fixed-width compact entry IDs rather than duplicating
+full DNs in each index row. Reads use LMDB multi-reader behavior and exact-DN
+entry/auth credential caches. Writes use a backend write lock.
 
 The in-memory backend is useful for tests and local experiments. It is not a
 durable backend.

@@ -34,6 +34,9 @@ pub const PROVIDER_CHANGELOG_FILE: &str = "provider_changelog.json";
 
 const LMDB_MAX_DBS: u32 = 50;
 const BYTES_PER_MIB: usize = 1024 * 1024;
+const LMDB_ENTRIES_BY_ENTRY_ID_DB: &str = "entries_by_entry_id";
+const LMDB_ENTRY_ID_BY_NORMALIZED_DN_DB: &str = "entry_id_by_normalized_dn";
+const LMDB_DN_BY_ENTRY_ID_DB: &str = "dn_by_entry_id";
 
 pub type BackupResult<T> = Result<T, BackupError>;
 
@@ -155,6 +158,17 @@ struct BackupStoredEntry {
 }
 
 #[derive(Debug, Deserialize)]
+struct BackupStoredEntryRecord {
+    attributes: HashMap<String, Vec<String>>,
+    #[serde(rename = "created_at")]
+    _created_at: u64,
+    #[serde(rename = "modified_at")]
+    _modified_at: u64,
+    #[serde(default)]
+    operational_attributes: OperationalAttributes,
+}
+
+#[derive(Debug, Deserialize)]
 struct BackupStoredEntryV1 {
     dn: String,
     attributes: HashMap<String, Vec<String>>,
@@ -225,6 +239,36 @@ fn deserialize_backup_stored_entry(bytes: &[u8]) -> BackupResult<BackupStoredEnt
                 ))
             }),
     }
+}
+
+fn deserialize_backup_stored_entry_record(
+    dn: String,
+    bytes: &[u8],
+) -> BackupResult<BackupStoredEntry> {
+    match bincode::deserialize::<BackupStoredEntryRecord>(bytes) {
+        Ok(record) => Ok(BackupStoredEntry {
+            dn,
+            attributes: record.attributes,
+            _created_at: record._created_at,
+            _modified_at: record._modified_at,
+            operational_attributes: record.operational_attributes,
+        }),
+        Err(record_err) => deserialize_backup_stored_entry(bytes).map_err(|legacy_err| {
+            BackupError::InvalidBackup(format!(
+                "failed to deserialize compact stored LMDB entry: {record_err}; legacy decode failed: {legacy_err}"
+            ))
+        }),
+    }
+}
+
+fn lmdb_entry_id_from_bytes(bytes: &[u8], context: &str) -> BackupResult<u64> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+        BackupError::InvalidBackup(format!(
+            "invalid LMDB entry id length for {context}: expected 8 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 #[derive(Debug, Deserialize)]
@@ -635,34 +679,47 @@ fn read_lmdb_entry_snapshot(
     max_readers: u32,
 ) -> BackupResult<Option<DirectoryEntry>> {
     let env = open_lmdb_readonly(data_dir, max_readers)?;
-    let dn_index_db = match env.open_db(Some("dn_index")) {
+    let entry_id_by_normalized_dn_db = match env.open_db(Some(LMDB_ENTRY_ID_BY_NORMALIZED_DN_DB)) {
         Ok(db) => db,
         Err(lmdb::Error::NotFound) => return Ok(None),
         Err(err) => return Err(BackupError::from(err)),
     };
-    let entries_db = match env.open_db(Some("entries")) {
+    let dn_by_entry_id_db = match env.open_db(Some(LMDB_DN_BY_ENTRY_ID_DB)) {
+        Ok(db) => db,
+        Err(lmdb::Error::NotFound) => return Ok(None),
+        Err(err) => return Err(BackupError::from(err)),
+    };
+    let entries_db = match env.open_db(Some(LMDB_ENTRIES_BY_ENTRY_ID_DB)) {
         Ok(db) => db,
         Err(lmdb::Error::NotFound) => return Ok(None),
         Err(err) => return Err(BackupError::from(err)),
     };
     let txn = env.begin_ro_txn()?;
     let normalized_dn = dn.to_lowercase().trim().to_string();
-    let actual_dn = match txn.get(dn_index_db, &normalized_dn.as_bytes()) {
-        Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-        Err(lmdb::Error::NotFound) => return Ok(None),
-        Err(err) => return Err(BackupError::from(err)),
-    };
-    let entry_bytes = match txn.get(entries_db, &actual_dn.as_bytes()) {
+    let entry_id_bytes = match txn.get(entry_id_by_normalized_dn_db, &normalized_dn.as_bytes()) {
         Ok(bytes) => bytes,
         Err(lmdb::Error::NotFound) => return Ok(None),
         Err(err) => return Err(BackupError::from(err)),
     };
-    let stored = deserialize_backup_stored_entry(entry_bytes).map_err(|err| {
-        BackupError::InvalidBackup(format!(
-            "failed to deserialize stored LMDB entry {}: {}",
-            actual_dn, err
-        ))
-    })?;
+    let entry_id = lmdb_entry_id_from_bytes(entry_id_bytes, &normalized_dn)?;
+    let entry_id_key = entry_id.to_be_bytes();
+    let actual_dn = match txn.get(dn_by_entry_id_db, &entry_id_key) {
+        Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+        Err(lmdb::Error::NotFound) => return Ok(None),
+        Err(err) => return Err(BackupError::from(err)),
+    };
+    let entry_bytes = match txn.get(entries_db, &entry_id_key) {
+        Ok(bytes) => bytes,
+        Err(lmdb::Error::NotFound) => return Ok(None),
+        Err(err) => return Err(BackupError::from(err)),
+    };
+    let stored =
+        deserialize_backup_stored_entry_record(actual_dn.clone(), entry_bytes).map_err(|err| {
+            BackupError::InvalidBackup(format!(
+                "failed to deserialize stored LMDB entry {} / id {}: {}",
+                actual_dn, entry_id, err
+            ))
+        })?;
     Ok(Some(stored.into_directory_entry()))
 }
 

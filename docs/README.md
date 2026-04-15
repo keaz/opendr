@@ -36,7 +36,7 @@ deploys the site.
 - [Backend transaction FSM](./backend_txn_fsm.md)
 - [Replication consumer FSM](./replication_consumer_fsm.md)
 - [Schema integration](./schema_integration.md)
-- [Docker performance comparison](./DOCKER_PERF_COMPARISON.md)
+- [Performance comparison](./PERFORMANCE_COMPARISON.md)
 
 Start with the developer operations guide when setting up or troubleshooting a
 server. Use the implementation references when changing runtime code.

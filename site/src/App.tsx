@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import perfComparisonMarkdown from "../../docs/DOCKER_PERF_COMPARISON.md?raw";
+import perfComparisonMarkdown from "../../docs/PERFORMANCE_COMPARISON.md?raw";
 import {
   replicationFlowDiagram,
   requestFlowDiagram,
@@ -523,17 +523,37 @@ const millionOpenDrRows = [
 ];
 
 const ldapConTenMillionRows = [
-  ["Search", "96", "39,281.55", "31,674.02", "+24.0%", "0"],
-  ["Auth", "84", "41,680.21", "16,941.98", "+146.0%", "0"],
-  ["Modify", "8", "1,852.72", "5,760.04", "-67.8%", "0"],
-  ["Mixed search", "96", "4,332.81", "25,399.99", "-82.9%", "0"],
-  ["Mixed modify", "96", "1,083.20", "1,652.35", "-34.4%", "0"],
+  ["Search", "96", "960,000", "118,520.69", "31,674.02", "+274.2%", "1.882 ms", "0"],
+  ["Auth", "84", "840,000", "172,020.69", "16,941.98", "+915.3%", "0.898 ms", "0"],
+  ["Modify", "8", "80,000", "8,100.10", "5,760.04", "+40.6%", "1.105 ms", "0"],
+  ["Mixed search", "96", "768,000", "33,248.74", "25,399.99", "+30.9%", "0.116 ms", "0"],
+  ["Mixed modify", "96", "192,000", "8,312.19", "1,652.35", "+403.0%", "12.935 ms", "0"],
+];
+
+const ldapConHighConcurrencyRows = [
+  ["Search", "192", "1,920,000", "114,359.60", "4.418 ms", "0"],
+  ["Auth", "168", "1,680,000", "172,343.45", "1.784 ms", "0"],
+  ["Modify", "8", "80,000", "5,793.40", "36.623 ms", "0"],
+  ["Mixed search", "192", "1,536,000", "22,171.45", "0.118 ms", "0"],
+  ["Mixed modify", "192", "384,000", "5,542.86", "142.131 ms", "0"],
+];
+
+const physicalHostResourceRows = [
+  ["OpenLDAP-shaped runtime", "46.34 seconds"],
+  ["OpenLDAP-shaped CPU avg / max", "370.10% / 857.90%"],
+  ["OpenLDAP-shaped RSS avg / max", "6.49 GiB / 7.51 GiB"],
+  ["High-concurrency runtime", "110.37 seconds"],
+  ["High-concurrency CPU avg / max", "300.81% / 854.50%"],
+  ["High-concurrency RSS avg / max", "8.67 GiB / 9.87 GiB"],
+  ["Clean host data.mdb", "17,739,038,720 bytes"],
+  ["data.mdb after high-concurrency run", "17,753,178,112 bytes"],
 ];
 
 const ldapConTenMillionThroughput = {
   labels: ["Search", "Auth", "Modify", "Mixed search", "Mixed modify"],
   series: [
-    { label: "OpenDR 12 CPU", values: [39281.55, 41680.21, 1852.72, 4332.81, 1083.2], color: "#7ce8c8" },
+    { label: "OpenDR host", values: [118520.69, 172020.69, 8100.1, 33248.74, 8312.19], color: "#7ce8c8" },
+    { label: "OpenDR high concurrency", values: [114359.6, 172343.45, 5793.4, 22171.45, 5542.86], color: "#8fb7ff" },
     { label: "OpenLDAP LMDB 2013", values: [31674.02, 16941.98, 5760.04, 25399.99, 1652.35], color: "#f2b26d" },
   ],
 };
@@ -936,11 +956,11 @@ cargo build --release`}</code></pre>
               <p className="chapter-label">Chapter 5</p>
               <h2 id="performance-title">Performance Results</h2>
               <p>
-                The site includes the complete Docker benchmark report from{" "}
-                <code>docs/DOCKER_PERF_COMPARISON.md</code>. The current
+                The site includes the complete benchmark report from{" "}
+                <code>docs/PERFORMANCE_COMPARISON.md</code>. The current
                 results include bounded Docker regression profiles, the OpenDR
-                1M-user baseline, and a completed 10M-user LDAPCon-style
-                OpenDR run shaped like the public LDAPCon 2013 OpenLDAP LMDB
+                1M-user baseline, and physical-machine 10M-user LDAPCon-style
+                OpenDR runs shaped like the public LDAPCon 2013 OpenLDAP LMDB
                 single-server benchmark.
               </p>
 
@@ -1045,13 +1065,15 @@ cargo build --release`}</code></pre>
                 generated 10M LMDB fixture.
               </div>
 
-              <h3>10M LDAPCon OpenLDAP-like result</h3>
+              <h3>10M physical-machine LDAPCon result</h3>
               <p>
                 The public OpenLDAP LMDB rows are single-server results. Their
                 published clients and threads are SLAMD load-generator settings:
                 search uses 96 effective workers, auth uses 84, and modify
                 uses 8. OpenDR uses the same operation-specific concurrency
-                shape for the comparison below.
+                shape for the comparison below, running directly on the
+                physical machine with 12 OpenDR worker threads and 10000
+                LDAPCon operations per client.
               </p>
               <div className="table-scroll">
                 <table>
@@ -1059,21 +1081,78 @@ cargo build --release`}</code></pre>
                     <tr>
                       <th>Operation</th>
                       <th>Concurrency</th>
+                      <th>Attempts</th>
                       <th>OpenDR ops/s</th>
                       <th>OpenLDAP LMDB ops/s</th>
                       <th>Gap</th>
+                      <th>P99</th>
                       <th>Failures</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {ldapConTenMillionRows.map(([operation, concurrency, opendr, openldap, gap, failures]) => (
+                    {ldapConTenMillionRows.map(([operation, concurrency, attempts, opendr, openldap, gap, p99, failures]) => (
                       <tr key={operation}>
                         <td>{operation}</td>
                         <td>{concurrency}</td>
+                        <td>{attempts}</td>
                         <td>{opendr}</td>
                         <td>{openldap}</td>
                         <td>{gap}</td>
+                        <td>{p99}</td>
                         <td>{failures}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <h3>10M high-concurrency diagnostic</h3>
+              <p>
+                This run doubled search, auth, and mixed concurrency while
+                keeping modify at 8 clients. It is a saturation diagnostic, not
+                the public OpenLDAP-shaped comparison row.
+              </p>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Operation</th>
+                      <th>Concurrency</th>
+                      <th>Attempts</th>
+                      <th>OpenDR ops/s</th>
+                      <th>P99</th>
+                      <th>Failures</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ldapConHighConcurrencyRows.map(([operation, concurrency, attempts, opendr, p99, failures]) => (
+                      <tr key={operation}>
+                        <td>{operation}</td>
+                        <td>{concurrency}</td>
+                        <td>{attempts}</td>
+                        <td>{opendr}</td>
+                        <td>{p99}</td>
+                        <td>{failures}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <h3>Physical-machine resource profile</h3>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Metric</th>
+                      <th>Value</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {physicalHostResourceRows.map(([metric, value]) => (
+                      <tr key={metric}>
+                        <td>{metric}</td>
+                        <td>{value}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -1104,14 +1183,14 @@ cargo build --release`}</code></pre>
               <div className="chart-grid">
                 <GroupedBarChart
                   title="10M LDAPCon throughput"
-                  description="Higher is better. OpenDR 12 CPU run compared with the public single-server OpenLDAP LMDB LDAPCon 2013 rows."
+                  description="Higher is better. Physical-machine OpenDR runs compared with the public single-server OpenLDAP LMDB LDAPCon 2013 rows."
                   labels={ldapConTenMillionThroughput.labels}
                   series={ldapConTenMillionThroughput.series}
                   unit="ops/s"
                   onExpand={() => setExpandedChart({
                     kind: "grouped",
                     title: "10M LDAPCon throughput",
-                    description: "Higher is better. OpenDR 12 CPU run compared with the public single-server OpenLDAP LMDB LDAPCon 2013 rows.",
+                    description: "Higher is better. Physical-machine OpenDR runs compared with the public single-server OpenLDAP LMDB LDAPCon 2013 rows.",
                     labels: ldapConTenMillionThroughput.labels,
                     series: ldapConTenMillionThroughput.series,
                     unit: "ops/s",

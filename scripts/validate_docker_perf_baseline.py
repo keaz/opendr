@@ -33,13 +33,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare OpenDR Docker perf summary CSV files against baseline values "
-            "recorded in docs/DOCKER_PERF_COMPARISON.md."
+            "recorded in docs/PERFORMANCE_COMPARISON.md."
         )
     )
     parser.add_argument(
         "--baseline-doc",
         type=Path,
-        default=Path("docs/DOCKER_PERF_COMPARISON.md"),
+        default=Path("docs/PERFORMANCE_COMPARISON.md"),
         help="Markdown document containing baseline tables.",
     )
     parser.add_argument(

@@ -243,9 +243,9 @@ attribute = "entryCSN"
 types = ["ordering"]
 ```
 
-When a new index is configured after data already exists, the LMDB backend rebuilds the configured attribute index keys during startup without modifying LDAP entries, operational attributes, or CSNs. Approximate-match filters currently use the equality index path because OpenDR's approximate-match semantics are case-insensitive equality.
+When a new index is configured after data already exists, the LMDB backend rebuilds the configured attribute index keys during startup without modifying LDAP entries, operational attributes, or CSNs. Attribute indexes use `idx3_<attribute>` databases with fixed-width duplicate LMDB values, storing compact entry IDs instead of repeating full DNs in every index row. Legacy DN-key and `idx2_*` index databases are cleared during rebuild so LMDB can reuse those pages. Approximate-match filters currently use the equality index path because OpenDR's approximate-match semantics are case-insensitive equality.
 
-For bind-heavy workloads, LMDB also maintains `credentials_by_normalized_dn`, a normalized-DN-to-compact-credential index used on authentication cache misses. Existing stores are backfilled during startup from the legacy `passwords` database; `passwords` still stores the same `{SSHA512}` format for compatibility and restore tooling, while the credential index stores decoded SSHA512 hash and salt bytes for the bind hot path.
+For bind-heavy workloads, LMDB stores compact decoded SSHA512 hash/salt records in `credentials_by_entry_id`, keyed by the same 8-byte entry IDs used by the primary entry table and attribute indexes. Fresh stores no longer populate the legacy `passwords`, `dn_index`, or `credentials_by_normalized_dn` databases.
 
 ### 5. Verify Listener-Based Replication
 

@@ -10,11 +10,11 @@
 //! ## Design
 //!
 //! The backend uses multiple LMDB databases (tables):
-//! - `entries`: DN → Entry data (primary storage)
-//! - `passwords`: DN → Password hash (separate for security)
-//! - `credentials_by_normalized_dn`: Normalized DN → compact credential record (bind hot path)
-//! - `dn_index`: Normalized DN → Original DN (case-insensitive lookups)
-//! - `attr_index_{name}`: Attribute value → DN (attribute indexing)
+//! - `entries_by_entry_id`: Compact entry id → Entry data (primary storage)
+//! - `credentials_by_entry_id`: Compact entry id → compact credential record (bind hot path)
+//! - `entry_id_by_normalized_dn`: Normalized DN → compact entry id
+//! - `dn_by_entry_id`: Compact entry id → Original DN
+//! - `idx3_{name}`: Normalized index key → duplicate fixed-width compact entry ids
 //!
 //! ## Read Optimization
 //!
@@ -52,18 +52,36 @@ use crate::perf_profile::PerfPhase;
 use crate::schema::{LdapSchema, ResolvedMatchingRule};
 
 const LMDB_SET_RANGE_OP: u32 = 17;
+const LMDB_GET_BOTH_OP: u32 = 2;
 const DEFAULT_ENTRY_CACHE_CAPACITY: usize = 1000;
-const PRESENCE_INDEX_VALUE_SENTINEL: &str = "\0present";
+const EQUALITY_INDEX_KEY_PREFIX: &str = "\0eq\0";
+const PRESENCE_INDEX_KEY: &str = "\0pres";
 const SUBSTRING_INDEX_KEY_PREFIX: &str = "\0sub\0";
 const ORDERING_INDEX_KEY_PREFIX: &str = "\0ord\0";
 const SUBSTRING_INDEX_TOKEN_LEN: usize = 3;
 const SUBSTRING_QUERY_MAX_TOKENS: usize = 2;
-const ATTRIBUTE_INDEX_VERSION: &[u8] = b"1";
+const ATTRIBUTE_INDEX_VERSION: &[u8] = b"3";
 const ATTRIBUTE_INDEX_CONFIG_METADATA_KEY: &str = "attribute_indexes_v1:configured";
-const CREDENTIAL_INDEX_VERSION: &[u8] = b"2";
-const CREDENTIAL_INDEX_METADATA_KEY: &str = "credential_index_v1:ready";
+const ATTRIBUTE_INDEX_DB_PREFIX: &str = "idx3_";
+const ATTRIBUTE_INDEX_BACKFILL_BATCH_SIZE: usize = 10_000;
+const CREDENTIAL_INDEX_VERSION: &[u8] = b"3";
+const CREDENTIAL_INDEX_METADATA_KEY: &str = "credential_index_v2:ready";
 const CREDENTIAL_RECORD_FORMAT_VERSION: u8 = 1;
 const CREDENTIAL_INDEX_BACKFILL_BATCH_SIZE: usize = 10_000;
+const ENTRY_ID_INDEX_VERSION: &[u8] = b"1";
+const ENTRY_ID_INDEX_METADATA_KEY: &str = "entry_ids_v1:ready";
+const NEXT_ENTRY_ID_METADATA_KEY: &str = "entry_ids_v1:next";
+const ENTRY_ID_BACKFILL_BATCH_SIZE: usize = 10_000;
+const ENTRY_STORAGE_VERSION: &[u8] = b"1";
+const ENTRY_STORAGE_METADATA_KEY: &str = "entries_by_entry_id_v1:ready";
+const ENTRY_STORAGE_BACKFILL_BATCH_SIZE: usize = 10_000;
+const FIRST_ENTRY_ID: u64 = 1;
+const LEGACY_ENTRIES_DB_NAME: &str = "entries";
+const LEGACY_PASSWORDS_DB_NAME: &str = "passwords";
+const LEGACY_CREDENTIALS_BY_NORMALIZED_DN_DB_NAME: &str = "credentials_by_normalized_dn";
+const LEGACY_DN_INDEX_DB_NAME: &str = "dn_index";
+const ENTRIES_BY_ENTRY_ID_DB_NAME: &str = "entries_by_entry_id";
+const CREDENTIALS_BY_ENTRY_ID_DB_NAME: &str = "credentials_by_entry_id";
 
 /// Serialized entry structure for LMDB storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +143,42 @@ impl From<StoredEntryV1> for StoredEntry {
             created_at: value.created_at,
             modified_at: value.modified_at,
             operational_attributes: value.operational_attributes.into(),
+        }
+    }
+}
+
+/// Compact serialized entry structure for the ID-keyed primary table.
+///
+/// The DN is stored once in `dn_by_entry_id`, so primary entry values avoid
+/// repeating it for every row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredEntryRecord {
+    pub attributes: HashMap<String, Vec<String>>,
+    pub created_at: u64,
+    pub modified_at: u64,
+    #[serde(default)]
+    pub operational_attributes: crate::backend::OperationalAttributes,
+}
+
+impl From<&StoredEntry> for StoredEntryRecord {
+    fn from(value: &StoredEntry) -> Self {
+        Self {
+            attributes: value.attributes.clone(),
+            created_at: value.created_at,
+            modified_at: value.modified_at,
+            operational_attributes: value.operational_attributes.clone(),
+        }
+    }
+}
+
+impl StoredEntryRecord {
+    fn into_stored_entry(self, dn: String) -> StoredEntry {
+        StoredEntry {
+            dn,
+            attributes: self.attributes,
+            created_at: self.created_at,
+            modified_at: self.modified_at,
+            operational_attributes: self.operational_attributes,
         }
     }
 }
@@ -1080,14 +1134,14 @@ fn ldap_attribute_key(attribute: &str) -> Cow<'_, str> {
 pub struct LmdbBackend {
     /// LMDB environment
     env: Arc<Environment>,
-    /// Main entries database
-    entries_db: Database,
-    /// Passwords database (separate for security)
-    passwords_db: Database,
-    /// Compact credential records keyed by normalized DN for the bind hot path.
-    credentials_by_normalized_dn_db: Database,
-    /// DN index for case-insensitive lookups
-    dn_index_db: Database,
+    /// Primary entries keyed by compact entry id.
+    entries_by_entry_id_db: Database,
+    /// Compact credential records keyed by compact entry id for the bind hot path.
+    credentials_by_entry_id_db: Database,
+    /// Normalized DN to compact entry id.
+    entry_id_by_normalized_dn_db: Database,
+    /// Compact entry id to original DN, used by attribute indexes.
+    dn_by_entry_id_db: Database,
     /// Metadata database (for contextCSN, etc.)
     metadata_db: Database,
     /// Attribute indexes: one database per indexed attribute
@@ -1249,27 +1303,44 @@ impl LmdbBackend {
 
         let env = Arc::new(env);
 
-        // Create databases
-        let entries_db = env
-            .create_db(Some("entries"), lmdb::DatabaseFlags::empty())
+        // Create current storage databases. Legacy DBs are opened only if they
+        // already exist so fresh stores do not grow empty compatibility tables.
+        let entries_by_entry_id_db = env
+            .create_db(
+                Some(ENTRIES_BY_ENTRY_ID_DB_NAME),
+                lmdb::DatabaseFlags::empty(),
+            )
             .map_err(|e| BackendError::Storage(format!("Failed to create entries db: {}", e)))?;
 
-        let passwords_db = env
-            .create_db(Some("passwords"), lmdb::DatabaseFlags::empty())
-            .map_err(|e| BackendError::Storage(format!("Failed to create passwords db: {}", e)))?;
-
-        let credentials_by_normalized_dn_db = env
+        let credentials_by_entry_id_db = env
             .create_db(
-                Some("credentials_by_normalized_dn"),
+                Some(CREDENTIALS_BY_ENTRY_ID_DB_NAME),
                 lmdb::DatabaseFlags::empty(),
             )
             .map_err(|e| {
                 BackendError::Storage(format!("Failed to create credential index db: {}", e))
             })?;
 
-        let dn_index_db = env
-            .create_db(Some("dn_index"), lmdb::DatabaseFlags::empty())
-            .map_err(|e| BackendError::Storage(format!("Failed to create dn_index db: {}", e)))?;
+        let legacy_entries_db = Self::open_optional_db(&env, LEGACY_ENTRIES_DB_NAME)?;
+        let legacy_passwords_db = Self::open_optional_db(&env, LEGACY_PASSWORDS_DB_NAME)?;
+        let legacy_credentials_by_normalized_dn_db =
+            Self::open_optional_db(&env, LEGACY_CREDENTIALS_BY_NORMALIZED_DN_DB_NAME)?;
+        let legacy_dn_index_db = Self::open_optional_db(&env, LEGACY_DN_INDEX_DB_NAME)?;
+
+        let entry_id_by_normalized_dn_db = env
+            .create_db(
+                Some("entry_id_by_normalized_dn"),
+                lmdb::DatabaseFlags::empty(),
+            )
+            .map_err(|e| {
+                BackendError::Storage(format!("Failed to create entry id index db: {}", e))
+            })?;
+
+        let dn_by_entry_id_db = env
+            .create_db(Some("dn_by_entry_id"), lmdb::DatabaseFlags::empty())
+            .map_err(|e| {
+                BackendError::Storage(format!("Failed to create entry id DN db: {}", e))
+            })?;
 
         let metadata_db = env
             .create_db(Some("metadata"), lmdb::DatabaseFlags::empty())
@@ -1278,27 +1349,56 @@ impl LmdbBackend {
         // Create attribute index databases.
         let mut attr_indexes = HashMap::new();
         for attr in index_plan.attribute_names() {
-            let db_name = format!("idx_{}", attr);
+            let db_name = format!("{ATTRIBUTE_INDEX_DB_PREFIX}{}", attr);
             let db = env
-                .create_db(Some(&db_name), lmdb::DatabaseFlags::empty())
+                .create_db(
+                    Some(&db_name),
+                    lmdb::DatabaseFlags::DUP_SORT | lmdb::DatabaseFlags::DUP_FIXED,
+                )
                 .map_err(|e| {
                     BackendError::Storage(format!("Failed to create index for {}: {}", attr, e))
                 })?;
             attr_indexes.insert(attr.clone(), db);
         }
 
+        Self::ensure_entry_ids_backfilled(
+            &env,
+            legacy_entries_db,
+            metadata_db,
+            entry_id_by_normalized_dn_db,
+            dn_by_entry_id_db,
+        )?;
+        Self::ensure_entries_by_entry_id_backfilled(
+            &env,
+            legacy_entries_db,
+            entries_by_entry_id_db,
+            metadata_db,
+            entry_id_by_normalized_dn_db,
+        )?;
         Self::ensure_attribute_indexes_backfilled(
             &env,
-            entries_db,
+            entries_by_entry_id_db,
+            dn_by_entry_id_db,
             metadata_db,
             &attr_indexes,
             &index_plan,
         )?;
         Self::ensure_credential_index_backfilled(
             &env,
-            passwords_db,
+            legacy_passwords_db,
+            legacy_credentials_by_normalized_dn_db,
             metadata_db,
-            credentials_by_normalized_dn_db,
+            entry_id_by_normalized_dn_db,
+            credentials_by_entry_id_db,
+        )?;
+        Self::clear_legacy_databases(
+            &env,
+            &[
+                legacy_entries_db,
+                legacy_passwords_db,
+                legacy_credentials_by_normalized_dn_db,
+                legacy_dn_index_db,
+            ],
         )?;
 
         // Initialize CSN generator with replica ID
@@ -1306,10 +1406,10 @@ impl LmdbBackend {
 
         Ok(Self {
             env,
-            entries_db,
-            passwords_db,
-            credentials_by_normalized_dn_db,
-            dn_index_db,
+            entries_by_entry_id_db,
+            credentials_by_entry_id_db,
+            entry_id_by_normalized_dn_db,
+            dn_by_entry_id_db,
             metadata_db,
             attr_indexes: Arc::new(RwLock::new(attr_indexes)),
             index_plan,
@@ -1338,9 +1438,24 @@ impl LmdbBackend {
 
         let normalized_dn = Self::normalize_dn(&entry.dn);
 
-        if txn.get(self.dn_index_db, &normalized_dn.as_bytes()).is_ok() {
+        if Self::entry_id_for_normalized_dn(
+            &txn,
+            self.entry_id_by_normalized_dn_db,
+            &normalized_dn,
+        )?
+        .is_some()
+        {
             return Err(BackendError::AlreadyExists);
         }
+        let mut next_entry_id = Self::read_next_entry_id(&txn, self.metadata_db)?;
+        let entry_id = Self::allocate_entry_id(
+            &mut txn,
+            self.entry_id_by_normalized_dn_db,
+            self.dn_by_entry_id_db,
+            &normalized_dn,
+            &entry.dn,
+            &mut next_entry_id,
+        )?;
 
         let csn = self.csn_generator.generate();
         entry.operational_attributes = crate::backend::OperationalAttributes::for_new_entry(
@@ -1361,37 +1476,18 @@ impl LmdbBackend {
             operational_attributes: entry.operational_attributes.clone(),
         };
 
-        let entry_bytes = bincode::serialize(&stored_entry)
-            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-
-        txn.put(
-            self.entries_db,
-            &entry.dn.as_bytes(),
-            &entry_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+        Self::put_entry_by_id(
+            &mut txn,
+            self.entries_by_entry_id_db,
+            entry_id,
+            &stored_entry,
+        )?;
 
         if let Some(password_hash) = Self::password_hash_from_bytes(&password) {
-            txn.put(
-                self.passwords_db,
-                &entry.dn.as_bytes(),
-                &password_hash.as_bytes(),
-                WriteFlags::empty(),
-            )
-            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
-            self.put_credential_index(&mut txn, &normalized_dn, &password_hash)?;
+            self.put_credential_index(&mut txn, entry_id, &password_hash)?;
         }
 
-        txn.put(
-            self.dn_index_db,
-            &normalized_dn.as_bytes(),
-            &entry.dn.as_bytes(),
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
-
-        self.update_attribute_indexes(&mut txn, &entry.dn, &stored_entry.attributes)?;
+        self.update_attribute_indexes(&mut txn, entry_id, &stored_entry.attributes)?;
 
         let csn_string = csn.to_ldap_string();
         txn.put(
@@ -1401,6 +1497,7 @@ impl LmdbBackend {
             WriteFlags::empty(),
         )
         .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
+        Self::put_next_entry_id(&mut txn, self.metadata_db, next_entry_id)?;
 
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -1435,6 +1532,12 @@ impl LmdbBackend {
         let mut entries = entries.into_iter();
         let batch_size = batch_size.max(1);
         let mut total_added = 0_usize;
+        let mut next_entry_id = {
+            let txn = self.env.begin_ro_txn().map_err(|e| {
+                BackendError::Storage(format!("Failed to begin entry id read txn: {}", e))
+            })?;
+            Self::read_next_entry_id(&txn, self.metadata_db)?
+        };
 
         loop {
             let mut txn = self
@@ -1450,9 +1553,23 @@ impl LmdbBackend {
                 };
 
                 let normalized_dn = Self::normalize_dn(&entry.dn);
-                if txn.get(self.dn_index_db, &normalized_dn.as_bytes()).is_ok() {
+                if Self::entry_id_for_normalized_dn(
+                    &txn,
+                    self.entry_id_by_normalized_dn_db,
+                    &normalized_dn,
+                )?
+                .is_some()
+                {
                     return Err(BackendError::AlreadyExists);
                 }
+                let entry_id = Self::allocate_entry_id(
+                    &mut txn,
+                    self.entry_id_by_normalized_dn_db,
+                    self.dn_by_entry_id_db,
+                    &normalized_dn,
+                    &entry.dn,
+                    &mut next_entry_id,
+                )?;
 
                 let csn = self.csn_generator.generate();
                 entry.operational_attributes = crate::backend::OperationalAttributes::for_new_entry(
@@ -1473,40 +1590,18 @@ impl LmdbBackend {
                     operational_attributes: entry.operational_attributes.clone(),
                 };
 
-                let entry_bytes = bincode::serialize(&stored_entry).map_err(|e| {
-                    BackendError::Storage(format!("Failed to serialize entry: {}", e))
-                })?;
-
-                txn.put(
-                    self.entries_db,
-                    &entry.dn.as_bytes(),
-                    &entry_bytes,
-                    WriteFlags::empty(),
-                )
-                .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+                Self::put_entry_by_id(
+                    &mut txn,
+                    self.entries_by_entry_id_db,
+                    entry_id,
+                    &stored_entry,
+                )?;
 
                 if let Some(password_hash) = Self::password_hash_from_bytes(&password) {
-                    txn.put(
-                        self.passwords_db,
-                        &entry.dn.as_bytes(),
-                        &password_hash.as_bytes(),
-                        WriteFlags::empty(),
-                    )
-                    .map_err(|e| {
-                        BackendError::Storage(format!("Failed to write password: {}", e))
-                    })?;
-                    self.put_credential_index(&mut txn, &normalized_dn, &password_hash)?;
+                    self.put_credential_index(&mut txn, entry_id, &password_hash)?;
                 }
 
-                txn.put(
-                    self.dn_index_db,
-                    &normalized_dn.as_bytes(),
-                    &entry.dn.as_bytes(),
-                    WriteFlags::empty(),
-                )
-                .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
-
-                self.update_attribute_indexes(&mut txn, &entry.dn, &stored_entry.attributes)?;
+                self.update_attribute_indexes(&mut txn, entry_id, &stored_entry.attributes)?;
 
                 last_csn = Some(csn.to_ldap_string());
                 total_added += 1;
@@ -1529,6 +1624,7 @@ impl LmdbBackend {
                     BackendError::Storage(format!("Failed to update contextCSN: {}", e))
                 })?;
             }
+            Self::put_next_entry_id(&mut txn, self.metadata_db, next_entry_id)?;
 
             txn.commit()
                 .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -1610,17 +1706,20 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
         let normalized_dn = Self::normalize_dn(dn);
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound.into()),
-            Err(e) => {
-                return Err(BackendError::Storage(format!("DN lookup failed: {}", e)).into());
-            }
+        let entry_id = match Self::entry_id_for_normalized_dn(
+            &txn,
+            self.entry_id_by_normalized_dn_db,
+            &normalized_dn,
+        )? {
+            Some(entry_id) => entry_id,
+            None => return Err(BackendError::NotFound.into()),
         };
-        let entry_bytes = txn
-            .get(self.entries_db, &actual_dn.as_bytes())
-            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
-        let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
+        let mut entry = Self::required_entry_by_id(
+            &txn,
+            self.entries_by_entry_id_db,
+            self.dn_by_entry_id_db,
+            entry_id,
+        )?;
         let indexed_modified_attributes = modifications
             .iter()
             .map(|modification| ldap_attribute_key(&modification.attribute).into_owned())
@@ -1661,16 +1760,7 @@ impl LmdbBackend {
             .operational_attributes
             .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
 
-        let entry_bytes = bincode::serialize(&entry)
-            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-
-        txn.put(
-            self.entries_db,
-            &entry.dn.as_bytes(),
-            &entry_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+        Self::put_entry_by_id(&mut txn, self.entries_by_entry_id_db, entry_id, &entry)?;
 
         let mut updated_auth_record = None;
         if password_touched {
@@ -1681,25 +1771,11 @@ impl LmdbBackend {
             {
                 let password_hash = Self::password_hash_from_value(password_value);
                 updated_auth_record = Self::decode_ssha512_hash(&password_hash).map(Arc::new);
-                txn.put(
-                    self.passwords_db,
-                    &entry.dn.as_bytes(),
-                    &password_hash.as_bytes(),
-                    WriteFlags::empty(),
-                )
-                .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
-                self.put_credential_index(&mut txn, &normalized_dn, &password_hash)?;
+                self.put_credential_index(&mut txn, entry_id, &password_hash)?;
             } else {
-                txn.del(self.passwords_db, &entry.dn.as_bytes(), None)
-                    .or_else(|e| match e {
-                        lmdb::Error::NotFound => Ok(()),
-                        _ => Err(BackendError::Storage(
-                            "Failed to delete password".to_string(),
-                        )),
-                    })?;
                 txn.del(
-                    self.credentials_by_normalized_dn_db,
-                    &normalized_dn.as_bytes(),
+                    self.credentials_by_entry_id_db,
+                    &Self::entry_id_bytes(entry_id),
                     None,
                 )
                 .or_else(|e| match e {
@@ -1714,13 +1790,13 @@ impl LmdbBackend {
         if let Some(old_attributes) = old_attributes.as_ref() {
             self.remove_attribute_indexes_for_filter(
                 &mut txn,
-                &entry.dn,
+                entry_id,
                 old_attributes,
                 Some(&indexed_modified_attributes),
             )?;
             self.update_attribute_indexes_for_filter(
                 &mut txn,
-                &entry.dn,
+                entry_id,
                 &entry.attributes,
                 Some(&indexed_modified_attributes),
             )?;
@@ -1764,36 +1840,41 @@ impl LmdbBackend {
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
         let normalized_dn = Self::normalize_dn(dn);
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
-            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        let entry_id = match Self::entry_id_for_normalized_dn(
+            &txn,
+            self.entry_id_by_normalized_dn_db,
+            &normalized_dn,
+        )? {
+            Some(entry_id) => entry_id,
+            None => return Err(BackendError::NotFound),
         };
-        let entry_bytes = txn
-            .get(self.entries_db, &actual_dn.as_bytes())
-            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
-        let entry = Self::deserialize_stored_entry(entry_bytes)?;
+        let entry_id_bytes = Self::entry_id_bytes(entry_id);
+        let entry = Self::required_entry_by_id(
+            &txn,
+            self.entries_by_entry_id_db,
+            self.dn_by_entry_id_db,
+            entry_id,
+        )?;
 
         let new_dn = if let Some(superior) = new_superior {
             format!("{},{}", new_rdn, superior)
-        } else if let Some((_, rest)) = actual_dn.split_once(',') {
+        } else if let Some((_, rest)) = entry.dn.split_once(',') {
             format!("{},{}", new_rdn, rest)
         } else {
             new_rdn.to_string()
         };
         let normalized_new_dn = Self::normalize_dn(&new_dn);
 
-        if txn
-            .get(self.dn_index_db, &normalized_new_dn.as_bytes())
-            .is_ok()
+        if Self::entry_id_for_normalized_dn(
+            &txn,
+            self.entry_id_by_normalized_dn_db,
+            &normalized_new_dn,
+        )?
+        .is_some()
         {
             return Err(BackendError::AlreadyExists);
         }
 
-        let password_hash = txn
-            .get(self.passwords_db, &actual_dn.as_bytes())
-            .map(|password| String::from_utf8_lossy(password).to_string())
-            .ok();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1806,7 +1887,7 @@ impl LmdbBackend {
             .operational_attributes
             .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
 
-        if delete_old && let Some((attr, _)) = actual_dn.split_once('=') {
+        if delete_old && let Some((attr, _)) = entry.dn.split_once('=') {
             let attr = ldap_attribute_key(attr.trim());
             new_entry.attributes.remove(attr.as_ref());
         }
@@ -1827,62 +1908,34 @@ impl LmdbBackend {
             modified_at: now,
             operational_attributes: new_entry.operational_attributes,
         };
-        let new_entry_bytes = bincode::serialize(&new_stored_entry)
-            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-
-        self.remove_attribute_indexes(&mut txn, &actual_dn, &entry.attributes)?;
-        txn.del(self.entries_db, &actual_dn.as_bytes(), None)
-            .map_err(|e| BackendError::Storage(format!("Failed to delete entry: {}", e)))?;
-        txn.del(self.dn_index_db, &normalized_dn.as_bytes(), None)
-            .map_err(|e| BackendError::Storage(format!("Failed to delete DN index: {}", e)))?;
-        txn.del(self.passwords_db, &actual_dn.as_bytes(), None)
-            .or_else(|e| match e {
-                lmdb::Error::NotFound => Ok(()),
-                _ => Err(BackendError::Storage(
-                    "Failed to delete password".to_string(),
-                )),
-            })?;
+        self.remove_attribute_indexes(&mut txn, entry_id, &entry.attributes)?;
         txn.del(
-            self.credentials_by_normalized_dn_db,
+            self.entry_id_by_normalized_dn_db,
             &normalized_dn.as_bytes(),
             None,
         )
-        .or_else(|e| match e {
-            lmdb::Error::NotFound => Ok(()),
-            _ => Err(BackendError::Storage(
-                "Failed to delete credential index".to_string(),
-            )),
-        })?;
-
+        .map_err(|e| BackendError::Storage(format!("Failed to delete entry id index: {}", e)))?;
         txn.put(
-            self.entries_db,
-            &new_dn.as_bytes(),
-            &new_entry_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
-        txn.put(
-            self.dn_index_db,
+            self.entry_id_by_normalized_dn_db,
             &normalized_new_dn.as_bytes(),
+            &entry_id_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update entry id index: {}", e)))?;
+        txn.put(
+            self.dn_by_entry_id_db,
+            &entry_id_bytes,
             &new_dn.as_bytes(),
             WriteFlags::empty(),
         )
-        .map_err(|e| BackendError::Storage(format!("Failed to update DN index: {}", e)))?;
-        let updated_auth_record = password_hash
-            .as_deref()
-            .and_then(Self::decode_ssha512_hash)
-            .map(Arc::new);
-        if let Some(password_hash) = password_hash.as_deref() {
-            txn.put(
-                self.passwords_db,
-                &new_dn.as_bytes(),
-                &password_hash.as_bytes(),
-                WriteFlags::empty(),
-            )
-            .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
-            self.put_credential_index(&mut txn, &normalized_new_dn, password_hash)?;
-        }
-        self.update_attribute_indexes(&mut txn, &new_dn, &new_stored_entry.attributes)?;
+        .map_err(|e| BackendError::Storage(format!("Failed to update entry id DN: {}", e)))?;
+        Self::put_entry_by_id(
+            &mut txn,
+            self.entries_by_entry_id_db,
+            entry_id,
+            &new_stored_entry,
+        )?;
+        self.update_attribute_indexes(&mut txn, entry_id, &new_stored_entry.attributes)?;
         let csn_string = csn.to_ldap_string();
         txn.put(
             self.metadata_db,
@@ -1898,11 +1951,7 @@ impl LmdbBackend {
         self.entry_cache.invalidate(&normalized_dn);
         self.entry_cache.invalidate(&normalized_new_dn);
         self.auth_cache.invalidate(&normalized_dn);
-        if let Some(record) = updated_auth_record {
-            self.auth_cache.insert(&normalized_new_dn, record);
-        } else {
-            self.auth_cache.invalidate(&normalized_new_dn);
-        }
+        self.auth_cache.invalidate(&normalized_new_dn);
         self.record_auth_cache_metrics();
         Ok(())
     }
@@ -1929,22 +1978,16 @@ impl LmdbBackend {
 
         let normalized_dn = Self::normalize_dn(dn);
 
-        // Get actual DN from index
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
-            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        let entry_id = match Self::entry_id_for_normalized_dn(
+            &txn,
+            self.entry_id_by_normalized_dn_db,
+            &normalized_dn,
+        )? {
+            Some(entry_id) => entry_id,
+            None => return Err(BackendError::NotFound),
         };
 
-        // Write the pre-hashed password directly
-        txn.put(
-            self.passwords_db,
-            &actual_dn.as_bytes(),
-            &hashed_password.as_bytes(),
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write password: {}", e)))?;
-        self.put_credential_index(&mut txn, &normalized_dn, hashed_password)?;
+        self.put_credential_index(&mut txn, entry_id, hashed_password)?;
 
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -1974,21 +2017,16 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
         let normalized_dn = Self::normalize_dn(dn);
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Ok(false),
-            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        let Some((entry_id, mut entry)) = Self::get_entry_by_normalized_dn(
+            &txn,
+            self.entries_by_entry_id_db,
+            self.entry_id_by_normalized_dn_db,
+            self.dn_by_entry_id_db,
+            &normalized_dn,
+        )?
+        else {
+            return Ok(false);
         };
-        let entry_bytes = match txn.get(self.entries_db, &actual_dn.as_bytes()) {
-            Ok(bytes) => bytes,
-            Err(lmdb::Error::NotFound) => {
-                return Err(BackendError::Storage(format!(
-                    "DN index references missing entry: {actual_dn}"
-                )));
-            }
-            Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
-        };
-        let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
 
         let csn = self.csn_generator.generate();
         if !update(&mut entry.operational_attributes, csn.clone()) {
@@ -1999,15 +2037,7 @@ impl LmdbBackend {
             .unwrap()
             .as_secs();
 
-        let entry_bytes = bincode::serialize(&entry)
-            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-        txn.put(
-            self.entries_db,
-            &actual_dn.as_bytes(),
-            &entry_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+        Self::put_entry_by_id(&mut txn, self.entries_by_entry_id_db, entry_id, &entry)?;
 
         let csn_string = csn.to_ldap_string();
         txn.put(
@@ -2043,6 +2073,92 @@ impl LmdbBackend {
         }
     }
 
+    fn serialize_stored_entry_record(entry: &StoredEntry) -> Result<Vec<u8>, BackendError> {
+        let record = StoredEntryRecord::from(entry);
+        bincode::serialize(&record)
+            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))
+    }
+
+    fn deserialize_stored_entry_record(
+        dn: String,
+        bytes: &[u8],
+    ) -> Result<StoredEntry, BackendError> {
+        match bincode::deserialize::<StoredEntryRecord>(bytes) {
+            Ok(record) => Ok(record.into_stored_entry(dn)),
+            Err(record_err) => Self::deserialize_stored_entry(bytes).map_err(|legacy_err| {
+                BackendError::Storage(format!(
+                    "Failed to deserialize compact entry: {record_err}; legacy decode failed: {legacy_err}"
+                ))
+            }),
+        }
+    }
+
+    fn get_entry_by_id<T: Transaction>(
+        txn: &T,
+        entries_by_entry_id_db: Database,
+        dn_by_entry_id_db: Database,
+        entry_id: u64,
+    ) -> Result<Option<StoredEntry>, BackendError> {
+        let Some(dn) = Self::dn_for_entry_id(txn, dn_by_entry_id_db, entry_id)? else {
+            return Ok(None);
+        };
+        let entry_id_bytes = Self::entry_id_bytes(entry_id);
+        match txn.get(entries_by_entry_id_db, &entry_id_bytes) {
+            Ok(entry_bytes) => Self::deserialize_stored_entry_record(dn, entry_bytes).map(Some),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(BackendError::Storage(format!(
+                "Failed to read entry for id {}: {}",
+                entry_id, e
+            ))),
+        }
+    }
+
+    fn required_entry_by_id<T: Transaction>(
+        txn: &T,
+        entries_by_entry_id_db: Database,
+        dn_by_entry_id_db: Database,
+        entry_id: u64,
+    ) -> Result<StoredEntry, BackendError> {
+        Self::get_entry_by_id(txn, entries_by_entry_id_db, dn_by_entry_id_db, entry_id)?
+            .ok_or_else(|| BackendError::Storage(format!("entry id {entry_id} has no entry row")))
+    }
+
+    fn get_entry_by_normalized_dn<T: Transaction>(
+        txn: &T,
+        entries_by_entry_id_db: Database,
+        entry_id_by_normalized_dn_db: Database,
+        dn_by_entry_id_db: Database,
+        normalized_dn: &str,
+    ) -> Result<Option<(u64, StoredEntry)>, BackendError> {
+        let Some(entry_id) =
+            Self::entry_id_for_normalized_dn(txn, entry_id_by_normalized_dn_db, normalized_dn)?
+        else {
+            return Ok(None);
+        };
+        let Some(entry) =
+            Self::get_entry_by_id(txn, entries_by_entry_id_db, dn_by_entry_id_db, entry_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((entry_id, entry)))
+    }
+
+    fn put_entry_by_id(
+        txn: &mut lmdb::RwTransaction<'_>,
+        entries_by_entry_id_db: Database,
+        entry_id: u64,
+        entry: &StoredEntry,
+    ) -> Result<(), BackendError> {
+        let entry_bytes = Self::serialize_stored_entry_record(entry)?;
+        txn.put(
+            entries_by_entry_id_db,
+            &Self::entry_id_bytes(entry_id),
+            &entry_bytes,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))
+    }
+
     /// Get entry by DN with read transaction (optimized for concurrency)
     fn get_entry_internal(&self, dn: &str) -> Result<Option<Arc<StoredEntry>>, BackendError> {
         let _profile_total = PerfPhase::start("lmdb_get_entry", "total", None);
@@ -2058,33 +2174,19 @@ impl LmdbBackend {
                 .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?
         };
 
-        // Check DN index for actual DN
-        let actual_dn = {
-            let _profile_phase = PerfPhase::start("lmdb_get_entry", "dn_index_lookup", None);
-            match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                Err(lmdb::Error::NotFound) => return Ok(None),
-                Err(e) => {
-                    return Err(BackendError::Storage(format!(
-                        "DN index lookup failed: {}",
-                        e
-                    )));
-                }
-            }
-        };
-
-        // Get entry data
-        let entry_bytes = {
-            let _profile_phase = PerfPhase::start("lmdb_get_entry", "entry_load", None);
-            match txn.get(self.entries_db, &actual_dn.as_bytes()) {
-                Ok(bytes) => bytes,
-                Err(lmdb::Error::NotFound) => return Ok(None),
-                Err(e) => return Err(BackendError::Storage(format!("Entry lookup failed: {}", e))),
-            }
-        };
         {
-            let _profile_phase = PerfPhase::start("lmdb_get_entry", "deserialize", None);
-            let entry = Arc::new(Self::deserialize_stored_entry(entry_bytes)?);
+            let _profile_phase = PerfPhase::start("lmdb_get_entry", "entry_id_lookup", None);
+            let Some((_, entry)) = Self::get_entry_by_normalized_dn(
+                &txn,
+                self.entries_by_entry_id_db,
+                self.entry_id_by_normalized_dn_db,
+                self.dn_by_entry_id_db,
+                &normalized_dn,
+            )?
+            else {
+                return Ok(None);
+            };
+            let entry = Arc::new(entry);
             self.entry_cache.insert(&normalized_dn, Arc::clone(&entry));
             Ok(Some(entry))
         }
@@ -2104,14 +2206,17 @@ impl LmdbBackend {
         let mut results = Vec::new();
         // Use cursor for efficient iteration
         let mut cursor = txn
-            .open_ro_cursor(self.entries_db)
+            .open_ro_cursor(self.entries_by_entry_id_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
 
         for (key, value) in cursor.iter() {
-            let dn = String::from_utf8_lossy(key).to_string();
+            let entry_id = Self::entry_id_from_bytes(key, ENTRIES_BY_ENTRY_ID_DB_NAME)?;
+            let Some(dn) = Self::dn_for_entry_id(&txn, self.dn_by_entry_id_db, entry_id)? else {
+                continue;
+            };
 
             if Self::entry_in_scope(&dn, base_dn, scope) {
-                let entry = Self::deserialize_stored_entry(value)?;
+                let entry = Self::deserialize_stored_entry_record(dn, value)?;
                 results.push(entry);
             }
         }
@@ -2139,11 +2244,14 @@ impl LmdbBackend {
         let mut matched = 0usize;
 
         let mut cursor = txn
-            .open_ro_cursor(self.entries_db)
+            .open_ro_cursor(self.entries_by_entry_id_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
 
         for (key, value) in cursor.iter() {
-            let dn = String::from_utf8_lossy(key).to_string();
+            let entry_id = Self::entry_id_from_bytes(key, ENTRIES_BY_ENTRY_ID_DB_NAME)?;
+            let Some(dn) = Self::dn_for_entry_id(&txn, self.dn_by_entry_id_db, entry_id)? else {
+                continue;
+            };
             if !Self::entry_in_scope(&dn, base_dn, scope) {
                 continue;
             }
@@ -2153,7 +2261,7 @@ impl LmdbBackend {
                 continue;
             }
 
-            let entry = Self::deserialize_stored_entry(value)?;
+            let entry = Self::deserialize_stored_entry_record(dn, value)?;
             results.push(entry);
             matched += 1;
 
@@ -2177,11 +2285,14 @@ impl LmdbBackend {
 
         let mut count = 0usize;
         let mut cursor = txn
-            .open_ro_cursor(self.entries_db)
+            .open_ro_cursor(self.entries_by_entry_id_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
 
         for (key, _) in cursor.iter() {
-            let dn = String::from_utf8_lossy(key).to_string();
+            let entry_id = Self::entry_id_from_bytes(key, ENTRIES_BY_ENTRY_ID_DB_NAME)?;
+            let Some(dn) = Self::dn_for_entry_id(&txn, self.dn_by_entry_id_db, entry_id)? else {
+                continue;
+            };
             if Self::entry_in_scope(&dn, base_dn, scope) {
                 count += 1;
             }
@@ -2357,13 +2468,13 @@ impl LmdbBackend {
     fn put_credential_index(
         &self,
         txn: &mut lmdb::RwTransaction<'_>,
-        normalized_dn: &str,
+        entry_id: u64,
         password_hash: &str,
     ) -> Result<(), BackendError> {
         let credential_value = Self::credential_index_value_from_hash(password_hash);
         txn.put(
-            self.credentials_by_normalized_dn_db,
-            &normalized_dn.as_bytes(),
+            self.credentials_by_entry_id_db,
+            &Self::entry_id_bytes(entry_id),
             &credential_value,
             WriteFlags::empty(),
         )
@@ -2414,55 +2525,65 @@ impl LmdbBackend {
         }
     }
 
-    fn equality_index_key(value: &str, dn: &str) -> String {
-        format!("{}:{}", value, dn)
+    fn equality_index_key(value: &str) -> String {
+        format!("{EQUALITY_INDEX_KEY_PREFIX}{value}")
     }
 
     fn equality_index_prefix(value: &str) -> String {
-        format!("{}:", value)
+        Self::equality_index_key(value)
     }
 
-    fn presence_index_key(dn: &str) -> String {
-        Self::equality_index_key(PRESENCE_INDEX_VALUE_SENTINEL, dn)
+    fn presence_index_key() -> &'static str {
+        PRESENCE_INDEX_KEY
     }
 
-    fn presence_index_prefix() -> String {
-        Self::equality_index_prefix(PRESENCE_INDEX_VALUE_SENTINEL)
+    fn presence_index_prefix() -> &'static str {
+        Self::presence_index_key()
     }
 
-    fn substring_index_key(token: &str, dn: &str) -> String {
-        format!("{SUBSTRING_INDEX_KEY_PREFIX}{token}\0{dn}")
+    fn substring_index_key(token: &str) -> String {
+        format!("{SUBSTRING_INDEX_KEY_PREFIX}{token}")
     }
 
     fn substring_index_prefix(token: &str) -> String {
-        format!("{SUBSTRING_INDEX_KEY_PREFIX}{token}\0")
+        Self::substring_index_key(token)
     }
 
-    fn ordering_index_key(value: &str, dn: &str) -> String {
-        format!("{ORDERING_INDEX_KEY_PREFIX}{value}\0{dn}")
+    fn ordering_index_key(value: &str) -> String {
+        format!("{ORDERING_INDEX_KEY_PREFIX}{value}")
     }
 
     fn ordering_index_prefix() -> &'static str {
         ORDERING_INDEX_KEY_PREFIX
     }
 
-    fn ordering_index_key_parts(key: &[u8]) -> Result<Option<(&str, &str)>, BackendError> {
+    fn ordering_index_key_value(key: &[u8]) -> Result<Option<&str>, BackendError> {
         let key = std::str::from_utf8(key)
             .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
-        Ok(key
-            .strip_prefix(ORDERING_INDEX_KEY_PREFIX)
-            .and_then(|suffix| suffix.split_once('\0')))
+        Ok(key.strip_prefix(ORDERING_INDEX_KEY_PREFIX))
+    }
+
+    fn legacy_attribute_index_db_name(attr: &str) -> String {
+        format!("idx_{attr}")
+    }
+
+    fn legacy_attribute_index_db_names(attr: &str) -> [String; 2] {
+        [
+            Self::legacy_attribute_index_db_name(attr),
+            format!("idx2_{attr}"),
+        ]
     }
 
     fn attribute_index_keys(
         index_db: Database,
-        dn: &str,
+        entry_id: u64,
         values: &[String],
         plan: &AttributeIndexPlan,
-    ) -> Result<Vec<(Database, String)>, BackendError> {
+    ) -> Result<Vec<(Database, String, [u8; 8])>, BackendError> {
         let mut index_keys = Vec::new();
-        Self::for_each_attribute_index_key(dn, values, plan, |index_key| {
-            index_keys.push((index_db, index_key));
+        let entry_id_bytes = Self::entry_id_bytes(entry_id);
+        Self::for_each_attribute_index_key(values, plan, |index_key| {
+            index_keys.push((index_db, index_key, entry_id_bytes));
             Ok(())
         })?;
 
@@ -2470,7 +2591,6 @@ impl LmdbBackend {
     }
 
     fn for_each_attribute_index_key<F>(
-        dn: &str,
         values: &[String],
         plan: &AttributeIndexPlan,
         mut visit: F,
@@ -2484,25 +2604,25 @@ impl LmdbBackend {
         let has_ordering = plan.index_types.contains(&IndexType::Ordering);
 
         if has_presence && !values.is_empty() {
-            visit(Self::presence_index_key(dn))?;
+            visit(Self::presence_index_key().to_string())?;
         }
 
         for value in values {
             if has_equality {
                 let normalized_value = plan.normalize_equality_value(value)?;
-                visit(Self::equality_index_key(&normalized_value, dn))?;
+                visit(Self::equality_index_key(&normalized_value))?;
             }
 
             if has_substring {
                 let normalized_value = plan.normalize_substring_value(value)?;
                 for token in Self::substring_index_tokens(&normalized_value) {
-                    visit(Self::substring_index_key(&token, dn))?;
+                    visit(Self::substring_index_key(&token))?;
                 }
             }
 
             if has_ordering {
                 let normalized_value = plan.normalize_ordering_value(value)?;
-                visit(Self::ordering_index_key(&normalized_value, dn))?;
+                visit(Self::ordering_index_key(&normalized_value))?;
             }
         }
 
@@ -2597,11 +2717,412 @@ impl LmdbBackend {
         format!("attribute_index_v1:{}", attribute)
     }
 
+    fn entry_id_bytes(entry_id: u64) -> [u8; 8] {
+        entry_id.to_be_bytes()
+    }
+
+    fn entry_id_from_bytes(bytes: &[u8], context: &str) -> Result<u64, BackendError> {
+        let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+            BackendError::Storage(format!(
+                "invalid entry id length for {context}: expected 8 bytes, got {}",
+                bytes.len()
+            ))
+        })?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    fn read_next_entry_id<T: Transaction>(
+        txn: &T,
+        metadata_db: Database,
+    ) -> Result<u64, BackendError> {
+        match txn.get(metadata_db, &NEXT_ENTRY_ID_METADATA_KEY.as_bytes()) {
+            Ok(bytes) => Self::entry_id_from_bytes(bytes, NEXT_ENTRY_ID_METADATA_KEY),
+            Err(lmdb::Error::NotFound) => Ok(FIRST_ENTRY_ID),
+            Err(e) => Err(BackendError::Storage(format!(
+                "Failed to read next entry id metadata: {}",
+                e
+            ))),
+        }
+    }
+
+    fn put_next_entry_id(
+        txn: &mut lmdb::RwTransaction<'_>,
+        metadata_db: Database,
+        next_entry_id: u64,
+    ) -> Result<(), BackendError> {
+        txn.put(
+            metadata_db,
+            &NEXT_ENTRY_ID_METADATA_KEY.as_bytes(),
+            &Self::entry_id_bytes(next_entry_id),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write next entry id: {}", e)))
+    }
+
+    fn entry_id_for_normalized_dn<T: Transaction>(
+        txn: &T,
+        entry_id_by_normalized_dn_db: Database,
+        normalized_dn: &str,
+    ) -> Result<Option<u64>, BackendError> {
+        match txn.get(entry_id_by_normalized_dn_db, &normalized_dn.as_bytes()) {
+            Ok(bytes) => Self::entry_id_from_bytes(bytes, normalized_dn).map(Some),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(BackendError::Storage(format!(
+                "Failed to read entry id for {}: {}",
+                normalized_dn, e
+            ))),
+        }
+    }
+
+    fn required_entry_id_for_normalized_dn<T: Transaction>(
+        txn: &T,
+        entry_id_by_normalized_dn_db: Database,
+        normalized_dn: &str,
+    ) -> Result<u64, BackendError> {
+        Self::entry_id_for_normalized_dn(txn, entry_id_by_normalized_dn_db, normalized_dn)?
+            .ok_or_else(|| {
+                BackendError::Storage(format!(
+                    "entry id index is missing normalized DN {}",
+                    normalized_dn
+                ))
+            })
+    }
+
+    fn allocate_entry_id(
+        txn: &mut lmdb::RwTransaction<'_>,
+        entry_id_by_normalized_dn_db: Database,
+        dn_by_entry_id_db: Database,
+        normalized_dn: &str,
+        dn: &str,
+        next_entry_id: &mut u64,
+    ) -> Result<u64, BackendError> {
+        let entry_id = *next_entry_id;
+        *next_entry_id = next_entry_id
+            .checked_add(1)
+            .ok_or_else(|| BackendError::Storage("entry id counter overflowed".to_string()))?;
+        let entry_id_bytes = Self::entry_id_bytes(entry_id);
+
+        txn.put(
+            entry_id_by_normalized_dn_db,
+            &normalized_dn.as_bytes(),
+            &entry_id_bytes,
+            WriteFlags::NO_OVERWRITE,
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry id index: {}", e)))?;
+        txn.put(
+            dn_by_entry_id_db,
+            &entry_id_bytes,
+            &dn.as_bytes(),
+            WriteFlags::NO_OVERWRITE,
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to write entry id DN: {}", e)))?;
+
+        Ok(entry_id)
+    }
+
+    fn dn_for_entry_id<T: Transaction>(
+        txn: &T,
+        dn_by_entry_id_db: Database,
+        entry_id: u64,
+    ) -> Result<Option<String>, BackendError> {
+        let entry_id_bytes = Self::entry_id_bytes(entry_id);
+        match txn.get(dn_by_entry_id_db, &entry_id_bytes) {
+            Ok(bytes) => std::str::from_utf8(bytes)
+                .map(|dn| Some(dn.to_string()))
+                .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in entry id DN: {}", e))),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(BackendError::Storage(format!(
+                "Failed to read DN for entry id {}: {}",
+                entry_id, e
+            ))),
+        }
+    }
+
+    fn dn_for_entry_id_bytes<T: Transaction>(
+        txn: &T,
+        dn_by_entry_id_db: Database,
+        entry_id_bytes: &[u8],
+    ) -> Result<Option<String>, BackendError> {
+        let entry_id = Self::entry_id_from_bytes(entry_id_bytes, "attribute index value")?;
+        Self::dn_for_entry_id(txn, dn_by_entry_id_db, entry_id)
+    }
+
+    fn max_entry_id_in_txn(
+        txn: &lmdb::RoTransaction<'_>,
+        dn_by_entry_id_db: Database,
+    ) -> Result<u64, BackendError> {
+        let mut cursor = txn
+            .open_ro_cursor(dn_by_entry_id_db)
+            .map_err(|e| BackendError::Storage(format!("Failed to open entry id cursor: {}", e)))?;
+        let mut max_entry_id = 0;
+        for (key, _) in cursor.iter() {
+            max_entry_id = max_entry_id.max(Self::entry_id_from_bytes(key, "dn_by_entry_id")?);
+        }
+        Ok(max_entry_id)
+    }
+
+    fn open_optional_db(
+        env: &Arc<Environment>,
+        name: &str,
+    ) -> Result<Option<Database>, BackendError> {
+        match env.open_db(Some(name)) {
+            Ok(db) => Ok(Some(db)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(e) => Err(BackendError::Storage(format!(
+                "Failed to open optional LMDB database {name}: {e}"
+            ))),
+        }
+    }
+
+    fn clear_legacy_databases(
+        env: &Arc<Environment>,
+        databases: &[Option<Database>],
+    ) -> Result<(), BackendError> {
+        let legacy_dbs = databases.iter().flatten().copied().collect::<Vec<_>>();
+        if legacy_dbs.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin legacy database cleanup txn: {}",
+                e
+            ))
+        })?;
+        for db in legacy_dbs {
+            txn.clear_db(db).map_err(|e| {
+                BackendError::Storage(format!("Failed to clear legacy database: {}", e))
+            })?;
+        }
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!("Failed to commit legacy database cleanup: {}", e))
+        })
+    }
+
+    fn ensure_entry_ids_backfilled(
+        env: &Arc<Environment>,
+        legacy_entries_db: Option<Database>,
+        metadata_db: Database,
+        entry_id_by_normalized_dn_db: Database,
+        dn_by_entry_id_db: Database,
+    ) -> Result<(), BackendError> {
+        {
+            let txn = env.begin_ro_txn().map_err(|e| {
+                BackendError::Storage(format!("Failed to begin entry id metadata read txn: {}", e))
+            })?;
+            match txn.get(metadata_db, &ENTRY_ID_INDEX_METADATA_KEY.as_bytes()) {
+                Ok(value) if value == ENTRY_ID_INDEX_VERSION => return Ok(()),
+                Ok(_) | Err(lmdb::Error::NotFound) => {}
+                Err(e) => {
+                    return Err(BackendError::Storage(format!(
+                        "Failed to read entry id metadata: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        let read_txn = env.begin_ro_txn().map_err(|e| {
+            BackendError::Storage(format!("Failed to begin entry id backfill read txn: {}", e))
+        })?;
+        let max_existing_id = Self::max_entry_id_in_txn(&read_txn, dn_by_entry_id_db)?;
+        let metadata_next_id = Self::read_next_entry_id(&read_txn, metadata_db)?;
+        let mut next_entry_id = metadata_next_id.max(max_existing_id.saturating_add(1));
+        let mut txn = env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!("Failed to begin entry id backfill txn: {}", e))
+        })?;
+        let mut pending_writes = 0usize;
+
+        if let Some(entries_db) = legacy_entries_db {
+            let mut cursor = read_txn.open_ro_cursor(entries_db).map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to open entries cursor for entry id backfill: {}",
+                    e
+                ))
+            })?;
+
+            for (dn_bytes, _) in cursor.iter() {
+                let dn = std::str::from_utf8(dn_bytes).map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Invalid UTF-8 DN in entries database during entry id backfill: {}",
+                        e
+                    ))
+                })?;
+                let normalized_dn = Self::normalize_dn(dn);
+                if Self::entry_id_for_normalized_dn(
+                    &read_txn,
+                    entry_id_by_normalized_dn_db,
+                    &normalized_dn,
+                )?
+                .is_some()
+                {
+                    continue;
+                }
+
+                Self::allocate_entry_id(
+                    &mut txn,
+                    entry_id_by_normalized_dn_db,
+                    dn_by_entry_id_db,
+                    &normalized_dn,
+                    dn,
+                    &mut next_entry_id,
+                )?;
+                pending_writes += 1;
+                if pending_writes >= ENTRY_ID_BACKFILL_BATCH_SIZE {
+                    Self::put_next_entry_id(&mut txn, metadata_db, next_entry_id)?;
+                    txn.commit().map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to commit entry id backfill batch: {}",
+                            e
+                        ))
+                    })?;
+                    txn = env.begin_rw_txn().map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to begin entry id backfill batch txn: {}",
+                            e
+                        ))
+                    })?;
+                    pending_writes = 0;
+                }
+            }
+            drop(cursor);
+        }
+        drop(read_txn);
+
+        Self::put_next_entry_id(&mut txn, metadata_db, next_entry_id)?;
+        txn.put(
+            metadata_db,
+            &ENTRY_ID_INDEX_METADATA_KEY.as_bytes(),
+            &ENTRY_ID_INDEX_VERSION,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to mark entry ids ready: {}", e)))?;
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!("Failed to commit entry id backfill: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    fn ensure_entries_by_entry_id_backfilled(
+        env: &Arc<Environment>,
+        legacy_entries_db: Option<Database>,
+        entries_by_entry_id_db: Database,
+        metadata_db: Database,
+        entry_id_by_normalized_dn_db: Database,
+    ) -> Result<(), BackendError> {
+        {
+            let txn = env.begin_ro_txn().map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to begin entry storage metadata read txn: {}",
+                    e
+                ))
+            })?;
+            match txn.get(metadata_db, &ENTRY_STORAGE_METADATA_KEY.as_bytes()) {
+                Ok(value) if value == ENTRY_STORAGE_VERSION => return Ok(()),
+                Ok(_) | Err(lmdb::Error::NotFound) => {}
+                Err(e) => {
+                    return Err(BackendError::Storage(format!(
+                        "Failed to read entry storage metadata: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        let mut txn = env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!("Failed to begin entry storage clear txn: {}", e))
+        })?;
+        txn.clear_db(entries_by_entry_id_db).map_err(|e| {
+            BackendError::Storage(format!("Failed to clear ID-keyed entries: {}", e))
+        })?;
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!("Failed to commit entry storage clear: {}", e))
+        })?;
+
+        let read_txn = env.begin_ro_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin entry storage backfill read txn: {}",
+                e
+            ))
+        })?;
+        let mut txn = env.begin_rw_txn().map_err(|e| {
+            BackendError::Storage(format!("Failed to begin entry storage backfill txn: {}", e))
+        })?;
+        let mut pending_writes = 0usize;
+
+        if let Some(entries_db) = legacy_entries_db {
+            let mut cursor = read_txn.open_ro_cursor(entries_db).map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to open legacy entries cursor for ID-keyed entry backfill: {}",
+                    e
+                ))
+            })?;
+
+            for (dn_bytes, entry_bytes) in cursor.iter() {
+                let dn = std::str::from_utf8(dn_bytes).map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Invalid UTF-8 DN in legacy entries database during backfill: {}",
+                        e
+                    ))
+                })?;
+                let normalized_dn = Self::normalize_dn(dn);
+                let entry_id = Self::required_entry_id_for_normalized_dn(
+                    &read_txn,
+                    entry_id_by_normalized_dn_db,
+                    &normalized_dn,
+                )?;
+                let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
+                entry.dn = dn.to_string();
+                Self::put_entry_by_id(&mut txn, entries_by_entry_id_db, entry_id, &entry)?;
+
+                pending_writes += 1;
+                if pending_writes >= ENTRY_STORAGE_BACKFILL_BATCH_SIZE {
+                    txn.commit().map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to commit entry storage backfill batch: {}",
+                            e
+                        ))
+                    })?;
+                    txn = env.begin_rw_txn().map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to begin entry storage backfill batch txn: {}",
+                            e
+                        ))
+                    })?;
+                    pending_writes = 0;
+                }
+            }
+            drop(cursor);
+        }
+        drop(read_txn);
+
+        txn.put(
+            metadata_db,
+            &ENTRY_STORAGE_METADATA_KEY.as_bytes(),
+            &ENTRY_STORAGE_VERSION,
+            WriteFlags::empty(),
+        )
+        .map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to mark ID-keyed entry storage ready: {}",
+                e
+            ))
+        })?;
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!("Failed to commit entry storage backfill: {}", e))
+        })?;
+
+        Ok(())
+    }
+
     fn ensure_credential_index_backfilled(
         env: &Arc<Environment>,
-        passwords_db: Database,
+        legacy_passwords_db: Option<Database>,
+        legacy_credentials_by_normalized_dn_db: Option<Database>,
         metadata_db: Database,
-        credentials_by_normalized_dn_db: Database,
+        entry_id_by_normalized_dn_db: Database,
+        credentials_by_entry_id_db: Database,
     ) -> Result<(), BackendError> {
         {
             let txn = env.begin_ro_txn().map_err(|e| {
@@ -2622,15 +3143,22 @@ impl LmdbBackend {
             }
         }
 
-        let read_txn = env.begin_ro_txn().map_err(|e| {
+        let mut txn = env.begin_rw_txn().map_err(|e| {
             BackendError::Storage(format!(
-                "Failed to begin credential index backfill read txn: {}",
+                "Failed to begin credential index backfill txn: {}",
                 e
             ))
         })?;
-        let mut cursor = read_txn.open_ro_cursor(passwords_db).map_err(|e| {
+        txn.clear_db(credentials_by_entry_id_db).map_err(|e| {
+            BackendError::Storage(format!("Failed to clear ID-keyed credential index: {}", e))
+        })?;
+        txn.commit().map_err(|e| {
+            BackendError::Storage(format!("Failed to commit credential index clear: {}", e))
+        })?;
+
+        let read_txn = env.begin_ro_txn().map_err(|e| {
             BackendError::Storage(format!(
-                "Failed to open passwords cursor for credential index backfill: {}",
+                "Failed to begin credential index backfill read txn: {}",
                 e
             ))
         })?;
@@ -2641,45 +3169,117 @@ impl LmdbBackend {
             ))
         })?;
         let mut pending_writes = 0usize;
-        for (dn_bytes, password_hash) in cursor.iter() {
-            let dn = std::str::from_utf8(dn_bytes).map_err(|e| {
+
+        if let Some(credentials_db) = legacy_credentials_by_normalized_dn_db {
+            let mut cursor = read_txn.open_ro_cursor(credentials_db).map_err(|e| {
                 BackendError::Storage(format!(
-                    "Invalid UTF-8 DN in password database during credential index backfill: {}",
+                    "Failed to open normalized-DN credential cursor for backfill: {}",
                     e
                 ))
             })?;
-            let normalized_dn = Self::normalize_dn(dn);
-            let credential_value = Self::credential_index_value_from_password_bytes(password_hash);
-            txn.put(
-                credentials_by_normalized_dn_db,
-                &normalized_dn.as_bytes(),
-                &credential_value,
-                WriteFlags::empty(),
-            )
-            .map_err(|e| {
+            for (normalized_dn_bytes, credential_value) in cursor.iter() {
+                let normalized_dn = std::str::from_utf8(normalized_dn_bytes).map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Invalid UTF-8 normalized DN in credential database during backfill: {}",
+                        e
+                    ))
+                })?;
+                let Some(entry_id) = Self::entry_id_for_normalized_dn(
+                    &read_txn,
+                    entry_id_by_normalized_dn_db,
+                    normalized_dn,
+                )?
+                else {
+                    continue;
+                };
+                txn.put(
+                    credentials_by_entry_id_db,
+                    &Self::entry_id_bytes(entry_id),
+                    &credential_value,
+                    WriteFlags::empty(),
+                )
+                .map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Failed to backfill credential index for {}: {}",
+                        normalized_dn, e
+                    ))
+                })?;
+                pending_writes += 1;
+                if pending_writes >= CREDENTIAL_INDEX_BACKFILL_BATCH_SIZE {
+                    txn.commit().map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to commit credential index backfill batch: {}",
+                            e
+                        ))
+                    })?;
+                    txn = env.begin_rw_txn().map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to begin credential index backfill batch txn: {}",
+                            e
+                        ))
+                    })?;
+                    pending_writes = 0;
+                }
+            }
+            drop(cursor);
+        }
+
+        if let Some(passwords_db) = legacy_passwords_db {
+            let mut cursor = read_txn.open_ro_cursor(passwords_db).map_err(|e| {
                 BackendError::Storage(format!(
-                    "Failed to backfill credential index for {}: {}",
-                    dn, e
+                    "Failed to open passwords cursor for credential index backfill: {}",
+                    e
                 ))
             })?;
-            pending_writes += 1;
-            if pending_writes >= CREDENTIAL_INDEX_BACKFILL_BATCH_SIZE {
-                txn.commit().map_err(|e| {
+            for (dn_bytes, password_hash) in cursor.iter() {
+                let dn = std::str::from_utf8(dn_bytes).map_err(|e| {
                     BackendError::Storage(format!(
-                        "Failed to commit credential index backfill batch: {}",
+                        "Invalid UTF-8 DN in password database during credential index backfill: {}",
                         e
                     ))
                 })?;
-                txn = env.begin_rw_txn().map_err(|e| {
+                let normalized_dn = Self::normalize_dn(dn);
+                let Some(entry_id) = Self::entry_id_for_normalized_dn(
+                    &read_txn,
+                    entry_id_by_normalized_dn_db,
+                    &normalized_dn,
+                )?
+                else {
+                    continue;
+                };
+                let credential_value =
+                    Self::credential_index_value_from_password_bytes(password_hash);
+                txn.put(
+                    credentials_by_entry_id_db,
+                    &Self::entry_id_bytes(entry_id),
+                    &credential_value,
+                    WriteFlags::empty(),
+                )
+                .map_err(|e| {
                     BackendError::Storage(format!(
-                        "Failed to begin credential index backfill batch txn: {}",
-                        e
+                        "Failed to backfill credential index for {}: {}",
+                        dn, e
                     ))
                 })?;
-                pending_writes = 0;
+                pending_writes += 1;
+                if pending_writes >= CREDENTIAL_INDEX_BACKFILL_BATCH_SIZE {
+                    txn.commit().map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to commit credential index backfill batch: {}",
+                            e
+                        ))
+                    })?;
+                    txn = env.begin_rw_txn().map_err(|e| {
+                        BackendError::Storage(format!(
+                            "Failed to begin credential index backfill batch txn: {}",
+                            e
+                        ))
+                    })?;
+                    pending_writes = 0;
+                }
             }
+            drop(cursor);
         }
-        drop(cursor);
         drop(read_txn);
         txn.put(
             metadata_db,
@@ -2699,7 +3299,8 @@ impl LmdbBackend {
 
     fn ensure_attribute_indexes_backfilled(
         env: &Arc<Environment>,
-        entries_db: Database,
+        entries_by_entry_id_db: Database,
+        dn_by_entry_id_db: Database,
         metadata_db: Database,
         attr_indexes: &HashMap<String, Database>,
         index_plan: &IndexPlan,
@@ -2789,68 +3390,102 @@ impl LmdbBackend {
             .iter()
             .map(|(attr, index_db, plan)| (attr.clone(), (*index_db, plan.clone())))
             .collect::<HashMap<_, _>>();
-        let index_entries = {
-            let txn = env.begin_ro_txn().map_err(|e| {
-                BackendError::Storage(format!(
-                    "Failed to begin attribute index backfill read txn: {}",
-                    e
-                ))
+        let legacy_index_dbs = Self::open_legacy_attribute_index_databases(env, &pending_indexes)?;
+        {
+            let mut txn = env.begin_rw_txn().map_err(|e| {
+                BackendError::Storage(format!("Failed to begin attribute index clear txn: {}", e))
             })?;
-            let mut cursor = txn.open_ro_cursor(entries_db).map_err(|e| {
+            for (attr, legacy_index_db) in &legacy_index_dbs {
+                txn.clear_db(*legacy_index_db).map_err(|e| {
+                    BackendError::Storage(format!(
+                        "Failed to clear legacy attribute index for {}: {}",
+                        attr, e
+                    ))
+                })?;
+            }
+            for (_, index_db, _) in &pending_indexes {
+                txn.clear_db(*index_db).map_err(|e| {
+                    BackendError::Storage(format!("Failed to clear attribute index: {}", e))
+                })?;
+            }
+            txn.commit().map_err(|e| {
+                BackendError::Storage(format!("Failed to commit attribute index clear: {}", e))
+            })?;
+        }
+
+        let read_txn = env.begin_ro_txn().map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to begin attribute index backfill read txn: {}",
+                e
+            ))
+        })?;
+        let mut cursor = read_txn
+            .open_ro_cursor(entries_by_entry_id_db)
+            .map_err(|e| {
                 BackendError::Storage(format!(
                     "Failed to open entries cursor for attribute index backfill: {}",
                     e
                 ))
             })?;
-
-            let mut index_entries = Vec::new();
-            for (_, entry_bytes) in cursor.iter() {
-                let entry = Self::deserialize_stored_entry(entry_bytes).map_err(|e| {
-                    BackendError::Storage(format!(
-                        "Failed to deserialize entry during attribute index backfill: {}",
-                        e
-                    ))
-                })?;
-
-                for (attr_name, values) in &entry.attributes {
-                    if values.is_empty() {
-                        continue;
-                    }
-
-                    let attr_lower = ldap_attribute_key(attr_name);
-                    if let Some((index_db, plan)) = pending_by_attr.get(attr_lower.as_ref()) {
-                        index_entries.extend(Self::attribute_index_keys(
-                            *index_db, &entry.dn, values, plan,
-                        )?);
-                    }
-                }
-            }
-
-            index_entries
-        };
-
         let mut txn = env.begin_rw_txn().map_err(|e| {
             BackendError::Storage(format!(
                 "Failed to begin attribute index backfill write txn: {}",
                 e
             ))
         })?;
+        let mut pending_writes = 0usize;
 
-        for (_, index_db, _) in &pending_indexes {
-            txn.clear_db(*index_db).map_err(|e| {
-                BackendError::Storage(format!("Failed to clear attribute index: {}", e))
+        for (entry_id_bytes, entry_bytes) in cursor.iter() {
+            let entry_id = Self::entry_id_from_bytes(entry_id_bytes, ENTRIES_BY_ENTRY_ID_DB_NAME)?;
+            let Some(dn) = Self::dn_for_entry_id(&read_txn, dn_by_entry_id_db, entry_id)? else {
+                continue;
+            };
+            let entry = Self::deserialize_stored_entry_record(dn, entry_bytes).map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to deserialize entry during attribute index backfill: {}",
+                    e
+                ))
             })?;
-        }
 
-        for (index_db, index_key) in index_entries {
-            txn.put(index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
-                .map_err(|e| {
-                    BackendError::Storage(format!(
-                        "Failed to write backfilled attribute index key: {}",
-                        e
-                    ))
-                })?;
+            for (attr_name, values) in &entry.attributes {
+                if values.is_empty() {
+                    continue;
+                }
+
+                let attr_lower = ldap_attribute_key(attr_name);
+                if let Some((index_db, plan)) = pending_by_attr.get(attr_lower.as_ref()) {
+                    for (index_db, index_key, entry_id_bytes) in
+                        Self::attribute_index_keys(*index_db, entry_id, values, plan)?
+                    {
+                        Self::put_attribute_index_entry(
+                            &mut txn,
+                            index_db,
+                            &index_key,
+                            &entry_id_bytes,
+                            attr_name,
+                        )?;
+                        pending_writes += 1;
+                        if pending_writes >= ATTRIBUTE_INDEX_BACKFILL_BATCH_SIZE {
+                            txn.commit().map_err(|e| {
+                                BackendError::Storage(format!(
+                                    "Failed to commit attribute index backfill batch: {}",
+                                    e
+                                ))
+                            })?;
+                            txn = env.begin_rw_txn().map_err(|e| {
+                                BackendError::Storage(format!(
+                                    "Failed to begin attribute index backfill batch txn: {}",
+                                    e
+                                ))
+                            })?;
+                            pending_writes = 0;
+                        }
+                    }
+                }
+            }
         }
+        drop(cursor);
+        drop(read_txn);
 
         for (attr, _, _) in pending_indexes {
             let metadata_key = Self::attribute_index_metadata_key(&attr);
@@ -2888,44 +3523,51 @@ impl LmdbBackend {
         Ok(())
     }
 
-    fn collect_index_dns_by_prefix(
+    fn open_legacy_attribute_index_databases(
+        env: &Arc<Environment>,
+        pending_indexes: &[(String, Database, AttributeIndexPlan)],
+    ) -> Result<Vec<(String, Database)>, BackendError> {
+        let mut legacy_index_dbs = Vec::new();
+
+        for (attr, _, _) in pending_indexes {
+            for db_name in Self::legacy_attribute_index_db_names(attr) {
+                match env.open_db(Some(&db_name)) {
+                    Ok(db) => legacy_index_dbs.push((attr.clone(), db)),
+                    Err(lmdb::Error::NotFound) => {}
+                    Err(e) => {
+                        return Err(BackendError::Storage(format!(
+                            "Failed to open legacy attribute index for {}: {}",
+                            attr, e
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(legacy_index_dbs)
+    }
+
+    fn collect_index_dns_by_key(
+        txn: &lmdb::RoTransaction<'_>,
         cursor: &mut lmdb::RoCursor<'_>,
-        prefix: &[u8],
+        dn_by_entry_id_db: Database,
+        key: &[u8],
     ) -> Result<Vec<String>, BackendError> {
-        let prefix_bytes = prefix;
-        let first_key = match cursor.get(Some(prefix), None, LMDB_SET_RANGE_OP) {
-            Ok((Some(key), _)) => key,
-            Ok((None, _)) => return Ok(Vec::new()),
+        let duplicates = match cursor.iter_dup_of(&key) {
+            Ok(duplicates) => duplicates,
             Err(lmdb::Error::NotFound) => return Ok(Vec::new()),
             Err(e) => {
                 return Err(BackendError::Storage(format!(
-                    "Failed to seek attribute index cursor: {}",
+                    "Failed to seek attribute index duplicates: {}",
                     e
                 )));
             }
         };
 
-        if !first_key.starts_with(prefix_bytes) {
-            return Ok(Vec::new());
-        }
-
-        let prefix = std::str::from_utf8(prefix)
-            .map_err(|e| BackendError::Storage(format!("Invalid index prefix encoding: {}", e)))?;
         let mut results = Vec::new();
-        let first_key = std::str::from_utf8(first_key)
-            .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
-        if let Some(dn) = first_key.strip_prefix(prefix) {
-            results.push(dn.to_string());
-        }
-
-        for (key, _value) in cursor.iter() {
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
-            let key = std::str::from_utf8(key)
-                .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
-            if let Some(dn) = key.strip_prefix(prefix) {
-                results.push(dn.to_string());
+        for (_, entry_id_bytes) in duplicates {
+            if let Some(dn) = Self::dn_for_entry_id_bytes(txn, dn_by_entry_id_db, entry_id_bytes)? {
+                results.push(dn);
             }
         }
 
@@ -2940,16 +3582,16 @@ impl LmdbBackend {
     fn update_attribute_indexes(
         &self,
         txn: &mut lmdb::RwTransaction,
-        dn: &str,
+        entry_id: u64,
         attributes: &HashMap<String, Vec<String>>,
     ) -> Result<(), BackendError> {
-        self.update_attribute_indexes_for_filter(txn, dn, attributes, None)
+        self.update_attribute_indexes_for_filter(txn, entry_id, attributes, None)
     }
 
     fn update_attribute_indexes_for_filter(
         &self,
         txn: &mut lmdb::RwTransaction,
-        dn: &str,
+        entry_id: u64,
         attributes: &HashMap<String, Vec<String>>,
         attribute_filter: Option<&HashSet<String>>,
     ) -> Result<(), BackendError> {
@@ -2970,14 +3612,15 @@ impl LmdbBackend {
                     .index_plan
                     .attribute_plan_normalized(attr_lower.as_ref())
             {
-                Self::for_each_attribute_index_key(dn, values, plan, |index_key| {
-                    txn.put(*index_db, &index_key.as_bytes(), &[], WriteFlags::empty())
-                        .map_err(|e| {
-                            BackendError::Storage(format!(
-                                "Failed to update index for {}: {}",
-                                attr_name, e
-                            ))
-                        })?;
+                let entry_id_bytes = Self::entry_id_bytes(entry_id);
+                Self::for_each_attribute_index_key(values, plan, |index_key| {
+                    Self::put_attribute_index_entry(
+                        txn,
+                        *index_db,
+                        &index_key,
+                        &entry_id_bytes,
+                        attr_name,
+                    )?;
                     Ok(())
                 })?;
             }
@@ -2986,22 +3629,76 @@ impl LmdbBackend {
         Ok(())
     }
 
+    fn put_attribute_index_entry(
+        txn: &mut lmdb::RwTransaction<'_>,
+        index_db: Database,
+        index_key: &str,
+        entry_id_bytes: &[u8; 8],
+        attribute_name: &str,
+    ) -> Result<(), BackendError> {
+        txn.put(
+            index_db,
+            &index_key.as_bytes(),
+            entry_id_bytes,
+            WriteFlags::NO_DUP_DATA,
+        )
+        .or_else(|e| match e {
+            lmdb::Error::KeyExist => Ok(()),
+            _ => Err(BackendError::Storage(format!(
+                "Failed to update index for {}: {}",
+                attribute_name, e
+            ))),
+        })
+    }
+
+    fn delete_attribute_index_entry(
+        txn: &mut lmdb::RwTransaction<'_>,
+        index_db: Database,
+        index_key: &str,
+        entry_id_bytes: &[u8; 8],
+        attribute_name: &str,
+    ) -> Result<(), BackendError> {
+        let mut cursor = txn.open_rw_cursor(index_db).map_err(|e| {
+            BackendError::Storage(format!(
+                "Failed to open index cursor for {}: {}",
+                attribute_name, e
+            ))
+        })?;
+        match cursor.get(
+            Some(index_key.as_bytes()),
+            Some(entry_id_bytes),
+            LMDB_GET_BOTH_OP,
+        ) {
+            Ok(_) => cursor.del(WriteFlags::empty()).map_err(|e| {
+                BackendError::Storage(format!(
+                    "Failed to remove index for {}: {}",
+                    attribute_name, e
+                ))
+            }),
+            Err(lmdb::Error::NotFound) => Ok(()),
+            Err(e) => Err(BackendError::Storage(format!(
+                "Failed to seek index for {}: {}",
+                attribute_name, e
+            ))),
+        }
+    }
+
     /// Remove attribute indexes for an entry
     ///
     /// This method removes index entries when an entry is deleted.
     fn remove_attribute_indexes(
         &self,
         txn: &mut lmdb::RwTransaction,
-        dn: &str,
+        entry_id: u64,
         attributes: &HashMap<String, Vec<String>>,
     ) -> Result<(), BackendError> {
-        self.remove_attribute_indexes_for_filter(txn, dn, attributes, None)
+        self.remove_attribute_indexes_for_filter(txn, entry_id, attributes, None)
     }
 
     fn remove_attribute_indexes_for_filter(
         &self,
         txn: &mut lmdb::RwTransaction,
-        dn: &str,
+        entry_id: u64,
         attributes: &HashMap<String, Vec<String>>,
         attribute_filter: Option<&HashSet<String>>,
     ) -> Result<(), BackendError> {
@@ -3022,15 +3719,15 @@ impl LmdbBackend {
                     .index_plan
                     .attribute_plan_normalized(attr_lower.as_ref())
             {
-                Self::for_each_attribute_index_key(dn, values, plan, |index_key| {
-                    txn.del(*index_db, &index_key.as_bytes(), None)
-                        .or_else(|e| match e {
-                            lmdb::Error::NotFound => Ok(()), // Already removed, that's OK
-                            _ => Err(BackendError::Storage(format!(
-                                "Failed to remove index for {}: {}",
-                                attr_name, e
-                            ))),
-                        })?;
+                let entry_id_bytes = Self::entry_id_bytes(entry_id);
+                Self::for_each_attribute_index_key(values, plan, |index_key| {
+                    Self::delete_attribute_index_entry(
+                        txn,
+                        *index_db,
+                        &index_key,
+                        &entry_id_bytes,
+                        attr_name,
+                    )?;
                     Ok(())
                 })?;
             }
@@ -3090,8 +3787,14 @@ impl LmdbBackend {
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
-        let search_prefix = Self::equality_index_prefix(&normalized_value);
-        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes()).map(Some)
+        let search_key = Self::equality_index_prefix(&normalized_value);
+        Self::collect_index_dns_by_key(
+            txn,
+            &mut cursor,
+            self.dn_by_entry_id_db,
+            search_key.as_bytes(),
+        )
+        .map(Some)
     }
 
     #[cfg(test)]
@@ -3134,8 +3837,14 @@ impl LmdbBackend {
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
-        let search_prefix = Self::presence_index_prefix();
-        Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes()).map(Some)
+        let search_key = Self::presence_index_prefix();
+        Self::collect_index_dns_by_key(
+            txn,
+            &mut cursor,
+            self.dn_by_entry_id_db,
+            search_key.as_bytes(),
+        )
+        .map(Some)
     }
 
     fn search_substring_by_index_in_txn(
@@ -3190,9 +3899,13 @@ impl LmdbBackend {
 
         let mut candidate_dns: Option<Vec<String>> = None;
         for token in tokens {
-            let search_prefix = Self::substring_index_prefix(&token);
-            let token_dns =
-                Self::collect_index_dns_by_prefix(&mut cursor, search_prefix.as_bytes())?;
+            let search_key = Self::substring_index_prefix(&token);
+            let token_dns = Self::collect_index_dns_by_key(
+                txn,
+                &mut cursor,
+                self.dn_by_entry_id_db,
+                search_key.as_bytes(),
+            )?;
             if token_dns.is_empty() {
                 return Ok(Some(SubstringIndexCandidates {
                     attribute: attr_lower.into_owned(),
@@ -3256,20 +3969,22 @@ impl LmdbBackend {
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
 
         let seek_key = if greater_or_equal {
-            Self::ordering_index_key(&normalized_value, "")
+            Self::ordering_index_key(&normalized_value)
         } else {
             Self::ordering_index_prefix().to_string()
         };
-        let first_key = match cursor.get(Some(seek_key.as_bytes()), None, LMDB_SET_RANGE_OP) {
-            Ok((Some(key), _)) => key,
-            Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(Some(Vec::new())),
-            Err(e) => {
-                return Err(BackendError::Storage(format!(
-                    "Failed to seek ordering index cursor: {}",
-                    e
-                )));
-            }
-        };
+        let (first_key, first_entry_id) =
+            match cursor.get(Some(seek_key.as_bytes()), None, LMDB_SET_RANGE_OP) {
+                Ok((Some(key), entry_id)) => (key, entry_id),
+                Ok((None, entry_id)) => (seek_key.as_bytes(), entry_id),
+                Err(lmdb::Error::NotFound) => return Ok(Some(Vec::new())),
+                Err(e) => {
+                    return Err(BackendError::Storage(format!(
+                        "Failed to seek ordering index cursor: {}",
+                        e
+                    )));
+                }
+            };
 
         if !first_key.starts_with(Self::ordering_index_prefix().as_bytes()) {
             return Ok(Some(Vec::new()));
@@ -3277,17 +3992,23 @@ impl LmdbBackend {
 
         let mut results = Vec::new();
         if Self::push_ordering_candidate(
+            txn,
+            self.dn_by_entry_id_db,
             first_key,
+            first_entry_id,
             &normalized_value,
             greater_or_equal,
             &mut results,
         )? {
-            for (key, _value) in cursor.iter() {
+            for (key, entry_id) in cursor.iter() {
                 if !key.starts_with(Self::ordering_index_prefix().as_bytes()) {
                     break;
                 }
                 if !Self::push_ordering_candidate(
+                    txn,
+                    self.dn_by_entry_id_db,
                     key,
+                    entry_id,
                     &normalized_value,
                     greater_or_equal,
                     &mut results,
@@ -3301,12 +4022,15 @@ impl LmdbBackend {
     }
 
     fn push_ordering_candidate(
+        txn: &lmdb::RoTransaction<'_>,
+        dn_by_entry_id_db: Database,
         key: &[u8],
+        entry_id_bytes: &[u8],
         target_value: &str,
         greater_or_equal: bool,
         results: &mut Vec<String>,
     ) -> Result<bool, BackendError> {
-        let Some((value, dn)) = Self::ordering_index_key_parts(key)? else {
+        let Some(value) = Self::ordering_index_key_value(key)? else {
             return Ok(false);
         };
 
@@ -3317,7 +4041,9 @@ impl LmdbBackend {
         };
 
         if in_range {
-            results.push(dn.to_string());
+            if let Some(dn) = Self::dn_for_entry_id_bytes(txn, dn_by_entry_id_db, entry_id_bytes)? {
+                results.push(dn);
+            }
             Ok(true)
         } else {
             Ok(greater_or_equal)
@@ -3373,12 +4099,17 @@ impl LmdbBackend {
             if !in_scope {
                 continue;
             }
-            let entry_bytes = match txn.get(self.entries_db, &dn.as_bytes()) {
-                Ok(bytes) => bytes,
-                Err(lmdb::Error::NotFound) => continue,
-                Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
+            let normalized_dn = Self::normalize_dn(dn);
+            let Some((_, entry)) = Self::get_entry_by_normalized_dn(
+                txn,
+                self.entries_by_entry_id_db,
+                self.entry_id_by_normalized_dn_db,
+                self.dn_by_entry_id_db,
+                &normalized_dn,
+            )?
+            else {
+                continue;
             };
-            let entry = Self::deserialize_stored_entry(entry_bytes)?;
             if !include_entry(&entry)? {
                 continue;
             }
@@ -3593,21 +4324,23 @@ impl LmdbBackend {
         let base_components =
             (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
         let mut cursor = txn
-            .open_ro_cursor(self.entries_db)
+            .open_ro_cursor(self.entries_by_entry_id_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
 
         for (key, value) in cursor.iter() {
-            let dn = std::str::from_utf8(key)
-                .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in entry DN: {}", e)))?;
+            let entry_id = Self::entry_id_from_bytes(key, ENTRIES_BY_ENTRY_ID_DB_NAME)?;
+            let Some(dn) = Self::dn_for_entry_id(&txn, self.dn_by_entry_id_db, entry_id)? else {
+                continue;
+            };
             if !Self::entry_in_scope_with_prepared_base(
-                dn,
+                &dn,
                 base_dn,
                 base_components.as_deref(),
                 scope,
             ) {
                 continue;
             }
-            let entry = Self::deserialize_stored_entry(value)?;
+            let entry = Self::deserialize_stored_entry_record(dn, value)?;
             if !send_entry(entry.to_directory_entry()) {
                 break;
             }
@@ -3768,11 +4501,11 @@ impl LmdbBackend {
         let Some(index_db) = self.index_db_for_attribute(attr_lower.as_ref())? else {
             return self.stream_uncovered_entries(base_dn, scope, send_entry);
         };
-        let search_prefix = Self::presence_index_prefix();
+        let search_key = Self::presence_index_prefix();
         self.stream_entries_by_index_prefix_in_txn(
             &txn,
             index_db,
-            search_prefix.as_bytes(),
+            search_key.as_bytes(),
             base_dn,
             scope,
             false,
@@ -3860,20 +4593,22 @@ impl LmdbBackend {
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
         let seek_key = if greater_or_equal {
-            Self::ordering_index_key(&normalized_value, "")
+            Self::ordering_index_key(&normalized_value)
         } else {
             Self::ordering_index_prefix().to_string()
         };
-        let first_key = match cursor.get(Some(seek_key.as_bytes()), None, LMDB_SET_RANGE_OP) {
-            Ok((Some(key), _)) => key,
-            Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(()),
-            Err(e) => {
-                return Err(BackendError::Storage(format!(
-                    "Failed to seek ordering index cursor: {}",
-                    e
-                )));
-            }
-        };
+        let (first_key, first_entry_id) =
+            match cursor.get(Some(seek_key.as_bytes()), None, LMDB_SET_RANGE_OP) {
+                Ok((Some(key), entry_id)) => (key, entry_id),
+                Ok((None, entry_id)) => (seek_key.as_bytes(), entry_id),
+                Err(lmdb::Error::NotFound) => return Ok(()),
+                Err(e) => {
+                    return Err(BackendError::Storage(format!(
+                        "Failed to seek ordering index cursor: {}",
+                        e
+                    )));
+                }
+            };
         if !first_key.starts_with(Self::ordering_index_prefix().as_bytes()) {
             return Ok(());
         }
@@ -3884,6 +4619,7 @@ impl LmdbBackend {
         let mut keep_streaming = self.stream_ordering_index_key(
             &txn,
             first_key,
+            first_entry_id,
             &normalized_value,
             greater_or_equal,
             base_dn,
@@ -3894,13 +4630,14 @@ impl LmdbBackend {
         )?;
 
         if keep_streaming {
-            for (key, _value) in cursor.iter() {
+            for (key, entry_id) in cursor.iter() {
                 if !key.starts_with(Self::ordering_index_prefix().as_bytes()) {
                     break;
                 }
                 keep_streaming = self.stream_ordering_index_key(
                     &txn,
                     key,
+                    entry_id,
                     &normalized_value,
                     greater_or_equal,
                     base_dn,
@@ -3923,6 +4660,7 @@ impl LmdbBackend {
         &self,
         txn: &lmdb::RoTransaction<'_>,
         key: &[u8],
+        entry_id_bytes: &[u8],
         target_value: &str,
         greater_or_equal: bool,
         base_dn: &str,
@@ -3934,7 +4672,7 @@ impl LmdbBackend {
     where
         F: FnMut(DirectoryEntry) -> bool,
     {
-        let Some((value, dn)) = Self::ordering_index_key_parts(key)? else {
+        let Some(value) = Self::ordering_index_key_value(key)? else {
             return Ok(false);
         };
 
@@ -3946,6 +4684,10 @@ impl LmdbBackend {
         if !in_range {
             return Ok(greater_or_equal);
         }
+        let Some(dn) = Self::dn_for_entry_id_bytes(txn, self.dn_by_entry_id_db, entry_id_bytes)?
+        else {
+            return Ok(true);
+        };
         if !seen_dns.insert(dn.to_string()) {
             return Ok(true);
         }
@@ -3953,7 +4695,7 @@ impl LmdbBackend {
         let mut include_all = Self::include_all_stored_entry;
         self.stream_entry_by_dn_in_txn(
             txn,
-            dn,
+            &dn,
             base_dn,
             base_components,
             scope,
@@ -3979,7 +4721,7 @@ impl LmdbBackend {
         &self,
         txn: &lmdb::RoTransaction<'_>,
         index_db: Database,
-        prefix: &[u8],
+        key: &[u8],
         base_dn: &str,
         scope: SearchScope,
         projection: &DirectoryAttributeProjection,
@@ -3991,89 +4733,39 @@ impl LmdbBackend {
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
-        let prefix_bytes = prefix;
-        let first_key = match cursor.get(Some(prefix), None, LMDB_SET_RANGE_OP) {
-            Ok((Some(key), _)) => key,
-            Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(()),
+        let duplicates = match cursor.iter_dup_of(&key) {
+            Ok(duplicates) => duplicates,
+            Err(lmdb::Error::NotFound) => return Ok(()),
             Err(e) => {
                 return Err(BackendError::Storage(format!(
-                    "Failed to seek attribute index cursor: {}",
+                    "Failed to seek attribute index duplicates: {}",
                     e
                 )));
             }
         };
-        if !first_key.starts_with(prefix_bytes) {
-            return Ok(());
-        }
 
-        let prefix = std::str::from_utf8(prefix)
-            .map_err(|e| BackendError::Storage(format!("Invalid index prefix encoding: {}", e)))?;
         let base_components =
             (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
-        let mut keep_streaming = self.stream_projected_index_key_entry(
-            txn,
-            first_key,
-            prefix,
-            base_dn,
-            base_components.as_deref(),
-            scope,
-            projection,
-            send_entry,
-        )?;
-
-        if keep_streaming {
-            for (key, _value) in cursor.iter() {
-                if !key.starts_with(prefix_bytes) {
-                    break;
-                }
-                keep_streaming = self.stream_projected_index_key_entry(
-                    txn,
-                    key,
-                    prefix,
-                    base_dn,
-                    base_components.as_deref(),
-                    scope,
-                    projection,
-                    send_entry,
-                )?;
-                if !keep_streaming {
-                    break;
-                }
+        for (_, entry_id_bytes) in duplicates {
+            let Some(dn) =
+                Self::dn_for_entry_id_bytes(txn, self.dn_by_entry_id_db, entry_id_bytes)?
+            else {
+                continue;
+            };
+            if !self.stream_projected_entry_by_dn_in_txn(
+                txn,
+                &dn,
+                base_dn,
+                base_components.as_deref(),
+                scope,
+                projection,
+                send_entry,
+            )? {
+                break;
             }
         }
 
         Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn stream_projected_index_key_entry<F>(
-        &self,
-        txn: &lmdb::RoTransaction<'_>,
-        key: &[u8],
-        prefix: &str,
-        base_dn: &str,
-        base_components: Option<&[&str]>,
-        scope: SearchScope,
-        projection: &DirectoryAttributeProjection,
-        send_entry: &mut F,
-    ) -> Result<bool, BackendError>
-    where
-        F: FnMut(ProjectedDirectoryEntry) -> bool,
-    {
-        let key = std::str::from_utf8(key)
-            .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
-        let Some(dn) = key.strip_prefix(prefix) else {
-            return Ok(true);
-        };
-        self.stream_projected_entry_by_dn_in_txn(
-            txn,
-            dn,
-            base_dn,
-            base_components,
-            scope,
-            projection,
-            send_entry,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4093,12 +4785,17 @@ impl LmdbBackend {
         if !Self::entry_in_scope_with_prepared_base(dn, base_dn, base_components, scope) {
             return Ok(true);
         }
-        let entry_bytes = match txn.get(self.entries_db, &dn.as_bytes()) {
-            Ok(bytes) => bytes,
-            Err(lmdb::Error::NotFound) => return Ok(true),
-            Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
+        let normalized_dn = Self::normalize_dn(dn);
+        let Some((_, entry)) = Self::get_entry_by_normalized_dn(
+            txn,
+            self.entries_by_entry_id_db,
+            self.entry_id_by_normalized_dn_db,
+            self.dn_by_entry_id_db,
+            &normalized_dn,
+        )?
+        else {
+            return Ok(true);
         };
-        let entry = Self::deserialize_stored_entry(entry_bytes)?;
         let projected = ProjectedDirectoryEntry {
             dn: entry.dn.clone(),
             attributes: projection.project_attributes(
@@ -4116,7 +4813,7 @@ impl LmdbBackend {
         &self,
         txn: &lmdb::RoTransaction<'_>,
         index_db: Database,
-        prefix: &[u8],
+        key: &[u8],
         base_dn: &str,
         scope: SearchScope,
         dedupe_dns: bool,
@@ -4130,99 +4827,46 @@ impl LmdbBackend {
         let mut cursor = txn
             .open_ro_cursor(index_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
-        let prefix_bytes = prefix;
-        let first_key = match cursor.get(Some(prefix), None, LMDB_SET_RANGE_OP) {
-            Ok((Some(key), _)) => key,
-            Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(()),
+        let duplicates = match cursor.iter_dup_of(&key) {
+            Ok(duplicates) => duplicates,
+            Err(lmdb::Error::NotFound) => return Ok(()),
             Err(e) => {
                 return Err(BackendError::Storage(format!(
-                    "Failed to seek attribute index cursor: {}",
+                    "Failed to seek attribute index duplicates: {}",
                     e
                 )));
             }
         };
-        if !first_key.starts_with(prefix_bytes) {
-            return Ok(());
-        }
 
-        let prefix = std::str::from_utf8(prefix)
-            .map_err(|e| BackendError::Storage(format!("Invalid index prefix encoding: {}", e)))?;
         let base_components =
             (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
         let mut seen_dns = dedupe_dns.then(HashSet::new);
-        let mut keep_streaming = self.stream_index_key_entry(
-            txn,
-            first_key,
-            prefix,
-            base_dn,
-            base_components.as_deref(),
-            scope,
-            seen_dns.as_mut(),
-            &mut include_entry,
-            send_entry,
-        )?;
-
-        if keep_streaming {
-            for (key, _value) in cursor.iter() {
-                if !key.starts_with(prefix_bytes) {
-                    break;
-                }
-                keep_streaming = self.stream_index_key_entry(
-                    txn,
-                    key,
-                    prefix,
-                    base_dn,
-                    base_components.as_deref(),
-                    scope,
-                    seen_dns.as_mut(),
-                    &mut include_entry,
-                    send_entry,
-                )?;
-                if !keep_streaming {
-                    break;
-                }
+        for (_, entry_id_bytes) in duplicates {
+            let Some(dn) =
+                Self::dn_for_entry_id_bytes(txn, self.dn_by_entry_id_db, entry_id_bytes)?
+            else {
+                continue;
+            };
+            if seen_dns
+                .as_mut()
+                .is_some_and(|seen_dns| !seen_dns.insert(dn.clone()))
+            {
+                continue;
+            }
+            if !self.stream_entry_by_dn_in_txn(
+                txn,
+                &dn,
+                base_dn,
+                base_components.as_deref(),
+                scope,
+                &mut include_entry,
+                send_entry,
+            )? {
+                break;
             }
         }
 
         Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn stream_index_key_entry<I, F>(
-        &self,
-        txn: &lmdb::RoTransaction<'_>,
-        key: &[u8],
-        prefix: &str,
-        base_dn: &str,
-        base_components: Option<&[&str]>,
-        scope: SearchScope,
-        seen_dns: Option<&mut HashSet<String>>,
-        include_entry: &mut I,
-        send_entry: &mut F,
-    ) -> Result<bool, BackendError>
-    where
-        I: FnMut(&StoredEntry) -> Result<bool, BackendError>,
-        F: FnMut(DirectoryEntry) -> bool,
-    {
-        let key = std::str::from_utf8(key)
-            .map_err(|e| BackendError::Storage(format!("Invalid UTF-8 in index key: {}", e)))?;
-        let Some(dn) = key.strip_prefix(prefix) else {
-            return Ok(true);
-        };
-        if let Some(seen_dns) = seen_dns
-            && !seen_dns.insert(dn.to_string())
-        {
-            return Ok(true);
-        }
-        self.stream_entry_by_dn_in_txn(
-            txn,
-            dn,
-            base_dn,
-            base_components,
-            scope,
-            include_entry,
-            send_entry,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4285,12 +4929,17 @@ impl LmdbBackend {
         if !Self::entry_in_scope_with_prepared_base(dn, base_dn, base_components, scope) {
             return Ok(true);
         }
-        let entry_bytes = match txn.get(self.entries_db, &dn.as_bytes()) {
-            Ok(bytes) => bytes,
-            Err(lmdb::Error::NotFound) => return Ok(true),
-            Err(e) => return Err(BackendError::Storage(format!("Failed to get entry: {}", e))),
+        let normalized_dn = Self::normalize_dn(dn);
+        let Some((_, entry)) = Self::get_entry_by_normalized_dn(
+            txn,
+            self.entries_by_entry_id_db,
+            self.entry_id_by_normalized_dn_db,
+            self.dn_by_entry_id_db,
+            &normalized_dn,
+        )?
+        else {
+            return Ok(true);
         };
-        let entry = Self::deserialize_stored_entry(entry_bytes)?;
         if !include_entry(&entry)? {
             return Ok(true);
         }
@@ -4516,44 +5165,29 @@ impl DirectoryBackend for LmdbBackend {
 
         log::debug!("Authentication cache miss - DN: {dn}, Normalized: {normalized_dn}");
 
-        // Get credential bytes from the normalized index first. Older
-        // stores are backfilled on open; the legacy fallback keeps auth
-        // tolerant if the index is missing a row.
+        // Resolve the bind DN through the compact entry-id maps, then load the
+        // ID-keyed credential record.
         let stored_credential_bytes = {
             let _profile_phase = PerfPhase::start("lmdb_authenticate", "password_lookup", None);
+            let Some(entry_id) = Self::entry_id_for_normalized_dn(
+                &txn,
+                self.entry_id_by_normalized_dn_db,
+                &normalized_dn,
+            )?
+            else {
+                log::debug!("DN not found in entry id index: {}", normalized_dn);
+                self.record_auth_cache_metrics();
+                return Ok(false);
+            };
             match txn.get(
-                self.credentials_by_normalized_dn_db,
-                &normalized_dn.as_bytes(),
+                self.credentials_by_entry_id_db,
+                &Self::entry_id_bytes(entry_id),
             ) {
                 Ok(stored_credential_bytes) => stored_credential_bytes,
                 Err(lmdb::Error::NotFound) => {
-                    let _profile_phase =
-                        PerfPhase::start("lmdb_authenticate", "dn_index_lookup", None);
-                    let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-                        Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                        Err(lmdb::Error::NotFound) => {
-                            log::debug!("DN not found in index: {}", normalized_dn);
-                            self.record_auth_cache_metrics();
-                            return Ok(false);
-                        }
-                        Err(e) => {
-                            return Err(BackendError::Storage(format!("DN lookup failed: {}", e)));
-                        }
-                    };
-                    match txn.get(self.passwords_db, &actual_dn.as_bytes()) {
-                        Ok(stored_password_bytes) => stored_password_bytes,
-                        Err(lmdb::Error::NotFound) => {
-                            log::debug!("Password not found for DN: {}", actual_dn);
-                            self.record_auth_cache_metrics();
-                            return Ok(false);
-                        }
-                        Err(e) => {
-                            return Err(BackendError::Storage(format!(
-                                "Password lookup failed: {}",
-                                e
-                            )));
-                        }
-                    }
+                    log::debug!("Credential not found for DN: {}", normalized_dn);
+                    self.record_auth_cache_metrics();
+                    return Ok(false);
                 }
                 Err(e) => {
                     return Err(BackendError::Storage(format!(
@@ -4608,23 +5242,16 @@ impl DirectoryBackend for LmdbBackend {
 
         for update in updates {
             let normalized_dn = Self::normalize_dn(&update.dn);
-            let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-                Err(lmdb::Error::NotFound) => continue,
-                Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+            let Some((entry_id, mut entry)) = Self::get_entry_by_normalized_dn(
+                &txn,
+                self.entries_by_entry_id_db,
+                self.entry_id_by_normalized_dn_db,
+                self.dn_by_entry_id_db,
+                &normalized_dn,
+            )?
+            else {
+                continue;
             };
-            let entry_bytes = match txn.get(self.entries_db, &actual_dn.as_bytes()) {
-                Ok(bytes) => bytes,
-                Err(lmdb::Error::NotFound) => {
-                    return Err(BackendError::Storage(format!(
-                        "DN index references missing entry: {actual_dn}"
-                    )));
-                }
-                Err(e) => {
-                    return Err(BackendError::Storage(format!("Failed to get entry: {}", e)));
-                }
-            };
-            let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
 
             let csn = self.csn_generator.generate();
             let changed = match update.outcome {
@@ -4643,15 +5270,7 @@ impl DirectoryBackend for LmdbBackend {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let entry_bytes = bincode::serialize(&entry)
-                .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-            txn.put(
-                self.entries_db,
-                &actual_dn.as_bytes(),
-                &entry_bytes,
-                WriteFlags::empty(),
-            )
-            .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+            Self::put_entry_by_id(&mut txn, self.entries_by_entry_id_db, entry_id, &entry)?;
 
             changed_dns.push(normalized_dn);
             last_csn = Some(csn);
@@ -4692,30 +5311,23 @@ impl DirectoryBackend for LmdbBackend {
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
         let normalized_dn = Self::normalize_dn(dn);
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
-            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        let Some((entry_id, mut entry)) = Self::get_entry_by_normalized_dn(
+            &txn,
+            self.entries_by_entry_id_db,
+            self.entry_id_by_normalized_dn_db,
+            self.dn_by_entry_id_db,
+            &normalized_dn,
+        )?
+        else {
+            return Err(BackendError::NotFound);
         };
-        let entry_bytes = txn
-            .get(self.entries_db, &actual_dn.as_bytes())
-            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
-        let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
         entry.operational_attributes = operational_attributes;
         entry.modified_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let entry_bytes = bincode::serialize(&entry)
-            .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
-        txn.put(
-            self.entries_db,
-            &actual_dn.as_bytes(),
-            &entry_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+        Self::put_entry_by_id(&mut txn, self.entries_by_entry_id_db, entry_id, &entry)?;
 
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -4755,49 +5367,47 @@ impl DirectoryBackend for LmdbBackend {
 
         let normalized_dn = Self::normalize_dn(dn);
 
-        // Get actual DN
-        let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
-            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Err(lmdb::Error::NotFound) => return Err(BackendError::NotFound),
-            Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+        let entry_id = match Self::entry_id_for_normalized_dn(
+            &txn,
+            self.entry_id_by_normalized_dn_db,
+            &normalized_dn,
+        )? {
+            Some(entry_id) => entry_id,
+            None => return Err(BackendError::NotFound),
         };
+        let entry_id_bytes = Self::entry_id_bytes(entry_id);
 
         // Get entry to remove from attribute indexes
-        let entry_bytes = txn
-            .get(self.entries_db, &actual_dn.as_bytes())
-            .map_err(|e| BackendError::Storage(format!("Failed to get entry: {}", e)))?;
-        let stored_entry = Self::deserialize_stored_entry(entry_bytes)?;
+        let stored_entry = Self::required_entry_by_id(
+            &txn,
+            self.entries_by_entry_id_db,
+            self.dn_by_entry_id_db,
+            entry_id,
+        )?;
 
         // Remove from attribute indexes
-        self.remove_attribute_indexes(&mut txn, &actual_dn, &stored_entry.attributes)?;
+        self.remove_attribute_indexes(&mut txn, entry_id, &stored_entry.attributes)?;
 
         // Delete entry
-        txn.del(self.entries_db, &actual_dn.as_bytes(), None)
+        txn.del(self.entries_by_entry_id_db, &entry_id_bytes, None)
             .map_err(|e| BackendError::Storage(format!("Failed to delete entry: {}", e)))?;
 
-        // Delete password (if it exists)
-        txn.del(self.passwords_db, &actual_dn.as_bytes(), None)
+        txn.del(self.credentials_by_entry_id_db, &entry_id_bytes, None)
             .or_else(|e| match e {
-                lmdb::Error::NotFound => Ok(()), // No password, that's fine
+                lmdb::Error::NotFound => Ok(()),
                 _ => Err(BackendError::Storage(
-                    "Failed to delete password".to_string(),
+                    "Failed to delete credential index".to_string(),
                 )),
             })?;
+
         txn.del(
-            self.credentials_by_normalized_dn_db,
+            self.entry_id_by_normalized_dn_db,
             &normalized_dn.as_bytes(),
             None,
         )
-        .or_else(|e| match e {
-            lmdb::Error::NotFound => Ok(()),
-            _ => Err(BackendError::Storage(
-                "Failed to delete credential index".to_string(),
-            )),
-        })?;
-
-        // Delete DN index
-        txn.del(self.dn_index_db, &normalized_dn.as_bytes(), None)
-            .map_err(|e| BackendError::Storage(format!("Failed to delete DN index: {}", e)))?;
+        .map_err(|e| BackendError::Storage(format!("Failed to delete entry id index: {}", e)))?;
+        txn.del(self.dn_by_entry_id_db, &entry_id_bytes, None)
+            .map_err(|e| BackendError::Storage(format!("Failed to delete entry id DN: {}", e)))?;
 
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
@@ -5199,9 +5809,15 @@ mod tests {
     fn credential_index_value(backend: &LmdbBackend, dn: &str) -> Option<Vec<u8>> {
         let txn = backend.env.begin_ro_txn().unwrap();
         let normalized_dn = LmdbBackend::normalize_dn(dn);
+        let entry_id = LmdbBackend::entry_id_for_normalized_dn(
+            &txn,
+            backend.entry_id_by_normalized_dn_db,
+            &normalized_dn,
+        )
+        .unwrap()?;
         txn.get(
-            backend.credentials_by_normalized_dn_db,
-            &normalized_dn.as_bytes(),
+            backend.credentials_by_entry_id_db,
+            &LmdbBackend::entry_id_bytes(entry_id),
         )
         .ok()
         .map(|bytes| bytes.to_vec())
@@ -5389,6 +6005,49 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
         let dir = tempdir().unwrap();
         let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
         assert!(backend._db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_fresh_store_uses_compact_current_lmdb_tables() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        assert!(
+            backend
+                .env
+                .open_db(Some(ENTRIES_BY_ENTRY_ID_DB_NAME))
+                .is_ok()
+        );
+        assert!(
+            backend
+                .env
+                .open_db(Some(CREDENTIALS_BY_ENTRY_ID_DB_NAME))
+                .is_ok()
+        );
+        assert!(backend.env.open_db(Some("idx3_cn")).is_ok());
+
+        assert!(matches!(
+            backend.env.open_db(Some(LEGACY_ENTRIES_DB_NAME)),
+            Err(lmdb::Error::NotFound)
+        ));
+        assert!(matches!(
+            backend.env.open_db(Some(LEGACY_PASSWORDS_DB_NAME)),
+            Err(lmdb::Error::NotFound)
+        ));
+        assert!(matches!(
+            backend
+                .env
+                .open_db(Some(LEGACY_CREDENTIALS_BY_NORMALIZED_DN_DB_NAME)),
+            Err(lmdb::Error::NotFound)
+        ));
+        assert!(matches!(
+            backend.env.open_db(Some(LEGACY_DN_INDEX_DB_NAME)),
+            Err(lmdb::Error::NotFound)
+        ));
+        assert!(matches!(
+            backend.env.open_db(Some("idx2_cn")),
+            Err(lmdb::Error::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -5608,44 +6267,28 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
     }
 
     #[tokio::test]
-    async fn test_credential_index_backfills_existing_password_database_on_reopen() {
+    async fn test_credentials_are_keyed_by_entry_id_on_reopen() {
         let dir = tempdir().unwrap();
         {
             let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
             let mut attributes = HashMap::new();
-            attributes.insert("cn".to_string(), vec!["Backfill User".to_string()]);
-            let entry = DirectoryEntry::new("cn=backfill,dc=example,dc=org", attributes);
+            attributes.insert("cn".to_string(), vec!["Credential User".to_string()]);
+            let entry = DirectoryEntry::new("cn=credential,dc=example,dc=org", attributes);
             backend.add_entry(entry, b"secret".to_vec()).await.unwrap();
-
-            let normalized_dn = LmdbBackend::normalize_dn("cn=backfill,dc=example,dc=org");
-            let mut txn = backend.env.begin_rw_txn().unwrap();
-            txn.del(
-                backend.credentials_by_normalized_dn_db,
-                &normalized_dn.as_bytes(),
-                None,
-            )
-            .unwrap();
-            txn.del(
-                backend.metadata_db,
-                &CREDENTIAL_INDEX_METADATA_KEY.as_bytes(),
-                None,
-            )
-            .unwrap();
-            txn.commit().unwrap();
-            assert!(credential_index_record(&backend, "cn=backfill,dc=example,dc=org").is_none());
+            assert!(credential_index_record(&backend, "cn=credential,dc=example,dc=org").is_some());
         }
 
         let reopened = LmdbBackend::new(dir.path(), 100, 1).unwrap();
         let credential_value =
-            credential_index_value(&reopened, "cn=backfill,dc=example,dc=org").unwrap();
+            credential_index_value(&reopened, "cn=credential,dc=example,dc=org").unwrap();
         assert_eq!(
             credential_value.first().copied(),
             Some(CREDENTIAL_RECORD_FORMAT_VERSION)
         );
-        assert!(credential_index_record(&reopened, "cn=backfill,dc=example,dc=org").is_some());
+        assert!(credential_index_record(&reopened, "cn=credential,dc=example,dc=org").is_some());
         assert!(
             reopened
-                .authenticate("cn=backfill,dc=example,dc=org", b"secret")
+                .authenticate("cn=credential,dc=example,dc=org", b"secret")
                 .await
                 .unwrap()
         );
@@ -6069,6 +6712,97 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
     }
 
     #[tokio::test]
+    async fn test_attribute_index_stores_compact_entry_ids() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        let dn = "uid=compact,dc=example,dc=org";
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Compact User".to_string()]);
+        backend
+            .add_entry(DirectoryEntry::new(dn, attributes), vec![])
+            .await
+            .unwrap();
+
+        let indexes = backend.attr_indexes.try_read().unwrap();
+        let index_db = *indexes.get("cn").unwrap();
+        drop(indexes);
+
+        let txn = backend.env.begin_ro_txn().unwrap();
+        let mut cursor = txn.open_ro_cursor(index_db).unwrap();
+        let index_key = LmdbBackend::equality_index_prefix("compact user");
+        let rows = cursor
+            .iter_dup_of(&index_key.as_bytes())
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, index_key.as_bytes());
+        assert_eq!(rows[0].1.len(), 8);
+        assert_ne!(rows[0].1, dn.as_bytes());
+        assert_eq!(
+            LmdbBackend::dn_for_entry_id_bytes(&txn, backend.dn_by_entry_id_db, rows[0].1).unwrap(),
+            Some(dn.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attribute_index_backfill_clears_legacy_dn_indexes() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+
+        let dn = "uid=legacy,dc=example,dc=org";
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Legacy User".to_string()]);
+        backend
+            .add_entry(DirectoryEntry::new(dn, attributes), vec![])
+            .await
+            .unwrap();
+
+        let legacy_db = backend
+            .env
+            .create_db(
+                Some(&LmdbBackend::legacy_attribute_index_db_name("cn")),
+                lmdb::DatabaseFlags::empty(),
+            )
+            .unwrap();
+        let metadata_key = LmdbBackend::attribute_index_metadata_key("cn");
+        let stale_version = b"1".to_vec();
+        let legacy_key = format!("legacy user:{dn}");
+        let mut txn = backend.env.begin_rw_txn().unwrap();
+        txn.put(
+            legacy_db,
+            &legacy_key.as_bytes(),
+            &dn.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.put(
+            backend.metadata_db,
+            &metadata_key.as_bytes(),
+            &stale_version,
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        drop(backend);
+
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+        assert_eq!(
+            backend.search_by_index("cn", "Legacy User").unwrap(),
+            vec![dn.to_string()]
+        );
+
+        let legacy_db = backend
+            .env
+            .open_db(Some(&LmdbBackend::legacy_attribute_index_db_name("cn")))
+            .unwrap();
+        let txn = backend.env.begin_ro_txn().unwrap();
+        let mut cursor = txn.open_ro_cursor(legacy_db).unwrap();
+        assert_eq!(cursor.iter().count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_attribute_index_case_insensitive() {
         let dir = tempdir().unwrap();
         let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
@@ -6166,9 +6900,13 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
         let txn = backend.env.begin_ro_txn().unwrap();
         let mut cursor = txn.open_ro_cursor(index_db).unwrap();
         let presence_prefix = LmdbBackend::presence_index_prefix();
-        let mut marker_results =
-            LmdbBackend::collect_index_dns_by_prefix(&mut cursor, presence_prefix.as_bytes())
-                .unwrap();
+        let mut marker_results = LmdbBackend::collect_index_dns_by_key(
+            &txn,
+            &mut cursor,
+            backend.dn_by_entry_id_db,
+            presence_prefix.as_bytes(),
+        )
+        .unwrap();
         marker_results.sort();
         assert_eq!(marker_results, results);
     }
