@@ -520,6 +520,42 @@ fn bench_connection_pool_accounting(c: &mut Criterion) {
                 );
             },
         );
+
+        group.bench_with_input(
+            BenchmarkId::new("activity_update", clients),
+            &clients,
+            |b, &clients| {
+                b.iter_batched(
+                    || {
+                        rt.block_on(async {
+                            let limits = ResourceLimits {
+                                max_connections: clients + 1,
+                                max_connections_per_ip: clients + 1,
+                                ..Default::default()
+                            };
+                            let pool = Arc::new(ConnectionPool::new(limits));
+                            let mut ids = Vec::with_capacity(clients);
+                            for idx in 0..clients {
+                                let addr = SocketAddr::new(
+                                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                                    idx as u16,
+                                );
+                                ids.push(pool.acquire_connection(addr).await.unwrap());
+                            }
+                            (pool, ids)
+                        })
+                    },
+                    |(pool, ids)| {
+                        rt.block_on(async {
+                            for conn_id in ids {
+                                pool.update_activity(black_box(conn_id)).await;
+                            }
+                        })
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
     }
 
     group.finish();

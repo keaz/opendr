@@ -88,8 +88,8 @@ struct ConnectionInfo {
     /// Client socket address
     addr: SocketAddr,
 
-    /// Last activity time
-    last_activity: Mutex<Instant>,
+    /// Last activity offset from the pool clock origin, in nanoseconds.
+    last_activity_nanos: AtomicU64,
 
     /// Current number of operations
     operation_count: AtomicUsize,
@@ -179,6 +179,9 @@ pub struct ConnectionPool {
 
     /// Statistics
     counters: PoolCounters,
+
+    /// Monotonic origin for cheap per-connection activity timestamps.
+    clock_origin: Instant,
 }
 
 impl ConnectionPool {
@@ -190,6 +193,7 @@ impl ConnectionPool {
             connections_by_ip: Arc::new(RwLock::new(HashMap::new())),
             next_id: AtomicU64::new(0),
             counters: PoolCounters::new(),
+            clock_origin: Instant::now(),
         }
     }
 
@@ -206,6 +210,19 @@ impl ConnectionPool {
                 Some(current.saturating_sub(value))
             })
             .ok();
+    }
+
+    fn activity_nanos(&self) -> u64 {
+        self.clock_origin
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    fn touch_connection(&self, conn_info: &ConnectionInfo) {
+        conn_info
+            .last_activity_nanos
+            .store(self.activity_nanos(), Ordering::Release);
     }
 
     fn try_reserve_total_memory(&self, delta: usize) -> bool {
@@ -267,7 +284,7 @@ impl ConnectionPool {
         let conn_info = Arc::new(ConnectionInfo {
             id: conn_id,
             addr,
-            last_activity: Mutex::new(Instant::now()),
+            last_activity_nanos: AtomicU64::new(self.activity_nanos()),
             operation_count: AtomicUsize::new(0),
             memory_usage: Mutex::new(0),
         });
@@ -349,10 +366,7 @@ impl ConnectionPool {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    *conn_info
-                        .last_activity
-                        .lock()
-                        .expect("connection activity lock poisoned") = Instant::now();
+                    self.touch_connection(&conn_info);
                     self.counters
                         .total_operations
                         .fetch_add(1, Ordering::AcqRel);
@@ -377,10 +391,7 @@ impl ConnectionPool {
             .unwrap_or(0);
 
         if previous > 0 {
-            *conn_info
-                .last_activity
-                .lock()
-                .expect("connection activity lock poisoned") = Instant::now();
+            self.touch_connection(&conn_info);
             self.counters
                 .total_operations
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -438,27 +449,21 @@ impl ConnectionPool {
     /// Update last activity time for a connection
     pub async fn update_activity(&self, conn_id: ConnectionId) {
         if let Some(conn_info) = self.connection_info(conn_id).await {
-            *conn_info
-                .last_activity
-                .lock()
-                .expect("connection activity lock poisoned") = Instant::now();
+            self.touch_connection(&conn_info);
         }
     }
 
     /// Get idle connections that exceed the timeout
     pub async fn get_idle_connections(&self) -> Vec<ConnectionId> {
         let connections = self.connections.read().await;
-        let now = Instant::now();
+        let now = self.activity_nanos();
         let timeout = self.limits.connection_idle_timeout;
 
         connections
             .values()
             .filter(|conn| {
-                let last_activity = *conn
-                    .last_activity
-                    .lock()
-                    .expect("connection activity lock poisoned");
-                now.duration_since(last_activity) > timeout
+                let last_activity = conn.last_activity_nanos.load(Ordering::Acquire);
+                Duration::from_nanos(now.saturating_sub(last_activity)) > timeout
             })
             .map(|conn| conn.id)
             .collect()
