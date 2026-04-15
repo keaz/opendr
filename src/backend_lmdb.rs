@@ -148,16 +148,17 @@ pub struct AuthCredentialCacheStats {
 }
 
 struct LruNode<T> {
+    key: Arc<str>,
     value: T,
-    previous: Option<String>,
-    next: Option<String>,
+    previous: Option<Arc<str>>,
+    next: Option<Arc<str>>,
 }
 
 struct BoundedLruCache<T> {
     capacity: usize,
-    entries: HashMap<String, LruNode<T>>,
-    oldest: Option<String>,
-    newest: Option<String>,
+    entries: HashMap<Arc<str>, LruNode<T>>,
+    oldest: Option<Arc<str>>,
+    newest: Option<Arc<str>>,
 }
 
 impl<T> BoundedLruCache<T> {
@@ -178,11 +179,12 @@ impl<T> BoundedLruCache<T> {
     where
         T: Clone,
     {
-        if !self.entries.contains_key(key) {
-            return None;
-        }
-        self.move_to_newest(key);
-        self.entries.get(key).map(|node| node.value.clone())
+        let (key, value) = self
+            .entries
+            .get(key)
+            .map(|node| (Arc::clone(&node.key), node.value.clone()))?;
+        self.move_to_newest(&key);
+        Some(value)
     }
 
     fn insert(&mut self, key: String, value: T) -> Option<T> {
@@ -190,8 +192,9 @@ impl<T> BoundedLruCache<T> {
             return None;
         }
 
-        if let Some(node) = self.entries.get_mut(&key) {
+        if let Some(node) = self.entries.get_mut(key.as_str()) {
             node.value = value;
+            let key = Arc::clone(&node.key);
             self.move_to_newest(&key);
             return None;
         }
@@ -199,39 +202,45 @@ impl<T> BoundedLruCache<T> {
         let evicted = (self.entries.len() == self.capacity)
             .then(|| self.pop_oldest())
             .flatten();
+        let key: Arc<str> = Arc::from(key);
 
         self.entries.insert(
-            key.clone(),
+            Arc::clone(&key),
             LruNode {
+                key: Arc::clone(&key),
                 value,
                 previous: None,
                 next: None,
             },
         );
-        self.attach_newest(&key);
+        self.attach_newest(key);
         evicted
     }
 
     fn remove(&mut self, key: &str) -> Option<T> {
-        self.entries.get(key)?;
+        let key = self.entries.get(key).map(|node| Arc::clone(&node.key))?;
+        self.remove_key(&key)
+    }
+
+    fn pop_oldest(&mut self) -> Option<T> {
+        let oldest = Arc::clone(self.oldest.as_ref()?);
+        self.remove_key(&oldest)
+    }
+
+    fn remove_key(&mut self, key: &Arc<str>) -> Option<T> {
         self.detach(key);
         self.entries.remove(key).map(|node| node.value)
     }
 
-    fn pop_oldest(&mut self) -> Option<T> {
-        let oldest = self.oldest.clone()?;
-        self.remove(&oldest)
-    }
-
-    fn move_to_newest(&mut self, key: &str) {
-        if self.newest.as_deref() == Some(key) {
+    fn move_to_newest(&mut self, key: &Arc<str>) {
+        if self.newest.as_deref() == Some(key.as_ref()) {
             return;
         }
         self.detach(key);
-        self.attach_newest(key);
+        self.attach_newest(Arc::clone(key));
     }
 
-    fn detach(&mut self, key: &str) {
+    fn detach(&mut self, key: &Arc<str>) {
         let Some((previous, next)) = self
             .entries
             .get(key)
@@ -240,7 +249,7 @@ impl<T> BoundedLruCache<T> {
             return;
         };
 
-        if let Some(previous_key) = previous.as_deref() {
+        if let Some(previous_key) = previous.as_ref() {
             if let Some(previous_node) = self.entries.get_mut(previous_key) {
                 previous_node.next = next.clone();
             }
@@ -248,7 +257,7 @@ impl<T> BoundedLruCache<T> {
             self.oldest = next.clone();
         }
 
-        if let Some(next_key) = next.as_deref() {
+        if let Some(next_key) = next.as_ref() {
             if let Some(next_node) = self.entries.get_mut(next_key) {
                 next_node.previous = previous.clone();
             }
@@ -262,21 +271,21 @@ impl<T> BoundedLruCache<T> {
         }
     }
 
-    fn attach_newest(&mut self, key: &str) {
+    fn attach_newest(&mut self, key: Arc<str>) {
         let previous_newest = self.newest.clone();
-        if let Some(previous_key) = previous_newest.as_deref() {
+        if let Some(previous_key) = previous_newest.as_ref() {
             if let Some(previous_node) = self.entries.get_mut(previous_key) {
-                previous_node.next = Some(key.to_string());
+                previous_node.next = Some(Arc::clone(&key));
             }
         } else {
-            self.oldest = Some(key.to_string());
+            self.oldest = Some(Arc::clone(&key));
         }
 
-        if let Some(node) = self.entries.get_mut(key) {
+        if let Some(node) = self.entries.get_mut(&key) {
             node.previous = previous_newest;
             node.next = None;
         }
-        self.newest = Some(key.to_string());
+        self.newest = Some(key);
     }
 }
 
@@ -5228,6 +5237,21 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
         let evicted = cache.insert("three".to_string(), 3);
         assert_eq!(evicted, Some(2));
         assert_eq!(cache.get_cloned("one"), Some(1));
+        assert_eq!(cache.get_cloned("two"), None);
+        assert_eq!(cache.get_cloned("three"), Some(3));
+    }
+
+    #[test]
+    fn bounded_lru_cache_moves_replaced_key_to_newest_without_growing() {
+        let mut cache = BoundedLruCache::with_capacity(2);
+        assert!(cache.insert("one".to_string(), 1).is_none());
+        assert!(cache.insert("two".to_string(), 2).is_none());
+        assert!(cache.insert("one".to_string(), 10).is_none());
+
+        let evicted = cache.insert("three".to_string(), 3);
+        assert_eq!(evicted, Some(2));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get_cloned("one"), Some(10));
         assert_eq!(cache.get_cloned("two"), None);
         assert_eq!(cache.get_cloned("three"), Some(3));
     }
