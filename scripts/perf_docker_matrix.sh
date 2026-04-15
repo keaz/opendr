@@ -84,7 +84,7 @@ Usage: scripts/perf_docker_matrix.sh [options]
 
 Options:
   --output-dir PATH         Output directory for the matrix run
-  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl, million, ten-million, ldapcon-ten-million (default: full)
+  --profile-set VALUE      One of: smoke, standard, full, concurrency, index, sasl, regression, million, ten-million, ldapcon-ten-million (default: full)
   --products LIST          Comma-separated subset of: opendr,opendj
   --sample-interval SEC    Container stats sample interval (default: 0.25)
   --cpu VALUE              Docker CPU limit for each server container (default: 2)
@@ -544,6 +544,25 @@ case "${PROFILE_SET}" in
       CONCURRENT_BIND_CLIENTS="1,4,8,16,32,64,128"
     fi
     ;;
+  regression)
+    LOAD_PROFILES=(
+      "regression-100k:100000:10:5:2"
+    )
+    SKIP_FULL_COUNTS="true"
+    INDEX_BENCHMARK="true"
+    if [[ -z "${CONCURRENT_INDEX_SEARCH_CLIENTS}" ]]; then
+      CONCURRENT_INDEX_SEARCH_CLIENTS="8,32,128"
+    fi
+    if [[ -z "${CONCURRENT_BIND_CLIENTS}" ]]; then
+      CONCURRENT_BIND_CLIENTS="8,32,128"
+    fi
+    if [[ -z "${OPENDR_BACKEND_INDEXES_TOML}" ]]; then
+      OPENDR_BACKEND_INDEXES_TOML="${DEFAULT_OPENDR_INDEX_BENCHMARK_TOML}"
+    fi
+    if [[ -z "${OPENDR_SCHEMA_LDIF}" ]]; then
+      OPENDR_SCHEMA_LDIF="${DEFAULT_OPENDR_INDEX_BENCHMARK_SCHEMA_LDIF}"
+    fi
+    ;;
   million)
     LOAD_PROFILES=(
       "million:1000000:3:3:1"
@@ -642,7 +661,7 @@ case "${PROFILE_SET}" in
     fi
     ;;
   *)
-    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl, million, ten-million, ldapcon-ten-million" >&2
+    echo "--profile-set must be one of: smoke, standard, full, concurrency, index, sasl, regression, million, ten-million, ldapcon-ten-million" >&2
     exit 1
     ;;
 esac

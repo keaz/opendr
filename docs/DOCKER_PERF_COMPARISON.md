@@ -16,6 +16,88 @@ This document records the current Dockerized OpenDR and OpenDJ benchmark baselin
 - A completed OpenDR-only 10M-user LDAPCon-style artifact is recorded below. The original synchronous-auth-metadata run is the historical 10M baseline; the async-auth-metadata run is the current targeted result for issue #131.
 - There is still no completed 10M-user OpenDR-vs-OpenDJ benchmark artifact in this repository.
 
+## Profiling And Regression Workflow
+
+Use the `regression` Docker profile for CI-friendly perf gates. It loads a
+100k-user fixture, enables indexed probes, and runs moderate concurrent bind and
+index-search levels without requiring the 10M artifact or 30 GiB memory.
+
+```bash
+scripts/perf_docker_matrix.sh \
+  --products opendr \
+  --profile-set regression \
+  --output-dir target/perf/regression-candidate \
+  --benchmark-timeout 900
+```
+
+Save a known-good result as the baseline, then compare a new run with:
+
+```bash
+python3 scripts/compare_perf_run.py \
+  --baseline-json target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json \
+  --candidate-json target/perf/regression-candidate/opendr/regression-100k/ldap-benchmark-results.json \
+  --threshold-percent 10 \
+  --report-out target/perf/regression-candidate/perf-regression-report.md
+```
+
+The comparison gate checks `success_throughput_ops_per_sec`, `mean_ms`,
+`p95_ms`, and `failure_rate_percent` for common operations and exits non-zero
+when a metric regresses beyond the threshold. The perf client JSON now includes
+`failure_reasons` buckets for concurrent and LDAPCon-style runs; for example
+`ready_timeout`, `collect_timeout`, `worker_join_error`, and
+`operation_failed`. These buckets should be reviewed first when c128, c256, or
+c1000 rows have non-zero failure rates.
+
+For local macOS/Linux profiling without Docker, build optimized binaries and run
+the server/client pair directly:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --profile perf \
+  --bin opendr \
+  --bin ldap_perf_client \
+  --bin opendr_perf_fixture_loader
+
+target/perf/opendr --config config/server.toml --log-config config/log4rs.yml
+
+target/perf/ldap_perf_client \
+  --url ldap://127.0.0.1:1389 \
+  --bind-dn "cn=admin,dc=example,dc=com" \
+  --password admin \
+  --base-dn "dc=example,dc=com" \
+  --preloaded-users 100000 \
+  --index-benchmark \
+  --concurrent-index-search-clients 8,32,128 \
+  --concurrent-bind-clients 8,32,128 \
+  --json-out target/perf/local-regression.json
+```
+
+Run the full 10M profile manually only when validating a completed perf issue or
+release candidate. The expected resource envelope is 8 CPU cores, 30 GiB memory,
+a large LMDB map, optimized `perf` build flags, and enough disk for a 10M LMDB
+fixture:
+
+```bash
+scripts/perf_docker_matrix.sh \
+  --products opendr \
+  --profile-set ldapcon-ten-million \
+  --output-dir target/perf/opendr-ldapcon-10m-candidate \
+  --cpu 8 \
+  --memory 30g \
+  --benchmark-timeout 7200 \
+  --opendr-lmdb-max-size 343597383680 \
+  --opendr-lmdb-max-readers 4096 \
+  --opendr-worker-threads 8 \
+  --opendr-cache-size 10000000 \
+  --opendr-build-profile perf \
+  --opendr-build-rustflags "-C target-cpu=native" \
+  --opendr-bulk-fixture-load
+```
+
+Compare 10M c8 rows against the public LDAPCon 2013 OpenLDAP LMDB rows when all
+operation families complete with 0 failures. Treat c128/c256/c1000 rows as
+saturation diagnostics until their `failure_rate_percent` is 0 and the
+`failure_reasons` buckets are empty.
+
 ## Targeted 10M LDAPCon-Style Auth Metadata Run
 
 Artifact root: `target/perf/opendr-auth-metadata-async-10m-8cpu-30g-20260415-102258/`

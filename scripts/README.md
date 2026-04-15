@@ -180,6 +180,12 @@ If tests fail:
   --sasl-plain-authcid-format rdn-value \
   --skip-sasl-plain-admin-benchmark \
   --concurrent-bind-clients 1,4,8,16,32,64,128
+
+# CI-friendly OpenDR regression profile with 100k fixture users
+./scripts/perf_docker_matrix.sh \
+  --products opendr \
+  --profile-set regression \
+  --output-dir target/perf/regression-candidate
 ```
 
 **Profiles**:
@@ -189,6 +195,7 @@ If tests fail:
 - `concurrency`: single `auth-concurrency` profile for focused concurrent bind comparison
 - `index`: single `index` profile for equality, presence, substring, ordering, and concurrent mixed index-search probes
 - `sasl`: single `sasl-auth` profile for SASL PLAIN fixture-user bind latency and concurrent throughput/failure probes
+- `regression`: single `regression-100k` profile for OpenDR perf gates with a 100k fixture, indexed probes, and moderate concurrent bind/index-search levels
 
 **Key options**:
 - `--cpu`: container CPU limit, default `2`
@@ -214,6 +221,27 @@ If tests fail:
 - Per-run raw metrics: `target/perf/.../<product>/<profile>/ldap-benchmark-results.json`
 - Per-run container stats: `target/perf/.../<product>/<profile>/container-stats-summary.json`
 - Per-run status: `target/perf/.../<product>/<profile>/run-status.json`
+
+### compare_perf_run.py
+
+**Purpose**: Compare two `ldap_perf_client` JSON reports and fail when key
+metrics regress beyond a configured threshold. Use this with the `regression`
+profile or a preserved 1M fixture; do not make CI depend on the 10M artifact.
+
+**Usage**:
+```bash
+python3 scripts/compare_perf_run.py \
+  --baseline-json target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json \
+  --candidate-json target/perf/regression-candidate/opendr/regression-100k/ldap-benchmark-results.json \
+  --threshold-percent 10 \
+  --report-out target/perf/regression-candidate/perf-regression-report.md
+```
+
+The default comparison checks successful throughput, mean latency, p95 latency,
+and failure rate for operations present in both reports. `ldap_perf_client`
+also emits `failure_reasons` buckets for concurrent and LDAPCon-style rows so
+c128/c256/c1000 failures can be separated into timeout, worker, and operation
+failure categories.
 
 ## Installing ldap-utils
 

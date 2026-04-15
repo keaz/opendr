@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
@@ -211,6 +211,7 @@ struct BenchmarkStats {
     successes: usize,
     failures: usize,
     failure_rate_percent: f64,
+    failure_reasons: Vec<FailureReasonBucket>,
     elapsed_ms: f64,
     throughput_ops_per_sec: f64,
     success_throughput_ops_per_sec: f64,
@@ -220,6 +221,46 @@ struct BenchmarkStats {
     p95_ms: f64,
     p99_ms: f64,
     max_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct FailureReasonBucket {
+    reason: String,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FailureBuckets {
+    counts: BTreeMap<&'static str, usize>,
+}
+
+impl FailureBuckets {
+    fn single(reason: &'static str, count: usize) -> Self {
+        let mut buckets = Self::default();
+        buckets.add(reason, count);
+        buckets
+    }
+
+    fn add(&mut self, reason: &'static str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        *self.counts.entry(reason).or_default() += count;
+    }
+
+    fn total(&self) -> usize {
+        self.counts.values().sum()
+    }
+
+    fn into_vec(self) -> Vec<FailureReasonBucket> {
+        self.counts
+            .into_iter()
+            .map(|(reason, count)| FailureReasonBucket {
+                reason: reason.to_string(),
+                count,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1474,7 +1515,7 @@ async fn run_concurrent_bind_benchmark(
                 for handle in &handles {
                     handle.abort();
                 }
-                return Ok(build_benchmark_stats_with_counts(
+                return Ok(build_benchmark_stats_with_counts_and_failure_reasons(
                     &format!("concurrent_bind_fixture_users_c{concurrency}"),
                     Vec::new(),
                     timeout_started,
@@ -1482,6 +1523,7 @@ async fn run_concurrent_bind_benchmark(
                     0,
                     expected_attempts,
                     concurrency,
+                    FailureBuckets::single("ready_timeout", expected_attempts),
                 ));
             }
         }
@@ -1493,6 +1535,7 @@ async fn run_concurrent_bind_benchmark(
     let mut latencies_ms = Vec::with_capacity(expected_attempts);
     let mut successes = 0;
     let mut failures = 0;
+    let mut failure_reasons = FailureBuckets::default();
     let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
     for handle_index in 0..handles.len() {
         match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
@@ -1503,18 +1546,20 @@ async fn run_concurrent_bind_benchmark(
             }
             Ok(Err(_)) => {
                 failures += args.concurrent_bind_iterations;
+                failure_reasons.add("worker_join_error", args.concurrent_bind_iterations);
             }
             Err(_) => {
                 for handle in handles.iter().skip(handle_index) {
                     handle.abort();
                     failures += args.concurrent_bind_iterations;
+                    failure_reasons.add("collect_timeout", args.concurrent_bind_iterations);
                 }
                 break;
             }
         }
     }
 
-    Ok(build_benchmark_stats_with_counts(
+    Ok(build_benchmark_stats_with_counts_and_failure_reasons(
         &format!("concurrent_bind_fixture_users_c{concurrency}"),
         latencies_ms,
         total_started,
@@ -1522,6 +1567,7 @@ async fn run_concurrent_bind_benchmark(
         successes,
         failures,
         concurrency,
+        failure_reasons,
     ))
 }
 
@@ -1702,7 +1748,7 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
                 for handle in &handles {
                     handle.abort();
                 }
-                return Ok(build_benchmark_stats_with_counts(
+                return Ok(build_benchmark_stats_with_counts_and_failure_reasons(
                     &format!("concurrent_sasl_plain_bind_fixture_users_c{concurrency}"),
                     Vec::new(),
                     timeout_started,
@@ -1710,6 +1756,7 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
                     0,
                     expected_attempts,
                     concurrency,
+                    FailureBuckets::single("ready_timeout", expected_attempts),
                 ));
             }
         }
@@ -1721,6 +1768,7 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
     let mut latencies_ms = Vec::with_capacity(expected_attempts);
     let mut successes = 0;
     let mut failures = 0;
+    let mut failure_reasons = FailureBuckets::default();
     let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
     for handle_index in 0..handles.len() {
         match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
@@ -1731,18 +1779,20 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
             }
             Ok(Err(_)) => {
                 failures += args.concurrent_bind_iterations;
+                failure_reasons.add("worker_join_error", args.concurrent_bind_iterations);
             }
             Err(_) => {
                 for handle in handles.iter().skip(handle_index) {
                     handle.abort();
                     failures += args.concurrent_bind_iterations;
+                    failure_reasons.add("collect_timeout", args.concurrent_bind_iterations);
                 }
                 break;
             }
         }
     }
 
-    Ok(build_benchmark_stats_with_counts(
+    Ok(build_benchmark_stats_with_counts_and_failure_reasons(
         &format!("concurrent_sasl_plain_bind_fixture_users_c{concurrency}"),
         latencies_ms,
         total_started,
@@ -1750,6 +1800,7 @@ async fn run_concurrent_sasl_plain_bind_benchmark(
         successes,
         failures,
         concurrency,
+        failure_reasons,
     ))
 }
 
@@ -1951,7 +2002,7 @@ async fn run_ldapcon_single_operation_benchmark(
                 for handle in &handles {
                     handle.abort();
                 }
-                return Ok(build_benchmark_stats_with_counts(
+                return Ok(build_benchmark_stats_with_counts_and_failure_reasons(
                     &format!("{}_c{concurrency}", operation.label()),
                     Vec::new(),
                     timeout_started,
@@ -1959,6 +2010,7 @@ async fn run_ldapcon_single_operation_benchmark(
                     0,
                     expected_attempts,
                     concurrency,
+                    FailureBuckets::single("ready_timeout", expected_attempts),
                 ));
             }
         }
@@ -1970,6 +2022,7 @@ async fn run_ldapcon_single_operation_benchmark(
     let mut latencies_ms = Vec::with_capacity(expected_attempts);
     let mut successes = 0;
     let mut failures = 0;
+    let mut failure_reasons = FailureBuckets::default();
     let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
     for handle_index in 0..handles.len() {
         match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
@@ -1980,18 +2033,20 @@ async fn run_ldapcon_single_operation_benchmark(
             }
             Ok(Err(_)) => {
                 failures += args.ldapcon_iterations;
+                failure_reasons.add("worker_join_error", args.ldapcon_iterations);
             }
             Err(_) => {
                 for handle in handles.iter().skip(handle_index) {
                     handle.abort();
                     failures += args.ldapcon_iterations;
+                    failure_reasons.add("collect_timeout", args.ldapcon_iterations);
                 }
                 break;
             }
         }
     }
 
-    Ok(build_benchmark_stats_with_counts(
+    Ok(build_benchmark_stats_with_counts_and_failure_reasons(
         &format!("{}_c{concurrency}", operation.label()),
         latencies_ms,
         total_started,
@@ -1999,6 +2054,7 @@ async fn run_ldapcon_single_operation_benchmark(
         successes,
         failures,
         concurrency,
+        failure_reasons,
     ))
 }
 
@@ -2198,7 +2254,7 @@ async fn run_ldapcon_mixed_benchmark(
                 }
                 let elapsed = elapsed_ms(timeout_started.elapsed().as_secs_f64());
                 return Ok(vec![
-                    build_benchmark_stats_with_elapsed(
+                    build_benchmark_stats_with_elapsed_and_failure_reasons(
                         &format!("ldapcon_mixed_search_c{concurrency}"),
                         Vec::new(),
                         elapsed,
@@ -2206,8 +2262,9 @@ async fn run_ldapcon_mixed_benchmark(
                         0,
                         expected_search_attempts,
                         concurrency,
+                        FailureBuckets::single("ready_timeout", expected_search_attempts),
                     ),
-                    build_benchmark_stats_with_elapsed(
+                    build_benchmark_stats_with_elapsed_and_failure_reasons(
                         &format!("ldapcon_mixed_modify_c{concurrency}"),
                         Vec::new(),
                         elapsed,
@@ -2215,6 +2272,7 @@ async fn run_ldapcon_mixed_benchmark(
                         0,
                         expected_modify_attempts,
                         concurrency,
+                        FailureBuckets::single("ready_timeout", expected_modify_attempts),
                     ),
                 ]);
             }
@@ -2230,6 +2288,8 @@ async fn run_ldapcon_mixed_benchmark(
     let mut search_failures = 0;
     let mut modify_successes = 0;
     let mut modify_failures = 0;
+    let mut search_failure_reasons = FailureBuckets::default();
+    let mut modify_failure_reasons = FailureBuckets::default();
     let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
     for handle_index in 0..handles.len() {
         match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
@@ -2241,7 +2301,7 @@ async fn run_ldapcon_mixed_benchmark(
                 modify_successes += result.modify_successes;
                 modify_failures += result.modify_failures;
             }
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
                 if handle_index < handles.len() {
                     for handle in handles.iter().skip(handle_index) {
                         handle.abort();
@@ -2256,6 +2316,27 @@ async fn run_ldapcon_mixed_benchmark(
                     );
                 search_failures += remaining_search_failures;
                 modify_failures += remaining_modify_failures;
+                search_failure_reasons.add("worker_join_error", remaining_search_failures);
+                modify_failure_reasons.add("worker_join_error", remaining_modify_failures);
+                break;
+            }
+            Err(_) => {
+                if handle_index < handles.len() {
+                    for handle in handles.iter().skip(handle_index) {
+                        handle.abort();
+                    }
+                }
+                let remaining_workers = handles.len() - handle_index;
+                let remaining_attempts = remaining_workers * args.ldapcon_iterations;
+                let (remaining_search_failures, remaining_modify_failures) =
+                    ldapcon_mixed_expected_counts(
+                        remaining_attempts,
+                        args.ldapcon_mixed_write_percent,
+                    );
+                search_failures += remaining_search_failures;
+                modify_failures += remaining_modify_failures;
+                search_failure_reasons.add("collect_timeout", remaining_search_failures);
+                modify_failure_reasons.add("collect_timeout", remaining_modify_failures);
                 break;
             }
         }
@@ -2263,7 +2344,7 @@ async fn run_ldapcon_mixed_benchmark(
 
     let elapsed_ms_total = elapsed_ms(total_started.elapsed().as_secs_f64());
     Ok(vec![
-        build_benchmark_stats_with_elapsed(
+        build_benchmark_stats_with_elapsed_and_failure_reasons(
             &format!("ldapcon_mixed_search_c{concurrency}"),
             search_latencies_ms,
             elapsed_ms_total,
@@ -2271,8 +2352,9 @@ async fn run_ldapcon_mixed_benchmark(
             search_successes,
             search_failures,
             concurrency,
+            search_failure_reasons,
         ),
-        build_benchmark_stats_with_elapsed(
+        build_benchmark_stats_with_elapsed_and_failure_reasons(
             &format!("ldapcon_mixed_modify_c{concurrency}"),
             modify_latencies_ms,
             elapsed_ms_total,
@@ -2280,6 +2362,7 @@ async fn run_ldapcon_mixed_benchmark(
             modify_successes,
             modify_failures,
             concurrency,
+            modify_failure_reasons,
         ),
     ])
 }
@@ -2556,7 +2639,7 @@ async fn run_concurrent_index_search_benchmark(
                 for handle in &handles {
                     handle.abort();
                 }
-                return Ok(build_benchmark_stats_with_counts(
+                return Ok(build_benchmark_stats_with_counts_and_failure_reasons(
                     &format!("concurrent_index_search_c{concurrency}"),
                     Vec::new(),
                     timeout_started,
@@ -2564,6 +2647,7 @@ async fn run_concurrent_index_search_benchmark(
                     0,
                     expected_attempts,
                     concurrency,
+                    FailureBuckets::single("ready_timeout", expected_attempts),
                 ));
             }
         }
@@ -2575,6 +2659,7 @@ async fn run_concurrent_index_search_benchmark(
     let mut latencies_ms = Vec::with_capacity(expected_attempts);
     let mut successes = 0;
     let mut failures = 0;
+    let mut failure_reasons = FailureBuckets::default();
     let collect_deadline = tokio::time::Instant::now() + per_concurrency_timeout;
     for handle_index in 0..handles.len() {
         match tokio::time::timeout_at(collect_deadline, &mut handles[handle_index]).await {
@@ -2585,18 +2670,20 @@ async fn run_concurrent_index_search_benchmark(
             }
             Ok(Err(_)) => {
                 failures += args.concurrent_index_search_iterations;
+                failure_reasons.add("worker_join_error", args.concurrent_index_search_iterations);
             }
             Err(_) => {
                 for handle in handles.iter().skip(handle_index) {
                     handle.abort();
                     failures += args.concurrent_index_search_iterations;
+                    failure_reasons.add("collect_timeout", args.concurrent_index_search_iterations);
                 }
                 break;
             }
         }
     }
 
-    Ok(build_benchmark_stats_with_counts(
+    Ok(build_benchmark_stats_with_counts_and_failure_reasons(
         &format!("concurrent_index_search_c{concurrency}"),
         latencies_ms,
         total_started,
@@ -2604,6 +2691,7 @@ async fn run_concurrent_index_search_benchmark(
         successes,
         failures,
         concurrency,
+        failure_reasons,
     ))
 }
 
@@ -3206,8 +3294,31 @@ fn build_benchmark_stats_with_counts(
     failures: usize,
     concurrency: usize,
 ) -> BenchmarkStats {
+    build_benchmark_stats_with_counts_and_failure_reasons(
+        operation,
+        latencies_ms,
+        total_start,
+        attempts,
+        successes,
+        failures,
+        concurrency,
+        FailureBuckets::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_benchmark_stats_with_counts_and_failure_reasons(
+    operation: &str,
+    latencies_ms: Vec<f64>,
+    total_start: Instant,
+    attempts: usize,
+    successes: usize,
+    failures: usize,
+    concurrency: usize,
+    failure_reasons: FailureBuckets,
+) -> BenchmarkStats {
     let elapsed_ms_total = elapsed_ms(total_start.elapsed().as_secs_f64());
-    build_benchmark_stats_with_elapsed(
+    build_benchmark_stats_with_elapsed_and_failure_reasons(
         operation,
         latencies_ms,
         elapsed_ms_total,
@@ -3215,10 +3326,12 @@ fn build_benchmark_stats_with_counts(
         successes,
         failures,
         concurrency,
+        failure_reasons,
     )
 }
 
-fn build_benchmark_stats_with_elapsed(
+#[allow(clippy::too_many_arguments)]
+fn build_benchmark_stats_with_elapsed_and_failure_reasons(
     operation: &str,
     latencies_ms: Vec<f64>,
     elapsed_ms_total: f64,
@@ -3226,6 +3339,7 @@ fn build_benchmark_stats_with_elapsed(
     successes: usize,
     failures: usize,
     concurrency: usize,
+    mut failure_reasons: FailureBuckets,
 ) -> BenchmarkStats {
     let throughput_ops_per_sec = if elapsed_ms_total > 0.0 {
         attempts as f64 / (elapsed_ms_total / 1000.0)
@@ -3242,6 +3356,10 @@ fn build_benchmark_stats_with_elapsed(
     } else {
         0.0
     };
+    let classified_failures = failure_reasons.total();
+    if failures > classified_failures {
+        failure_reasons.add("operation_failed", failures - classified_failures);
+    }
     let latency_count = latencies_ms.len();
     let mean_ms = if latency_count > 0 {
         latencies_ms.iter().sum::<f64>() / latency_count as f64
@@ -3256,6 +3374,7 @@ fn build_benchmark_stats_with_elapsed(
         successes,
         failures,
         failure_rate_percent,
+        failure_reasons: failure_reasons.into_vec(),
         elapsed_ms: elapsed_ms_total,
         throughput_ops_per_sec,
         success_throughput_ops_per_sec,
@@ -3296,18 +3415,19 @@ fn print_human_summary(report: &BenchmarkReport) {
     println!("## Benchmarks");
     println!();
     println!(
-        "| Operation | Concurrency | Attempts | Successes | Failures | Failure % | Mean ms | P50 ms | P95 ms | P99 ms | Max ms | Attempt ops/s | Success ops/s |"
+        "| Operation | Concurrency | Attempts | Successes | Failures | Failure % | Failure buckets | Mean ms | P50 ms | P95 ms | P99 ms | Max ms | Attempt ops/s | Success ops/s |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|");
     for benchmark in &report.benchmarks {
         println!(
-            "| {} | {} | {} | {} | {} | {:.2} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.2} | {:.2} |",
+            "| {} | {} | {} | {} | {} | {:.2} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.2} | {:.2} |",
             benchmark.operation,
             benchmark.concurrency,
             benchmark.iterations,
             benchmark.successes,
             benchmark.failures,
             benchmark.failure_rate_percent,
+            format_failure_buckets(&benchmark.failure_reasons),
             benchmark.mean_ms,
             benchmark.p50_ms,
             benchmark.p95_ms,
@@ -3317,6 +3437,18 @@ fn print_human_summary(report: &BenchmarkReport) {
             benchmark.success_throughput_ops_per_sec,
         );
     }
+}
+
+fn format_failure_buckets(buckets: &[FailureReasonBucket]) -> String {
+    if buckets.is_empty() {
+        return "-".to_string();
+    }
+
+    buckets
+        .iter()
+        .map(|bucket| format!("{}={}", bucket.reason, bucket.count))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn parse_concurrent_bind_clients(raw: &str) -> AppResult<Vec<usize>> {
@@ -3550,6 +3682,35 @@ mod tests {
         assert_eq!(stats.successes, 4);
         assert_eq!(stats.failures, 1);
         assert_eq!(stats.failure_rate_percent, 20.0);
+        assert_eq!(
+            stats.failure_reasons,
+            vec![FailureReasonBucket {
+                reason: "operation_failed".to_string(),
+                count: 1,
+            }]
+        );
         assert!(stats.throughput_ops_per_sec >= stats.success_throughput_ops_per_sec);
+    }
+
+    #[test]
+    fn benchmark_stats_preserve_timeout_failure_buckets() {
+        let stats = build_benchmark_stats_with_counts_and_failure_reasons(
+            "ldapcon_auth_c128",
+            Vec::new(),
+            Instant::now(),
+            128,
+            0,
+            128,
+            128,
+            FailureBuckets::single("ready_timeout", 128),
+        );
+
+        assert_eq!(
+            stats.failure_reasons,
+            vec![FailureReasonBucket {
+                reason: "ready_timeout".to_string(),
+                count: 128,
+            }]
+        );
     }
 }
