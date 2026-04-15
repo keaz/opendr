@@ -10,7 +10,10 @@ use opendr::backend::{
     DirectoryBackend, DirectoryEntry, MockBackend, Modification, ModifyOperation,
     SearchCandidateHint, SearchSubstringPart,
 };
-use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBackend};
+use opendr::backend_lmdb::{
+    AttributeIndexConfig, IndexConfig, IndexType, LmdbAuthCacheBenchmarkHarness, LmdbBackend,
+    LmdbEntryCacheBenchmarkHarness,
+};
 use opendr::schema::LdapSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -202,6 +205,24 @@ fn bench_read_operations(c: &mut Criterion) {
         });
     });
 
+    let lmdb_cached_backend = setup_lmdb_backend();
+    rt.block_on(async {
+        lmdb_cached_backend
+            .get_entry("uid=user500,ou=people,dc=example,dc=org")
+            .await
+            .unwrap();
+    });
+    group.bench_function("lmdb_backend_get_entry_cache_hit", |b| {
+        b.iter(|| {
+            let backend = lmdb_cached_backend.clone();
+            rt.block_on(async move {
+                let _ = backend
+                    .get_entry(black_box("uid=user500,ou=people,dc=example,dc=org"))
+                    .await;
+            })
+        });
+    });
+
     group.finish();
 }
 
@@ -240,6 +261,89 @@ fn bench_authentication(c: &mut Criterion) {
             })
         });
     });
+
+    let lmdb_cached_backend = setup_lmdb_backend();
+    rt.block_on(async {
+        lmdb_cached_backend
+            .authenticate("uid=user500,ou=people,dc=example,dc=org", b"password500")
+            .await
+            .unwrap();
+    });
+    group.bench_function("lmdb_backend_authenticate_cache_hit", |b| {
+        b.iter(|| {
+            let backend = lmdb_cached_backend.clone();
+            rt.block_on(async move {
+                let _ = backend
+                    .authenticate(
+                        black_box("uid=user500,ou=people,dc=example,dc=org"),
+                        black_box(b"password500"),
+                    )
+                    .await;
+            })
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_lmdb_cache_internals(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lmdb_cache_internals");
+
+    for capacity in [1_000_usize, 50_000, 500_000] {
+        let entry_get = LmdbEntryCacheBenchmarkHarness::new(capacity);
+        let mut index = 0usize;
+        group.bench_function(format!("entry_get_hit_cap_{capacity}"), |b| {
+            b.iter(|| {
+                index = index.wrapping_add(1);
+                black_box(entry_get.get_hit(black_box(index)));
+            });
+        });
+
+        let entry_insert = LmdbEntryCacheBenchmarkHarness::new(capacity);
+        let mut sequence = capacity;
+        group.bench_function(format!("entry_insert_evict_cap_{capacity}"), |b| {
+            b.iter(|| {
+                sequence = sequence.wrapping_add(1);
+                black_box(entry_insert.insert_new(black_box(sequence)));
+            });
+        });
+
+        let entry_invalidate = LmdbEntryCacheBenchmarkHarness::new(capacity);
+        let mut index = 0usize;
+        group.bench_function(format!("entry_invalidate_reinsert_cap_{capacity}"), |b| {
+            b.iter(|| {
+                index = index.wrapping_add(1);
+                black_box(entry_invalidate.invalidate_and_reinsert(black_box(index)));
+            });
+        });
+
+        let auth_get = LmdbAuthCacheBenchmarkHarness::new(capacity);
+        let mut index = 0usize;
+        group.bench_function(format!("auth_get_hit_cap_{capacity}"), |b| {
+            b.iter(|| {
+                index = index.wrapping_add(1);
+                black_box(auth_get.get_hit(black_box(index)));
+            });
+        });
+
+        let auth_insert = LmdbAuthCacheBenchmarkHarness::new(capacity);
+        let mut sequence = capacity;
+        group.bench_function(format!("auth_insert_evict_cap_{capacity}"), |b| {
+            b.iter(|| {
+                sequence = sequence.wrapping_add(1);
+                black_box(auth_insert.insert_new(black_box(sequence)));
+            });
+        });
+
+        let auth_invalidate = LmdbAuthCacheBenchmarkHarness::new(capacity);
+        let mut index = 0usize;
+        group.bench_function(format!("auth_invalidate_reinsert_cap_{capacity}"), |b| {
+            b.iter(|| {
+                index = index.wrapping_add(1);
+                black_box(auth_invalidate.invalidate_and_reinsert(black_box(index)));
+            });
+        });
+    }
 
     group.finish();
 }
@@ -443,6 +547,7 @@ criterion_group!(
     benches,
     bench_read_operations,
     bench_authentication,
+    bench_lmdb_cache_internals,
     bench_search_operations,
     bench_lmdb_indexed_search_hints,
     bench_lmdb_modify_operations

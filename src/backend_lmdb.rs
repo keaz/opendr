@@ -24,7 +24,7 @@
 //! - DN normalization for fast case-insensitive searches
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -141,15 +141,146 @@ pub struct AuthCredentialCacheStats {
     pub evictions: u64,
 }
 
-#[derive(Default)]
-struct EntryCacheState {
-    entries: HashMap<String, StoredEntry>,
-    lru: VecDeque<String>,
+struct LruNode<T> {
+    value: T,
+    previous: Option<String>,
+    next: Option<String>,
+}
+
+struct BoundedLruCache<T> {
+    capacity: usize,
+    entries: HashMap<String, LruNode<T>>,
+    oldest: Option<String>,
+    newest: Option<String>,
+}
+
+impl<T> BoundedLruCache<T> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::with_capacity(capacity),
+            oldest: None,
+            newest: None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get_cloned(&mut self, key: &str) -> Option<T>
+    where
+        T: Clone,
+    {
+        if !self.entries.contains_key(key) {
+            return None;
+        }
+        self.move_to_newest(key);
+        self.entries.get(key).map(|node| node.value.clone())
+    }
+
+    fn insert(&mut self, key: String, value: T) -> Option<T> {
+        if self.capacity == 0 {
+            return None;
+        }
+
+        if let Some(node) = self.entries.get_mut(&key) {
+            node.value = value;
+            self.move_to_newest(&key);
+            return None;
+        }
+
+        let evicted = (self.entries.len() == self.capacity)
+            .then(|| self.pop_oldest())
+            .flatten();
+
+        self.entries.insert(
+            key.clone(),
+            LruNode {
+                value,
+                previous: None,
+                next: None,
+            },
+        );
+        self.attach_newest(&key);
+        evicted
+    }
+
+    fn remove(&mut self, key: &str) -> Option<T> {
+        self.entries.get(key)?;
+        self.detach(key);
+        self.entries.remove(key).map(|node| node.value)
+    }
+
+    fn pop_oldest(&mut self) -> Option<T> {
+        let oldest = self.oldest.clone()?;
+        self.remove(&oldest)
+    }
+
+    fn move_to_newest(&mut self, key: &str) {
+        if self.newest.as_deref() == Some(key) {
+            return;
+        }
+        self.detach(key);
+        self.attach_newest(key);
+    }
+
+    fn detach(&mut self, key: &str) {
+        let Some((previous, next)) = self
+            .entries
+            .get(key)
+            .map(|node| (node.previous.clone(), node.next.clone()))
+        else {
+            return;
+        };
+
+        if let Some(previous_key) = previous.as_deref() {
+            if let Some(previous_node) = self.entries.get_mut(previous_key) {
+                previous_node.next = next.clone();
+            }
+        } else {
+            self.oldest = next.clone();
+        }
+
+        if let Some(next_key) = next.as_deref() {
+            if let Some(next_node) = self.entries.get_mut(next_key) {
+                next_node.previous = previous.clone();
+            }
+        } else {
+            self.newest = previous.clone();
+        }
+
+        if let Some(node) = self.entries.get_mut(key) {
+            node.previous = None;
+            node.next = None;
+        }
+    }
+
+    fn attach_newest(&mut self, key: &str) {
+        let previous_newest = self.newest.clone();
+        if let Some(previous_key) = previous_newest.as_deref() {
+            if let Some(previous_node) = self.entries.get_mut(previous_key) {
+                previous_node.next = Some(key.to_string());
+            }
+        } else {
+            self.oldest = Some(key.to_string());
+        }
+
+        if let Some(node) = self.entries.get_mut(key) {
+            node.previous = previous_newest;
+            node.next = None;
+        }
+        self.newest = Some(key.to_string());
+    }
+}
+
+struct EntryCacheShard {
+    cache: BoundedLruCache<Arc<StoredEntry>>,
 }
 
 struct EntryCache {
     capacity: usize,
-    state: Mutex<EntryCacheState>,
+    shards: Vec<Mutex<EntryCacheShard>>,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
@@ -157,64 +288,56 @@ struct EntryCache {
 
 impl EntryCache {
     fn new(capacity: usize) -> Self {
+        let shard_count = cache_shard_count(capacity);
+        let mut shards = Vec::with_capacity(shard_count);
+        for index in 0..shard_count {
+            shards.push(Mutex::new(EntryCacheShard {
+                cache: BoundedLruCache::with_capacity(cache_shard_capacity(
+                    capacity,
+                    shard_count,
+                    index,
+                )),
+            }));
+        }
+
         Self {
             capacity,
-            state: Mutex::new(EntryCacheState::default()),
+            shards,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
         }
     }
 
-    fn get(&self, normalized_dn: &str) -> Option<StoredEntry> {
+    fn get(&self, normalized_dn: &str) -> Option<Arc<StoredEntry>> {
         if self.capacity == 0 {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let entry = state.entries.get(normalized_dn).cloned();
-        match entry {
-            Some(entry) => {
-                Self::touch_key(&mut state.lru, normalized_dn);
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(entry)
-            }
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+        let mut shard = self.lock_shard(normalized_dn);
+        let entry = shard.cache.get_cloned(normalized_dn);
+        if entry.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
+        entry
     }
 
-    fn insert(&self, entry: StoredEntry) {
+    fn insert(&self, normalized_dn: &str, entry: Arc<StoredEntry>) {
         if self.capacity == 0 {
             return;
         }
 
-        let normalized_dn = entry.dn.to_lowercase().trim().to_string();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
-        if !state.entries.contains_key(&normalized_dn) && state.entries.len() == self.capacity {
-            while let Some(oldest_key) = state.lru.pop_front() {
-                if oldest_key == normalized_dn {
-                    continue;
-                }
-                if state.entries.remove(&oldest_key).is_some() {
-                    self.evictions.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-            }
+        let mut shard = self.lock_shard(normalized_dn);
+        if shard
+            .cache
+            .insert(normalized_dn.to_string(), entry)
+            .is_some()
+        {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
-
-        state.entries.insert(normalized_dn.clone(), entry);
-        Self::touch_key(&mut state.lru, &normalized_dn);
     }
 
     fn invalidate(&self, normalized_dn: &str) {
@@ -222,38 +345,24 @@ impl EntryCache {
             return;
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if state.entries.remove(normalized_dn).is_some() {
-            Self::remove_key(&mut state.lru, normalized_dn);
-        }
+        let mut shard = self.lock_shard(normalized_dn);
+        shard.cache.remove(normalized_dn);
     }
 
     fn stats(&self) -> EntryCacheStats {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         EntryCacheStats {
             capacity: self.capacity,
-            len: state.entries.len(),
+            len: self.shards.iter().map(lock_shard_len).sum(),
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
         }
     }
 
-    fn touch_key(lru: &mut VecDeque<String>, normalized_dn: &str) {
-        Self::remove_key(lru, normalized_dn);
-        lru.push_back(normalized_dn.to_string());
-    }
-
-    fn remove_key(lru: &mut VecDeque<String>, normalized_dn: &str) {
-        if let Some(position) = lru.iter().position(|existing| existing == normalized_dn) {
-            lru.remove(position);
-        }
+    fn lock_shard(&self, normalized_dn: &str) -> std::sync::MutexGuard<'_, EntryCacheShard> {
+        self.shards[cache_shard_index(normalized_dn, self.shards.len())]
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
@@ -263,11 +372,8 @@ struct AuthCredentialRecord {
     salt: Vec<u8>,
 }
 
-#[derive(Default)]
 struct AuthCredentialCacheShard {
-    capacity: usize,
-    records: HashMap<String, Arc<AuthCredentialRecord>>,
-    lru: VecDeque<String>,
+    cache: BoundedLruCache<Arc<AuthCredentialRecord>>,
 }
 
 struct AuthCredentialCache {
@@ -279,22 +385,16 @@ struct AuthCredentialCache {
 }
 
 impl AuthCredentialCache {
-    const MAX_SHARDS: usize = 64;
-
     fn new(capacity: usize) -> Self {
-        let shard_count = if capacity == 0 {
-            1
-        } else {
-            capacity.min(Self::MAX_SHARDS)
-        };
-        let base_capacity = capacity / shard_count;
-        let extra_capacity = capacity % shard_count;
+        let shard_count = cache_shard_count(capacity);
         let mut shards = Vec::with_capacity(shard_count);
-
         for index in 0..shard_count {
             shards.push(Mutex::new(AuthCredentialCacheShard {
-                capacity: base_capacity + usize::from(index < extra_capacity),
-                ..AuthCredentialCacheShard::default()
+                cache: BoundedLruCache::with_capacity(cache_shard_capacity(
+                    capacity,
+                    shard_count,
+                    index,
+                )),
             }));
         }
 
@@ -314,18 +414,13 @@ impl AuthCredentialCache {
         }
 
         let mut shard = self.lock_shard(normalized_dn);
-        let record = shard.records.get(normalized_dn).cloned();
-        match record {
-            Some(record) => {
-                Self::touch_key(&mut shard.lru, normalized_dn);
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(record)
-            }
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+        let record = shard.cache.get_cloned(normalized_dn);
+        if record.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
+        record
     }
 
     fn insert(&self, normalized_dn: &str, record: Arc<AuthCredentialRecord>) {
@@ -334,24 +429,13 @@ impl AuthCredentialCache {
         }
 
         let mut shard = self.lock_shard(normalized_dn);
-        if shard.capacity == 0 {
-            return;
-        }
-
-        if !shard.records.contains_key(normalized_dn) && shard.records.len() == shard.capacity {
-            while let Some(oldest_key) = shard.lru.pop_front() {
-                if oldest_key == normalized_dn {
-                    continue;
-                }
-                if shard.records.remove(&oldest_key).is_some() {
-                    self.evictions.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-            }
-        }
-
-        shard.records.insert(normalized_dn.to_string(), record);
-        Self::touch_key(&mut shard.lru, normalized_dn);
+        if shard
+            .cache
+            .insert(normalized_dn.to_string(), record)
+            .is_some()
+        {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        };
     }
 
     fn invalidate(&self, normalized_dn: &str) {
@@ -360,24 +444,13 @@ impl AuthCredentialCache {
         }
 
         let mut shard = self.lock_shard(normalized_dn);
-        if shard.records.remove(normalized_dn).is_some() {
-            Self::remove_key(&mut shard.lru, normalized_dn);
-        }
+        shard.cache.remove(normalized_dn);
     }
 
     fn stats(&self) -> AuthCredentialCacheStats {
-        let mut len = 0;
-        for shard in &self.shards {
-            len += shard
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .records
-                .len();
-        }
-
         AuthCredentialCacheStats {
             capacity: self.capacity,
-            len,
+            len: self.shards.iter().map(lock_shard_len).sum(),
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
@@ -401,17 +474,168 @@ impl AuthCredentialCache {
         }
         (hash as usize) % self.shards.len()
     }
+}
 
-    fn touch_key(lru: &mut VecDeque<String>, normalized_dn: &str) {
-        Self::remove_key(lru, normalized_dn);
-        lru.push_back(normalized_dn.to_string());
+const CACHE_MAX_SHARDS: usize = 64;
+const CACHE_ENTRIES_PER_SHARD_TARGET: usize = 1024;
+
+fn cache_shard_count(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 1;
     }
 
-    fn remove_key(lru: &mut VecDeque<String>, normalized_dn: &str) {
-        if let Some(position) = lru.iter().position(|existing| existing == normalized_dn) {
-            lru.remove(position);
+    let target_shards = capacity.div_ceil(CACHE_ENTRIES_PER_SHARD_TARGET);
+    target_shards.clamp(1, CACHE_MAX_SHARDS).min(capacity)
+}
+
+fn cache_shard_capacity(capacity: usize, shard_count: usize, shard_index: usize) -> usize {
+    let base_capacity = capacity / shard_count;
+    let extra_capacity = capacity % shard_count;
+    base_capacity + usize::from(shard_index < extra_capacity)
+}
+
+fn cache_shard_index(normalized_dn: &str, shard_count: usize) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in normalized_dn.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) % shard_count
+}
+
+fn lock_shard_len<T>(shard: &Mutex<T>) -> usize
+where
+    T: CacheShardLen,
+{
+    shard
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .len()
+}
+
+trait CacheShardLen {
+    fn len(&self) -> usize;
+}
+
+impl CacheShardLen for EntryCacheShard {
+    fn len(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+impl CacheShardLen for AuthCredentialCacheShard {
+    fn len(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+#[doc(hidden)]
+pub struct LmdbEntryCacheBenchmarkHarness {
+    cache: EntryCache,
+    keys: Vec<String>,
+}
+
+impl LmdbEntryCacheBenchmarkHarness {
+    pub fn new(capacity: usize) -> Self {
+        let cache = EntryCache::new(capacity);
+        let keys = (0..capacity)
+            .map(|index| benchmark_cache_dn("entry", index))
+            .collect::<Vec<_>>();
+
+        for key in &keys {
+            cache.insert(key, Arc::new(benchmark_stored_entry(key.clone())));
         }
+
+        Self { cache, keys }
     }
+
+    pub fn get_hit(&self, index: usize) -> bool {
+        let Some(key) = self.keys.get(index % self.keys.len().max(1)) else {
+            return false;
+        };
+        self.cache.get(key).is_some()
+    }
+
+    pub fn insert_new(&self, sequence: usize) -> EntryCacheStats {
+        let dn = benchmark_cache_dn("entry-new", sequence);
+        self.cache
+            .insert(&dn, Arc::new(benchmark_stored_entry(dn.clone())));
+        self.cache.stats()
+    }
+
+    pub fn invalidate_and_reinsert(&self, index: usize) -> EntryCacheStats {
+        let Some(key) = self.keys.get(index % self.keys.len().max(1)) else {
+            return self.cache.stats();
+        };
+        self.cache.invalidate(key);
+        self.cache
+            .insert(key, Arc::new(benchmark_stored_entry(key.clone())));
+        self.cache.stats()
+    }
+}
+
+#[doc(hidden)]
+pub struct LmdbAuthCacheBenchmarkHarness {
+    cache: AuthCredentialCache,
+    keys: Vec<String>,
+}
+
+impl LmdbAuthCacheBenchmarkHarness {
+    pub fn new(capacity: usize) -> Self {
+        let cache = AuthCredentialCache::new(capacity);
+        let keys = (0..capacity)
+            .map(|index| benchmark_cache_dn("auth", index))
+            .collect::<Vec<_>>();
+
+        for (index, key) in keys.iter().enumerate() {
+            cache.insert(key, benchmark_auth_record(index));
+        }
+
+        Self { cache, keys }
+    }
+
+    pub fn get_hit(&self, index: usize) -> bool {
+        let Some(key) = self.keys.get(index % self.keys.len().max(1)) else {
+            return false;
+        };
+        self.cache.get(key).is_some()
+    }
+
+    pub fn insert_new(&self, sequence: usize) -> AuthCredentialCacheStats {
+        let dn = benchmark_cache_dn("auth-new", sequence);
+        self.cache.insert(&dn, benchmark_auth_record(sequence));
+        self.cache.stats()
+    }
+
+    pub fn invalidate_and_reinsert(&self, index: usize) -> AuthCredentialCacheStats {
+        let Some(key) = self.keys.get(index % self.keys.len().max(1)) else {
+            return self.cache.stats();
+        };
+        self.cache.invalidate(key);
+        self.cache.insert(key, benchmark_auth_record(index));
+        self.cache.stats()
+    }
+}
+
+fn benchmark_cache_dn(prefix: &str, index: usize) -> String {
+    format!("uid={prefix}-{index},ou=people,dc=example,dc=org")
+}
+
+fn benchmark_stored_entry(dn: String) -> StoredEntry {
+    StoredEntry {
+        dn,
+        attributes: HashMap::new(),
+        created_at: 0,
+        modified_at: 0,
+        operational_attributes: OperationalAttributes::default(),
+    }
+}
+
+fn benchmark_auth_record(seed: usize) -> Arc<AuthCredentialRecord> {
+    Arc::new(AuthCredentialRecord {
+        hash: [seed as u8; 64],
+        salt: vec![seed as u8],
+    })
 }
 
 impl StoredEntry {
@@ -1740,7 +1964,7 @@ impl LmdbBackend {
     }
 
     /// Get entry by DN with read transaction (optimized for concurrency)
-    fn get_entry_internal(&self, dn: &str) -> Result<Option<StoredEntry>, BackendError> {
+    fn get_entry_internal(&self, dn: &str) -> Result<Option<Arc<StoredEntry>>, BackendError> {
         let normalized_dn = Self::normalize_dn(dn);
         if let Some(entry) = self.entry_cache.get(&normalized_dn) {
             return Ok(Some(entry));
@@ -1766,8 +1990,8 @@ impl LmdbBackend {
         // Get entry data
         match txn.get(self.entries_db, &actual_dn.as_bytes()) {
             Ok(bytes) => {
-                let entry = Self::deserialize_stored_entry(bytes)?;
-                self.entry_cache.insert(entry.clone());
+                let entry = Arc::new(Self::deserialize_stored_entry(bytes)?);
+                self.entry_cache.insert(&normalized_dn, Arc::clone(&entry));
                 Ok(Some(entry))
             }
             Err(lmdb::Error::NotFound) => Ok(None),
@@ -4620,6 +4844,137 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
             )
             .unwrap();
         schema
+    }
+
+    #[test]
+    fn bounded_lru_cache_moves_hits_to_newest_and_evicts_oldest() {
+        let mut cache = BoundedLruCache::with_capacity(2);
+        assert!(cache.insert("one".to_string(), 1).is_none());
+        assert!(cache.insert("two".to_string(), 2).is_none());
+        assert_eq!(cache.get_cloned("one"), Some(1));
+
+        let evicted = cache.insert("three".to_string(), 3);
+        assert_eq!(evicted, Some(2));
+        assert_eq!(cache.get_cloned("one"), Some(1));
+        assert_eq!(cache.get_cloned("two"), None);
+        assert_eq!(cache.get_cloned("three"), Some(3));
+    }
+
+    #[test]
+    fn entry_cache_hit_returns_shared_stored_entry() {
+        let cache = EntryCache::new(8);
+        let key = "uid=shared,dc=example,dc=org";
+        let entry = Arc::new(benchmark_stored_entry(key.to_string()));
+
+        cache.insert(key, Arc::clone(&entry));
+        let cached = cache.get(key).unwrap();
+
+        assert!(Arc::ptr_eq(&entry, &cached));
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 0);
+    }
+
+    #[test]
+    fn caches_keep_capacity_zero_behavior() {
+        let entry_cache = EntryCache::new(0);
+        let key = "uid=zero,dc=example,dc=org";
+        entry_cache.insert(key, Arc::new(benchmark_stored_entry(key.to_string())));
+        assert!(entry_cache.get(key).is_none());
+        assert_eq!(
+            entry_cache.stats(),
+            EntryCacheStats {
+                capacity: 0,
+                len: 0,
+                hits: 0,
+                misses: 1,
+                evictions: 0,
+            }
+        );
+
+        let auth_cache = AuthCredentialCache::new(0);
+        auth_cache.insert(key, benchmark_auth_record(1));
+        assert!(auth_cache.get(key).is_none());
+        assert_eq!(
+            auth_cache.stats(),
+            AuthCredentialCacheStats {
+                capacity: 0,
+                len: 0,
+                hits: 0,
+                misses: 1,
+                evictions: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn entry_cache_concurrent_access_remains_bounded_and_correct() {
+        let cache = Arc::new(EntryCache::new(16_384));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+
+        for worker_id in 0..8 {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for iteration in 0..1_000 {
+                    let key = format!(
+                        "uid=entry-worker-{worker_id}-{iteration},ou=people,dc=example,dc=org"
+                    );
+                    cache.insert(&key, Arc::new(benchmark_stored_entry(key.clone())));
+                    assert!(cache.get(&key).is_some());
+                    if iteration % 3 == 0 {
+                        cache.invalidate(&key);
+                        assert!(cache.get(&key).is_none());
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let stats = cache.stats();
+        assert!(stats.len <= stats.capacity);
+        assert!(stats.hits > 0);
+        assert!(stats.misses > 0);
+    }
+
+    #[test]
+    fn auth_cache_concurrent_access_remains_bounded_and_correct() {
+        let cache = Arc::new(AuthCredentialCache::new(16_384));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+
+        for worker_id in 0..8 {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for iteration in 0..1_000 {
+                    let key = format!(
+                        "uid=auth-worker-{worker_id}-{iteration},ou=people,dc=example,dc=org"
+                    );
+                    cache.insert(&key, benchmark_auth_record(iteration));
+                    assert!(cache.get(&key).is_some());
+                    if iteration % 3 == 0 {
+                        cache.invalidate(&key);
+                        assert!(cache.get(&key).is_none());
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let stats = cache.stats();
+        assert!(stats.len <= stats.capacity);
+        assert!(stats.hits > 0);
+        assert!(stats.misses > 0);
     }
 
     #[test]
