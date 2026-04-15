@@ -20,6 +20,30 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 
+async fn drain_projected_search_stream(
+    backend: Arc<LmdbBackend>,
+    base_dn: &str,
+    scope: ldap_parser::ldap::SearchScope,
+    hint: Option<SearchCandidateHint>,
+    requested_attributes: Vec<String>,
+) -> usize {
+    let mut report = backend
+        .stream_projected_search_entries_with_hint_report(
+            black_box(base_dn),
+            black_box(scope),
+            hint,
+            requested_attributes,
+        )
+        .await
+        .unwrap();
+    let mut entries = 0usize;
+    while let Some(entry) = report.entries.recv().await {
+        black_box(entry.unwrap());
+        entries += 1;
+    }
+    black_box(entries)
+}
+
 fn setup_mock_backend() -> Arc<MockBackend> {
     let backend = Arc::new(MockBackend::default());
 
@@ -106,7 +130,11 @@ objectClasses: ( 1.3.6.1.4.1.55555.250.2 NAME 'benchmarkIndexedObject' DESC 'Ben
             100,
             1,
             IndexConfig {
-                indexed_attributes: vec!["uid".to_string(), "mail".to_string()],
+                indexed_attributes: vec![
+                    "uid".to_string(),
+                    "mail".to_string(),
+                    "objectClass".to_string(),
+                ],
                 attribute_indexes: vec![
                     AttributeIndexConfig {
                         attribute: "description".to_string(),
@@ -484,23 +512,51 @@ fn bench_lmdb_indexed_search_hints(c: &mut Criterion) {
             let backend = backend.clone();
             let hint = equality_hint.clone();
             let requested_attributes = projected_attributes.clone();
-            rt.block_on(async move {
-                let mut report = backend
-                    .stream_projected_search_entries_with_hint_report(
-                        black_box(base_dn),
-                        black_box(scope),
-                        hint,
-                        requested_attributes,
-                    )
-                    .await
-                    .unwrap();
-                let mut entries = 0usize;
-                while let Some(entry) = report.entries.recv().await {
-                    black_box(entry.unwrap());
-                    entries += 1;
-                }
-                black_box(entries);
-            })
+            rt.block_on(drain_projected_search_stream(
+                backend,
+                base_dn,
+                scope,
+                hint,
+                requested_attributes,
+            ))
+        });
+    });
+
+    let mail_hint = Some(SearchCandidateHint::Equality {
+        attribute: "mail".to_string(),
+        value: "perfbench-user-000500@example.org".to_string(),
+    });
+    group.bench_function("projected_equality_mail", |b| {
+        b.iter(|| {
+            let backend = backend.clone();
+            let hint = mail_hint.clone();
+            let requested_attributes = projected_attributes.clone();
+            rt.block_on(drain_projected_search_stream(
+                backend,
+                base_dn,
+                scope,
+                hint,
+                requested_attributes,
+            ))
+        });
+    });
+
+    let object_class_hint = Some(SearchCandidateHint::Equality {
+        attribute: "objectClass".to_string(),
+        value: "benchmarkIndexedObject".to_string(),
+    });
+    group.bench_function("projected_equality_objectClass", |b| {
+        b.iter(|| {
+            let backend = backend.clone();
+            let hint = object_class_hint.clone();
+            let requested_attributes = projected_attributes.clone();
+            rt.block_on(drain_projected_search_stream(
+                backend,
+                base_dn,
+                scope,
+                hint,
+                requested_attributes,
+            ))
         });
     });
 
