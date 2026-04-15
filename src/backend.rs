@@ -597,10 +597,17 @@ pub trait DirectoryBackend: Send + Sync {
         scope: SearchScope,
         hint: Option<SearchCandidateHint>,
     ) -> Result<SearchEntriesWithHintReport, BackendError> {
+        let fallback_reason = if hint.is_some() {
+            SearchPlanFallbackReason::IndexUnavailable
+        } else {
+            SearchPlanFallbackReason::MissingHint
+        };
         let entries = self.search_entries_with_hint(base_dn, scope, hint).await?;
         Ok(SearchEntriesWithHintReport {
             entries,
             hint_covers_filter: false,
+            plan_type: SearchPlanType::FullScan,
+            fallback_reason: Some(fallback_reason),
         })
     }
 
@@ -629,6 +636,8 @@ pub trait DirectoryBackend: Send + Sync {
         Ok(SearchEntriesStreamReport {
             entries,
             hint_covers_filter: report.hint_covers_filter,
+            plan_type: report.plan_type,
+            fallback_reason: report.fallback_reason,
         })
     }
 
@@ -658,6 +667,8 @@ pub trait DirectoryBackend: Send + Sync {
         Ok(ProjectedSearchEntriesStreamReport {
             entries,
             hint_covers_filter: report.hint_covers_filter,
+            plan_type: report.plan_type,
+            fallback_reason: report.fallback_reason,
         })
     }
 
@@ -758,10 +769,48 @@ pub enum SearchCandidateHint {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchPlanType {
+    FullScan,
+    EqualityIndex,
+    PresenceIndex,
+    SubstringIndex,
+    OrderingIndex,
+}
+
+impl SearchPlanType {
+    pub fn metric_suffix(self) -> &'static str {
+        match self {
+            SearchPlanType::FullScan => "full_scan",
+            SearchPlanType::EqualityIndex => "equality_index",
+            SearchPlanType::PresenceIndex => "presence_index",
+            SearchPlanType::SubstringIndex => "substring_index",
+            SearchPlanType::OrderingIndex => "ordering_index",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchPlanFallbackReason {
+    MissingHint,
+    IndexUnavailable,
+}
+
+impl SearchPlanFallbackReason {
+    pub fn metric_suffix(self) -> &'static str {
+        match self {
+            SearchPlanFallbackReason::MissingHint => "missing_hint",
+            SearchPlanFallbackReason::IndexUnavailable => "index_unavailable",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchEntriesWithHintReport {
     pub entries: Vec<DirectoryEntry>,
     pub hint_covers_filter: bool,
+    pub plan_type: SearchPlanType,
+    pub fallback_reason: Option<SearchPlanFallbackReason>,
 }
 
 pub type SearchEntryStreamReceiver = mpsc::Receiver<Result<DirectoryEntry, BackendError>>;
@@ -769,6 +818,8 @@ pub type SearchEntryStreamReceiver = mpsc::Receiver<Result<DirectoryEntry, Backe
 pub struct SearchEntriesStreamReport {
     pub entries: SearchEntryStreamReceiver,
     pub hint_covers_filter: bool,
+    pub plan_type: SearchPlanType,
+    pub fallback_reason: Option<SearchPlanFallbackReason>,
 }
 
 pub type ProjectedSearchEntryStreamReceiver =
@@ -777,6 +828,8 @@ pub type ProjectedSearchEntryStreamReceiver =
 pub struct ProjectedSearchEntriesStreamReport {
     pub entries: ProjectedSearchEntryStreamReceiver,
     pub hint_covers_filter: bool,
+    pub plan_type: SearchPlanType,
+    pub fallback_reason: Option<SearchPlanFallbackReason>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

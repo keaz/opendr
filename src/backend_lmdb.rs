@@ -42,8 +42,8 @@ use crate::backend::{
     DirectoryAttributeProjection, DirectoryBackend, DirectoryEntry, Modification,
     NativeModifyError, OperationalAttributes, ProjectedDirectoryEntry,
     ProjectedSearchEntriesStreamReport, SearchCandidateHint, SearchEntriesStreamReport,
-    SearchEntriesWithHintReport, SearchSubstringPart, apply_modifications_to_attributes,
-    referral_urls_from_attributes,
+    SearchEntriesWithHintReport, SearchPlanFallbackReason, SearchPlanType, SearchSubstringPart,
+    apply_modifications_to_attributes, referral_urls_from_attributes,
 };
 use crate::csn::{Csn, CsnGenerator};
 use crate::metrics::MetricsCollector;
@@ -769,6 +769,7 @@ enum SearchStreamPlan {
     Uncovered {
         base_dn: String,
         scope: SearchScope,
+        fallback_reason: SearchPlanFallbackReason,
     },
     Equality {
         base_dn: String,
@@ -804,6 +805,25 @@ impl SearchStreamPlan {
                 | SearchStreamPlan::Present { .. }
                 | SearchStreamPlan::Ordering { .. }
         )
+    }
+
+    fn plan_type(&self) -> SearchPlanType {
+        match self {
+            SearchStreamPlan::Uncovered { .. } => SearchPlanType::FullScan,
+            SearchStreamPlan::Equality { .. } => SearchPlanType::EqualityIndex,
+            SearchStreamPlan::Present { .. } => SearchPlanType::PresenceIndex,
+            SearchStreamPlan::Substring { .. } => SearchPlanType::SubstringIndex,
+            SearchStreamPlan::Ordering { .. } => SearchPlanType::OrderingIndex,
+        }
+    }
+
+    fn fallback_reason(&self) -> Option<SearchPlanFallbackReason> {
+        match self {
+            SearchStreamPlan::Uncovered {
+                fallback_reason, ..
+            } => Some(*fallback_reason),
+            _ => None,
+        }
     }
 }
 
@@ -3153,13 +3173,14 @@ impl LmdbBackend {
         scope: SearchScope,
         hint: Option<SearchCandidateHint>,
     ) -> Result<SearchStreamPlan, BackendError> {
-        let uncovered = || SearchStreamPlan::Uncovered {
+        let uncovered = |fallback_reason| SearchStreamPlan::Uncovered {
             base_dn: base_dn.to_string(),
             scope,
+            fallback_reason,
         };
 
         let Some(hint) = hint else {
-            return Ok(uncovered());
+            return Ok(uncovered(SearchPlanFallbackReason::MissingHint));
         };
 
         match hint {
@@ -3172,7 +3193,7 @@ impl LmdbBackend {
                         value,
                     })
                 } else {
-                    Ok(uncovered())
+                    Ok(uncovered(SearchPlanFallbackReason::IndexUnavailable))
                 }
             }
             SearchCandidateHint::Present { attribute } => {
@@ -3183,7 +3204,7 @@ impl LmdbBackend {
                         attribute,
                     })
                 } else {
-                    Ok(uncovered())
+                    Ok(uncovered(SearchPlanFallbackReason::IndexUnavailable))
                 }
             }
             SearchCandidateHint::Substring { attribute, parts } => {
@@ -3195,7 +3216,7 @@ impl LmdbBackend {
                         parts,
                     })
                 } else {
-                    Ok(uncovered())
+                    Ok(uncovered(SearchPlanFallbackReason::IndexUnavailable))
                 }
             }
             SearchCandidateHint::GreaterOrEqual { attribute, value } => {
@@ -3208,7 +3229,7 @@ impl LmdbBackend {
                         greater_or_equal: true,
                     })
                 } else {
-                    Ok(uncovered())
+                    Ok(uncovered(SearchPlanFallbackReason::IndexUnavailable))
                 }
             }
             SearchCandidateHint::LessOrEqual { attribute, value } => {
@@ -3221,7 +3242,7 @@ impl LmdbBackend {
                         greater_or_equal: false,
                     })
                 } else {
-                    Ok(uncovered())
+                    Ok(uncovered(SearchPlanFallbackReason::IndexUnavailable))
                 }
             }
         }
@@ -3253,7 +3274,7 @@ impl LmdbBackend {
         F: FnMut(DirectoryEntry) -> bool,
     {
         match plan {
-            SearchStreamPlan::Uncovered { base_dn, scope } => {
+            SearchStreamPlan::Uncovered { base_dn, scope, .. } => {
                 self.stream_uncovered_entries(&base_dn, scope, &mut send_entry)
             }
             SearchStreamPlan::Equality {
@@ -3441,6 +3462,7 @@ impl LmdbBackend {
                 SearchStreamPlan::Uncovered {
                     base_dn: base_dn.to_string(),
                     scope,
+                    fallback_reason: SearchPlanFallbackReason::IndexUnavailable,
                 },
                 requested_attributes,
                 send_entry,
@@ -3451,6 +3473,7 @@ impl LmdbBackend {
                 SearchStreamPlan::Uncovered {
                     base_dn: base_dn.to_string(),
                     scope,
+                    fallback_reason: SearchPlanFallbackReason::IndexUnavailable,
                 },
                 requested_attributes,
                 send_entry,
@@ -3462,6 +3485,7 @@ impl LmdbBackend {
                 SearchStreamPlan::Uncovered {
                     base_dn: base_dn.to_string(),
                     scope,
+                    fallback_reason: SearchPlanFallbackReason::IndexUnavailable,
                 },
                 requested_attributes,
                 send_entry,
@@ -4119,7 +4143,9 @@ impl LmdbBackend {
         &self,
         base_dn: &str,
         scope: SearchScope,
+        fallback_reason: SearchPlanFallbackReason,
     ) -> Result<SearchEntriesWithHintReport, BackendError> {
+        self.record_search_plan(SearchPlanType::FullScan, Some(fallback_reason));
         Ok(SearchEntriesWithHintReport {
             entries: self
                 .search_entries_internal(base_dn, scope)?
@@ -4127,6 +4153,8 @@ impl LmdbBackend {
                 .map(|entry| entry.to_directory_entry())
                 .collect(),
             hint_covers_filter: false,
+            plan_type: SearchPlanType::FullScan,
+            fallback_reason: Some(fallback_reason),
         })
     }
 
@@ -4220,6 +4248,25 @@ impl LmdbBackend {
                 stats.misses,
                 stats.evictions,
             );
+        }
+    }
+
+    fn record_search_plan(
+        &self,
+        plan_type: SearchPlanType,
+        fallback_reason: Option<SearchPlanFallbackReason>,
+    ) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.increment_counter(
+                &format!("ldap_search_plan_{}_total", plan_type.metric_suffix()),
+                1,
+            );
+            if let Some(reason) = fallback_reason {
+                metrics.increment_counter(
+                    &format!("ldap_search_full_scan_{}_total", reason.metric_suffix()),
+                    1,
+                );
+            }
         }
     }
 }
@@ -4636,7 +4683,11 @@ impl DirectoryBackend for LmdbBackend {
         hint: Option<SearchCandidateHint>,
     ) -> Result<SearchEntriesWithHintReport, BackendError> {
         let Some(hint) = hint else {
-            return self.search_entries_uncovered_report(base_dn, scope);
+            return self.search_entries_uncovered_report(
+                base_dn,
+                scope,
+                SearchPlanFallbackReason::MissingHint,
+            );
         };
 
         let txn = self
@@ -4644,37 +4695,54 @@ impl DirectoryBackend for LmdbBackend {
             .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
-        let (candidates, hint_covers_filter, dedupe_dns) = match hint {
+        let (candidates, hint_covers_filter, dedupe_dns, plan_type) = match hint {
             SearchCandidateHint::Equality { attribute, value } => {
                 let Some(candidates) = self.search_by_index_in_txn(&txn, &attribute, &value)?
                 else {
                     drop(txn);
-                    return self.search_entries_uncovered_report(base_dn, scope);
+                    return self.search_entries_uncovered_report(
+                        base_dn,
+                        scope,
+                        SearchPlanFallbackReason::IndexUnavailable,
+                    );
                 };
-                (candidates, true, false)
+                (candidates, true, false, SearchPlanType::EqualityIndex)
             }
             SearchCandidateHint::Present { attribute } => {
                 let Some(candidates) = self.search_present_by_index_in_txn(&txn, &attribute)?
                 else {
                     drop(txn);
-                    return self.search_entries_uncovered_report(base_dn, scope);
+                    return self.search_entries_uncovered_report(
+                        base_dn,
+                        scope,
+                        SearchPlanFallbackReason::IndexUnavailable,
+                    );
                 };
-                (candidates, true, false)
+                (candidates, true, false, SearchPlanType::PresenceIndex)
             }
             SearchCandidateHint::Substring { attribute, parts } => {
                 let Some(candidates) =
                     self.search_substring_by_index_in_txn(&txn, &attribute, &parts)?
                 else {
                     drop(txn);
-                    return self.search_entries_uncovered_report(base_dn, scope);
+                    return self.search_entries_uncovered_report(
+                        base_dn,
+                        scope,
+                        SearchPlanFallbackReason::IndexUnavailable,
+                    );
                 };
                 let Some(plan) = self
                     .index_plan
                     .attribute_plan_normalized(&candidates.attribute)
                 else {
                     drop(txn);
-                    return self.search_entries_uncovered_report(base_dn, scope);
+                    return self.search_entries_uncovered_report(
+                        base_dn,
+                        scope,
+                        SearchPlanFallbackReason::IndexUnavailable,
+                    );
                 };
+                self.record_search_plan(SearchPlanType::SubstringIndex, None);
                 return Ok(SearchEntriesWithHintReport {
                     entries: self.load_entries_by_dns_in_txn_filtering(
                         &txn,
@@ -4692,6 +4760,8 @@ impl DirectoryBackend for LmdbBackend {
                         },
                     )?,
                     hint_covers_filter: false,
+                    plan_type: SearchPlanType::SubstringIndex,
+                    fallback_reason: None,
                 });
             }
             SearchCandidateHint::GreaterOrEqual { attribute, value } => {
@@ -4699,21 +4769,30 @@ impl DirectoryBackend for LmdbBackend {
                     self.search_ordering_by_index_in_txn(&txn, &attribute, &value, true)?
                 else {
                     drop(txn);
-                    return self.search_entries_uncovered_report(base_dn, scope);
+                    return self.search_entries_uncovered_report(
+                        base_dn,
+                        scope,
+                        SearchPlanFallbackReason::IndexUnavailable,
+                    );
                 };
-                (candidates, true, true)
+                (candidates, true, true, SearchPlanType::OrderingIndex)
             }
             SearchCandidateHint::LessOrEqual { attribute, value } => {
                 let Some(candidates) =
                     self.search_ordering_by_index_in_txn(&txn, &attribute, &value, false)?
                 else {
                     drop(txn);
-                    return self.search_entries_uncovered_report(base_dn, scope);
+                    return self.search_entries_uncovered_report(
+                        base_dn,
+                        scope,
+                        SearchPlanFallbackReason::IndexUnavailable,
+                    );
                 };
-                (candidates, true, true)
+                (candidates, true, true, SearchPlanType::OrderingIndex)
             }
         };
 
+        self.record_search_plan(plan_type, None);
         Ok(SearchEntriesWithHintReport {
             entries: self.load_entries_by_dns_in_txn(
                 &txn,
@@ -4723,6 +4802,8 @@ impl DirectoryBackend for LmdbBackend {
                 dedupe_dns,
             )?,
             hint_covers_filter,
+            plan_type,
+            fallback_reason: None,
         })
     }
 
@@ -4738,6 +4819,9 @@ impl DirectoryBackend for LmdbBackend {
     ) -> Result<SearchEntriesStreamReport, BackendError> {
         let plan = self.search_stream_plan(base_dn, scope, hint)?;
         let hint_covers_filter = plan.hint_covers_filter();
+        let plan_type = plan.plan_type();
+        let fallback_reason = plan.fallback_reason();
+        self.record_search_plan(plan_type, fallback_reason);
         let backend = self.clone();
         let (sender, entries) = tokio::sync::mpsc::channel(128);
 
@@ -4752,6 +4836,8 @@ impl DirectoryBackend for LmdbBackend {
         Ok(SearchEntriesStreamReport {
             entries,
             hint_covers_filter,
+            plan_type,
+            fallback_reason,
         })
     }
 
@@ -4764,6 +4850,9 @@ impl DirectoryBackend for LmdbBackend {
     ) -> Result<ProjectedSearchEntriesStreamReport, BackendError> {
         let plan = self.search_stream_plan(base_dn, scope, hint)?;
         let hint_covers_filter = plan.hint_covers_filter();
+        let plan_type = plan.plan_type();
+        let fallback_reason = plan.fallback_reason();
+        self.record_search_plan(plan_type, fallback_reason);
         let backend = self.clone();
         let (sender, entries) = tokio::sync::mpsc::channel(128);
 
@@ -4781,6 +4870,8 @@ impl DirectoryBackend for LmdbBackend {
         Ok(ProjectedSearchEntriesStreamReport {
             entries,
             hint_covers_filter,
+            plan_type,
+            fallback_reason,
         })
     }
 
@@ -7298,6 +7389,8 @@ attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseEx
             .await
             .unwrap();
         assert!(equality_report.hint_covers_filter);
+        assert_eq!(equality_report.plan_type, SearchPlanType::EqualityIndex);
+        assert_eq!(equality_report.fallback_reason, None);
         assert_eq!(equality_report.entries.len(), 1);
         assert_eq!(
             equality_report.entries[0].dn,
@@ -7315,6 +7408,8 @@ attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseEx
             .await
             .unwrap();
         assert!(presence_report.hint_covers_filter);
+        assert_eq!(presence_report.plan_type, SearchPlanType::PresenceIndex);
+        assert_eq!(presence_report.fallback_reason, None);
         assert_eq!(presence_report.entries.len(), 2);
 
         let ordering_report = backend
@@ -7329,6 +7424,8 @@ attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseEx
             .await
             .unwrap();
         assert!(ordering_report.hint_covers_filter);
+        assert_eq!(ordering_report.plan_type, SearchPlanType::OrderingIndex);
+        assert_eq!(ordering_report.fallback_reason, None);
         assert_eq!(ordering_report.entries.len(), 1);
         assert_eq!(
             ordering_report.entries[0].dn,
@@ -7383,6 +7480,8 @@ attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseEx
             .await
             .unwrap();
         assert!(!substring_report.hint_covers_filter);
+        assert_eq!(substring_report.plan_type, SearchPlanType::SubstringIndex);
+        assert_eq!(substring_report.fallback_reason, None);
         assert_eq!(substring_report.entries.len(), 1);
         assert_eq!(
             substring_report.entries[0].dn,
@@ -7400,7 +7499,84 @@ attributeTypes: ( 1.3.6.1.4.1.55555.41.1 NAME 'exampleRuleShift' EQUALITY caseEx
             .await
             .unwrap();
         assert!(!fallback_report.hint_covers_filter);
+        assert_eq!(fallback_report.plan_type, SearchPlanType::FullScan);
+        assert_eq!(
+            fallback_report.fallback_reason,
+            Some(SearchPlanFallbackReason::IndexUnavailable)
+        );
         assert_eq!(fallback_report.entries.len(), 2);
+
+        let missing_hint_report = backend
+            .search_entries_with_hint_report("ou=people,dc=example,dc=org", SearchScope(2), None)
+            .await
+            .unwrap();
+        assert_eq!(missing_hint_report.plan_type, SearchPlanType::FullScan);
+        assert_eq!(
+            missing_hint_report.fallback_reason,
+            Some(SearchPlanFallbackReason::MissingHint)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_plan_metrics_record_index_and_full_scan_paths() {
+        let dir = tempdir().unwrap();
+        let mut backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+        let metrics = MetricsCollector::new();
+        backend.set_metrics(Some(metrics.clone()));
+
+        let mut attributes = HashMap::new();
+        attributes.insert("cn".to_string(), vec!["Alice".to_string()]);
+        attributes.insert("description".to_string(), vec!["fixture".to_string()]);
+        backend
+            .add_entry(
+                DirectoryEntry::new("uid=alice,ou=people,dc=example,dc=org", attributes),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        backend
+            .search_entries_with_hint_report(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Equality {
+                    attribute: "cn".to_string(),
+                    value: "alice".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        backend
+            .search_entries_with_hint_report(
+                "ou=people,dc=example,dc=org",
+                SearchScope(2),
+                Some(SearchCandidateHint::Present {
+                    attribute: "description".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        backend
+            .search_entries_with_hint_report("ou=people,dc=example,dc=org", SearchScope(2), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            metrics.get_counter("ldap_search_plan_equality_index_total"),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.get_counter("ldap_search_plan_full_scan_total"),
+            Some(2)
+        );
+        assert_eq!(
+            metrics.get_counter("ldap_search_full_scan_index_unavailable_total"),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.get_counter("ldap_search_full_scan_missing_hint_total"),
+            Some(1)
+        );
     }
 
     #[tokio::test]

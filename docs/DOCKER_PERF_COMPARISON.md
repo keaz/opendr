@@ -80,6 +80,15 @@ server. The flag is disabled by default; when enabled, the server writes
 `operation=lmdb_get_entry phase=deserialize`, and
 `operation=lmdb_authenticate phase=password_lookup`.
 
+Search-plan guardrail counters are emitted when metrics are enabled. For the
+10M hot path, expected indexed probes should increment
+`ldap_search_plan_equality_index_total`, `ldap_search_plan_presence_index_total`,
+`ldap_search_plan_substring_index_total`, or `ldap_search_plan_ordering_index_total`.
+Unexpected growth in `ldap_search_plan_full_scan_total`,
+`ldap_search_full_scan_missing_hint_total`, or
+`ldap_search_full_scan_index_unavailable_total` means a benchmark probe fell back
+to a full LMDB scan and should be fixed before comparing throughput.
+
 Run the full 10M profile manually only when validating a completed perf issue or
 release candidate. The expected resource envelope is 8 CPU cores, 30 GiB memory,
 a large LMDB map, optimized `perf` build flags, and enough disk for a 10M LMDB

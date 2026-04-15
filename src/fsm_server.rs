@@ -6118,6 +6118,20 @@ mod tests {
             Ok(crate::backend::SearchEntriesStreamReport {
                 entries: receiver,
                 hint_covers_filter,
+                plan_type: match hint.as_ref() {
+                    Some(SearchCandidateHint::Equality { .. }) => {
+                        crate::backend::SearchPlanType::EqualityIndex
+                    }
+                    Some(SearchCandidateHint::Present { .. }) => {
+                        crate::backend::SearchPlanType::PresenceIndex
+                    }
+                    _ => crate::backend::SearchPlanType::FullScan,
+                },
+                fallback_reason: (!hint_covers_filter).then_some(if hint.is_some() {
+                    crate::backend::SearchPlanFallbackReason::IndexUnavailable
+                } else {
+                    crate::backend::SearchPlanFallbackReason::MissingHint
+                }),
             })
         }
 
@@ -6157,6 +6171,16 @@ mod tests {
             Ok(crate::backend::ProjectedSearchEntriesStreamReport {
                 entries: receiver,
                 hint_covers_filter,
+                plan_type: if hint_covers_filter {
+                    crate::backend::SearchPlanType::EqualityIndex
+                } else {
+                    crate::backend::SearchPlanType::FullScan
+                },
+                fallback_reason: (!hint_covers_filter).then_some(if hint.is_some() {
+                    crate::backend::SearchPlanFallbackReason::IndexUnavailable
+                } else {
+                    crate::backend::SearchPlanFallbackReason::MissingHint
+                }),
             })
         }
 
