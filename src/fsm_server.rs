@@ -23,6 +23,7 @@ use tokio::time::sleep;
 
 use crate::aci::Permission;
 use crate::audit::{AuditEventType, AuditLevel};
+use crate::auth_metadata::AuthMetadataRecorder;
 use crate::backend::{DirectoryBackend, DirectoryEntry, OperationalAttributes};
 use crate::backend_adapters::{
     AllowAllCompareAccessControl, AllowAllWriteAciChecker, CompareBackendAdapter,
@@ -81,9 +82,9 @@ use crate::server::{
     log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
     log_password_modify_audit_event, log_sasl_bind, log_simple_bind_failure,
     log_simple_bind_success, online_schema_update_result, parse_sync_request_control,
-    record_authentication_failure_metadata, record_authentication_success_metadata,
-    referral_urls_for_entry, reject_sync_request, resolve_search_base_dn,
-    resolve_search_candidate_entry, schema_snapshot,
+    record_authentication_failure_metadata_with_context,
+    record_authentication_success_metadata_with_context, referral_urls_for_entry,
+    reject_sync_request, resolve_search_base_dn, resolve_search_candidate_entry, schema_snapshot,
     server_managed_operational_attribute_diagnostic, shared_schema,
 };
 use crate::shutdown::ShutdownCoordinator;
@@ -134,6 +135,7 @@ pub struct FsmServerRuntimeContext {
     pub metrics: Option<Arc<MetricsCollector>>,
     pub security: Option<Arc<LegacySecurityConfig>>,
     pub tls_handler: Option<Arc<RustlsTlsHandler>>,
+    pub auth_metadata: Option<AuthMetadataRecorder>,
 }
 
 impl FsmServerRuntimeContext {
@@ -144,6 +146,7 @@ impl FsmServerRuntimeContext {
             self.security.clone(),
             self.metrics.clone(),
         )
+        .with_auth_metadata(self.auth_metadata.clone())
     }
 
     fn boxed_tls_handler(&self) -> Option<Box<dyn TlsHandler>> {
@@ -5098,7 +5101,8 @@ async fn handle_bind_with_fsm(
                                 if let Some(bound_dn) =
                                     fsm_set.authenticated_dn().map(str::to_string)
                                 {
-                                    record_authentication_success_metadata(
+                                    record_authentication_success_metadata_with_context(
+                                        request_context,
                                         backend.as_ref(),
                                         &bound_dn,
                                     )
@@ -5110,7 +5114,12 @@ async fn handle_bind_with_fsm(
                                 if let Some(metrics) = metrics {
                                     metrics.record_fsm_state(FsmType::Auth, "anonymous");
                                 }
-                                record_authentication_failure_metadata(backend.as_ref(), &dn).await;
+                                record_authentication_failure_metadata_with_context(
+                                    request_context,
+                                    backend.as_ref(),
+                                    &dn,
+                                )
+                                .await;
                                 log_simple_bind_failure(
                                     request_context,
                                     &dn,
@@ -5301,7 +5310,12 @@ async fn handle_sasl_bind_with_fsm(
                 if let Some(metrics) = metrics {
                     metrics.record_fsm_state(FsmType::Auth, "sasl_bound");
                 }
-                record_authentication_success_metadata(backend.as_ref(), &bind_dn).await;
+                record_authentication_success_metadata_with_context(
+                    request_context,
+                    backend.as_ref(),
+                    &bind_dn,
+                )
+                .await;
                 log_sasl_bind(request_context, bind_dn.as_str(), "PLAIN", true, None).await;
                 send_bind_success(fsm_set, message_id).await?;
             }
@@ -5309,7 +5323,12 @@ async fn handle_sasl_bind_with_fsm(
                 if let Some(metrics) = metrics {
                     metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
                 }
-                record_authentication_failure_metadata(backend.as_ref(), &bind_dn).await;
+                record_authentication_failure_metadata_with_context(
+                    request_context,
+                    backend.as_ref(),
+                    &bind_dn,
+                )
+                .await;
                 log_sasl_bind(
                     request_context,
                     bind_dn.as_str(),

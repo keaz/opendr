@@ -52,6 +52,11 @@ OPENDR_MAX_MEMORY_PER_CONNECTION="${OPENDR_MAX_MEMORY_PER_CONNECTION:-10485760}"
 OPENDR_MAX_TOTAL_MEMORY="${OPENDR_MAX_TOTAL_MEMORY:-2147483648}"
 OPENDR_WORKER_THREADS="${OPENDR_WORKER_THREADS:-0}"
 OPENDR_CACHE_SIZE="${OPENDR_CACHE_SIZE:-1000}"
+OPENDR_AUTH_METADATA_UPDATE_MODE="${OPENDR_AUTH_METADATA_UPDATE_MODE:-sync}"
+OPENDR_AUTH_METADATA_QUEUE_CAPACITY="${OPENDR_AUTH_METADATA_QUEUE_CAPACITY:-100000}"
+OPENDR_AUTH_METADATA_FLUSH_INTERVAL_MS="${OPENDR_AUTH_METADATA_FLUSH_INTERVAL_MS:-100}"
+OPENDR_AUTH_METADATA_BATCH_SIZE="${OPENDR_AUTH_METADATA_BATCH_SIZE:-1000}"
+OPENDR_AUTH_METADATA_OVERFLOW_POLICY="${OPENDR_AUTH_METADATA_OVERFLOW_POLICY:-fallback_sync}"
 OPENDR_LOG_LEVEL="${OPENDR_LOG_LEVEL:-info}"
 OPENDR_BUILD_CARGO_PROFILE="${OPENDR_BUILD_CARGO_PROFILE:-release}"
 OPENDR_BUILD_RUSTFLAGS="${OPENDR_BUILD_RUSTFLAGS:-}"
@@ -153,6 +158,16 @@ Options:
                           OpenDR Tokio worker threads, 0 means runtime default
   --opendr-cache-size N
                           OpenDR exact DN and credential cache capacity
+  --opendr-auth-metadata-update-mode VALUE
+                          OpenDR auth metadata mode: sync, async_coalesced, or disabled
+  --opendr-auth-metadata-queue-capacity N
+                          OpenDR async auth metadata queue capacity
+  --opendr-auth-metadata-flush-interval-ms N
+                          OpenDR async auth metadata flush interval in milliseconds
+  --opendr-auth-metadata-batch-size N
+                          OpenDR async auth metadata batch size
+  --opendr-auth-metadata-overflow-policy VALUE
+                          OpenDR async auth metadata overflow policy: fallback_sync, block, or drop_with_metric
   --opendr-log-level LEVEL
                           OpenDR Docker log level (default: info)
   --opendr-build-profile VALUE
@@ -364,6 +379,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --opendr-cache-size)
       OPENDR_CACHE_SIZE="$2"
+      shift 2
+      ;;
+    --opendr-auth-metadata-update-mode)
+      OPENDR_AUTH_METADATA_UPDATE_MODE="$2"
+      shift 2
+      ;;
+    --opendr-auth-metadata-queue-capacity)
+      OPENDR_AUTH_METADATA_QUEUE_CAPACITY="$2"
+      shift 2
+      ;;
+    --opendr-auth-metadata-flush-interval-ms)
+      OPENDR_AUTH_METADATA_FLUSH_INTERVAL_MS="$2"
+      shift 2
+      ;;
+    --opendr-auth-metadata-batch-size)
+      OPENDR_AUTH_METADATA_BATCH_SIZE="$2"
+      shift 2
+      ;;
+    --opendr-auth-metadata-overflow-policy)
+      OPENDR_AUTH_METADATA_OVERFLOW_POLICY="$2"
       shift 2
       ;;
     --opendr-log-level)
@@ -961,6 +996,11 @@ write_run_metadata() {
   "opendr_max_total_memory": ${OPENDR_MAX_TOTAL_MEMORY},
   "opendr_worker_threads": ${OPENDR_WORKER_THREADS},
   "opendr_cache_size": ${OPENDR_CACHE_SIZE},
+  "opendr_auth_metadata_update_mode": "${OPENDR_AUTH_METADATA_UPDATE_MODE}",
+  "opendr_auth_metadata_queue_capacity": ${OPENDR_AUTH_METADATA_QUEUE_CAPACITY},
+  "opendr_auth_metadata_flush_interval_ms": ${OPENDR_AUTH_METADATA_FLUSH_INTERVAL_MS},
+  "opendr_auth_metadata_batch_size": ${OPENDR_AUTH_METADATA_BATCH_SIZE},
+  "opendr_auth_metadata_overflow_policy": "${OPENDR_AUTH_METADATA_OVERFLOW_POLICY}",
   "opendr_log_level": "${OPENDR_LOG_LEVEL}",
   "opendr_build_cargo_profile": "${OPENDR_BUILD_CARGO_PROFILE}",
   "opendr_build_rustflags": "${OPENDR_BUILD_RUSTFLAGS}",
@@ -1249,6 +1289,11 @@ EOF
         -e OPENDR_MAX_TOTAL_MEMORY="${OPENDR_MAX_TOTAL_MEMORY}" \
         -e OPENDR_WORKER_THREADS="${OPENDR_WORKER_THREADS}" \
         -e OPENDR_CACHE_SIZE="${OPENDR_CACHE_SIZE}" \
+        -e OPENDR_AUTH_METADATA_UPDATE_MODE="${OPENDR_AUTH_METADATA_UPDATE_MODE}" \
+        -e OPENDR_AUTH_METADATA_QUEUE_CAPACITY="${OPENDR_AUTH_METADATA_QUEUE_CAPACITY}" \
+        -e OPENDR_AUTH_METADATA_FLUSH_INTERVAL_MS="${OPENDR_AUTH_METADATA_FLUSH_INTERVAL_MS}" \
+        -e OPENDR_AUTH_METADATA_BATCH_SIZE="${OPENDR_AUTH_METADATA_BATCH_SIZE}" \
+        -e OPENDR_AUTH_METADATA_OVERFLOW_POLICY="${OPENDR_AUTH_METADATA_OVERFLOW_POLICY}" \
         -e OPENDR_LOG_LEVEL="${OPENDR_LOG_LEVEL}" \
         -e OPENDR_BACKEND_INDEXES_TOML="${OPENDR_BACKEND_INDEXES_TOML}" \
         -e OPENDR_SCHEMA_LDIF="${OPENDR_SCHEMA_LDIF}" \

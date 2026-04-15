@@ -239,6 +239,27 @@ pub enum BackendError {
     Storage(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationOutcome {
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationMetadataUpdate {
+    pub dn: String,
+    pub outcome: AuthenticationOutcome,
+}
+
+impl AuthenticationMetadataUpdate {
+    pub fn new(dn: impl Into<String>, outcome: AuthenticationOutcome) -> Self {
+        Self {
+            dn: dn.into(),
+            outcome,
+        }
+    }
+}
+
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -265,6 +286,27 @@ pub trait DirectoryBackend: Send + Sync {
     async fn record_authentication_failure(&self, dn: &str) -> Result<bool, BackendError> {
         let _ = dn;
         Ok(false)
+    }
+
+    async fn record_authentication_updates(
+        &self,
+        updates: &[AuthenticationMetadataUpdate],
+    ) -> Result<usize, BackendError> {
+        let mut written = 0usize;
+        for update in updates {
+            let updated = match update.outcome {
+                AuthenticationOutcome::Success => {
+                    self.record_authentication_success(&update.dn).await?
+                }
+                AuthenticationOutcome::Failure => {
+                    self.record_authentication_failure(&update.dn).await?
+                }
+            };
+            if updated {
+                written += 1;
+            }
+        }
+        Ok(written)
     }
 
     async fn replace_operational_attributes(

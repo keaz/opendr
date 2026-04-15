@@ -6,6 +6,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use opendr::aci::AciEngine;
 use opendr::audit::{AuditConfig, AuditFormat, AuditLevel, AuditLogger};
+use opendr::auth_metadata::AuthMetadataRecorder;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::{AttributeIndexConfig, IndexConfig, IndexType, LmdbBackend};
 use opendr::config::ServerConfig;
@@ -386,6 +387,8 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
 
     // Get the backend to use (wrapped with changelog if provider enabled)
     let backend = replication_service.backend();
+    let auth_metadata_recorder =
+        AuthMetadataRecorder::new(backend.clone(), config.to_auth_metadata_config());
 
     // Start replication provider if enabled
     let provider_handle = match replication_service.start_provider(shutdown.clone()).await {
@@ -496,7 +499,8 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
     let ldaps_bind_addr = config.ldaps_bind_address();
     println!("Starting LDAP server on {}", bind_addr);
     let fsm_server_config = config.to_fsm_server_config();
-    let legacy_server_config = server::LegacyServerConfig::from_server_config(&config);
+    let mut legacy_server_config = server::LegacyServerConfig::from_server_config(&config);
+    legacy_server_config.auth_metadata = Some(auth_metadata_recorder.clone());
     let legacy_security_config = build_legacy_security_config(&config).await?;
     let tls_handler = if config.tls.enabled {
         let min_tls_version = match config.tls.min_tls_version.as_str() {
@@ -540,6 +544,7 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
         metrics: monitoring_metrics.clone(),
         security: legacy_security_config.clone(),
         tls_handler: tls_handler.clone(),
+        auth_metadata: Some(auth_metadata_recorder.clone()),
     };
     let ldap_tls_handler = tls_handler.clone();
     let ldap_security = legacy_security_config.clone();
@@ -594,6 +599,7 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
                 metrics: monitoring_metrics.clone(),
                 security: legacy_security_config.clone(),
                 tls_handler: Some(tls_handler.clone()),
+                auth_metadata: Some(auth_metadata_recorder.clone()),
             };
             let ldaps_security = legacy_security_config.clone();
             let ldaps_runtime = config.server.runtime.clone();
@@ -670,6 +676,8 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
             Err(e) => eprintln!("Monitoring task error: {}", e),
         }
     }
+
+    auth_metadata_recorder.shutdown().await;
 
     // Wait for replication provider to finish if it was started
     if let Some(handle) = provider_handle {

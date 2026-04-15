@@ -1777,6 +1777,14 @@ struct LdapConWorkerResult {
     failures: usize,
 }
 
+struct LdapConOperationContext<'a> {
+    preloaded_users: usize,
+    name_prefix: &'a str,
+    users_ou_dn: &'a str,
+    user_password: &'a str,
+    operation_timeout: Duration,
+}
+
 async fn run_ldapcon_search_benchmark(
     args: &Args,
     dns: &ScenarioDns,
@@ -1836,6 +1844,13 @@ async fn run_ldapcon_single_operation_benchmark(
         let warmup_iterations = args.ldapcon_warmup_iterations;
 
         handles.push(tokio::spawn(async move {
+            let operation_context = LdapConOperationContext {
+                preloaded_users,
+                name_prefix: &name_prefix,
+                users_ou_dn: &users_ou_dn,
+                user_password: &user_password,
+                operation_timeout,
+            };
             let mut ldap =
                 match connect_with_timeout(&url, starttls, insecure, operation_timeout).await {
                     Ok(ldap) => ldap,
@@ -1869,11 +1884,7 @@ async fn run_ldapcon_single_operation_benchmark(
                     &mut ldap,
                     operation,
                     global_attempt,
-                    preloaded_users,
-                    &name_prefix,
-                    &users_ou_dn,
-                    &user_password,
-                    operation_timeout,
+                    &operation_context,
                 )
                 .await
                 {
@@ -1909,11 +1920,7 @@ async fn run_ldapcon_single_operation_benchmark(
                     &mut ldap,
                     operation,
                     global_attempt,
-                    preloaded_users,
-                    &name_prefix,
-                    &users_ou_dn,
-                    &user_password,
-                    operation_timeout,
+                    &operation_context,
                 )
                 .await
                 {
@@ -2041,6 +2048,13 @@ async fn run_ldapcon_mixed_benchmark(
         let write_percent = args.ldapcon_mixed_write_percent;
 
         handles.push(tokio::spawn(async move {
+            let operation_context = LdapConOperationContext {
+                preloaded_users,
+                name_prefix: &name_prefix,
+                users_ou_dn: &users_ou_dn,
+                user_password: "",
+                operation_timeout,
+            };
             let mut ldap =
                 match connect_with_timeout(&url, starttls, insecure, operation_timeout).await {
                     Ok(ldap) => ldap,
@@ -2084,11 +2098,7 @@ async fn run_ldapcon_mixed_benchmark(
                     &mut ldap,
                     operation,
                     global_attempt,
-                    preloaded_users,
-                    &name_prefix,
-                    &users_ou_dn,
-                    "",
-                    operation_timeout,
+                    &operation_context,
                 )
                 .await
                 {
@@ -2138,11 +2148,7 @@ async fn run_ldapcon_mixed_benchmark(
                     &mut ldap,
                     operation,
                     global_attempt,
-                    preloaded_users,
-                    &name_prefix,
-                    &users_ou_dn,
-                    "",
-                    operation_timeout,
+                    &operation_context,
                 )
                 .await;
                 let latency = elapsed_ms(started.elapsed().as_secs_f64());
@@ -2282,23 +2288,25 @@ async fn run_ldapcon_operation_once(
     ldap: &mut Ldap,
     operation: LdapConOperation,
     global_attempt: usize,
-    preloaded_users: usize,
-    name_prefix: &str,
-    users_ou_dn: &str,
-    user_password: &str,
-    operation_timeout: Duration,
+    context: &LdapConOperationContext<'_>,
 ) -> bool {
-    let user_index = global_attempt % preloaded_users;
-    let uid = ldapcon_user_uid(name_prefix, user_index);
-    let dn = ldapcon_user_dn(&uid, users_ou_dn);
+    let user_index = global_attempt % context.preloaded_users;
+    let uid = ldapcon_user_uid(context.name_prefix, user_index);
+    let dn = ldapcon_user_dn(&uid, context.users_ou_dn);
 
     match operation {
         LdapConOperation::Search => {
-            ldapcon_search_matches_with_timeout(ldap, users_ou_dn, &uid, &dn, operation_timeout)
-                .await
+            ldapcon_search_matches_with_timeout(
+                ldap,
+                context.users_ou_dn,
+                &uid,
+                &dn,
+                context.operation_timeout,
+            )
+            .await
         }
         LdapConOperation::Auth => {
-            simple_bind_with_timeout(ldap, &dn, user_password, operation_timeout)
+            simple_bind_with_timeout(ldap, &dn, context.user_password, context.operation_timeout)
                 .await
                 .is_ok()
         }
@@ -2307,7 +2315,7 @@ async fn run_ldapcon_operation_once(
                 ldap,
                 &dn,
                 &format!("LDAPCon modify attempt {global_attempt}"),
-                operation_timeout,
+                context.operation_timeout,
             )
             .await
         }
@@ -3050,7 +3058,7 @@ async fn add_preloaded_user(
 }
 
 fn report_preload_progress(loaded: usize, count: usize) {
-    if count >= 100_000 && (loaded % 100_000 == 0 || loaded == count) {
+    if count >= 100_000 && (loaded.is_multiple_of(100_000) || loaded == count) {
         progress(&format!("fixture.preload.{loaded}of{count}"));
     }
 }

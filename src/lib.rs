@@ -1,6 +1,7 @@
 pub mod aci;
 pub mod audit;
 pub mod auth_fsm;
+pub mod auth_metadata;
 pub mod backend;
 pub mod backend_adapters;
 pub mod backend_changelog_wrapper;

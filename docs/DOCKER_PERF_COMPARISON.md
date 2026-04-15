@@ -13,8 +13,95 @@ This document records the current Dockerized OpenDR and OpenDJ benchmark baselin
 - Cache hit/miss metrics were not captured for these artifacts because the Docker perf harness disables the monitoring endpoint and samples container CPU/memory only.
 - The 1M-user OpenDR run used a `16 GiB` LMDB map. The default `1 GiB` Docker map filled around 300k users.
 - The 1M-user concurrency artifact covers simple-bind and SASL PLAIN auth concurrency. It does not include index-concurrency probes because the preserved 1M fixture was loaded without benchmark ordering attributes.
-- A completed OpenDR-only 10M-user LDAPCon-style artifact is recorded below. It is the current 10M OpenDR baseline for public LDAPCon comparisons.
+- A completed OpenDR-only 10M-user LDAPCon-style artifact is recorded below. The original synchronous-auth-metadata run is the historical 10M baseline; the async-auth-metadata run is the current targeted result for issue #131.
 - There is still no completed 10M-user OpenDR-vs-OpenDJ benchmark artifact in this repository.
+
+## Targeted 10M LDAPCon-Style Auth Metadata Run
+
+Artifact root: `target/perf/opendr-auth-metadata-async-10m-8cpu-30g-20260415-102258/`
+
+This run reused the existing 10M LDAPCon-style LMDB fixture and targeted the
+issue #131 optimization: bind success/failure metadata is no longer written in
+the bind hot path when `auth_metadata.update_mode = "async_coalesced"`. The
+server still queues account metadata updates for a background writer; clean
+shutdown drains the queue, while a forced container removal can lose in-memory
+queued metadata events.
+
+Configuration:
+
+| Setting | Value |
+|---|---:|
+| Fixture users | `10000000` |
+| Benchmark-record count after setup | `10000005` |
+| CPU limit | `8` |
+| Memory limit | `30g` |
+| LMDB map size | `343597383680` bytes |
+| LMDB max readers | `4096` |
+| OpenDR runtime | `fsm` |
+| Tokio worker threads | `8` |
+| OpenDR cache size | `50000` |
+| Max connections | `4096` |
+| Max connections per IP | `4096` |
+| Max operations per connection | `200` |
+| Max total tracked connection memory | `30000000000` bytes |
+| Auth metadata mode | `async_coalesced` |
+| Auth metadata queue capacity | `2000000` |
+| Auth metadata flush interval | `50` ms |
+| Auth metadata batch size | `5000` |
+| Auth metadata overflow policy | `fallback_sync` |
+| Build profile | `perf` |
+| Build RUSTFLAGS | `-C target-cpu=native` |
+| Build profile flags | `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`, `debug = false`, `incremental = false` |
+| LDAPCon-style client levels | `8,128,256,1000` |
+| Operations per client and operation family | `100` |
+| Warmup operations per client | `5` |
+| Per-operation timeout | `10000` ms |
+
+Run summary:
+
+| Metric | Result |
+|---|---:|
+| Total benchmark client runtime | `73,190.208` ms |
+| Server CPU avg / max | `44.22%` / `207.11%` |
+| Server memory avg / max | `310.50 MiB` / `395.30 MiB` |
+| Server memory limit | `30.00 GiB` |
+
+LDAPCon auth result:
+
+| Auth row | Attempts | Successes | Failure % | Success ops/s | Mean ms | P95 ms | P99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `ldapcon_auth_c8` | 800 | 800 | 0.00% | 13,919.54 | 0.552 | 1.100 | 1.329 |
+| `ldapcon_auth_c128` | 12,800 | 12,800 | 0.00% | 15,833.10 | 7.857 | 13.818 | 17.273 |
+| `ldapcon_auth_c256` | 25,600 | 24,700 | 3.52% | 12,066.33 | 19.809 | 40.696 | 52.593 |
+| `ldapcon_auth_c1000` | 100,000 | 24,700 | 75.30% | 11,445.83 | 21.197 | 32.708 | 35.250 |
+
+Auth improvement versus the synchronous-auth-metadata 10M baseline:
+
+| Auth row | Old mean ms | New mean ms | Mean speedup | Old success ops/s | New success ops/s | Success ops/s speedup | Old failure % | New failure % |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ldapcon_auth_c8` | 4.950 | 0.552 | 8.97x | 1,605.49 | 13,919.54 | 8.67x | 0.00% | 0.00% |
+| `ldapcon_auth_c128` | 71.027 | 7.857 | 9.04x | 1,596.99 | 15,833.10 | 9.91x | 10.94% | 0.00% |
+| `ldapcon_auth_c256` | 63.512 | 19.809 | 3.21x | 1,284.70 | 12,066.33 | 9.39x | 67.97% | 3.52% |
+| `ldapcon_auth_c1000` | 95.397 | 21.197 | 4.50x | 1,200.05 | 11,445.83 | 9.54x | 88.50% | 75.30% |
+
+Comparison against the public LDAPCon 2013 OpenLDAP LMDB auth row:
+
+| OpenDR row | OpenDR success ops/s | OpenLDAP LMDB public auth ops/s | Difference |
+|---|---:|---:|---:|
+| `ldapcon_auth_c8` | 13,919.54 | 16,942 | -17.8% |
+| `ldapcon_auth_c128` | 15,833.10 | 16,942 | -6.5% |
+| `ldapcon_auth_c256` | 12,066.33 | 16,942 | -28.8% |
+
+Interpretation:
+
+- The issue #131 path removes the LMDB metadata write from the bind response
+  path and improves clean `c8` auth throughput by 8.67x.
+- The clean `c128` auth row is now close to the public LDAPCon OpenLDAP LMDB
+  auth row, but it is still 6.5% below that public result.
+- The `c256` and `c1000` rows are saturation data, not clean sustained-capacity
+  claims, because they still include failures under this harness.
+- Modify rows remain write-bound and are not improved by this auth-specific
+  change.
 
 ## Completed 10M LDAPCon-Style OpenDR Run
 

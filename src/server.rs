@@ -25,6 +25,7 @@ use tokio_rustls::server::TlsStream;
 
 use crate::aci::{AciEngine, Permission};
 use crate::audit::{AuditEvent, AuditEventType, AuditLevel, AuditLogger};
+use crate::auth_metadata::AuthMetadataRecorder;
 #[cfg(test)]
 use crate::backend::SearchCandidateHint;
 use crate::backend::{
@@ -378,6 +379,7 @@ pub struct LegacyServerConfig {
     pub resource_limits: ResourceLimits,
     pub rate_limit_config: RateLimitConfig,
     pub rate_limiting_enabled: bool,
+    pub auth_metadata: Option<AuthMetadataRecorder>,
     pub naming_contexts: Vec<String>,
     pub subschema_dn: String,
     pub schema_dir: PathBuf,
@@ -390,6 +392,7 @@ impl Default for LegacyServerConfig {
             resource_limits: ResourceLimits::default(),
             rate_limit_config: RateLimitConfig::default(),
             rate_limiting_enabled: true,
+            auth_metadata: None,
             naming_contexts: Vec::new(),
             subschema_dn: SUBSCHEMA_DN.to_string(),
             schema_dir: PathBuf::from("config/schema"),
@@ -411,6 +414,7 @@ impl LegacyServerConfig {
             },
             rate_limit_config: config.to_rate_limit_config(),
             rate_limiting_enabled: config.rate_limit.enabled,
+            auth_metadata: None,
             naming_contexts: vec![config.server.base_dn.clone()],
             subschema_dn: SUBSCHEMA_DN.to_string(),
             schema_dir: config.schema.schema_dir.clone(),
@@ -461,6 +465,7 @@ pub(crate) struct RequestContext {
     session_id: Option<ConnectionId>,
     security: Option<Arc<LegacySecurityConfig>>,
     metrics: Option<Arc<MetricsCollector>>,
+    auth_metadata: Option<AuthMetadataRecorder>,
 }
 
 impl RequestContext {
@@ -475,7 +480,16 @@ impl RequestContext {
             session_id,
             security,
             metrics,
+            auth_metadata: None,
         }
+    }
+
+    pub(crate) fn with_auth_metadata(
+        mut self,
+        auth_metadata: Option<AuthMetadataRecorder>,
+    ) -> Self {
+        self.auth_metadata = auth_metadata;
+        self
     }
 }
 
@@ -835,6 +849,7 @@ async fn run_plain_listener(
                         session_id: Some(conn_id),
                         security: security.clone(),
                         metrics: metrics.clone(),
+                        auth_metadata: connection_runtime_config.auth_metadata.clone(),
                     };
                     handle_client_with_metrics_and_tls(
                         ConnectionStream::plain(socket),
@@ -1041,6 +1056,7 @@ pub async fn run_tls_with_metrics_and_config_and_security_and_shared_schema(
                         session_id: Some(conn_id),
                         security: security.clone(),
                         metrics: metrics.clone(),
+                        auth_metadata: connection_runtime_config.auth_metadata.clone(),
                     };
                     handle_client_with_metrics_and_tls(
                         ConnectionStream::tls(tls_stream),
@@ -2529,6 +2545,18 @@ pub(crate) async fn record_authentication_success_metadata(
     }
 }
 
+pub(crate) async fn record_authentication_success_metadata_with_context(
+    request_context: &RequestContext,
+    backend: &dyn DirectoryBackend,
+    user_dn: &str,
+) {
+    if let Some(recorder) = request_context.auth_metadata.as_ref() {
+        recorder.record_success(user_dn).await;
+    } else {
+        record_authentication_success_metadata(backend, user_dn).await;
+    }
+}
+
 pub(crate) async fn record_authentication_failure_metadata(
     backend: &dyn DirectoryBackend,
     user_dn: &str,
@@ -2538,6 +2566,18 @@ pub(crate) async fn record_authentication_failure_metadata(
             "Failed to update account authentication failure metadata for {}: {}",
             user_dn, err
         );
+    }
+}
+
+pub(crate) async fn record_authentication_failure_metadata_with_context(
+    request_context: &RequestContext,
+    backend: &dyn DirectoryBackend,
+    user_dn: &str,
+) {
+    if let Some(recorder) = request_context.auth_metadata.as_ref() {
+        recorder.record_failure(user_dn).await;
+    } else {
+        record_authentication_failure_metadata(backend, user_dn).await;
     }
 }
 
@@ -2863,7 +2903,8 @@ async fn handle_bind_request_with_session_and_context(
             match backend.authenticate(&dn, password.as_ref()).await {
                 Ok(true) => {
                     session.bind(dn);
-                    record_authentication_success_metadata(
+                    record_authentication_success_metadata_with_context(
+                        request_context,
                         backend,
                         session.bound_dn().unwrap_or(""),
                     )
@@ -2877,7 +2918,12 @@ async fn handle_bind_request_with_session_and_context(
                 }
                 Ok(false) => {
                     session.clear();
-                    record_authentication_failure_metadata(backend, &dn).await;
+                    record_authentication_failure_metadata_with_context(
+                        request_context,
+                        backend,
+                        &dn,
+                    )
+                    .await;
                     log_simple_bind_failure(request_context, &dn, "invalid credentials").await;
                     send_bind_response(
                         socket,
@@ -3010,13 +3056,23 @@ async fn handle_bind_request_with_session_and_context(
             match backend.authenticate(&bind_dn, parsed.password).await {
                 Ok(true) => {
                     session.bind(bind_dn.clone());
-                    record_authentication_success_metadata(backend, &bind_dn).await;
+                    record_authentication_success_metadata_with_context(
+                        request_context,
+                        backend,
+                        &bind_dn,
+                    )
+                    .await;
                     log_sasl_bind(request_context, &bind_dn, "PLAIN", true, None).await;
                     send_bind_success(socket, message_id).await?;
                 }
                 Ok(false) => {
                     session.clear();
-                    record_authentication_failure_metadata(backend, &bind_dn).await;
+                    record_authentication_failure_metadata_with_context(
+                        request_context,
+                        backend,
+                        &bind_dn,
+                    )
+                    .await;
                     log_sasl_bind(
                         request_context,
                         &bind_dn,
@@ -8540,6 +8596,7 @@ mod tests {
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
             })),
             metrics: None,
+            auth_metadata: None,
         };
 
         let mut session = ConnectionSession::default();
@@ -8598,6 +8655,7 @@ mod tests {
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
             })),
             metrics: None,
+            auth_metadata: None,
         };
         let mut session = ConnectionSession::default();
         session.bind("cn=user,dc=example,dc=org".to_string());

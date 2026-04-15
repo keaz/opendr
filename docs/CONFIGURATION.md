@@ -379,6 +379,36 @@ Each rule target sets one of `dn`, `subtree`, or `attributes`, or combines
 `attributes` with `dn` or `subtree`. Each subject sets exactly one of `user`,
 `group`, `all_authenticated`, `all`, or `self_entry`.
 
+## Auth Metadata
+
+```toml
+[auth_metadata]
+update_mode = "sync"
+queue_capacity = 100000
+flush_interval_ms = 100
+batch_size = 1000
+overflow_policy = "fallback_sync"
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `update_mode` | `sync` | `sync`, `async_coalesced`, or `disabled` |
+| `queue_capacity` | `100000` | Async event queue capacity |
+| `flush_interval_ms` | `100` | Maximum async flush interval |
+| `batch_size` | `1000` | Maximum queued updates applied per flush |
+| `overflow_policy` | `fallback_sync` | `fallback_sync`, `block`, or `drop_with_metric` |
+
+`sync` preserves existing behavior: successful and failed bind metadata is
+written before the bind response is sent. `async_coalesced` records bind
+metadata through a background writer and is intended for high-throughput
+profiles where login metadata can be eventually durable. `disabled` skips these
+metadata writes and is primarily useful for isolating raw authentication
+throughput in benchmarks.
+
+The async writer drains queued events on clean shutdown. A process crash can
+lose in-memory queued metadata events, so use `sync` when bind-response-before-
+metadata-commit semantics are required.
+
 ## Schema
 
 ```toml

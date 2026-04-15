@@ -38,8 +38,9 @@ use sha2::{Digest, Sha512};
 use tokio::sync::RwLock;
 
 use crate::backend::{
-    BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
-    OperationalAttributes, SearchCandidateHint, SearchEntriesWithHintReport, SearchSubstringPart,
+    AuthenticationMetadataUpdate, AuthenticationOutcome, BackendError, DirectoryBackend,
+    DirectoryEntry, Modification, ModifyOperation, OperationalAttributes, SearchCandidateHint,
+    SearchEntriesWithHintReport, SearchSubstringPart,
 };
 use crate::csn::{Csn, CsnGenerator};
 use crate::metrics::MetricsCollector;
@@ -3086,6 +3087,99 @@ impl DirectoryBackend for LmdbBackend {
             .await
     }
 
+    async fn record_authentication_updates(
+        &self,
+        updates: &[AuthenticationMetadataUpdate],
+    ) -> Result<usize, BackendError> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let _lock = self.write_lock.write().await;
+        let mut txn = self
+            .env
+            .begin_rw_txn()
+            .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
+
+        let mut changed_dns = Vec::new();
+        let mut last_csn = None;
+        let mut written = 0usize;
+
+        for update in updates {
+            let normalized_dn = Self::normalize_dn(&update.dn);
+            let actual_dn = match txn.get(self.dn_index_db, &normalized_dn.as_bytes()) {
+                Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                Err(lmdb::Error::NotFound) => continue,
+                Err(e) => return Err(BackendError::Storage(format!("DN lookup failed: {}", e))),
+            };
+            let entry_bytes = match txn.get(self.entries_db, &actual_dn.as_bytes()) {
+                Ok(bytes) => bytes,
+                Err(lmdb::Error::NotFound) => {
+                    return Err(BackendError::Storage(format!(
+                        "DN index references missing entry: {actual_dn}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(BackendError::Storage(format!("Failed to get entry: {}", e)));
+                }
+            };
+            let mut entry = Self::deserialize_stored_entry(entry_bytes)?;
+
+            let csn = self.csn_generator.generate();
+            let changed = match update.outcome {
+                AuthenticationOutcome::Success => entry
+                    .operational_attributes
+                    .record_successful_login(csn.clone()),
+                AuthenticationOutcome::Failure => entry
+                    .operational_attributes
+                    .record_failed_login(csn.clone()),
+            };
+            if !changed {
+                continue;
+            }
+
+            entry.modified_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let entry_bytes = bincode::serialize(&entry)
+                .map_err(|e| BackendError::Storage(format!("Failed to serialize entry: {}", e)))?;
+            txn.put(
+                self.entries_db,
+                &actual_dn.as_bytes(),
+                &entry_bytes,
+                WriteFlags::empty(),
+            )
+            .map_err(|e| BackendError::Storage(format!("Failed to write entry: {}", e)))?;
+
+            changed_dns.push(normalized_dn);
+            last_csn = Some(csn);
+            written += 1;
+        }
+
+        let Some(csn) = last_csn else {
+            return Ok(0);
+        };
+
+        let csn_string = csn.to_ldap_string();
+        txn.put(
+            self.metadata_db,
+            &b"context_csn",
+            &csn_string.as_bytes(),
+            WriteFlags::empty(),
+        )
+        .map_err(|e| BackendError::Storage(format!("Failed to update contextCSN: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
+
+        for normalized_dn in changed_dns {
+            self.entry_cache.invalidate(&normalized_dn);
+        }
+
+        Ok(written)
+    }
+
     async fn replace_operational_attributes(
         &self,
         dn: &str,
@@ -3509,6 +3603,38 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
             .unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().dn, "cn=test,dc=example,dc=org");
+    }
+
+    #[tokio::test]
+    async fn test_lmdb_record_authentication_updates_batches_events() {
+        let dir = tempdir().unwrap();
+        let backend = LmdbBackend::new(dir.path(), 100, 1).unwrap();
+        let dn = "cn=batch-auth,dc=example,dc=org";
+
+        let mut attributes = HashMap::new();
+        attributes.insert("objectClass".to_string(), vec!["person".to_string()]);
+        attributes.insert("cn".to_string(), vec!["batch-auth".to_string()]);
+        let entry = DirectoryEntry::new(dn, attributes);
+
+        backend
+            .add_entry(entry, b"password".to_vec())
+            .await
+            .unwrap();
+
+        let written = backend
+            .record_authentication_updates(&[
+                AuthenticationMetadataUpdate::new(dn, AuthenticationOutcome::Failure),
+                AuthenticationMetadataUpdate::new(dn, AuthenticationOutcome::Success),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(written, 2);
+        let entry = backend.get_entry(dn).await.unwrap().unwrap();
+        assert!(entry.operational_attributes.last_failed_login.is_some());
+        assert!(entry.operational_attributes.last_successful_login.is_some());
+        assert_eq!(entry.operational_attributes.failed_login_count, Some(0));
+        assert!(backend.get_context_csn().await.unwrap().is_some());
     }
 
     #[tokio::test]

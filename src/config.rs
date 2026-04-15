@@ -97,6 +97,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub access_control: AccessControlSettings,
 
+    /// Account authentication metadata write settings
+    #[serde(default)]
+    pub auth_metadata: AuthMetadataSettings,
+
     /// Performance tuning settings
     #[serde(default)]
     pub performance: PerformanceSettings,
@@ -579,6 +583,30 @@ pub struct AccessControlSettings {
     pub rules_file: Option<PathBuf>,
 }
 
+/// Account authentication metadata write settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthMetadataSettings {
+    /// Metadata update mode: "sync", "async_coalesced", or "disabled".
+    #[serde(default = "default_auth_metadata_update_mode")]
+    pub update_mode: String,
+
+    /// Async metadata queue capacity.
+    #[serde(default = "default_auth_metadata_queue_capacity")]
+    pub queue_capacity: usize,
+
+    /// Async metadata flush interval in milliseconds.
+    #[serde(default = "default_auth_metadata_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+
+    /// Maximum queued updates to apply per background flush.
+    #[serde(default = "default_auth_metadata_batch_size")]
+    pub batch_size: usize,
+
+    /// Queue overflow policy: "fallback_sync", "block", or "drop_with_metric".
+    #[serde(default = "default_auth_metadata_overflow_policy")]
+    pub overflow_policy: String,
+}
+
 /// Performance tuning settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceSettings {
@@ -842,6 +870,26 @@ fn default_access_policy() -> String {
     "deny".to_string()
 }
 
+fn default_auth_metadata_update_mode() -> String {
+    "sync".to_string()
+}
+
+fn default_auth_metadata_queue_capacity() -> usize {
+    100_000
+}
+
+fn default_auth_metadata_flush_interval_ms() -> u64 {
+    100
+}
+
+fn default_auth_metadata_batch_size() -> usize {
+    1_000
+}
+
+fn default_auth_metadata_overflow_policy() -> String {
+    "fallback_sync".to_string()
+}
+
 fn default_cache_size() -> usize {
     1000
 }
@@ -925,6 +973,18 @@ impl Default for ResourceSettings {
             max_memory_per_connection: default_max_memory_per_connection(),
             max_total_memory: default_max_total_memory(),
             connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
+        }
+    }
+}
+
+impl Default for AuthMetadataSettings {
+    fn default() -> Self {
+        Self {
+            update_mode: default_auth_metadata_update_mode(),
+            queue_capacity: default_auth_metadata_queue_capacity(),
+            flush_interval_ms: default_auth_metadata_flush_interval_ms(),
+            batch_size: default_auth_metadata_batch_size(),
+            overflow_policy: default_auth_metadata_overflow_policy(),
         }
     }
 }
@@ -1424,6 +1484,32 @@ impl ServerConfig {
         }
     }
 
+    /// Convert to runtime account authentication metadata writer config.
+    pub fn to_auth_metadata_config(&self) -> crate::auth_metadata::AuthMetadataConfig {
+        use crate::auth_metadata::{
+            AuthMetadataConfig, AuthMetadataOverflowPolicy, AuthMetadataUpdateMode,
+        };
+
+        let update_mode = match self.auth_metadata.update_mode.as_str() {
+            "async_coalesced" => AuthMetadataUpdateMode::AsyncCoalesced,
+            "disabled" => AuthMetadataUpdateMode::Disabled,
+            _ => AuthMetadataUpdateMode::Sync,
+        };
+        let overflow_policy = match self.auth_metadata.overflow_policy.as_str() {
+            "block" => AuthMetadataOverflowPolicy::Block,
+            "drop_with_metric" => AuthMetadataOverflowPolicy::DropWithMetric,
+            _ => AuthMetadataOverflowPolicy::FallbackSync,
+        };
+
+        AuthMetadataConfig {
+            update_mode,
+            queue_capacity: self.auth_metadata.queue_capacity,
+            flush_interval: Duration::from_millis(self.auth_metadata.flush_interval_ms),
+            batch_size: self.auth_metadata.batch_size,
+            overflow_policy,
+        }
+    }
+
     /// Get LDAP bind address
     pub fn ldap_bind_address(&self) -> String {
         format!("{}:{}", self.server.bind_address, self.server.ldap_port)
@@ -1624,6 +1710,38 @@ impl ServerConfig {
                     ConfigError::ValidationError(format!("Invalid whitelist IP: {}", ip))
                 })?;
             }
+        }
+
+        if !["sync", "async_coalesced", "disabled"]
+            .contains(&self.auth_metadata.update_mode.as_str())
+        {
+            return Err(ConfigError::ValidationError(format!(
+                "auth_metadata.update_mode must be one of: sync, async_coalesced, disabled (got {})",
+                self.auth_metadata.update_mode
+            )));
+        }
+        if self.auth_metadata.queue_capacity == 0 {
+            return Err(ConfigError::ValidationError(
+                "auth_metadata.queue_capacity must be > 0".to_string(),
+            ));
+        }
+        if self.auth_metadata.flush_interval_ms == 0 {
+            return Err(ConfigError::ValidationError(
+                "auth_metadata.flush_interval_ms must be > 0".to_string(),
+            ));
+        }
+        if self.auth_metadata.batch_size == 0 {
+            return Err(ConfigError::ValidationError(
+                "auth_metadata.batch_size must be > 0".to_string(),
+            ));
+        }
+        if !["fallback_sync", "block", "drop_with_metric"]
+            .contains(&self.auth_metadata.overflow_policy.as_str())
+        {
+            return Err(ConfigError::ValidationError(format!(
+                "auth_metadata.overflow_policy must be one of: fallback_sync, block, drop_with_metric (got {})",
+                self.auth_metadata.overflow_policy
+            )));
         }
 
         // Validate replication settings
