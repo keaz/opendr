@@ -3,6 +3,7 @@
 //! This module provides an adapter between the write FSM's SchemaValidator trait
 //! and the LdapSchema implementation. It handles LDIF parsing and validation.
 
+use crate::dn::parse_rdn;
 use crate::schema::LdapSchema;
 use crate::write_fsm::{Modification, SchemaValidator, WriteEntry};
 use async_trait::async_trait;
@@ -139,21 +140,15 @@ impl SchemaValidator for LdapSchemaValidator {
         new_rdn: &str,
         _new_superior: Option<&str>,
     ) -> Result<(), String> {
-        // Validate RDN format: attribute=value
-        if !new_rdn.contains('=') {
-            return Err("Invalid RDN format: must be attribute=value".to_string());
-        }
+        let rdn = parse_rdn(new_rdn).map_err(|err| format!("Invalid RDN format: {}", err))?;
 
-        let parts: Vec<&str> = new_rdn.split('=').collect();
-        if parts.len() != 2 {
-            return Err("Invalid RDN format: must be attribute=value".to_string());
-        }
-
-        let attr_name = parts[0].trim();
-
-        // Check if the attribute exists in schema
-        if self.schema.get_attribute_type(attr_name).is_none() {
-            return Err(format!("Unknown attribute type in RDN: {}", attr_name));
+        for ava in rdn.avas() {
+            if self.schema.get_attribute_type(ava.attribute()).is_none() {
+                return Err(format!(
+                    "Unknown attribute type in RDN: {}",
+                    ava.attribute()
+                ));
+            }
         }
 
         Ok(())

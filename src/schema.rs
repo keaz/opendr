@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::dn::{canonicalize_dn, parse_rdn};
+
 /// LDAP Schema containing attribute types and object classes
 #[derive(Debug, Clone)]
 pub struct LdapSchema {
@@ -1735,13 +1737,18 @@ impl LdapSchema {
         attributes: &HashMap<String, Vec<String>>,
         new_rdn: &str,
     ) -> Result<(), SchemaError> {
-        let (rdn_attr, _) = new_rdn.split_once('=').ok_or_else(|| {
-            SchemaError::NamingViolation("RDN must be attribute=value".to_string())
-        })?;
-        let rdn_attr = rdn_attr.trim();
-        if self.get_attribute_type(rdn_attr).is_none() {
-            return Err(SchemaError::AttributeNotFound(rdn_attr.to_string()));
+        let rdn = parse_rdn(new_rdn)
+            .map_err(|err| SchemaError::NamingViolation(format!("Invalid RDN syntax: {}", err)))?;
+        for ava in rdn.avas() {
+            if self.get_attribute_type(ava.attribute()).is_none() {
+                return Err(SchemaError::AttributeNotFound(ava.attribute().to_string()));
+            }
         }
+        let rdn_attr = rdn
+            .avas()
+            .first()
+            .map(|ava| ava.attribute())
+            .ok_or_else(|| SchemaError::NamingViolation("RDN must not be empty".to_string()))?;
 
         let object_classes = attributes
             .get("objectclass")
@@ -1931,9 +1938,8 @@ impl LdapSchema {
         let is_valid = match syntax_oid {
             // Boolean
             "1.3.6.1.4.1.1466.115.121.1.7" => value == "TRUE" || value == "FALSE",
-            // Distinguished Name. This is a conservative structural check; full
-            // DN parsing is still handled by LDAP request parsing paths.
-            "1.3.6.1.4.1.1466.115.121.1.12" => value.contains('='),
+            // Distinguished Name.
+            "1.3.6.1.4.1.1466.115.121.1.12" => canonicalize_dn(value).is_ok(),
             // Directory String
             "1.3.6.1.4.1.1466.115.121.1.15" => !value.is_empty(),
             // Generalized Time: YYYYMMDDHHMMSSZ.
@@ -2439,7 +2445,8 @@ fn normalize_matching_rule_value(
         | SupportedMatchingRuleKind::GeneralizedTimeOrdering => {
             normalize_generalized_time_for_rule(rule, value)
         }
-        SupportedMatchingRuleKind::DistinguishedName => Ok(normalize_dn_value_for_matching(value)),
+        SupportedMatchingRuleKind::DistinguishedName => normalize_dn_value_for_matching(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
         SupportedMatchingRuleKind::ObjectIdentifier => {
             let normalized = value.trim();
             if !is_valid_oid_or_descriptor(normalized) {
@@ -2581,13 +2588,8 @@ fn normalize_generalized_time_for_rule(
     }
 }
 
-fn normalize_dn_value_for_matching(value: &str) -> String {
-    value
-        .split(',')
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join(",")
-        .to_ascii_lowercase()
+fn normalize_dn_value_for_matching(value: &str) -> Result<String, String> {
+    canonicalize_dn(value).map_err(|err| err.to_string())
 }
 
 fn invalid_matching_syntax(

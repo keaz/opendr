@@ -1316,7 +1316,7 @@ userPassword: {{SSHA512}}{}
 description: Root Administrator Account
 "#,
             config.root_user_dn,
-            extract_cn(&config.root_user_dn).unwrap_or("Directory Manager"),
+            extract_cn(&config.root_user_dn).unwrap_or_else(|| "Directory Manager".to_string()),
             password_hash
         );
 
@@ -1528,8 +1528,16 @@ description: Standard users group
 }
 
 /// Extract CN from DN
-fn extract_cn(dn: &str) -> Option<&str> {
-    dn.split(',').next()?.split('=').nth(1)
+fn extract_cn(dn: &str) -> Option<String> {
+    let parsed = crate::dn::parse_dn(dn).ok()?;
+    parsed
+        .rdns()
+        .first()?
+        .avas()
+        .iter()
+        .find(|ava| ava.attribute().eq_ignore_ascii_case("cn"))
+        .or_else(|| parsed.rdns().first()?.avas().first())
+        .map(|ava| ava.value().to_string())
 }
 
 fn replication_password_source_summary(config: &ConsumerConfig) -> &'static str {
@@ -1546,17 +1554,13 @@ fn replication_password_source_summary(config: &ConsumerConfig) -> &'static str 
 
 /// Parse DN into components
 fn parse_dn(dn: &str) -> Result<Vec<(String, String)>, String> {
-    let mut components = Vec::new();
-
-    for part in dn.split(',') {
-        let kv: Vec<&str> = part.trim().splitn(2, '=').collect();
-        if kv.len() != 2 {
-            return Err(format!("Invalid DN component: {}", part));
-        }
-        components.push((kv[0].trim().to_string(), kv[1].trim().to_string()));
-    }
-
-    Ok(components)
+    let parsed = crate::dn::parse_dn(dn).map_err(|err| err.to_string())?;
+    Ok(parsed
+        .rdns()
+        .iter()
+        .filter_map(|rdn| rdn.avas().first())
+        .map(|ava| (ava.attribute().to_string(), ava.value().to_string()))
+        .collect())
 }
 
 #[cfg(test)]
@@ -1847,10 +1851,13 @@ mod tests {
 
     #[test]
     fn test_extract_cn() {
-        assert_eq!(extract_cn("cn=admin,dc=example,dc=com"), Some("admin"));
+        assert_eq!(
+            extract_cn("cn=admin,dc=example,dc=com"),
+            Some("admin".to_string())
+        );
         assert_eq!(
             extract_cn("uid=user,ou=people,dc=example,dc=com"),
-            Some("user")
+            Some("user".to_string())
         );
     }
 

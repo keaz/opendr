@@ -1,4 +1,8 @@
 use crate::backend::{DirectoryEntry, SearchCandidateHint, SearchSubstringPart};
+use crate::dn::{
+    dn_attribute_values as parsed_dn_attribute_values, dn_eq, dn_is_descendant_or_equal,
+    replace_dn_rdn,
+};
 use crate::replication::RenameChange;
 use crate::replication_provider_fsm::{ChangeType, ChangelogEntry};
 use crate::schema::{LdapSchema, MatchingRuleError, ResolvedMatchingRule};
@@ -267,7 +271,7 @@ pub(crate) fn prepare_change(
             let rename = serde_json::from_slice::<RenameChange>(&change.change_data)
                 .map_err(|e| format!("invalid rename change payload for {}: {}", change.dn, e))?;
             let target_dn =
-                rename_target_dn(&change.dn, &rename.new_rdn, rename.new_superior.as_deref());
+                rename_target_dn(&change.dn, &rename.new_rdn, rename.new_superior.as_deref())?;
 
             Ok(PreparedChange {
                 change_type: ChangeType::Rename,
@@ -280,21 +284,7 @@ pub(crate) fn prepare_change(
 }
 
 pub(crate) fn is_dn_in_scope(dn: &str, base_dn: &str) -> bool {
-    if dn == base_dn {
-        return true;
-    }
-
-    let dn_lower = dn.to_lowercase();
-    let base_dn_lower = base_dn.to_lowercase();
-
-    if dn_lower.ends_with(&base_dn_lower) {
-        let prefix_len = dn_lower.len() - base_dn_lower.len();
-        if prefix_len > 0 {
-            return &dn_lower[prefix_len - 1..prefix_len] == ",";
-        }
-    }
-
-    false
+    dn_is_descendant_or_equal(dn, base_dn)
 }
 
 impl PreparedChange {
@@ -1233,14 +1223,8 @@ fn deserialize_entry(change: &ChangelogEntry) -> Result<DirectoryEntry, String> 
     })
 }
 
-fn rename_target_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {
-    if let Some(superior) = new_superior {
-        format!("{new_rdn},{superior}")
-    } else if let Some((_, rest)) = dn.split_once(',') {
-        format!("{new_rdn},{rest}")
-    } else {
-        new_rdn.to_string()
-    }
+fn rename_target_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> Result<String, String> {
+    replace_dn_rdn(dn, new_rdn, new_superior).map_err(|err| err.to_string())
 }
 
 fn parse_substrings_sequence(
@@ -1487,9 +1471,7 @@ fn extensible_value_matches(candidate: &str, assertion: &str, matching_rule: Opt
         Some("caseignorematch") | Some("2.5.13.2") => {
             candidate.to_lowercase() == assertion.to_lowercase()
         }
-        Some("distinguishednamematch") | Some("2.5.13.1") => {
-            normalize_dn_value(candidate) == normalize_dn_value(assertion)
-        }
+        Some("distinguishednamematch") | Some("2.5.13.1") => dn_eq(candidate, assertion),
         Some("integermatch") | Some("2.5.13.14") => {
             let candidate = candidate.trim().parse::<i64>();
             let assertion = assertion.trim().parse::<i64>();
@@ -1504,25 +1486,7 @@ fn extensible_value_matches(candidate: &str, assertion: &str, matching_rule: Opt
 }
 
 fn dn_attribute_values(dn: &str, attribute: Option<&str>) -> Vec<String> {
-    dn.split(',')
-        .flat_map(|rdn| rdn.split('+'))
-        .filter_map(|ava| {
-            let (name, value) = ava.split_once('=')?;
-            match attribute {
-                Some(attribute) if !name.trim().eq_ignore_ascii_case(attribute) => None,
-                _ => Some(value.trim().to_string()),
-            }
-        })
-        .collect()
-}
-
-fn normalize_dn_value(value: &str) -> String {
-    value
-        .split(',')
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join(",")
-        .to_ascii_lowercase()
+    parsed_dn_attribute_values(dn, attribute).unwrap_or_default()
 }
 
 fn substring_matches(value: &str, parts: &[SubstringPart]) -> bool {
@@ -1849,6 +1813,34 @@ attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMa
                     Some(&compile_filter("(cn=alice)").unwrap())
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn prepare_change_handles_rename_scope_with_escaped_dn_components() {
+        let rename = RenameChange {
+            new_rdn: r"cn=Jane\+Doe".to_string(),
+            delete_old: true,
+            new_superior: Some("ou=People,dc=example,dc=com".to_string()),
+            actor_dn: None,
+        };
+        let change = ChangelogEntry::new(
+            Csn::new(1),
+            ChangeType::Rename,
+            r"cn=Doe\, John,ou=Staging,dc=example,dc=com".to_string(),
+            serde_json::to_vec(&rename).unwrap(),
+        );
+        let prepared = prepare_change(&change, false).unwrap();
+
+        assert!(
+            prepared
+                .matches(r"cn=jane\2Bdoe,ou=people,dc=example,dc=com", None)
+                .unwrap()
+        );
+        assert!(
+            prepared
+                .matches(r"ou=staging,dc=example,dc=com", None)
+                .unwrap()
         );
     }
 }

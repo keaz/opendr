@@ -82,7 +82,7 @@ use crate::server::{
     LegacyServerConfig, PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError,
     SharedLdapSchema, SyncRequestError, apply_online_schema_modify,
     authorize_attribute_permissions, authorize_operation, build_entry_from_add_request,
-    can_skip_search_post_filter, compute_new_dn, convert_ldap_changes_to_modifications,
+    can_skip_search_post_filter, convert_ldap_changes_to_modifications,
     entry_is_referral as directory_entry_is_referral, filter_search_entries_for_read_access,
     first_server_managed_operational_attribute, handle_sync_search_request,
     increment_control_counter, log_add_audit_event, log_anonymous_bind, log_compare_audit,
@@ -4404,7 +4404,20 @@ async fn handle_moddn_request_with_fsm_runtime(
         .newsuperior
         .map(|sup| sup.0.into_owned())
         .filter(|sup| !sup.is_empty());
-    let new_dn = compute_new_dn(&dn, &new_rdn, new_superior.as_deref());
+    let new_dn = match crate::dn::replace_dn_rdn(&dn, &new_rdn, new_superior.as_deref()) {
+        Ok(new_dn) => new_dn,
+        Err(err) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::InvalidDnSyntax,
+                &format!("invalid DN syntax: {}", err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     let authorized = {
         let stream = fsm_set
@@ -4894,6 +4907,7 @@ fn map_backend_error_code(err: &crate::backend::BackendError) -> ResultCode {
     match err {
         crate::backend::BackendError::AlreadyExists => ResultCode::EntryAlreadyExists,
         crate::backend::BackendError::NotFound => ResultCode::NoSuchObject,
+        crate::backend::BackendError::InvalidDn(_) => ResultCode::InvalidDnSyntax,
         crate::backend::BackendError::Storage(_) => ResultCode::Unavailable,
     }
 }
@@ -4911,6 +4925,7 @@ fn backend_diagnostic(err: &crate::backend::BackendError) -> &'static str {
     match err {
         crate::backend::BackendError::AlreadyExists => "entry already exists",
         crate::backend::BackendError::NotFound => "no such object",
+        crate::backend::BackendError::InvalidDn(_) => "invalid DN syntax",
         crate::backend::BackendError::Storage(_) => "backend failure",
     }
 }

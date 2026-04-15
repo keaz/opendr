@@ -20,6 +20,7 @@ pub mod connection_pool;
 pub mod consumer_persist_mode;
 pub mod csn;
 pub mod data;
+pub mod dn;
 pub mod extended_op_fsm;
 pub mod extended_ops;
 pub mod fsm;

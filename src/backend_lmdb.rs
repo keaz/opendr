@@ -47,6 +47,9 @@ use crate::backend::{
     apply_modifications_to_attributes, referral_urls_from_attributes,
 };
 use crate::csn::{Csn, CsnGenerator};
+use crate::dn::{
+    LdapDn, canonicalize_dn, dn_is_in_scope, parse_dn, rdn_attribute_values, replace_dn_rdn,
+};
 use crate::metrics::MetricsCollector;
 use crate::perf_profile::PerfPhase;
 use crate::schema::{LdapSchema, ResolvedMatchingRule};
@@ -97,6 +100,14 @@ struct StoredEntry {
     /// Operational attributes (entryCSN, timestamps, etc.)
     #[serde(default)]
     pub operational_attributes: crate::backend::OperationalAttributes,
+}
+
+struct DnRenamePlan {
+    entry_id: u64,
+    old_dn: String,
+    new_dn: String,
+    old_normalized_dn: String,
+    new_normalized_dn: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1129,6 +1140,37 @@ fn ldap_attribute_key(attribute: &str) -> Cow<'_, str> {
     }
 }
 
+fn update_entry_rdn_attributes(
+    entry: &mut DirectoryEntry,
+    old_dn: &str,
+    new_rdn: &str,
+    delete_old: bool,
+) {
+    if delete_old
+        && let Some(old_rdn) = parse_dn(old_dn)
+            .ok()
+            .and_then(|dn| dn.rdns().first().cloned())
+    {
+        for ava in old_rdn.avas() {
+            let attr = ldap_attribute_key(ava.attribute()).into_owned();
+            if let Some(values) = entry.attributes.get_mut(&attr) {
+                values.retain(|candidate| candidate != ava.value());
+                if values.is_empty() {
+                    entry.attributes.remove(&attr);
+                }
+            }
+        }
+    }
+
+    for (attribute, value) in rdn_attribute_values(new_rdn).unwrap_or_default() {
+        let attr = ldap_attribute_key(&attribute).into_owned();
+        let values = entry.attributes.entry(attr).or_default();
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+}
+
 /// LMDB-based persistent backend optimized for read performance
 #[derive(Clone)]
 pub struct LmdbBackend {
@@ -1436,7 +1478,7 @@ impl LmdbBackend {
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
-        let normalized_dn = Self::normalize_dn(&entry.dn);
+        let normalized_dn = Self::normalize_dn(&entry.dn)?;
 
         if Self::entry_id_for_normalized_dn(
             &txn,
@@ -1552,7 +1594,7 @@ impl LmdbBackend {
                     break;
                 };
 
-                let normalized_dn = Self::normalize_dn(&entry.dn);
+                let normalized_dn = Self::normalize_dn(&entry.dn)?;
                 if Self::entry_id_for_normalized_dn(
                     &txn,
                     self.entry_id_by_normalized_dn_db,
@@ -1705,7 +1747,7 @@ impl LmdbBackend {
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn).map_err(NativeModifyError::Backend)?;
         let entry_id = match Self::entry_id_for_normalized_dn(
             &txn,
             self.entry_id_by_normalized_dn_db,
@@ -1839,7 +1881,7 @@ impl LmdbBackend {
             .env
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
         let entry_id = match Self::entry_id_for_normalized_dn(
             &txn,
             self.entry_id_by_normalized_dn_db,
@@ -1848,7 +1890,6 @@ impl LmdbBackend {
             Some(entry_id) => entry_id,
             None => return Err(BackendError::NotFound),
         };
-        let entry_id_bytes = Self::entry_id_bytes(entry_id);
         let entry = Self::required_entry_by_id(
             &txn,
             self.entries_by_entry_id_db,
@@ -1856,21 +1897,16 @@ impl LmdbBackend {
             entry_id,
         )?;
 
-        let new_dn = if let Some(superior) = new_superior {
-            format!("{},{}", new_rdn, superior)
-        } else if let Some((_, rest)) = entry.dn.split_once(',') {
-            format!("{},{}", new_rdn, rest)
-        } else {
-            new_rdn.to_string()
-        };
-        let normalized_new_dn = Self::normalize_dn(&new_dn);
+        let new_dn = replace_dn_rdn(&entry.dn, new_rdn, new_superior.as_deref())
+            .map_err(|err| BackendError::InvalidDn(err.to_string()))?;
+        let normalized_new_dn = Self::normalize_dn(&new_dn)?;
 
         if Self::entry_id_for_normalized_dn(
             &txn,
             self.entry_id_by_normalized_dn_db,
             &normalized_new_dn,
         )?
-        .is_some()
+        .is_some_and(|existing_entry_id| existing_entry_id != entry_id)
         {
             return Err(BackendError::AlreadyExists);
         }
@@ -1880,62 +1916,72 @@ impl LmdbBackend {
             .unwrap()
             .as_secs();
         let csn = self.csn_generator.generate();
-
-        let mut new_entry = entry.to_directory_entry();
-        new_entry.dn = new_dn.clone();
-        new_entry
-            .operational_attributes
-            .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
-
-        if delete_old && let Some((attr, _)) = entry.dn.split_once('=') {
-            let attr = ldap_attribute_key(attr.trim());
-            new_entry.attributes.remove(attr.as_ref());
-        }
-
-        if let Some((attr, val)) = new_rdn.split_once('=') {
-            let attr_lower = ldap_attribute_key(attr.trim()).into_owned();
-            let val_str = val.trim().to_string();
-            new_entry
-                .attributes
-                .entry(attr_lower)
-                .or_default()
-                .push(val_str);
-        }
-        let new_stored_entry = StoredEntry {
-            dn: new_dn.clone(),
-            attributes: new_entry.attributes.clone(),
-            created_at: entry.created_at,
-            modified_at: now,
-            operational_attributes: new_entry.operational_attributes,
-        };
-        self.remove_attribute_indexes(&mut txn, entry_id, &entry.attributes)?;
-        txn.del(
-            self.entry_id_by_normalized_dn_db,
-            &normalized_dn.as_bytes(),
-            None,
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to delete entry id index: {}", e)))?;
-        txn.put(
-            self.entry_id_by_normalized_dn_db,
-            &normalized_new_dn.as_bytes(),
-            &entry_id_bytes,
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to update entry id index: {}", e)))?;
-        txn.put(
+        let plans = Self::plan_dn_renames_in_txn(
+            &txn,
             self.dn_by_entry_id_db,
-            &entry_id_bytes,
-            &new_dn.as_bytes(),
-            WriteFlags::empty(),
-        )
-        .map_err(|e| BackendError::Storage(format!("Failed to update entry id DN: {}", e)))?;
-        Self::put_entry_by_id(
-            &mut txn,
-            self.entries_by_entry_id_db,
-            entry_id,
-            &new_stored_entry,
+            self.entry_id_by_normalized_dn_db,
+            &entry.dn,
+            &new_dn,
         )?;
-        self.update_attribute_indexes(&mut txn, entry_id, &new_stored_entry.attributes)?;
+
+        for plan in &plans {
+            let entry_id_bytes = Self::entry_id_bytes(plan.entry_id);
+            let stored_entry = Self::required_entry_by_id(
+                &txn,
+                self.entries_by_entry_id_db,
+                self.dn_by_entry_id_db,
+                plan.entry_id,
+            )?;
+            let mut new_entry = stored_entry.to_directory_entry();
+            new_entry.dn = plan.new_dn.clone();
+            new_entry
+                .operational_attributes
+                .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
+
+            if plan.entry_id == entry_id {
+                update_entry_rdn_attributes(&mut new_entry, &plan.old_dn, new_rdn, delete_old);
+            }
+
+            let new_stored_entry = StoredEntry {
+                dn: plan.new_dn.clone(),
+                attributes: new_entry.attributes.clone(),
+                created_at: stored_entry.created_at,
+                modified_at: now,
+                operational_attributes: new_entry.operational_attributes,
+            };
+            self.remove_attribute_indexes(&mut txn, plan.entry_id, &stored_entry.attributes)?;
+            txn.del(
+                self.entry_id_by_normalized_dn_db,
+                &plan.old_normalized_dn.as_bytes(),
+                None,
+            )
+            .map_err(|e| {
+                BackendError::Storage(format!("Failed to delete entry id index: {}", e))
+            })?;
+            txn.put(
+                self.entry_id_by_normalized_dn_db,
+                &plan.new_normalized_dn.as_bytes(),
+                &entry_id_bytes,
+                WriteFlags::empty(),
+            )
+            .map_err(|e| {
+                BackendError::Storage(format!("Failed to update entry id index: {}", e))
+            })?;
+            txn.put(
+                self.dn_by_entry_id_db,
+                &entry_id_bytes,
+                &plan.new_dn.as_bytes(),
+                WriteFlags::empty(),
+            )
+            .map_err(|e| BackendError::Storage(format!("Failed to update entry id DN: {}", e)))?;
+            Self::put_entry_by_id(
+                &mut txn,
+                self.entries_by_entry_id_db,
+                plan.entry_id,
+                &new_stored_entry,
+            )?;
+            self.update_attribute_indexes(&mut txn, plan.entry_id, &new_stored_entry.attributes)?;
+        }
         let csn_string = csn.to_ldap_string();
         txn.put(
             self.metadata_db,
@@ -1948,10 +1994,12 @@ impl LmdbBackend {
         txn.commit()
             .map_err(|e| BackendError::Storage(format!("Failed to commit txn: {}", e)))?;
 
-        self.entry_cache.invalidate(&normalized_dn);
-        self.entry_cache.invalidate(&normalized_new_dn);
-        self.auth_cache.invalidate(&normalized_dn);
-        self.auth_cache.invalidate(&normalized_new_dn);
+        for plan in &plans {
+            self.entry_cache.invalidate(&plan.old_normalized_dn);
+            self.entry_cache.invalidate(&plan.new_normalized_dn);
+            self.auth_cache.invalidate(&plan.old_normalized_dn);
+            self.auth_cache.invalidate(&plan.new_normalized_dn);
+        }
         self.record_auth_cache_metrics();
         Ok(())
     }
@@ -1976,7 +2024,7 @@ impl LmdbBackend {
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
 
         let entry_id = match Self::entry_id_for_normalized_dn(
             &txn,
@@ -2016,7 +2064,7 @@ impl LmdbBackend {
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
         let Some((entry_id, mut entry)) = Self::get_entry_by_normalized_dn(
             &txn,
             self.entries_by_entry_id_db,
@@ -2055,9 +2103,64 @@ impl LmdbBackend {
         Ok(true)
     }
 
-    /// Normalize DN for case-insensitive comparison
-    fn normalize_dn(dn: &str) -> String {
-        dn.to_lowercase().trim().to_string()
+    /// Normalize DN for RFC 4514-aware case-insensitive comparison.
+    fn normalize_dn(dn: &str) -> Result<String, BackendError> {
+        canonicalize_dn(dn).map_err(|err| BackendError::InvalidDn(err.to_string()))
+    }
+
+    fn plan_dn_renames_in_txn(
+        txn: &lmdb::RwTransaction<'_>,
+        dn_by_entry_id_db: Database,
+        entry_id_by_normalized_dn_db: Database,
+        old_dn: &str,
+        new_dn: &str,
+    ) -> Result<Vec<DnRenamePlan>, BackendError> {
+        let old_dn = parse_dn(old_dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
+        let new_dn = parse_dn(new_dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
+        let mut cursor = txn.open_ro_cursor(dn_by_entry_id_db).map_err(|e| {
+            BackendError::Storage(format!("Failed to open entry id DN cursor: {}", e))
+        })?;
+        let mut plans = Vec::new();
+
+        for (entry_id_bytes, current_dn_bytes) in cursor.iter() {
+            let entry_id = Self::entry_id_from_bytes(entry_id_bytes, "dn_by_entry_id")?;
+            let current_dn = std::str::from_utf8(current_dn_bytes).map_err(|err| {
+                BackendError::Storage(format!("Invalid UTF-8 DN in entry id map: {}", err))
+            })?;
+            let parsed_current =
+                parse_dn(current_dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
+            if !parsed_current.is_descendant_or_equal_of(&old_dn) {
+                continue;
+            }
+
+            let prefix_len = parsed_current.rdns().len() - old_dn.rdns().len();
+            let mut next_rdns = parsed_current.rdns()[..prefix_len].to_vec();
+            next_rdns.extend(new_dn.rdns().to_vec());
+            let next_dn = LdapDn::from_rdns(next_rdns).to_canonical_string();
+            plans.push(DnRenamePlan {
+                entry_id,
+                old_dn: current_dn.to_string(),
+                new_normalized_dn: Self::normalize_dn(&next_dn)?,
+                old_normalized_dn: Self::normalize_dn(current_dn)?,
+                new_dn: next_dn,
+            });
+        }
+
+        for plan in &plans {
+            if let Some(existing_entry_id) = Self::entry_id_for_normalized_dn(
+                txn,
+                entry_id_by_normalized_dn_db,
+                &plan.new_normalized_dn,
+            )? && !plans
+                .iter()
+                .any(|candidate| candidate.entry_id == existing_entry_id)
+            {
+                return Err(BackendError::AlreadyExists);
+            }
+        }
+
+        plans.sort_by(|left, right| left.old_dn.len().cmp(&right.old_dn.len()));
+        Ok(plans)
     }
 
     fn deserialize_stored_entry(bytes: &[u8]) -> Result<StoredEntry, BackendError> {
@@ -2162,7 +2265,7 @@ impl LmdbBackend {
     /// Get entry by DN with read transaction (optimized for concurrency)
     fn get_entry_internal(&self, dn: &str) -> Result<Option<Arc<StoredEntry>>, BackendError> {
         let _profile_total = PerfPhase::start("lmdb_get_entry", "total", None);
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
         if let Some(entry) = self.entry_cache.get(&normalized_dn) {
             return Ok(Some(entry));
         }
@@ -2303,66 +2406,7 @@ impl LmdbBackend {
 
     /// Check if DN is in search scope
     fn entry_in_scope(dn: &str, base_dn: &str, scope: SearchScope) -> bool {
-        if scope == SearchScope(2) {
-            return Self::entry_in_subtree_scope(dn, base_dn);
-        }
-
-        let base_components = Self::scope_base_components(base_dn);
-        Self::entry_in_scope_with_base_components(dn, &base_components, scope)
-    }
-
-    fn entry_in_subtree_scope(dn: &str, base_dn: &str) -> bool {
-        let base_dn = base_dn.trim();
-        if base_dn.is_empty() {
-            return true;
-        }
-
-        let dn = dn.trim();
-        let dn_bytes = dn.as_bytes();
-        let base_bytes = base_dn.as_bytes();
-        if dn_bytes.len() < base_bytes.len() {
-            return false;
-        }
-
-        let suffix_start = dn_bytes.len() - base_bytes.len();
-        if !dn_bytes[suffix_start..].eq_ignore_ascii_case(base_bytes) {
-            return false;
-        }
-
-        suffix_start == 0 || dn_bytes.get(suffix_start - 1) == Some(&b',')
-    }
-
-    fn scope_base_components(base_dn: &str) -> Vec<&str> {
-        base_dn
-            .split(',')
-            .rev()
-            .map(str::trim)
-            .filter(|component| !component.is_empty())
-            .collect()
-    }
-
-    fn entry_in_scope_with_base_components(
-        dn: &str,
-        base_components: &[&str],
-        scope: SearchScope,
-    ) -> bool {
-        let mut dn_components = dn.split(',').rev().map(str::trim).filter(|c| !c.is_empty());
-
-        for base_component in base_components {
-            let Some(dn_component) = dn_components.next() else {
-                return false;
-            };
-            if !dn_component.eq_ignore_ascii_case(base_component) {
-                return false;
-            }
-        }
-
-        match scope {
-            SearchScope(0) => dn_components.next().is_none(),
-            SearchScope(1) => dn_components.next().is_some() && dn_components.next().is_none(),
-            SearchScope(2) => true,
-            _ => false,
-        }
+        dn_is_in_scope(dn, base_dn, scope)
     }
 
     /// Create SSHA512 password hash
@@ -2948,7 +2992,7 @@ impl LmdbBackend {
                         e
                     ))
                 })?;
-                let normalized_dn = Self::normalize_dn(dn);
+                let normalized_dn = Self::normalize_dn(dn)?;
                 if Self::entry_id_for_normalized_dn(
                     &read_txn,
                     entry_id_by_normalized_dn_db,
@@ -3066,7 +3110,7 @@ impl LmdbBackend {
                         e
                     ))
                 })?;
-                let normalized_dn = Self::normalize_dn(dn);
+                let normalized_dn = Self::normalize_dn(dn)?;
                 let entry_id = Self::required_entry_id_for_normalized_dn(
                     &read_txn,
                     entry_id_by_normalized_dn_db,
@@ -3238,7 +3282,7 @@ impl LmdbBackend {
                         e
                     ))
                 })?;
-                let normalized_dn = Self::normalize_dn(dn);
+                let normalized_dn = Self::normalize_dn(dn)?;
                 let Some(entry_id) = Self::entry_id_for_normalized_dn(
                     &read_txn,
                     entry_id_by_normalized_dn_db,
@@ -4075,8 +4119,6 @@ impl LmdbBackend {
     where
         F: FnMut(&StoredEntry) -> Result<bool, BackendError>,
     {
-        let base_components =
-            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
         let mut results = Vec::with_capacity(dns.len());
         let mut seen_dns = dedupe_dns.then(|| HashSet::with_capacity(dns.len()));
 
@@ -4087,19 +4129,10 @@ impl LmdbBackend {
             {
                 continue;
             }
-            let in_scope = if scope == SearchScope(2) {
-                Self::entry_in_subtree_scope(dn, base_dn)
-            } else {
-                Self::entry_in_scope_with_base_components(
-                    dn,
-                    base_components.as_deref().unwrap_or(&[]),
-                    scope,
-                )
-            };
-            if !in_scope {
+            if !Self::entry_in_scope(dn, base_dn, scope) {
                 continue;
             }
-            let normalized_dn = Self::normalize_dn(dn);
+            let normalized_dn = Self::normalize_dn(dn)?;
             let Some((_, entry)) = Self::get_entry_by_normalized_dn(
                 txn,
                 self.entries_by_entry_id_db,
@@ -4321,8 +4354,6 @@ impl LmdbBackend {
             .begin_ro_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin read txn: {}", e)))?;
 
-        let base_components =
-            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
         let mut cursor = txn
             .open_ro_cursor(self.entries_by_entry_id_db)
             .map_err(|e| BackendError::Storage(format!("Failed to open cursor: {}", e)))?;
@@ -4332,12 +4363,7 @@ impl LmdbBackend {
             let Some(dn) = Self::dn_for_entry_id(&txn, self.dn_by_entry_id_db, entry_id)? else {
                 continue;
             };
-            if !Self::entry_in_scope_with_prepared_base(
-                &dn,
-                base_dn,
-                base_components.as_deref(),
-                scope,
-            ) {
+            if !Self::entry_in_scope_with_prepared_base(&dn, base_dn, (), scope) {
                 continue;
             }
             let entry = Self::deserialize_stored_entry_record(dn, value)?;
@@ -4613,8 +4639,6 @@ impl LmdbBackend {
             return Ok(());
         }
 
-        let base_components =
-            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
         let mut seen_dns = HashSet::new();
         let mut keep_streaming = self.stream_ordering_index_key(
             &txn,
@@ -4623,7 +4647,7 @@ impl LmdbBackend {
             &normalized_value,
             greater_or_equal,
             base_dn,
-            base_components.as_deref(),
+            (),
             scope,
             &mut seen_dns,
             send_entry,
@@ -4641,7 +4665,7 @@ impl LmdbBackend {
                     &normalized_value,
                     greater_or_equal,
                     base_dn,
-                    base_components.as_deref(),
+                    (),
                     scope,
                     &mut seen_dns,
                     send_entry,
@@ -4664,7 +4688,7 @@ impl LmdbBackend {
         target_value: &str,
         greater_or_equal: bool,
         base_dn: &str,
-        base_components: Option<&[&str]>,
+        _base_components: (),
         scope: SearchScope,
         seen_dns: &mut HashSet<String>,
         send_entry: &mut F,
@@ -4693,15 +4717,7 @@ impl LmdbBackend {
         }
 
         let mut include_all = Self::include_all_stored_entry;
-        self.stream_entry_by_dn_in_txn(
-            txn,
-            &dn,
-            base_dn,
-            base_components,
-            scope,
-            &mut include_all,
-            send_entry,
-        )
+        self.stream_entry_by_dn_in_txn(txn, &dn, base_dn, (), scope, &mut include_all, send_entry)
     }
 
     fn index_db_for_attribute(&self, attribute: &str) -> Result<Option<Database>, BackendError> {
@@ -4744,8 +4760,6 @@ impl LmdbBackend {
             }
         };
 
-        let base_components =
-            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
         for (_, entry_id_bytes) in duplicates {
             let Some(dn) =
                 Self::dn_for_entry_id_bytes(txn, self.dn_by_entry_id_db, entry_id_bytes)?
@@ -4756,7 +4770,7 @@ impl LmdbBackend {
                 txn,
                 &dn,
                 base_dn,
-                base_components.as_deref(),
+                (),
                 scope,
                 projection,
                 send_entry,
@@ -4774,7 +4788,7 @@ impl LmdbBackend {
         txn: &lmdb::RoTransaction<'_>,
         dn: &str,
         base_dn: &str,
-        base_components: Option<&[&str]>,
+        _base_components: (),
         scope: SearchScope,
         projection: &DirectoryAttributeProjection,
         send_entry: &mut F,
@@ -4782,10 +4796,10 @@ impl LmdbBackend {
     where
         F: FnMut(ProjectedDirectoryEntry) -> bool,
     {
-        if !Self::entry_in_scope_with_prepared_base(dn, base_dn, base_components, scope) {
+        if !Self::entry_in_scope_with_prepared_base(dn, base_dn, (), scope) {
             return Ok(true);
         }
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
         let Some((_, entry)) = Self::get_entry_by_normalized_dn(
             txn,
             self.entries_by_entry_id_db,
@@ -4838,8 +4852,6 @@ impl LmdbBackend {
             }
         };
 
-        let base_components =
-            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
         let mut seen_dns = dedupe_dns.then(HashSet::new);
         for (_, entry_id_bytes) in duplicates {
             let Some(dn) =
@@ -4857,7 +4869,7 @@ impl LmdbBackend {
                 txn,
                 &dn,
                 base_dn,
-                base_components.as_deref(),
+                (),
                 scope,
                 &mut include_entry,
                 send_entry,
@@ -4884,8 +4896,6 @@ impl LmdbBackend {
         I: FnMut(&StoredEntry) -> Result<bool, BackendError>,
         F: FnMut(DirectoryEntry) -> bool,
     {
-        let base_components =
-            (scope != SearchScope(2)).then(|| Self::scope_base_components(base_dn));
         let mut seen_dns = dedupe_dns.then(|| HashSet::with_capacity(dns.len()));
 
         for dn in dns {
@@ -4899,7 +4909,7 @@ impl LmdbBackend {
                 txn,
                 dn,
                 base_dn,
-                base_components.as_deref(),
+                (),
                 scope,
                 &mut include_entry,
                 send_entry,
@@ -4917,7 +4927,7 @@ impl LmdbBackend {
         txn: &lmdb::RoTransaction<'_>,
         dn: &str,
         base_dn: &str,
-        base_components: Option<&[&str]>,
+        _base_components: (),
         scope: SearchScope,
         include_entry: &mut I,
         send_entry: &mut F,
@@ -4926,10 +4936,10 @@ impl LmdbBackend {
         I: FnMut(&StoredEntry) -> Result<bool, BackendError>,
         F: FnMut(DirectoryEntry) -> bool,
     {
-        if !Self::entry_in_scope_with_prepared_base(dn, base_dn, base_components, scope) {
+        if !Self::entry_in_scope_with_prepared_base(dn, base_dn, (), scope) {
             return Ok(true);
         }
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
         let Some((_, entry)) = Self::get_entry_by_normalized_dn(
             txn,
             self.entries_by_entry_id_db,
@@ -4949,18 +4959,10 @@ impl LmdbBackend {
     fn entry_in_scope_with_prepared_base(
         dn: &str,
         base_dn: &str,
-        base_components: Option<&[&str]>,
+        _base_components: (),
         scope: SearchScope,
     ) -> bool {
-        if scope == SearchScope(2) {
-            Self::entry_in_subtree_scope(dn, base_dn)
-        } else {
-            Self::entry_in_scope_with_base_components(
-                dn,
-                base_components.expect("base components are prepared for non-subtree scope"),
-                scope,
-            )
-        }
+        Self::entry_in_scope(dn, base_dn, scope)
     }
 
     fn stored_entry_matches_normalized_substring(
@@ -5145,7 +5147,7 @@ impl LmdbBackend {
 impl DirectoryBackend for LmdbBackend {
     async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError> {
         let _profile_total = PerfPhase::start("lmdb_authenticate", "total", None);
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
 
         if let Some(record) = self.auth_cache.get(&normalized_dn) {
             let result = {
@@ -5241,7 +5243,7 @@ impl DirectoryBackend for LmdbBackend {
         let mut written = 0usize;
 
         for update in updates {
-            let normalized_dn = Self::normalize_dn(&update.dn);
+            let normalized_dn = Self::normalize_dn(&update.dn)?;
             let Some((entry_id, mut entry)) = Self::get_entry_by_normalized_dn(
                 &txn,
                 self.entries_by_entry_id_db,
@@ -5310,7 +5312,7 @@ impl DirectoryBackend for LmdbBackend {
             .env
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
         let Some((entry_id, mut entry)) = Self::get_entry_by_normalized_dn(
             &txn,
             self.entries_by_entry_id_db,
@@ -5365,7 +5367,7 @@ impl DirectoryBackend for LmdbBackend {
             .begin_rw_txn()
             .map_err(|e| BackendError::Storage(format!("Failed to begin write txn: {}", e)))?;
 
-        let normalized_dn = Self::normalize_dn(dn);
+        let normalized_dn = Self::normalize_dn(dn)?;
 
         let entry_id = match Self::entry_id_for_normalized_dn(
             &txn,
@@ -5808,7 +5810,7 @@ mod tests {
 
     fn credential_index_value(backend: &LmdbBackend, dn: &str) -> Option<Vec<u8>> {
         let txn = backend.env.begin_ro_txn().unwrap();
-        let normalized_dn = LmdbBackend::normalize_dn(dn);
+        let normalized_dn = LmdbBackend::normalize_dn(dn).ok()?;
         let entry_id = LmdbBackend::entry_id_for_normalized_dn(
             &txn,
             backend.entry_id_by_normalized_dn_db,

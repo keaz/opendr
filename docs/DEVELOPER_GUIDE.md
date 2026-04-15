@@ -626,8 +626,8 @@ Search fails:
 
 - Unknown critical controls are rejected.
 - Bad paged cookies are rejected.
-- Subtree and one-level scope depend on DN normalization by lowercasing and
-  trimming, not full LDAP DN canonicalization.
+- Subtree and one-level scope use the shared RFC 4514 DN parser and
+  canonicalization path, including escaped separators and multi-valued RDNs.
 - Request `+` or explicit operational attributes for `entryCSN`, `entryUUID`,
   `lastSuccessfulLogin`, `lastFailedLogin`, `failedLoginCount`, and other
   operational values.

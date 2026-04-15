@@ -88,10 +88,9 @@ impl AuthenticationBackend for DirectoryAuthenticationBackend {
         if normalized.is_empty() {
             return Err("DN must not be empty".to_string());
         }
-        if !normalized.contains('=') {
-            return Err(format!("Invalid DN format: {normalized}"));
-        }
-        Ok(())
+        crate::dn::parse_dn(normalized)
+            .map(|_| ())
+            .map_err(|err| format!("Invalid DN format: {err}"))
     }
 
     async fn get_user_info(&self, dn: &str) -> Result<AuthUserInfo, String> {

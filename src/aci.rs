@@ -4,6 +4,7 @@
 //! in LDAP operations, following LDAP ACI specifications.
 
 use crate::backend::{DirectoryBackend, DirectoryEntry, OperationalAttributes};
+use crate::dn::{dn_eq, dn_is_descendant_or_equal};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -88,13 +89,8 @@ impl AciTarget {
     /// Check if a DN matches this target
     pub fn matches_dn(&self, dn: &str) -> bool {
         match self {
-            AciTarget::Dn(target_dn) => dn.eq_ignore_ascii_case(target_dn),
-            AciTarget::Subtree(base_dn) => {
-                dn.eq_ignore_ascii_case(base_dn)
-                    || dn
-                        .to_lowercase()
-                        .ends_with(&format!(",{}", base_dn.to_lowercase()))
-            }
+            AciTarget::Dn(target_dn) => dn_eq(dn, target_dn),
+            AciTarget::Subtree(base_dn) => dn_is_descendant_or_equal(dn, base_dn),
             AciTarget::Attributes(_) => true, // DN matching for attributes is always true
             AciTarget::Combined(left, right) => left.matches_dn(dn) && right.matches_dn(dn),
         }
@@ -141,7 +137,7 @@ impl AciSubject {
     /// Check if a user DN matches this subject
     pub fn matches_user(&self, user_dn: Option<&str>, target_dn: &str) -> bool {
         match self {
-            AciSubject::User(dn) => user_dn.map(|u| u.eq_ignore_ascii_case(dn)).unwrap_or(false),
+            AciSubject::User(dn) => user_dn.map(|u| dn_eq(u, dn)).unwrap_or(false),
             AciSubject::Group(_group_dn) => {
                 // TODO: Implement group membership checking
                 // This would require a backend lookup
@@ -149,9 +145,7 @@ impl AciSubject {
             }
             AciSubject::AllAuthenticated => user_dn.is_some(),
             AciSubject::All => true,
-            AciSubject::SelfEntry => user_dn
-                .map(|u| u.eq_ignore_ascii_case(target_dn))
-                .unwrap_or(false),
+            AciSubject::SelfEntry => user_dn.map(|u| dn_eq(u, target_dn)).unwrap_or(false),
         }
     }
 
@@ -182,7 +176,7 @@ impl AciSubject {
                     .into_iter()
                     .chain(group_entry.attributes.get("uniquemember"))
                     .flat_map(|values| values.iter())
-                    .any(|member_dn| member_dn.eq_ignore_ascii_case(user_dn)))
+                    .any(|member_dn| dn_eq(member_dn, user_dn)))
             }
             _ => Ok(self.matches_user(user_dn, target_dn)),
         }
@@ -1060,6 +1054,21 @@ mod tests {
         assert!(target.matches_dn("cn=user,dc=example,dc=org"));
         assert!(target.matches_dn("ou=dept,cn=user,dc=example,dc=org"));
         assert!(!target.matches_dn("dc=other,dc=org"));
+    }
+
+    #[test]
+    fn test_aci_dn_matching_uses_rfc4514_canonicalization() {
+        let target = AciTarget::Dn(r"cn=Doe\, John+uid=user\+1,dc=example,dc=org".to_string());
+        assert!(target.matches_dn(r"UID=user\2B1+CN=doe\2C john,DC=example,DC=org"));
+
+        let subtree = AciTarget::Subtree(r"ou=People,dc=example,dc=org".to_string());
+        assert!(subtree.matches_dn(r"cn=Doe\, John+uid=user\+1,ou=people,dc=example,dc=org"));
+
+        let subject = AciSubject::SelfEntry;
+        assert!(subject.matches_user(
+            Some(r"CN=doe\2C john,DC=example,DC=org"),
+            r"cn=Doe\, John,dc=example,dc=org"
+        ));
     }
 
     #[test]

@@ -10,6 +10,9 @@ use sha2::{Digest, Sha512};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::csn::Csn;
+use crate::dn::{
+    canonicalize_dn, dn_eq, dn_is_in_scope, parse_dn, rdn_attribute_values, replace_dn_rdn,
+};
 
 /// Operational attributes for LDAP entries per RFC 4512
 ///
@@ -356,6 +359,7 @@ pub fn referral_urls_from_attributes(
 pub enum BackendError {
     AlreadyExists,
     NotFound,
+    InvalidDn(String),
     Storage(String),
 }
 
@@ -392,6 +396,7 @@ impl fmt::Display for BackendError {
         match self {
             BackendError::AlreadyExists => write!(f, "entry already exists"),
             BackendError::NotFound => write!(f, "entry not found"),
+            BackendError::InvalidDn(reason) => write!(f, "invalid DN: {}", reason),
             BackendError::Storage(reason) => write!(f, "storage error: {}", reason),
         }
     }
@@ -926,8 +931,9 @@ impl MockBackend {
 
         for (dn, password) in credentials {
             let dn_string = dn.into();
+            let dn_key = normalize_dn_key(&dn_string).unwrap_or_else(|_| dn_string.clone());
             entries.insert(
-                dn_string.clone(),
+                dn_key,
                 StoredEntry {
                     password: password.into(),
                     entry: DirectoryEntry {
@@ -953,7 +959,8 @@ impl MockBackend {
         actor_dn: Option<&str>,
     ) -> Result<(), BackendError> {
         let mut entries = self.entries.write().await;
-        if entries.contains_key(&entry.dn) {
+        let dn_key = normalize_dn_key(&entry.dn)?;
+        if entries.contains_key(&dn_key) {
             return Err(BackendError::AlreadyExists);
         }
 
@@ -965,7 +972,7 @@ impl MockBackend {
         *context_csn = Some(csn);
         drop(context_csn);
 
-        entries.insert(entry.dn.clone(), StoredEntry { password, entry });
+        entries.insert(dn_key, StoredEntry { password, entry });
 
         Ok(())
     }
@@ -977,7 +984,8 @@ impl MockBackend {
         actor_dn: Option<&str>,
     ) -> Result<(), BackendError> {
         let mut entries = self.entries.write().await;
-        let stored = entries.get_mut(dn).ok_or(BackendError::NotFound)?;
+        let dn_key = normalize_dn_key(dn)?;
+        let stored = entries.get_mut(&dn_key).ok_or(BackendError::NotFound)?;
 
         let csn = self.csn_generator.generate();
         stored
@@ -1004,27 +1012,30 @@ impl MockBackend {
         actor_dn: Option<&str>,
     ) -> Result<(), BackendError> {
         let mut entries = self.entries.write().await;
-        let Some(_) = entries.get(dn) else {
+        let dn_key = normalize_dn_key(dn)?;
+        let Some(_) = entries.get(&dn_key) else {
             return Err(BackendError::NotFound);
         };
 
-        let target_dn = compute_new_dn(dn, new_rdn, new_superior.as_deref());
+        let target_dn = compute_new_dn(dn, new_rdn, new_superior.as_deref())?;
+        let target_dn_key = normalize_dn_key(&target_dn)?;
 
-        if entries.contains_key(&target_dn) {
+        if entries.contains_key(&target_dn_key) {
             return Err(BackendError::AlreadyExists);
         }
 
         let renames = plan_dn_renames(&entries, dn, &target_dn)?;
         let csn = self.csn_generator.generate();
 
-        for (old_dn, new_dn) in renames {
-            if let Some(mut stored) = entries.remove(&old_dn) {
+        for (old_dn_key, new_dn_key, new_dn) in renames {
+            if let Some(mut stored) = entries.remove(&old_dn_key) {
+                let current_dn = stored.entry.dn.clone();
                 update_entry_for_rename(
                     &mut stored.entry,
                     &mut stored.password,
                     dn,
                     new_rdn,
-                    &old_dn,
+                    &current_dn,
                     &new_dn,
                     delete_old,
                 );
@@ -1033,7 +1044,7 @@ impl MockBackend {
                     .entry
                     .operational_attributes
                     .for_modified_entry(csn.clone(), actor_dn.map(str::to_string));
-                entries.insert(new_dn, stored);
+                entries.insert(new_dn_key, stored);
             }
         }
 
@@ -1052,7 +1063,8 @@ impl MockBackend {
         F: FnOnce(&mut OperationalAttributes, Csn) -> bool,
     {
         let mut entries = self.entries.write().await;
-        let Some(stored) = entries.get_mut(dn) else {
+        let dn_key = normalize_dn_key(dn)?;
+        let Some(stored) = entries.get_mut(&dn_key) else {
             return Ok(false);
         };
 
@@ -1081,8 +1093,9 @@ impl Default for MockBackend {
 impl DirectoryBackend for MockBackend {
     async fn authenticate(&self, dn: &str, password: &[u8]) -> Result<bool, BackendError> {
         let entries = self.entries.read().await;
+        let dn_key = normalize_dn_key(dn)?;
         Ok(entries
-            .get(dn)
+            .get(&dn_key)
             .map(|entry| password_matches(entry.password.as_slice(), password))
             .unwrap_or(false))
     }
@@ -1103,7 +1116,8 @@ impl DirectoryBackend for MockBackend {
         operational_attributes: OperationalAttributes,
     ) -> Result<(), BackendError> {
         let mut entries = self.entries.write().await;
-        let stored = entries.get_mut(dn).ok_or(BackendError::NotFound)?;
+        let dn_key = normalize_dn_key(dn)?;
+        let stored = entries.get_mut(&dn_key).ok_or(BackendError::NotFound)?;
         stored.entry.operational_attributes = operational_attributes;
 
         Ok(())
@@ -1111,7 +1125,8 @@ impl DirectoryBackend for MockBackend {
 
     async fn get_entry(&self, dn: &str) -> Result<Option<DirectoryEntry>, BackendError> {
         let entries = self.entries.read().await;
-        Ok(entries.get(dn).map(|entry| entry.entry.clone()))
+        let dn_key = normalize_dn_key(dn)?;
+        Ok(entries.get(&dn_key).map(|entry| entry.entry.clone()))
     }
 
     async fn add_entry(
@@ -1134,7 +1149,8 @@ impl DirectoryBackend for MockBackend {
 
     async fn delete_entry(&self, dn: &str) -> Result<(), BackendError> {
         let mut entries = self.entries.write().await;
-        entries.remove(dn).ok_or(BackendError::NotFound)?;
+        let dn_key = normalize_dn_key(dn)?;
+        entries.remove(&dn_key).ok_or(BackendError::NotFound)?;
 
         // Update contextCSN after delete
         let csn = self.csn_generator.generate();
@@ -1170,7 +1186,8 @@ impl DirectoryBackend for MockBackend {
         schema: &crate::schema::LdapSchema,
     ) -> Result<(), NativeModifyError> {
         let mut entries = self.entries.write().await;
-        let stored = entries.get_mut(dn).ok_or(BackendError::NotFound)?;
+        let dn_key = normalize_dn_key(dn).map_err(NativeModifyError::Backend)?;
+        let stored = entries.get_mut(&dn_key).ok_or(BackendError::NotFound)?;
         let mut candidate_attributes = stored.entry.attributes.clone();
         apply_modifications_to_attributes(&mut candidate_attributes, &modifications);
         schema
@@ -1202,7 +1219,8 @@ impl DirectoryBackend for MockBackend {
         value: &str,
     ) -> Result<bool, BackendError> {
         let entries = self.entries.read().await;
-        let Some(stored) = entries.get(dn) else {
+        let dn_key = normalize_dn_key(dn)?;
+        let Some(stored) = entries.get(&dn_key) else {
             return Err(BackendError::NotFound);
         };
 
@@ -1243,12 +1261,12 @@ impl DirectoryBackend for MockBackend {
         base_dn: &str,
         scope: SearchScope,
     ) -> Result<Vec<DirectoryEntry>, BackendError> {
+        canonicalize_dn(base_dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
         let entries = self.entries.read().await;
         let mut results = Vec::new();
-        let base_components = dn_components(base_dn);
 
         for stored in entries.values() {
-            if entry_in_scope(&stored.entry.dn, &base_components, scope) {
+            if entry_in_scope(&stored.entry.dn, base_dn, scope) {
                 results.push(stored.entry.clone());
             }
         }
@@ -1267,12 +1285,12 @@ impl DirectoryBackend for MockBackend {
             return Ok(Vec::new());
         }
 
+        canonicalize_dn(base_dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
         let entries = self.entries.read().await;
-        let base_components = dn_components(base_dn);
 
         Ok(entries
             .values()
-            .filter(|stored| entry_in_scope(&stored.entry.dn, &base_components, scope))
+            .filter(|stored| entry_in_scope(&stored.entry.dn, base_dn, scope))
             .skip(offset)
             .take(limit)
             .map(|stored| stored.entry.clone())
@@ -1284,12 +1302,12 @@ impl DirectoryBackend for MockBackend {
         base_dn: &str,
         scope: SearchScope,
     ) -> Result<usize, BackendError> {
+        canonicalize_dn(base_dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
         let entries = self.entries.read().await;
-        let base_components = dn_components(base_dn);
 
         Ok(entries
             .values()
-            .filter(|stored| entry_in_scope(&stored.entry.dn, &base_components, scope))
+            .filter(|stored| entry_in_scope(&stored.entry.dn, base_dn, scope))
             .count())
     }
 
@@ -1385,55 +1403,51 @@ fn verify_ssha512(password: &[u8], stored_hash: &str) -> bool {
     hasher.finalize().as_slice() == stored_hash
 }
 
-fn compute_new_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {
-    if let Some(superior) = new_superior {
-        format!("{},{}", new_rdn, superior)
-    } else if let Some((_, rest)) = dn.split_once(',') {
-        if rest.is_empty() {
-            new_rdn.to_string()
-        } else {
-            format!("{},{}", new_rdn, rest)
-        }
-    } else {
-        new_rdn.to_string()
-    }
+fn normalize_dn_key(dn: &str) -> Result<String, BackendError> {
+    canonicalize_dn(dn).map_err(|err| BackendError::InvalidDn(err.to_string()))
+}
+
+fn compute_new_dn(
+    dn: &str,
+    new_rdn: &str,
+    new_superior: Option<&str>,
+) -> Result<String, BackendError> {
+    replace_dn_rdn(dn, new_rdn, new_superior)
+        .map_err(|err| BackendError::InvalidDn(err.to_string()))
 }
 
 fn plan_dn_renames(
     entries: &HashMap<String, StoredEntry>,
     old_dn: &str,
     new_dn: &str,
-) -> Result<Vec<(String, String)>, BackendError> {
-    let old_components = dn_components(old_dn);
-    let new_components = dn_components(new_dn);
+) -> Result<Vec<(String, String, String)>, BackendError> {
+    let old_dn = parse_dn(old_dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
+    let new_dn = parse_dn(new_dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
     let mut planned = Vec::new();
 
-    for (current_dn, _) in entries.iter() {
-        let current_components = dn_components(current_dn);
-        if current_components.len() < old_components.len() {
+    for (current_key, stored) in entries.iter() {
+        let current_dn =
+            parse_dn(&stored.entry.dn).map_err(|err| BackendError::InvalidDn(err.to_string()))?;
+        if !current_dn.is_descendant_or_equal_of(&old_dn) {
             continue;
         }
 
-        let suffix = &current_components[current_components.len() - old_components.len()..];
-        if suffix
-            .iter()
-            .map(|component| component.to_lowercase())
-            .eq(old_components
-                .iter()
-                .map(|component| component.to_lowercase()))
-        {
-            let mut updated =
-                current_components[..current_components.len() - old_components.len()].to_vec();
-            updated.extend(new_components.clone());
-            let next_dn = updated.join(",");
-            planned.push((current_dn.clone(), next_dn));
-        }
+        let prefix_len = current_dn.rdns().len() - old_dn.rdns().len();
+        let mut next_rdns = current_dn.rdns()[..prefix_len].to_vec();
+        next_rdns.extend(new_dn.rdns().to_vec());
+        let next_dn = crate::dn::LdapDn::from_rdns(next_rdns).to_canonical_string();
+        let next_key = normalize_dn_key(&next_dn)?;
+        planned.push((current_key.clone(), next_key, next_dn));
     }
 
     planned.sort_by(|a, b| a.0.len().cmp(&b.0.len()));
 
-    for (_, target) in &planned {
-        if entries.contains_key(target) && !planned.iter().any(|(source, _)| source == target) {
+    for (_, target_key, _) in &planned {
+        if entries.contains_key(target_key)
+            && !planned
+                .iter()
+                .any(|(source_key, _, _)| source_key == target_key)
+        {
             return Err(BackendError::AlreadyExists);
         }
     }
@@ -1450,13 +1464,23 @@ fn update_entry_for_rename(
     new_dn: &str,
     delete_old: bool,
 ) {
-    if current_dn != original_dn {
+    if !dn_eq(current_dn, original_dn) {
         return;
     }
 
     if delete_old {
-        let old_rdn = original_dn.split(',').next().unwrap_or("");
-        for (attribute, value) in parse_rdn_components(old_rdn) {
+        let old_rdn = parse_dn(original_dn)
+            .ok()
+            .and_then(|dn| dn.rdns().first().cloned());
+        for (attribute, value) in old_rdn
+            .map(|rdn| {
+                rdn.avas()
+                    .iter()
+                    .map(|ava| (ava.attribute().to_string(), ava.value().to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+        {
             if let Some(existing) = entry.attributes.get_mut(&attribute) {
                 existing.retain(|candidate| candidate != &value);
                 if existing.is_empty() {
@@ -1466,7 +1490,7 @@ fn update_entry_for_rename(
         }
     }
 
-    for (attribute, value) in parse_rdn_components(new_rdn) {
+    for (attribute, value) in rdn_attribute_values(new_rdn).unwrap_or_default() {
         let values = entry.attributes.entry(attribute.clone()).or_default();
         if !values.contains(&value) {
             values.push(value.clone());
@@ -1486,56 +1510,8 @@ fn update_entry_for_rename(
     entry.dn = new_dn.to_string();
 }
 
-fn dn_components(dn: &str) -> Vec<String> {
-    dn.split(',')
-        .map(|component| component.trim().to_string())
-        .filter(|component| !component.is_empty())
-        .collect()
-}
-
-fn parse_rdn_components(rdn: &str) -> Vec<(String, String)> {
-    rdn.split('+')
-        .filter_map(|part| {
-            let (attr, value) = part.split_once('=')?;
-            Some((attr.trim().to_lowercase(), value.trim().to_string()))
-        })
-        .collect()
-}
-
-fn entry_in_scope(dn: &str, base_components: &[String], scope: SearchScope) -> bool {
-    let components = dn_components(dn);
-
-    match scope {
-        SearchScope(0) => components
-            .iter()
-            .map(|component| component.to_lowercase())
-            .eq(base_components
-                .iter()
-                .map(|component| component.to_lowercase())),
-        SearchScope(1) => {
-            if components.len() != base_components.len() + 1 {
-                return false;
-            }
-            components[1..]
-                .iter()
-                .map(|component| component.to_lowercase())
-                .eq(base_components
-                    .iter()
-                    .map(|component| component.to_lowercase()))
-        }
-        SearchScope(2) => {
-            if components.len() < base_components.len() {
-                return false;
-            }
-            components[components.len() - base_components.len()..]
-                .iter()
-                .map(|component| component.to_lowercase())
-                .eq(base_components
-                    .iter()
-                    .map(|component| component.to_lowercase()))
-        }
-        _ => false,
-    }
+fn entry_in_scope(dn: &str, base_dn: &str, scope: SearchScope) -> bool {
+    dn_is_in_scope(dn, base_dn, scope)
 }
 
 #[cfg(test)]

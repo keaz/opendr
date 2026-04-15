@@ -3446,6 +3446,7 @@ fn map_backend_error(err: &BackendError) -> ResultCode {
     match err {
         BackendError::AlreadyExists => ResultCode::EntryAlreadyExists,
         BackendError::NotFound => ResultCode::NoSuchObject,
+        BackendError::InvalidDn(_) => ResultCode::InvalidDnSyntax,
         BackendError::Storage(_) => ResultCode::Unavailable,
     }
 }
@@ -3463,21 +3464,8 @@ fn diagnostic_for_error(err: &BackendError) -> &'static str {
     match err {
         BackendError::AlreadyExists => "entry already exists",
         BackendError::NotFound => "no such object",
+        BackendError::InvalidDn(_) => "invalid DN syntax",
         BackendError::Storage(_) => "backend failure",
-    }
-}
-
-pub(crate) fn compute_new_dn(dn: &str, new_rdn: &str, new_superior: Option<&str>) -> String {
-    if let Some(superior) = new_superior {
-        format!("{},{}", new_rdn, superior)
-    } else if let Some((_, rest)) = dn.split_once(',') {
-        if rest.is_empty() {
-            new_rdn.to_string()
-        } else {
-            format!("{},{}", new_rdn, rest)
-        }
-    } else {
-        new_rdn.to_string()
     }
 }
 
@@ -6768,7 +6756,21 @@ pub(crate) async fn handle_moddn_request_with_context(
         return Ok(());
     }
 
-    let new_dn = compute_new_dn(&dn, &new_rdn, new_superior.as_deref());
+    let new_dn = match crate::dn::replace_dn_rdn(&dn, &new_rdn, new_superior.as_deref()) {
+        Ok(new_dn) => new_dn,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::ModifyDn,
+                ResultCode::InvalidDnSyntax,
+                &dn,
+                &format!("invalid DN syntax: {}", err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     let existing_entry = match backend.get_entry(&dn).await {
         Ok(Some(existing_entry)) => existing_entry,
