@@ -62,8 +62,8 @@ these gates pass and their artifacts are retained:
 4. `cargo test --doc --quiet`
 5. `scripts/ldap_interop_gate.sh`
 6. `scripts/referral_alias_interop.sh` against a fixture with referral and alias entries
-7. `cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000`
-8. `cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000`
+7. `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh`
+8. Retain `target/fuzz-gate/release-candidate` logs, corpora, dictionaries, and crash artifacts
 9. `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh`
 
 The manual GitHub workflow `Production Readiness Gate` runs the CI-friendly

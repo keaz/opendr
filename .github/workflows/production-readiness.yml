@@ -7,10 +7,12 @@ on:
       - ".github/workflows/production-readiness.yml"
       - "docs/LDAP_RFC_COMPLIANCE_MATRIX.md"
       - "docs/BACKUP_RESTORE.md"
+      - "docs/FUZZING.md"
       - "docs/PRODUCTION_READINESS_CHECKLIST.md"
       - "docs/REPLICATION_PRODUCTION_GUARANTEES.md"
       - "e2e_tests/**"
       - "fuzz/**"
+      - "scripts/fuzz_gate.sh"
       - "scripts/backup_restore_drill.sh"
       - "scripts/ldap_interop_gate.sh"
       - "scripts/perf_regression_gate.sh"
@@ -43,6 +45,7 @@ jobs:
           bash -n scripts/referral_alias_interop.sh
           bash -n scripts/perf_regression_gate.sh
           bash -n scripts/backup_restore_drill.sh
+          bash -n scripts/fuzz_gate.sh
           zsh -n e2e_tests/helpers.sh
           zsh -n e2e_tests/test_single_provider_single_consumer.sh
           zsh -n e2e_tests/test_replication_soak.sh
@@ -109,13 +112,24 @@ jobs:
       - name: Fuzz target compile gate
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
 
+      - name: Fuzz smoke gate
+        run: |
+          rustup toolchain install nightly-2026-03-01 --profile minimal
+          if ! cargo fuzz --help >/dev/null 2>&1; then
+            cargo install cargo-fuzz --locked
+          fi
+          FUZZ_GATE_MODE=smoke \
+          FUZZ_GATE_SMOKE_RUNS=16 \
+          FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/readiness-smoke \
+          ./scripts/fuzz_gate.sh
+
       - name: Release-only long gates
         run: |
           cat <<'EOF'
           Run these before a production-ready release and retain artifacts:
           rustup toolchain install nightly-2026-03-01 --profile minimal
-          cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000
-          cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000
+          cargo install cargo-fuzz --locked
+          FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh
           SOAK_DURATION_SECS=86400 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh
           FAILURE_DRILL_MODE=release FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/release-candidate ./e2e_tests/test_replication_failure_drills.sh
           PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh

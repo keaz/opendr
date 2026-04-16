@@ -20,8 +20,8 @@ operation behavior.
 | Referral and alias interoperability | `scripts/referral_alias_interop.sh` | `ldapsearch` and optional Python `ldap3` cover referral URL, ManageDsaIT, and alias dereference behavior against a prepared fixture. | Script log |
 | Replication soak | `SOAK_DURATION_SECS=86400 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh` | Two isolated OpenDR instances maintain provider-consumer convergence while repeated ADD, MODIFY, and DELETE operations run for the configured duration. | `target/replication-soak/release-candidate` |
 | Replication failure drills | `FAILURE_DRILL_MODE=release FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/release-candidate ./e2e_tests/test_replication_failure_drills.sh` | Provider restart, consumer restart, provider network interruption, stale cookie with truncated changelog, and operator full-refresh recovery all complete with visible diagnostics and convergence evidence. | `target/replication-failure-drills/release-candidate` |
-| BER fuzzing | `cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth. | Fuzz corpus and log |
-| Request-handler fuzzing | `cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth in parser/server request handling. | Fuzz corpus and log |
+| BER fuzzing | `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh` | `ber_decoder` completes the release fuzz budget with no panic, crash, timeout, sanitizer finding, or unbounded memory growth. | `target/fuzz-gate/release-candidate` |
+| Request-handler fuzzing | `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh` | `ldap_request_handler` completes the release fuzz budget with no panic, crash, timeout, sanitizer finding, or unbounded memory growth. | `target/fuzz-gate/release-candidate` |
 | Load/performance regression | `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh` | Regression profile exits 0 and baseline validation stays within the documented threshold. | `target/perf/regression-candidate` |
 | Backup/restore drill | `BACKUP_DRILL_MODE=release BACKUP_DRILL_USERS=100000 BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate ./scripts/backup_restore_drill.sh` | Production-like LMDB fixture is backed up, inspected, dry-run restored, restored into a clean data directory, and validated through LDAP binds, indexed searches, operational attributes, and contextCSN evidence. | `target/backup-restore-drill/release-candidate` |
 
@@ -48,6 +48,8 @@ fuzz/load commands when those are not run in the same job. For tagged releases,
 retain the workflow run, fuzz logs, and performance artifacts with the release
 candidate.
 
-The fuzz commands pin `nightly-2026-03-01` because the current `rasn` dependency
-tree does not build with later nightly pointer-metadata checks. Revisit the pin
-when the ASN.1 dependency stack is upgraded.
+The fuzz gate pins `nightly-2026-03-01` because the current ASN.1 dependency
+stack is known to compile with that nightly. Revisit the pin when the `rasn`
+dependency stack is upgraded or when newer sanitizer support is required. See
+`docs/FUZZING.md` for smoke commands, release budgets, artifact retention, and
+failure minimization.

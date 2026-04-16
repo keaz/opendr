@@ -355,6 +355,55 @@ BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate \
 - Validation LDIF and contextCSN evidence:
   `target/backup-restore-drill/.../validation`
 
+### fuzz_gate.sh
+
+**Purpose**: Production-readiness fuzz wrapper for LDAP BER parsing and request
+handling.
+
+**What it does**:
+1. Runs `ber_decoder` and `ldap_request_handler` through `cargo-fuzz`.
+2. Uses the pinned `nightly-2026-03-01` toolchain.
+3. Supports short smoke runs for local/CI validation.
+4. Supports release-candidate runs with a long per-target time budget or run
+   count.
+5. Captures logs, corpus, dictionaries, crash artifacts, and reproduction
+   commands under one output directory.
+
+**Usage**:
+```bash
+# Fast local smoke gate
+FUZZ_GATE_MODE=smoke \
+FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/readiness-smoke \
+./scripts/fuzz_gate.sh
+
+# Release-candidate gate: six hours per target by default
+FUZZ_GATE_MODE=release \
+FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate \
+./scripts/fuzz_gate.sh
+
+# Release-candidate gate using a run-count budget instead
+FUZZ_GATE_MODE=release \
+FUZZ_GATE_RELEASE_RUNS=1000000 \
+FUZZ_GATE_RELEASE_MAX_TOTAL_TIME_SECS= \
+FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate \
+./scripts/fuzz_gate.sh
+```
+
+**Prerequisites**:
+```bash
+rustup toolchain install nightly-2026-03-01 --profile minimal
+cargo install cargo-fuzz --locked
+```
+
+**Artifacts**:
+- Summary and reproduction commands: `target/fuzz-gate/.../summary.md`
+- Per-target logs: `target/fuzz-gate/.../logs/<target>.log`
+- Per-target corpus: `target/fuzz-gate/.../corpus/<target>/`
+- Crash/timeout artifacts: `target/fuzz-gate/.../artifacts/<target>/`
+- Dictionaries used by the run: `target/fuzz-gate/.../dictionaries/`
+
+See `docs/FUZZING.md` for failure triage and minimization commands.
+
 ### compare_perf_run.py
 
 **Purpose**: Compare two `ldap_perf_client` JSON reports and fail when key
