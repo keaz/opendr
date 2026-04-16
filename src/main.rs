@@ -129,6 +129,7 @@ async fn build_legacy_security_config(
             log_authorization: config.audit.log_authorization,
             log_modifications: config.audit.log_modifications,
             log_connections: config.audit.log_connections,
+            log_replication: config.audit.log_replication,
         },
         access_control,
         root_dn: Some(config.canonical_root_dn()?),
@@ -348,8 +349,14 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
             .await;
     }
 
+    let legacy_security_config = build_legacy_security_config(&config).await?;
+    let replication_audit_logger = legacy_security_config
+        .as_ref()
+        .and_then(|security| security.audit_logger.clone());
+
     // Wrap backend with replication service if configured
-    let replication_service = ReplicationService::from_config(&config, raw_backend)?;
+    let replication_service =
+        ReplicationService::from_config_with_audit(&config, raw_backend, replication_audit_logger)?;
 
     if let Some(health) = monitoring_health.as_ref() {
         let provider_status = if replication_service.is_provider() {
@@ -496,7 +503,6 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
     let fsm_server_config = config.to_fsm_server_config();
     let mut legacy_server_config = server::LegacyServerConfig::from_server_config(&config);
     legacy_server_config.auth_metadata = Some(auth_metadata_recorder.clone());
-    let legacy_security_config = build_legacy_security_config(&config).await?;
     let tls_handler = if config.tls.enabled {
         let min_tls_version = match config.tls.min_tls_version.as_str() {
             "1.2" => TlsVersion::Tls12,

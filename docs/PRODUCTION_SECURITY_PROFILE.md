@@ -73,11 +73,14 @@ controlled exception. SASL PLAIN still requires LDAPS or StartTLS even when
 ## Audit And Authorization Checklist
 
 - Keep `[audit].enabled = true`.
-- Keep `log_authentication`, `log_authorization`, `log_modifications`, and
-  `log_connections` enabled for production.
+- Keep `log_authentication`, `log_authorization`, `log_modifications`,
+  `log_connections`, and `log_replication` enabled for production.
 - Keep `[access_control].enabled = true` and `default_policy = "deny"`.
 - Add explicit ACI rules for every non-public read or write path.
 - Review audit logs for successful and failed bind, SASL bind, StartTLS,
-  Password Modify, authorization denial, connection, and administrative events.
+  Password Modify, authorization denial, connection, administrative, and
+  replication lifecycle events. Replication audit records must identify session
+  start/completion, stale-cookie or changelog-gap rejection, reconnects, and
+  provider/consumer disconnects without bind passwords or URL credentials.
 - Failed and successful bind metadata is stored in operational attributes when
   `auth_metadata.update_mode` is `sync` or `async_coalesced`.

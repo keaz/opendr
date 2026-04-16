@@ -28,6 +28,7 @@ fn test_load_default_config() {
     assert_eq!(config.replication.provider_timeout_secs, 30);
     assert_eq!(config.replication.state_persistence_timeout_secs, 10);
     assert_eq!(config.replication.change_buffer_size, 1000);
+    assert!(config.audit.log_replication);
     assert_eq!(
         config.replication.state_storage_path,
         PathBuf::from("./data/replication_state")
@@ -626,6 +627,7 @@ log_authentication = true
 log_authorization = true
 log_modifications = true
 log_connections = true
+log_replication = true
 
 [access_control]
 enabled = true
@@ -651,6 +653,7 @@ query_optimization = true
     assert_eq!(config.rate_limit.global_requests_per_second, 2000);
     assert_eq!(config.monitoring.metrics_port, 9090);
     assert_eq!(config.audit.format, "json");
+    assert!(config.audit.log_replication);
     assert_eq!(config.access_control.default_policy, "deny");
     assert_eq!(config.performance.worker_threads, 8);
 }

@@ -47,6 +47,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::audit::{AuditLevel, AuditLogger};
 use crate::backend::DirectoryBackend;
 use crate::backend_changelog_wrapper::ChangelogBackendWrapper;
 use crate::config::ServerConfig;
@@ -74,6 +75,47 @@ pub struct ReplicationService {
 
     /// Runtime status shared with the management console.
     status: Arc<ReplicationStatusRegistry>,
+
+    /// Replication audit event sink.
+    audit: ReplicationAuditSink,
+}
+
+#[derive(Clone, Default)]
+struct ReplicationAuditSink {
+    logger: Option<Arc<AuditLogger>>,
+    enabled: bool,
+    replica_id: u16,
+}
+
+impl ReplicationAuditSink {
+    fn new(logger: Option<Arc<AuditLogger>>, enabled: bool, replica_id: u16) -> Self {
+        Self {
+            logger,
+            enabled,
+            replica_id,
+        }
+    }
+
+    async fn log(
+        &self,
+        level: AuditLevel,
+        action: &str,
+        success: bool,
+        error: Option<&str>,
+        mut details: Vec<(String, String)>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let Some(logger) = self.logger.as_ref() else {
+            return;
+        };
+
+        details.push(("replica_id".to_string(), self.replica_id.to_string()));
+        logger
+            .log_replication(level, action, success, error, details)
+            .await;
+    }
 }
 
 /// Replication configuration extracted from ServerConfig
@@ -467,6 +509,74 @@ impl ReplicationService {
         provider_url.starts_with("local://") || provider_url.starts_with("in-memory://")
     }
 
+    fn sanitized_provider_url(provider_url: &str) -> String {
+        if let Ok(mut url) = url::Url::parse(provider_url) {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            return url.to_string();
+        }
+
+        let Some((scheme, rest)) = provider_url.split_once("://") else {
+            return provider_url.to_string();
+        };
+        if let Some((_, after_userinfo)) = rest.split_once('@') {
+            format!("{scheme}://{after_userinfo}")
+        } else {
+            provider_url.to_string()
+        }
+    }
+
+    fn summarize_audit_value(value: Option<&str>) -> String {
+        const MAX_INLINE_LEN: usize = 48;
+        match value {
+            Some(value) if value.chars().count() > MAX_INLINE_LEN => {
+                let prefix = value.chars().take(24).collect::<String>();
+                let suffix = value
+                    .chars()
+                    .rev()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>();
+                format!("{prefix}...{suffix} (len={})", value.chars().count())
+            }
+            Some(value) => value.to_string(),
+            None => "none".to_string(),
+        }
+    }
+
+    fn consumer_audit_details(
+        provider_url: &str,
+        bind_dn: Option<&str>,
+        previous_cookie: Option<&str>,
+        current_cookie: Option<&str>,
+        sync_kind: &str,
+        result: &str,
+    ) -> Vec<(String, String)> {
+        vec![
+            ("role".to_string(), "consumer".to_string()),
+            (
+                "provider_url".to_string(),
+                Self::sanitized_provider_url(provider_url),
+            ),
+            (
+                "bind_dn".to_string(),
+                bind_dn.unwrap_or("anonymous").to_string(),
+            ),
+            (
+                "previous_cookie".to_string(),
+                Self::summarize_audit_value(previous_cookie),
+            ),
+            (
+                "current_cookie".to_string(),
+                Self::summarize_audit_value(current_cookie),
+            ),
+            ("sync_kind".to_string(), sync_kind.to_string()),
+            ("result".to_string(), result.to_string()),
+        ]
+    }
+
     /// Create a new replication service from configuration
     ///
     /// # Arguments
@@ -479,7 +589,20 @@ impl ReplicationService {
         config: &ServerConfig,
         backend: Arc<dyn DirectoryBackend>,
     ) -> Result<Self, String> {
+        Self::from_config_with_audit(config, backend, None)
+    }
+
+    pub fn from_config_with_audit(
+        config: &ServerConfig,
+        backend: Arc<dyn DirectoryBackend>,
+        audit_logger: Option<Arc<AuditLogger>>,
+    ) -> Result<Self, String> {
         let repl_config = Self::parse_replication_config(config)?;
+        let audit = ReplicationAuditSink::new(
+            audit_logger,
+            config.audit.enabled && config.audit.log_replication,
+            config.server.replica_id,
+        );
         let should_track_changelog = repl_config
             .provider_config
             .as_ref()
@@ -530,6 +653,7 @@ impl ReplicationService {
             config: repl_config,
             provider_lifecycle,
             status,
+            audit,
         })
     }
 
@@ -684,6 +808,27 @@ impl ReplicationService {
         let drain_timeout = shutdown.drain_timeout();
         let status = self.status.clone();
         status.set_provider_running(true);
+        self.audit
+            .log(
+                AuditLevel::Info,
+                "provider_service_start",
+                true,
+                None,
+                vec![
+                    ("role".to_string(), "provider".to_string()),
+                    (
+                        "changelog_enabled".to_string(),
+                        provider_config.changelog_enabled.to_string(),
+                    ),
+                    (
+                        "changelog_capacity".to_string(),
+                        provider_config.changelog_capacity.to_string(),
+                    ),
+                    ("result".to_string(), "started".to_string()),
+                ],
+            )
+            .await;
+        let audit = self.audit.clone();
 
         // Spawn provider service task
         let handle = tokio::spawn(async move {
@@ -695,6 +840,18 @@ impl ReplicationService {
             let _ = shutdown_rx.recv().await;
 
             info!("Replication provider service shutting down");
+            audit
+                .log(
+                    AuditLevel::Info,
+                    "provider_service_stop",
+                    true,
+                    None,
+                    vec![
+                        ("role".to_string(), "provider".to_string()),
+                        ("result".to_string(), "shutdown".to_string()),
+                    ],
+                )
+                .await;
             provider_lifecycle.begin_shutdown();
             status.set_provider_draining(true);
 
@@ -827,8 +984,10 @@ impl ReplicationService {
         let retry_delay = Duration::from_secs(consumer_config.retry_delay_secs);
 
         let provider_url = consumer_config.provider_url.clone();
+        let provider_bind_dn = consumer_config.provider_bind_dn.clone();
         let status = self.status.clone();
         status.set_consumer_running(true);
+        let audit = self.audit.clone();
 
         // Spawn consumer service task
         let handle = tokio::spawn(async move {
@@ -836,16 +995,57 @@ impl ReplicationService {
 
             use crate::fsm::{ReplicationConsumerEvent, ReplicationConsumerFsm, StateMachine};
 
+            let mut reconnect_attempts = 0u64;
+
             loop {
                 if let Err(e) = consumer_fsm.reset().await {
                     error!("Failed to reset consumer FSM: {:?}", e);
-                    status.set_consumer_error(format!("consumer FSM reset failed: {e:?}"));
+                    let message = format!("consumer FSM reset failed: {e:?}");
+                    status.set_consumer_error(message.clone());
+                    let mut details = Self::consumer_audit_details(
+                        &provider_url,
+                        provider_bind_dn.as_deref(),
+                        status.snapshot().consumer.last_applied_cookie.as_deref(),
+                        None,
+                        "unknown",
+                        "fsm_reset_failed",
+                    );
+                    details.push((
+                        "reconnect_attempt".to_string(),
+                        reconnect_attempts.to_string(),
+                    ));
+                    audit
+                        .log(
+                            AuditLevel::Warning,
+                            "consumer_session_failure",
+                            false,
+                            Some(&message),
+                            details,
+                        )
+                        .await;
+                    reconnect_attempts += 1;
                     tokio::select! {
                         _ = tokio::time::sleep(retry_delay) => {}
                         _ = shutdown_rx.recv() => {
                             info!("Replication consumer service shutting down");
                             let _ = consumer_fsm.stop_live_listening().await;
                             status.set_consumer_running(false);
+                            audit
+                                .log(
+                                    AuditLevel::Info,
+                                    "consumer_disconnect",
+                                    true,
+                                    None,
+                                    Self::consumer_audit_details(
+                                        &provider_url,
+                                        provider_bind_dn.as_deref(),
+                                        status.snapshot().consumer.last_applied_cookie.as_deref(),
+                                        None,
+                                        "unknown",
+                                        "shutdown",
+                                    ),
+                                )
+                                .await;
                             info!("Replication consumer service stopped");
                             return;
                         }
@@ -853,8 +1053,56 @@ impl ReplicationService {
                     continue;
                 }
 
-                let started_without_cookie =
-                    !status.snapshot().consumer.persisted_cookie.unwrap_or(false);
+                let snapshot_before_sync = status.snapshot();
+                let started_without_cookie = !snapshot_before_sync
+                    .consumer
+                    .persisted_cookie
+                    .unwrap_or(false);
+                let previous_cookie = snapshot_before_sync.consumer.last_applied_cookie.clone();
+                let sync_kind = if started_without_cookie {
+                    "full_refresh"
+                } else {
+                    "incremental_replay"
+                };
+                if reconnect_attempts > 0 {
+                    let mut details = Self::consumer_audit_details(
+                        &provider_url,
+                        provider_bind_dn.as_deref(),
+                        previous_cookie.as_deref(),
+                        None,
+                        sync_kind,
+                        "retrying",
+                    );
+                    details.push((
+                        "reconnect_attempt".to_string(),
+                        reconnect_attempts.to_string(),
+                    ));
+                    audit
+                        .log(
+                            AuditLevel::Info,
+                            "consumer_reconnect_attempt",
+                            true,
+                            None,
+                            details,
+                        )
+                        .await;
+                }
+                audit
+                    .log(
+                        AuditLevel::Info,
+                        "consumer_session_start",
+                        true,
+                        None,
+                        Self::consumer_audit_details(
+                            &provider_url,
+                            provider_bind_dn.as_deref(),
+                            previous_cookie.as_deref(),
+                            None,
+                            sync_kind,
+                            "started",
+                        ),
+                    )
+                    .await;
                 let event = ReplicationConsumerEvent::StartConsumption {
                     provider_url: provider_url.clone(),
                     cookie: None,
@@ -863,23 +1111,85 @@ impl ReplicationService {
                 match consumer_fsm.handle_event(event).await {
                     Ok(entries_processed) if consumer_fsm.is_listening_state() => {
                         info!("Replication consumer entered listening mode");
+                        let entries_processed = entries_processed.unwrap_or(0);
+                        let current_cookie = consumer_fsm.current_cookie().map(str::to_string);
                         status.record_consumer_success(
-                            consumer_fsm.current_cookie(),
-                            entries_processed.unwrap_or(0),
+                            current_cookie.as_deref(),
+                            entries_processed,
                             started_without_cookie,
                         );
+                        let mut details = Self::consumer_audit_details(
+                            &provider_url,
+                            provider_bind_dn.as_deref(),
+                            previous_cookie.as_deref(),
+                            current_cookie.as_deref(),
+                            sync_kind,
+                            "success",
+                        );
+                        details.push((
+                            "entries_processed".to_string(),
+                            entries_processed.to_string(),
+                        ));
+                        audit
+                            .log(
+                                AuditLevel::Info,
+                                "consumer_session_complete",
+                                true,
+                                None,
+                                details,
+                            )
+                            .await;
+                        reconnect_attempts = 0;
                     }
                     Ok(_) => {
                         error!("Replication consumer completed without entering listening mode");
-                        status.set_consumer_error(
-                            "consumer completed without entering listening mode",
+                        let message =
+                            "consumer completed without entering listening mode".to_string();
+                        status.set_consumer_error(message.clone());
+                        let mut details = Self::consumer_audit_details(
+                            &provider_url,
+                            provider_bind_dn.as_deref(),
+                            previous_cookie.as_deref(),
+                            consumer_fsm.current_cookie(),
+                            sync_kind,
+                            "completed_without_listening",
                         );
+                        details.push((
+                            "reconnect_attempt".to_string(),
+                            reconnect_attempts.to_string(),
+                        ));
+                        audit
+                            .log(
+                                AuditLevel::Warning,
+                                "consumer_session_failure",
+                                false,
+                                Some(&message),
+                                details,
+                            )
+                            .await;
+                        reconnect_attempts += 1;
                         tokio::select! {
                             _ = tokio::time::sleep(retry_delay) => {}
                             _ = shutdown_rx.recv() => {
                                 info!("Replication consumer service shutting down");
                                 let _ = consumer_fsm.stop_live_listening().await;
                                 status.set_consumer_running(false);
+                                audit
+                                    .log(
+                                        AuditLevel::Info,
+                                        "consumer_disconnect",
+                                        true,
+                                        None,
+                                        Self::consumer_audit_details(
+                                            &provider_url,
+                                            provider_bind_dn.as_deref(),
+                                            consumer_fsm.current_cookie(),
+                                            None,
+                                            sync_kind,
+                                            "shutdown",
+                                        ),
+                                    )
+                                    .await;
                                 info!("Replication consumer service stopped");
                                 return;
                             }
@@ -888,13 +1198,57 @@ impl ReplicationService {
                     }
                     Err(e) => {
                         error!("Initial listening sync failed: {:?}", e);
-                        status.set_consumer_error(format!("initial listening sync failed: {e:?}"));
+                        let message = format!("initial listening sync failed: {e:?}");
+                        let result = if ReplicationStatusRegistry::requires_full_refresh(&message) {
+                            "full_refresh_required"
+                        } else {
+                            "sync_failed"
+                        };
+                        status.set_consumer_error(message.clone());
+                        let mut details = Self::consumer_audit_details(
+                            &provider_url,
+                            provider_bind_dn.as_deref(),
+                            previous_cookie.as_deref(),
+                            consumer_fsm.current_cookie(),
+                            sync_kind,
+                            result,
+                        );
+                        details.push((
+                            "reconnect_attempt".to_string(),
+                            reconnect_attempts.to_string(),
+                        ));
+                        audit
+                            .log(
+                                AuditLevel::Warning,
+                                "consumer_session_failure",
+                                false,
+                                Some(&message),
+                                details,
+                            )
+                            .await;
+                        reconnect_attempts += 1;
                         tokio::select! {
                             _ = tokio::time::sleep(retry_delay) => {}
                             _ = shutdown_rx.recv() => {
                                 info!("Replication consumer service shutting down");
                                 let _ = consumer_fsm.stop_live_listening().await;
                                 status.set_consumer_running(false);
+                                audit
+                                    .log(
+                                        AuditLevel::Info,
+                                        "consumer_disconnect",
+                                        true,
+                                        None,
+                                        Self::consumer_audit_details(
+                                            &provider_url,
+                                            provider_bind_dn.as_deref(),
+                                            consumer_fsm.current_cookie(),
+                                            None,
+                                            sync_kind,
+                                            "shutdown",
+                                        ),
+                                    )
+                                    .await;
                                 info!("Replication consumer service stopped");
                                 return;
                             }
@@ -909,6 +1263,22 @@ impl ReplicationService {
                             info!("Replication consumer service shutting down");
                             let _ = consumer_fsm.stop_live_listening().await;
                             status.set_consumer_running(false);
+                            audit
+                                .log(
+                                    AuditLevel::Info,
+                                    "consumer_disconnect",
+                                    true,
+                                    None,
+                                    Self::consumer_audit_details(
+                                        &provider_url,
+                                        provider_bind_dn.as_deref(),
+                                        consumer_fsm.current_cookie(),
+                                        None,
+                                        "incremental_replay",
+                                        "shutdown",
+                                    ),
+                                )
+                                .await;
                             info!("Replication consumer service stopped");
                             return;
                         }
@@ -917,15 +1287,63 @@ impl ReplicationService {
                                 Ok(Some(change)) => {
                                     match consumer_fsm.handle_event(ReplicationConsumerEvent::ChangeReceived(change)).await {
                                         Ok(entries_processed) => {
+                                            let entries_processed = entries_processed.unwrap_or(0);
+                                            let current_cookie = consumer_fsm.current_cookie().map(str::to_string);
                                             status.record_consumer_success(
-                                                consumer_fsm.current_cookie(),
-                                                entries_processed.unwrap_or(0),
+                                                current_cookie.as_deref(),
+                                                entries_processed,
                                                 false,
                                             );
+                                            let mut details = Self::consumer_audit_details(
+                                                &provider_url,
+                                                provider_bind_dn.as_deref(),
+                                                None,
+                                                current_cookie.as_deref(),
+                                                "incremental_replay",
+                                                "success",
+                                            );
+                                            details.push(("entries_processed".to_string(), entries_processed.to_string()));
+                                            audit
+                                                .log(
+                                                    AuditLevel::Info,
+                                                    "consumer_live_change_applied",
+                                                    true,
+                                                    None,
+                                                    details,
+                                                )
+                                                .await;
                                         }
                                         Err(e) => {
                                             error!("Failed to process live replication change: {:?}", e);
-                                            status.set_consumer_error(format!("live replication change failed: {e:?}"));
+                                            let message = format!("live replication change failed: {e:?}");
+                                            status.set_consumer_error(message.clone());
+                                            let result = if ReplicationStatusRegistry::requires_full_refresh(&message) {
+                                                "full_refresh_required"
+                                            } else {
+                                                "live_change_failed"
+                                            };
+                                            let mut details = Self::consumer_audit_details(
+                                                &provider_url,
+                                                provider_bind_dn.as_deref(),
+                                                None,
+                                                consumer_fsm.current_cookie(),
+                                                "incremental_replay",
+                                                result,
+                                            );
+                                            details.push((
+                                                "reconnect_attempt".to_string(),
+                                                reconnect_attempts.to_string(),
+                                            ));
+                                            audit
+                                                .log(
+                                                    AuditLevel::Warning,
+                                                    "consumer_session_failure",
+                                                    false,
+                                                    Some(&message),
+                                                    details,
+                                                )
+                                                .await;
+                                            reconnect_attempts += 1;
                                             let _ = consumer_fsm.stop_live_listening().await;
                                             break;
                                         }
@@ -936,7 +1354,30 @@ impl ReplicationService {
                                 }
                                 Err(e) => {
                                     error!("Listening channel failed: {:?}", e);
-                                    status.set_consumer_error(format!("listening channel failed: {e:?}"));
+                                    let message = format!("listening channel failed: {e:?}");
+                                    status.set_consumer_error(message.clone());
+                                    let mut details = Self::consumer_audit_details(
+                                        &provider_url,
+                                        provider_bind_dn.as_deref(),
+                                        None,
+                                        consumer_fsm.current_cookie(),
+                                        "incremental_replay",
+                                        "listener_failed",
+                                    );
+                                    details.push((
+                                        "reconnect_attempt".to_string(),
+                                        reconnect_attempts.to_string(),
+                                    ));
+                                    audit
+                                        .log(
+                                            AuditLevel::Warning,
+                                            "consumer_session_failure",
+                                            false,
+                                            Some(&message),
+                                            details,
+                                        )
+                                        .await;
+                                    reconnect_attempts += 1;
                                     let _ = consumer_fsm.stop_live_listening().await;
                                     break;
                                 }
@@ -951,6 +1392,22 @@ impl ReplicationService {
                         info!("Replication consumer service shutting down");
                         let _ = consumer_fsm.stop_live_listening().await;
                         status.set_consumer_running(false);
+                        audit
+                            .log(
+                                AuditLevel::Info,
+                                "consumer_disconnect",
+                                true,
+                                None,
+                                Self::consumer_audit_details(
+                                    &provider_url,
+                                    provider_bind_dn.as_deref(),
+                                    consumer_fsm.current_cookie(),
+                                    None,
+                                    "incremental_replay",
+                                    "shutdown",
+                                ),
+                            )
+                            .await;
                         info!("Replication consumer service stopped");
                         return;
                     }
@@ -1471,6 +1928,40 @@ mod tests {
             consumer_cfg.provider_bind_dn,
             Some("cn=admin,dc=example,dc=com".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_consumer_replication_audit_sanitizes_provider_url_credentials() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let audit_logger = AuditLogger::new(temp_file.path(), AuditLevel::Debug);
+        audit_logger.initialize().await.unwrap();
+        let audit = ReplicationAuditSink::new(Some(audit_logger), true, 7);
+
+        audit
+            .log(
+                AuditLevel::Warning,
+                "consumer_session_failure",
+                false,
+                Some("provider bind failed"),
+                ReplicationService::consumer_audit_details(
+                    "ldaps://replicator:bind-secret@provider.example.com:636",
+                    Some("cn=replicator,dc=example,dc=org"),
+                    Some("csn-20260416010101000000#001#000001#000000"),
+                    None,
+                    "incremental_replay",
+                    "sync_failed",
+                ),
+            )
+            .await;
+
+        let content = tokio::fs::read_to_string(temp_file.path()).await.unwrap();
+        assert!(content.contains("\"event_type\":\"Replication\""));
+        assert!(content.contains("\"action\":\"consumer_session_failure\""));
+        assert!(content.contains("provider.example.com:636"));
+        assert!(content.contains("\"bind_dn\":\"cn=replicator,dc=example,dc=org\""));
+        assert!(content.contains("\"replica_id\":\"7\""));
+        assert!(!content.contains("bind-secret"));
+        assert!(!content.contains("ldaps://replicator:"));
     }
 
     #[test]

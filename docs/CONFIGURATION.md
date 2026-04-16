@@ -344,6 +344,7 @@ log_authentication = true
 log_authorization = true
 log_modifications = true
 log_connections = true
+log_replication = true
 ```
 
 | Key | Default | Notes |
@@ -356,6 +357,7 @@ log_connections = true
 | `log_authorization` | `true` | Logs authorization decisions |
 | `log_modifications` | `true` | Logs add, modify, delete, and ModifyDN-style changes |
 | `log_connections` | `true` | Logs connection lifecycle events |
+| `log_replication` | `true` | Logs provider and consumer replication lifecycle, replay, stale-cookie, disconnect, and failure events |
 
 Valid formats are `json`, `syslog`, and `text`.
 

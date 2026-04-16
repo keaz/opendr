@@ -695,6 +695,26 @@ impl AuditLogger {
         self.log_event(event).await;
     }
 
+    /// Log a structured replication event.
+    pub async fn log_replication(
+        &self,
+        level: AuditLevel,
+        action: impl Into<String>,
+        success: bool,
+        error: Option<&str>,
+        details: impl IntoIterator<Item = (String, String)>,
+    ) {
+        let mut event = AuditEvent::new(level, AuditEventType::Replication, action.into(), success);
+        if let Some(error) = error {
+            event = event.with_error(error);
+        }
+        for (key, value) in details {
+            event = event.with_detail(key, value);
+        }
+
+        self.log_event(event).await;
+    }
+
     /// Flush and close the audit log
     pub async fn close(&self) -> Result<(), String> {
         let mut file_guard = self.file.write().await;
@@ -970,6 +990,39 @@ mod tests {
             .await;
 
         assert_eq!(logger.events_logged().await, 3);
+    }
+
+    #[tokio::test]
+    async fn test_audit_logger_replication_event_redacts_secrets_by_contract() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let logger = AuditLogger::new(temp_file.path(), AuditLevel::Info);
+        logger.initialize().await.unwrap();
+
+        logger
+            .log_replication(
+                AuditLevel::Info,
+                "consumer_sync_complete",
+                true,
+                None,
+                vec![
+                    (
+                        "provider_url".to_string(),
+                        "ldaps://provider.example.com:636".to_string(),
+                    ),
+                    (
+                        "bind_dn".to_string(),
+                        "cn=replicator,dc=example,dc=org".to_string(),
+                    ),
+                    ("result".to_string(), "success".to_string()),
+                ],
+            )
+            .await;
+
+        let content = tokio::fs::read_to_string(temp_file.path()).await.unwrap();
+        assert!(content.contains("\"event_type\":\"Replication\""));
+        assert!(content.contains("\"action\":\"consumer_sync_complete\""));
+        assert!(!content.contains("bind-password"));
+        assert!(!content.contains("secret"));
     }
 
     #[tokio::test]

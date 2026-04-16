@@ -438,6 +438,7 @@ pub struct LegacyAuditConfig {
     pub log_authorization: bool,
     pub log_modifications: bool,
     pub log_connections: bool,
+    pub log_replication: bool,
 }
 
 impl Default for LegacyAuditConfig {
@@ -447,6 +448,7 @@ impl Default for LegacyAuditConfig {
             log_authorization: true,
             log_modifications: true,
             log_connections: true,
+            log_replication: true,
         }
     }
 }
@@ -5080,7 +5082,7 @@ async fn validate_sync_cookie(
         && csn < oldest
     {
         return Err(SyncRequestError::InvalidCookie(format!(
-            "stale sync cookie {cookie}"
+            "stale sync cookie {cookie} requires a full refresh"
         )));
     }
 
@@ -5314,6 +5316,104 @@ async fn emit_sync_refresh_entries(
     Ok((returned, false))
 }
 
+fn sync_mode_name(mode: SyncRefreshMode) -> &'static str {
+    match mode {
+        SyncRefreshMode::RefreshOnly => "refresh_only",
+        SyncRefreshMode::RefreshAndPersist => "refresh_and_persist",
+    }
+}
+
+fn summarize_audit_value(value: Option<&str>) -> String {
+    const MAX_INLINE_LEN: usize = 48;
+    match value {
+        Some(value) if value.chars().count() > MAX_INLINE_LEN => {
+            let prefix = value.chars().take(24).collect::<String>();
+            let suffix = value
+                .chars()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>();
+            format!("{prefix}...{suffix} (len={})", value.chars().count())
+        }
+        Some(value) => value.to_string(),
+        None => "none".to_string(),
+    }
+}
+
+fn sync_request_error_message(error: &SyncRequestError) -> &str {
+    match error {
+        SyncRequestError::ProtocolError(message)
+        | SyncRequestError::InvalidCookie(message)
+        | SyncRequestError::Unsupported(message) => message.as_str(),
+    }
+}
+
+fn provider_replica_id(changelog: &crate::replication::ChangelogTracker) -> String {
+    changelog
+        .get_context_csn()
+        .map(|csn| csn.replica_id().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn provider_context_csn(changelog: &crate::replication::ChangelogTracker) -> String {
+    changelog
+        .get_context_csn()
+        .map(|csn| csn.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+async fn log_replication_audit_event(
+    request_context: &RequestContext,
+    session: &ConnectionSession,
+    level: AuditLevel,
+    action: &str,
+    success: bool,
+    error_message: Option<&str>,
+    details: Vec<(String, String)>,
+) {
+    let Some(security) = request_context.security.as_ref() else {
+        return;
+    };
+    if !security.audit_config.log_replication {
+        return;
+    }
+
+    log_generic_audit_event(
+        request_context,
+        session,
+        level,
+        AuditEventType::Replication,
+        action,
+        success,
+        None,
+        error_message,
+        details,
+    )
+    .await;
+}
+
+fn provider_sync_audit_details(
+    changelog: &crate::replication::ChangelogTracker,
+    base_dn: &str,
+    mode: SyncRefreshMode,
+    cookie: Option<&str>,
+) -> Vec<(String, String)> {
+    vec![
+        ("role".to_string(), "provider".to_string()),
+        ("base_dn".to_string(), base_dn.to_string()),
+        ("sync_mode".to_string(), sync_mode_name(mode).to_string()),
+        ("cookie".to_string(), summarize_audit_value(cookie)),
+        ("replica_id".to_string(), provider_replica_id(changelog)),
+        (
+            "latest_context_csn".to_string(),
+            provider_context_csn(changelog),
+        ),
+    ]
+}
+
 pub(crate) async fn reject_sync_request(
     socket: &mut (impl AsyncWrite + Unpin),
     message_id: u32,
@@ -5382,6 +5482,34 @@ pub(crate) async fn handle_sync_search_request(
     };
 
     let Some(changelog) = backend.replication_changelog() else {
+        log_replication_audit_event(
+            request_context,
+            connection_session,
+            AuditLevel::Warning,
+            "provider_session_failure",
+            false,
+            Some("replication sync not available"),
+            vec![
+                ("role".to_string(), "provider".to_string()),
+                ("base_dn".to_string(), base_dn.to_string()),
+                (
+                    "sync_mode".to_string(),
+                    sync_mode_name(sync_request.request.mode).to_string(),
+                ),
+                (
+                    "cookie".to_string(),
+                    summarize_audit_value(
+                        sync_request
+                            .request
+                            .cookie
+                            .as_deref()
+                            .and_then(|cookie| std::str::from_utf8(cookie).ok()),
+                    ),
+                ),
+                ("result".to_string(), "unavailable".to_string()),
+            ],
+        )
+        .await;
         session
             .send_unavailable("replication sync not available")
             .await?;
@@ -5392,6 +5520,20 @@ pub(crate) async fn handle_sync_search_request(
     let cookie_text = match sync_cookie_string(sync_request.request.cookie.as_deref()) {
         Ok(cookie_text) => cookie_text,
         Err(error) => {
+            let diagnostic = sync_request_error_message(&error).to_string();
+            let mut details =
+                provider_sync_audit_details(&changelog, base_dn, sync_request.request.mode, None);
+            details.push(("result".to_string(), "cookie_rejected".to_string()));
+            log_replication_audit_event(
+                request_context,
+                connection_session,
+                AuditLevel::Warning,
+                "provider_cookie_rejected",
+                false,
+                Some(&diagnostic),
+                details,
+            )
+            .await;
             reject_sync_request(session.socket, message_id, base_dn, &error).await?;
             operation_registry.finish(message_id, FinishedOperationState::Completed);
             return Ok(());
@@ -5400,6 +5542,24 @@ pub(crate) async fn handle_sync_search_request(
     let cookie_csn = match validate_sync_cookie(backend, &changelog, cookie_text.as_deref()).await {
         Ok(cookie_csn) => cookie_csn,
         Err(error) => {
+            let diagnostic = sync_request_error_message(&error).to_string();
+            let mut details = provider_sync_audit_details(
+                &changelog,
+                base_dn,
+                sync_request.request.mode,
+                cookie_text.as_deref(),
+            );
+            details.push(("result".to_string(), "cookie_rejected".to_string()));
+            log_replication_audit_event(
+                request_context,
+                connection_session,
+                AuditLevel::Warning,
+                "provider_cookie_rejected",
+                false,
+                Some(&diagnostic),
+                details,
+            )
+            .await;
             reject_sync_request(session.socket, message_id, base_dn, &error).await?;
             operation_registry.finish(message_id, FinishedOperationState::Completed);
             return Ok(());
@@ -5412,6 +5572,23 @@ pub(crate) async fn handle_sync_search_request(
         match backend.subscribe_to_replication_changes() {
             Some(receiver) => Some(receiver),
             _ => {
+                let mut details = provider_sync_audit_details(
+                    &changelog,
+                    base_dn,
+                    sync_request.request.mode,
+                    cookie_text.as_deref(),
+                );
+                details.push(("result".to_string(), "stream_unavailable".to_string()));
+                log_replication_audit_event(
+                    request_context,
+                    connection_session,
+                    AuditLevel::Warning,
+                    "provider_session_failure",
+                    false,
+                    Some("replication stream not available"),
+                    details,
+                )
+                .await;
                 session
                     .send_unavailable("replication stream not available")
                     .await?;
@@ -5422,6 +5599,32 @@ pub(crate) async fn handle_sync_search_request(
     } else {
         None
     };
+
+    let mut start_details = provider_sync_audit_details(
+        &changelog,
+        base_dn,
+        sync_request.request.mode,
+        cookie_text.as_deref(),
+    );
+    start_details.push((
+        "sync_kind".to_string(),
+        if cookie_csn.is_some() {
+            "incremental_replay".to_string()
+        } else {
+            "full_refresh".to_string()
+        },
+    ));
+    start_details.push(("result".to_string(), "started".to_string()));
+    log_replication_audit_event(
+        request_context,
+        connection_session,
+        AuditLevel::Info,
+        "provider_session_start",
+        true,
+        None,
+        start_details,
+    )
+    .await;
 
     if cookie_csn.is_none() {
         let result_set = collect_search_result_set(
@@ -5438,7 +5641,7 @@ pub(crate) async fn handle_sync_search_request(
         )
         .await
         .map_err(|err| ServerError::Io(std::io::Error::other(err.diagnostic)))?;
-        let (_returned, time_limit_hit) = emit_sync_refresh_entries(
+        let (returned, time_limit_hit) = emit_sync_refresh_entries(
             session.socket,
             message_id,
             &result_set.entries,
@@ -5468,15 +5671,66 @@ pub(crate) async fn handle_sync_search_request(
                 &[sync_done],
             )
             .await?;
+            let mut details = provider_sync_audit_details(
+                &changelog,
+                base_dn,
+                sync_request.request.mode,
+                cookie_text.as_deref(),
+            );
+            details.push(("sync_kind".to_string(), "full_refresh".to_string()));
+            details.push(("entries_sent".to_string(), returned.to_string()));
+            details.push((
+                "result".to_string(),
+                if time_limit_hit {
+                    "time_limit_exceeded"
+                } else {
+                    "success"
+                }
+                .to_string(),
+            ));
+            log_replication_audit_event(
+                request_context,
+                connection_session,
+                if time_limit_hit {
+                    AuditLevel::Warning
+                } else {
+                    AuditLevel::Info
+                },
+                "provider_session_complete",
+                !time_limit_hit,
+                time_limit_hit.then_some("time limit exceeded"),
+                details,
+            )
+            .await;
             operation_registry.finish(message_id, FinishedOperationState::Completed);
             return Ok(());
         }
     } else if let Some(cookie_csn) = cookie_csn.as_ref() {
+        let mut entries_sent = 0usize;
         for change in changelog.get_since_csn(cookie_csn) {
             if provider_lifecycle
                 .as_ref()
                 .is_some_and(|lifecycle| lifecycle.is_draining())
             {
+                let mut details = provider_sync_audit_details(
+                    &changelog,
+                    base_dn,
+                    sync_request.request.mode,
+                    cookie_text.as_deref(),
+                );
+                details.push(("sync_kind".to_string(), "incremental_replay".to_string()));
+                details.push(("entries_sent".to_string(), entries_sent.to_string()));
+                details.push(("result".to_string(), "provider_shutdown".to_string()));
+                log_replication_audit_event(
+                    request_context,
+                    connection_session,
+                    AuditLevel::Warning,
+                    "provider_session_failure",
+                    false,
+                    Some("replication provider shutting down"),
+                    details,
+                )
+                .await;
                 operation_registry.finish(message_id, FinishedOperationState::Completed);
                 return finish_replication_stream_unavailable(
                     &mut session,
@@ -5498,6 +5752,7 @@ pub(crate) async fn handle_sync_search_request(
             {
                 emit_sync_entry(session.socket, message_id, &sync_entry, request.types_only)
                     .await?;
+                entries_sent += 1;
             }
         }
 
@@ -5514,6 +5769,25 @@ pub(crate) async fn handle_sync_search_request(
                 &[sync_done],
             )
             .await?;
+            let mut details = provider_sync_audit_details(
+                &changelog,
+                base_dn,
+                sync_request.request.mode,
+                cookie_text.as_deref(),
+            );
+            details.push(("sync_kind".to_string(), "incremental_replay".to_string()));
+            details.push(("entries_sent".to_string(), entries_sent.to_string()));
+            details.push(("result".to_string(), "success".to_string()));
+            log_replication_audit_event(
+                request_context,
+                connection_session,
+                AuditLevel::Info,
+                "provider_session_complete",
+                true,
+                None,
+                details,
+            )
+            .await;
             operation_registry.finish(message_id, FinishedOperationState::Completed);
             return Ok(());
         }
@@ -5542,6 +5816,23 @@ pub(crate) async fn handle_sync_search_request(
         let recv_result = if let Some(lifecycle) = provider_lifecycle.as_ref() {
             tokio::select! {
                 _ = lifecycle.wait_for_shutdown() => {
+                    let mut details = provider_sync_audit_details(
+                        &changelog,
+                        base_dn,
+                        sync_request.request.mode,
+                        cookie_text.as_deref(),
+                    );
+                    details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                    details.push(("result".to_string(), "provider_shutdown".to_string()));
+                    log_replication_audit_event(
+                        request_context,
+                        connection_session,
+                        AuditLevel::Warning,
+                        "provider_session_failure",
+                        false,
+                        Some("replication provider shutting down"),
+                        details,
+                    ).await;
                     operation_registry.finish(message_id, FinishedOperationState::Completed);
                     return finish_replication_stream_unavailable(
                         &mut session,
@@ -5560,6 +5851,23 @@ pub(crate) async fn handle_sync_search_request(
                     match control_result? {
                         StreamControlEvent::Continue => continue,
                         StreamControlEvent::Cancel => {
+                            let mut details = provider_sync_audit_details(
+                                &changelog,
+                                base_dn,
+                                sync_request.request.mode,
+                                cookie_text.as_deref(),
+                            );
+                            details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                            details.push(("result".to_string(), "canceled".to_string()));
+                            log_replication_audit_event(
+                                request_context,
+                                connection_session,
+                                AuditLevel::Info,
+                                "provider_session_complete",
+                                true,
+                                None,
+                                details,
+                            ).await;
                             operation_registry.finish(message_id, FinishedOperationState::Canceled);
                             let _ = send_custom_search_done(
                                 session.socket,
@@ -5571,10 +5879,44 @@ pub(crate) async fn handle_sync_search_request(
                             return Ok(());
                         }
                         StreamControlEvent::Abandon => {
+                            let mut details = provider_sync_audit_details(
+                                &changelog,
+                                base_dn,
+                                sync_request.request.mode,
+                                cookie_text.as_deref(),
+                            );
+                            details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                            details.push(("result".to_string(), "abandoned".to_string()));
+                            log_replication_audit_event(
+                                request_context,
+                                connection_session,
+                                AuditLevel::Info,
+                                "provider_session_complete",
+                                true,
+                                None,
+                                details,
+                            ).await;
                             operation_registry.finish(message_id, FinishedOperationState::Abandoned);
                             return Ok(());
                         }
                         StreamControlEvent::ClientClosed => {
+                            let mut details = provider_sync_audit_details(
+                                &changelog,
+                                base_dn,
+                                sync_request.request.mode,
+                                cookie_text.as_deref(),
+                            );
+                            details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                            details.push(("result".to_string(), "client_closed".to_string()));
+                            log_replication_audit_event(
+                                request_context,
+                                connection_session,
+                                AuditLevel::Info,
+                                "provider_session_complete",
+                                true,
+                                None,
+                                details,
+                            ).await;
                             operation_registry.finish(message_id, FinishedOperationState::Completed);
                             return Ok(());
                         }
@@ -5596,6 +5938,23 @@ pub(crate) async fn handle_sync_search_request(
                     match control_result? {
                         StreamControlEvent::Continue => continue,
                         StreamControlEvent::Cancel => {
+                            let mut details = provider_sync_audit_details(
+                                &changelog,
+                                base_dn,
+                                sync_request.request.mode,
+                                cookie_text.as_deref(),
+                            );
+                            details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                            details.push(("result".to_string(), "canceled".to_string()));
+                            log_replication_audit_event(
+                                request_context,
+                                connection_session,
+                                AuditLevel::Info,
+                                "provider_session_complete",
+                                true,
+                                None,
+                                details,
+                            ).await;
                             operation_registry.finish(message_id, FinishedOperationState::Canceled);
                             let _ = send_custom_search_done(
                                 session.socket,
@@ -5607,10 +5966,44 @@ pub(crate) async fn handle_sync_search_request(
                             return Ok(());
                         }
                         StreamControlEvent::Abandon => {
+                            let mut details = provider_sync_audit_details(
+                                &changelog,
+                                base_dn,
+                                sync_request.request.mode,
+                                cookie_text.as_deref(),
+                            );
+                            details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                            details.push(("result".to_string(), "abandoned".to_string()));
+                            log_replication_audit_event(
+                                request_context,
+                                connection_session,
+                                AuditLevel::Info,
+                                "provider_session_complete",
+                                true,
+                                None,
+                                details,
+                            ).await;
                             operation_registry.finish(message_id, FinishedOperationState::Abandoned);
                             return Ok(());
                         }
                         StreamControlEvent::ClientClosed => {
+                            let mut details = provider_sync_audit_details(
+                                &changelog,
+                                base_dn,
+                                sync_request.request.mode,
+                                cookie_text.as_deref(),
+                            );
+                            details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                            details.push(("result".to_string(), "client_closed".to_string()));
+                            log_replication_audit_event(
+                                request_context,
+                                connection_session,
+                                AuditLevel::Info,
+                                "provider_session_complete",
+                                true,
+                                None,
+                                details,
+                            ).await;
                             operation_registry.finish(message_id, FinishedOperationState::Completed);
                             return Ok(());
                         }
@@ -5626,6 +6019,24 @@ pub(crate) async fn handle_sync_search_request(
                     .as_ref()
                     .is_some_and(|lifecycle| lifecycle.is_draining())
                 {
+                    let mut details = provider_sync_audit_details(
+                        &changelog,
+                        base_dn,
+                        sync_request.request.mode,
+                        cookie_text.as_deref(),
+                    );
+                    details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                    details.push(("result".to_string(), "provider_shutdown".to_string()));
+                    log_replication_audit_event(
+                        request_context,
+                        connection_session,
+                        AuditLevel::Warning,
+                        "provider_session_failure",
+                        false,
+                        Some("replication provider shutting down"),
+                        details,
+                    )
+                    .await;
                     operation_registry.finish(message_id, FinishedOperationState::Completed);
                     return finish_replication_stream_unavailable(
                         &mut session,
@@ -5653,17 +6064,72 @@ pub(crate) async fn handle_sync_search_request(
                         .await
                 {
                     warn!("Replication stream send failed: {}", err);
+                    let mut details = provider_sync_audit_details(
+                        &changelog,
+                        base_dn,
+                        sync_request.request.mode,
+                        cookie_text.as_deref(),
+                    );
+                    details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                    details.push(("result".to_string(), "send_failed".to_string()));
+                    log_replication_audit_event(
+                        request_context,
+                        connection_session,
+                        AuditLevel::Warning,
+                        "provider_session_failure",
+                        false,
+                        Some(&err.to_string()),
+                        details,
+                    )
+                    .await;
                     operation_registry.finish(message_id, FinishedOperationState::Completed);
                     break;
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 warn!("Replication stream lagged by {} messages", skipped);
+                let mut details = provider_sync_audit_details(
+                    &changelog,
+                    base_dn,
+                    sync_request.request.mode,
+                    cookie_text.as_deref(),
+                );
+                details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+                details.push(("skipped_messages".to_string(), skipped.to_string()));
+                details.push(("result".to_string(), "stream_lagged".to_string()));
+                log_replication_audit_event(
+                    request_context,
+                    connection_session,
+                    AuditLevel::Warning,
+                    "provider_stream_lagged",
+                    false,
+                    Some("replication stream lagged"),
+                    details,
+                )
+                .await;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 
+    let mut details = provider_sync_audit_details(
+        &changelog,
+        base_dn,
+        sync_request.request.mode,
+        cookie_text.as_deref(),
+    );
+    details.push(("sync_kind".to_string(), "refresh_and_persist".to_string()));
+    details.push(("result".to_string(), "stream_closed".to_string()));
+    log_replication_audit_event(
+        request_context,
+        connection_session,
+        AuditLevel::Info,
+        "provider_session_complete",
+        true,
+        None,
+        details,
+    )
+    .await;
     operation_registry.finish(message_id, FinishedOperationState::Completed);
     let _ = session.finish().await;
 
@@ -8185,6 +8651,24 @@ mod tests {
         let client_stream = client.await.unwrap();
 
         (server_stream, client_stream)
+    }
+
+    async fn replication_audit_request_context(temp_file: &NamedTempFile) -> RequestContext {
+        let audit_logger = AuditLogger::new(temp_file.path(), AuditLevel::Debug);
+        audit_logger.initialize().await.unwrap();
+        RequestContext {
+            client_ip: Some("127.0.0.1".parse().unwrap()),
+            session_id: Some(2026),
+            security: Some(Arc::new(LegacySecurityConfig {
+                audit_logger: Some(audit_logger),
+                audit_config: LegacyAuditConfig::default(),
+                access_control: None,
+                root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
+                security_policy: LegacySecurityPolicy::default(),
+            })),
+            metrics: None,
+            auth_metadata: None,
+        }
     }
 
     #[derive(Default)]
@@ -11521,6 +12005,73 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
     }
 
     #[tokio::test]
+    async fn sync_refresh_only_request_emits_replication_audit_events() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=sync-user,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["sync-user".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let request_context = replication_audit_request_context(&temp_file).await;
+        let schema = LdapSchema::default();
+        let runtime_config = LegacyServerConfig::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        let mut session = ConnectionSession::default();
+        session.bind("cn=replicator,dc=example,dc=org".to_string());
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            provider_backend.as_ref(),
+            &schema,
+            &runtime_config,
+            151,
+            sync_search_request(),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &sync_request_controls(SyncRefreshMode::RefreshOnly, None),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 2);
+
+        let log_content = tokio::fs::read_to_string(temp_file.path()).await.unwrap();
+        assert!(log_content.contains("\"event_type\":\"Replication\""));
+        assert!(log_content.contains("\"action\":\"provider_session_start\""));
+        assert!(log_content.contains("\"action\":\"provider_session_complete\""));
+        assert!(log_content.contains("\"role\":\"provider\""));
+        assert!(log_content.contains("\"sync_kind\":\"full_refresh\""));
+        assert!(log_content.contains("\"entries_sent\":\"1\""));
+        assert!(log_content.contains("\"replica_id\":\"1\""));
+        assert!(!log_content.contains("bind-password"));
+        assert!(!log_content.contains("secret"));
+    }
+
+    #[tokio::test]
     async fn sync_refresh_only_request_resumes_from_cookie() {
         let mut config = ServerConfig::default();
         config.server.base_dn = "dc=example,dc=org".to_string();
@@ -11696,6 +12247,100 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
             }
             other => panic!("unexpected response: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn sync_refresh_only_stale_cookie_emits_replication_audit_failure() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "provider".to_string();
+        config.replication.changelog_capacity = 1;
+
+        let backend = Arc::new(MockBackend::new());
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let provider_backend = service.backend();
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=old,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["old".to_string()]),
+                        ("sn".to_string(), vec!["Old".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let stale_cookie = format!(
+            "csn-{}",
+            provider_backend
+                .replication_changelog()
+                .unwrap()
+                .get_context_csn()
+                .unwrap()
+        );
+        provider_backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=newer,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["newer".to_string()]),
+                        ("sn".to_string(), vec!["Newer".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let request_context = replication_audit_request_context(&temp_file).await;
+        let schema = LdapSchema::default();
+        let runtime_config = LegacyServerConfig::default();
+        let mut operation_registry = ConnectionOperationRegistry::default();
+        let mut session = ConnectionSession::default();
+        session.bind("cn=replicator,dc=example,dc=org".to_string());
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_context_and_registry(
+            &mut server_stream,
+            provider_backend.as_ref(),
+            &schema,
+            &runtime_config,
+            154,
+            sync_search_request(),
+            &session,
+            &mut operation_registry,
+            &request_context,
+            &sync_request_controls(SyncRefreshMode::RefreshOnly, Some(stale_cookie.as_bytes())),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0].protocol_op,
+            ProtocolOp::SearchResultDone(done)
+                if done.result_code == ParserResultCode::UnwillingToPerform
+        ));
+
+        let log_content = tokio::fs::read_to_string(temp_file.path()).await.unwrap();
+        assert!(log_content.contains("\"event_type\":\"Replication\""));
+        assert!(log_content.contains("\"action\":\"provider_cookie_rejected\""));
+        assert!(log_content.contains("\"success\":false"));
+        assert!(log_content.contains("\"result\":\"cookie_rejected\""));
+        assert!(log_content.contains("full refresh"));
+        assert!(log_content.contains("\"replica_id\":\"1\""));
+        assert!(!log_content.contains("bind-password"));
+        assert!(!log_content.contains("secret"));
     }
 
     #[tokio::test]

@@ -577,6 +577,10 @@ pub struct AuditSettings {
     /// Log connection events
     #[serde(default = "default_true")]
     pub log_connections: bool,
+
+    /// Log replication lifecycle and failure events
+    #[serde(default = "default_true")]
+    pub log_replication: bool,
 }
 
 /// Access control settings
@@ -1126,6 +1130,7 @@ impl Default for AuditSettings {
             log_authorization: true,
             log_modifications: true,
             log_connections: true,
+            log_replication: true,
         }
     }
 }
