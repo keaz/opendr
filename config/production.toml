@@ -1,0 +1,145 @@
+# OpenDR hardened production configuration template.
+# Copy this file to /etc/opendr/<role>/server.toml and replace example DNs,
+# hostnames, ports, paths, TLS material, and secret sources for the deployment.
+# Validate the final file with scripts/production_config_gate.sh before use.
+
+[server]
+bind_address = "0.0.0.0"
+ldap_port = 1389
+ldaps_port = 1636
+hostname = "opendr-provider.example.org"
+runtime = "fsm"
+replica_id = 1
+base_dn = "dc=example,dc=org"
+root_user_dn = "cn=Directory Manager,dc=example,dc=org"
+root_password_file = "/run/secrets/opendr-provider-root-password-hash"
+organization_name = "Example Organization"
+read_buffer_size = 4096
+operation_timeout_secs = 300
+cleanup_interval_secs = 60
+max_concurrent_operations = 100
+
+[backend]
+backend_type = "lmdb"
+data_directory = "/var/lib/opendr/provider/data"
+lmdb_max_size = 10737418240
+lmdb_max_readers = 256
+import_sample_data = false
+indexed_attributes = ["cn", "uid", "mail", "objectClass"]
+indexes = []
+
+[schema]
+enabled = true
+schema_dir = "/etc/opendr/schema"
+load_builtin = ["core"]
+strict_validation = true
+allow_online_updates = false
+
+[tls]
+enabled = true
+cert_file = "/etc/opendr/provider/certs/provider.crt"
+key_file = "/etc/opendr/provider/certs/provider.key"
+ca_file = "/etc/opendr/provider/certs/ca.crt"
+require_client_cert = false
+min_tls_version = "1.2"
+
+[security]
+profile = "production"
+allow_anonymous_bind = false
+allow_cleartext_simple_bind = false
+allow_sasl_plain = true
+allow_password_modify = true
+root_dse_requires_authentication = true
+
+[resources]
+max_connections = 512
+max_connections_per_ip = 256
+max_operations_per_connection = 200
+max_memory_per_connection = 10485760
+max_total_memory = 2147483648
+connection_idle_timeout_secs = 600
+
+[rate_limit]
+enabled = true
+global_requests_per_second = 1000
+per_client_requests_per_second = 100
+burst_size = 50
+window_duration_secs = 1
+adaptive_enabled = true
+adaptive_threshold = 0.8
+adaptive_multiplier = 0.5
+auto_ban_threshold = 100
+auto_ban_duration_secs = 300
+blacklist = []
+whitelist = []
+
+[rate_limit.operation_limits]
+bind = 10
+search = 50
+modify = 20
+add = 20
+delete = 10
+modifydn = 10
+compare = 30
+extended = 20
+
+[replication]
+enabled = false
+mode = "provider"
+changelog_capacity = 10000
+changelog_enabled = true
+max_batch_size = 100
+sync_interval_secs = 60
+max_retry_attempts = 3
+retry_delay_secs = 5
+enable_change_listening = true
+enable_streaming = true
+heartbeat_interval_secs = 30
+max_concurrent_consumers = 10
+consumer_timeout_secs = 300
+provider_timeout_secs = 30
+state_persistence_timeout_secs = 10
+change_buffer_size = 1000
+state_storage_path = "/var/lib/opendr/provider/replication_state"
+stream_port = 0
+allow_insecure_provider_bind = false
+
+[monitoring]
+enabled = true
+metrics_address = "127.0.0.1"
+metrics_port = 9090
+metrics_path = "/metrics"
+health_path = "/health"
+console_enabled = true
+console_path = "/console"
+console_session_ttl_secs = 3600
+
+[audit]
+enabled = true
+log_file = "/var/log/opendr/provider-audit.log"
+format = "json"
+level = "info"
+log_authentication = true
+log_authorization = true
+log_modifications = true
+log_connections = true
+log_replication = true
+
+[access_control]
+enabled = true
+default_policy = "deny"
+rules_file = "/etc/opendr/provider/aci.toml"
+
+[auth_metadata]
+update_mode = "sync"
+queue_capacity = 100000
+flush_interval_ms = 100
+batch_size = 1000
+overflow_policy = "fallback_sync"
+
+[performance]
+worker_threads = 0
+schema_validation = true
+indexing_enabled = true
+cache_size = 1000
+query_optimization = true

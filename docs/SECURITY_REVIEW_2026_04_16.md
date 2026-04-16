@@ -162,6 +162,10 @@ Before a deployment can claim production readiness, use or create a config with:
 - Separate runtime directories for data, logs, audit logs, replication state,
   backup artifacts, and TLS key material.
 
+Start from `config/production.toml`, tune `config/production-aci.toml`, and run
+`scripts/production_config_gate.sh <server.toml>` against every finalized
+provider and consumer config before using it as release evidence.
+
 ## Release Decision
 
 OpenDR can claim partial production readiness for tested protocol behavior after

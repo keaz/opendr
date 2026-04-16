@@ -124,6 +124,16 @@ Use a hardened config as the starting point:
 - The provider certificate chain is installed in the consumer host trust store
   or signed by a CA already trusted by the consumer host.
 
+Start from the repository
+[`config/production.toml`](../config/production.toml) template and copy
+[`config/production-aci.toml`](../config/production-aci.toml) to the configured
+ACI rules path. Before startup, run:
+
+```bash
+scripts/production_config_gate.sh /etc/opendr/provider/server.toml
+scripts/production_config_gate.sh /etc/opendr/consumer/server.toml
+```
+
 ## First Deployment
 
 1. Install the release binary and record the SHA:
@@ -145,10 +155,10 @@ Use a hardened config as the starting point:
 3. Install secrets and TLS material using your secret manager. Confirm file
    ownership allows only the OpenDR service account to read secret files.
 
-4. Write provider and consumer configs. Start from
-   `config/examples/replication/provider.toml` and
-   `config/examples/replication/consumer.toml`, then apply the hardening baseline
-   above.
+4. Write provider and consumer configs. Start from `config/production.toml`,
+   apply role-specific replication settings, copy and tune
+   `config/production-aci.toml`, then run `scripts/production_config_gate.sh`
+   against each final config.
 
 5. Start the provider:
 

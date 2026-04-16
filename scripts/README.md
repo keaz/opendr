@@ -62,6 +62,31 @@ OPENDR_BIND_PW="$LOCAL_TEST_BIND_PASSWORD" \
 - Python 3 with the `ldap3` package.
 - `openssl` when the script starts its own temporary server.
 
+### production_config_gate.sh
+
+**Purpose**: Production-readiness gate for finalized OpenDR server TOML files.
+It validates the hardening baseline before a config is used as deployment
+evidence.
+
+**What it covers**:
+1. `security.profile = "production"` and `tls.enabled = true`.
+2. Audit, access control, and rate limiting are enabled.
+3. Access control is deny-by-default and points at a rules file.
+4. Root and replication secrets use `_env` or `_file` sources, not inline TOML.
+5. LMDB data and replication state paths are absolute production paths outside
+   the source tree.
+6. Cleartext simple bind, anonymous bind, insecure replication provider bind,
+   and `ldap://` replication provider URLs are rejected.
+
+**Usage**:
+```bash
+./scripts/production_config_gate.sh /etc/opendr/provider/server.toml
+./scripts/production_config_gate.sh /etc/opendr/consumer/server.toml
+```
+
+**Prerequisites**:
+- Python 3.11 or newer for `tomllib`.
+
 ### tls_rotation_gate.sh
 
 **Purpose**: Production-readiness TLS certificate rotation gate. The script

@@ -1,0 +1,27 @@
+# Production ACI starter policy.
+# Copy to the path configured by access_control.rules_file and tune the DNs,
+# groups, attributes, and priorities for the deployment.
+
+[[rules]]
+name = "deny-password-read"
+effect = "deny"
+priority = 1000
+permissions = ["read"]
+target = { subtree = "dc=example,dc=org", attributes = ["userPassword"] }
+subject = { all_authenticated = true }
+
+[[rules]]
+name = "directory-operators-search"
+effect = "grant"
+priority = 200
+permissions = ["search"]
+target = { subtree = "dc=example,dc=org" }
+subject = { group = "cn=directory-operators,ou=Groups,dc=example,dc=org" }
+
+[[rules]]
+name = "directory-operators-read-visible-attributes"
+effect = "grant"
+priority = 190
+permissions = ["read", "compare"]
+target = { subtree = "dc=example,dc=org", attributes = ["cn", "sn", "uid", "mail", "objectClass", "entryUUID", "entryCSN", "createTimestamp", "modifyTimestamp"] }
+subject = { group = "cn=directory-operators,ou=Groups,dc=example,dc=org" }

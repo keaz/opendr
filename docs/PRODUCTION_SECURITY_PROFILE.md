@@ -27,6 +27,12 @@ validation time. It also rejects inline `server.root_password`; use
 `server.root_password_file` or `server.root_password_env` with an
 operator-provided secret.
 
+Start production deployment configs from
+[`config/production.toml`](../config/production.toml), tune
+[`config/production-aci.toml`](../config/production-aci.toml), and run
+`scripts/production_config_gate.sh <server.toml>` against each final provider
+and consumer config.
+
 ## Profile Defaults
 
 | Policy | Development | Production |
