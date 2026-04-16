@@ -21,7 +21,7 @@ operation behavior.
 | Replication soak | `SOAK_DURATION_SECS=86400 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh` | Two isolated OpenDR instances maintain provider-consumer convergence while repeated ADD, MODIFY, and DELETE operations run for the configured duration. | `target/replication-soak/release-candidate` |
 | BER fuzzing | `cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth. | Fuzz corpus and log |
 | Request-handler fuzzing | `cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth in parser/server request handling. | Fuzz corpus and log |
-| Load and soak | `scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate` | Exit code 0 and baseline validation within the documented threshold. | `target/perf/regression-candidate` |
+| Load/performance regression | `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh` | Regression profile exits 0 and baseline validation stays within the documented threshold. | `target/perf/regression-candidate` |
 
 ## Release Decision Rules
 

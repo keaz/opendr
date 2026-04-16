@@ -64,7 +64,7 @@ these gates pass and their artifacts are retained:
 6. `scripts/referral_alias_interop.sh` against a fixture with referral and alias entries
 7. `cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000`
 8. `cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000`
-9. `scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate`
+9. `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh`
 
 The manual GitHub workflow `Production Readiness Gate` runs the CI-friendly
 subset and documents the longer fuzz and soak commands that must be executed

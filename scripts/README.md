@@ -284,6 +284,42 @@ If tests fail:
 - Per-run container stats: `target/perf/.../<product>/<profile>/container-stats-summary.json`
 - Per-run status: `target/perf/.../<product>/<profile>/run-status.json`
 
+### perf_regression_gate.sh
+
+**Purpose**: Production-readiness wrapper for LDAP load and performance
+regression validation.
+
+**What it does**:
+1. `PERF_GATE_MODE=smoke` runs a small isolated LMDB benchmark through
+   `perf_single_instance_lmdb.sh`.
+2. Smoke mode enforces a maximum failure rate and optional p95 latency
+   threshold against the generated `ldap-benchmark-results.json`.
+3. `PERF_GATE_MODE=release` runs the Docker `regression` profile through
+   `perf_docker_matrix.sh`.
+4. Release mode requires `PERF_GATE_BASELINE_JSON` by default and uses
+   `compare_perf_run.py` to fail when throughput, latency, or failure-rate
+   metrics regress beyond `PERF_GATE_THRESHOLD_PERCENT`.
+
+**Usage**:
+```bash
+# Fast local smoke gate
+PERF_GATE_MODE=smoke \
+PERF_GATE_OUTPUT_DIR=target/perf/readiness-smoke \
+./scripts/perf_regression_gate.sh
+
+# Release-candidate regression gate
+PERF_GATE_MODE=release \
+PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json \
+PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate \
+./scripts/perf_regression_gate.sh
+```
+
+**Artifacts**:
+- Smoke report: `target/perf/.../perf-smoke-gate-report.md`
+- Smoke raw metrics: `target/perf/.../smoke-single-instance/ldap-benchmark-results.json`
+- Release comparison report: `target/perf/.../perf-regression-report.md`
+- Release matrix artifacts under `target/perf/.../regression-candidate`
+
 ### compare_perf_run.py
 
 **Purpose**: Compare two `ldap_perf_client` JSON reports and fail when key

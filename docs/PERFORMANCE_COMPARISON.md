@@ -172,14 +172,15 @@ Use the `regression` Docker profile for CI-friendly perf gates. It loads a
 index-search levels without requiring the 10M artifact or 30 GiB memory.
 
 ```bash
-scripts/perf_docker_matrix.sh \
-  --products opendr \
-  --profile-set regression \
-  --output-dir target/perf/regression-candidate \
-  --benchmark-timeout 900
+PERF_GATE_MODE=release \
+PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json \
+PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate \
+./scripts/perf_regression_gate.sh
 ```
 
-Save a known-good result as the baseline, then compare a new run with:
+The wrapper runs `scripts/perf_docker_matrix.sh --products opendr --profile-set
+regression`, requires a known-good baseline by default, then compares the new
+run with:
 
 ```bash
 python3 scripts/compare_perf_run.py \

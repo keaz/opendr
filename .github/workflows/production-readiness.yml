@@ -10,6 +10,7 @@ on:
       - "e2e_tests/**"
       - "fuzz/**"
       - "scripts/ldap_interop_gate.sh"
+      - "scripts/perf_regression_gate.sh"
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,6 +38,7 @@ jobs:
         run: |
           bash -n scripts/ldap_interop_gate.sh
           bash -n scripts/referral_alias_interop.sh
+          bash -n scripts/perf_regression_gate.sh
           zsh -n e2e_tests/helpers.sh
           zsh -n e2e_tests/test_single_provider_single_consumer.sh
           zsh -n e2e_tests/test_replication_soak.sh
@@ -65,6 +67,20 @@ jobs:
           REPL_TIMEOUT_SECS=45 \
           ./e2e_tests/test_replication_soak.sh
 
+      - name: Performance regression smoke gate
+        run: |
+          PERF_GATE_MODE=smoke \
+          PERF_GATE_OUTPUT_DIR=target/perf/readiness-smoke \
+          PERF_GATE_PORT=43920 \
+          PERF_GATE_SMOKE_PROFILE=debug \
+          PERF_GATE_SMOKE_USERS=20 \
+          PERF_GATE_SMOKE_READ_ITERATIONS=5 \
+          PERF_GATE_SMOKE_WRITE_ITERATIONS=3 \
+          PERF_GATE_SMOKE_WARMUP_ITERATIONS=1 \
+          PERF_GATE_MAX_FAILURE_RATE_PERCENT=0 \
+          PERF_GATE_MAX_P95_MS=5000 \
+          ./scripts/perf_regression_gate.sh
+
       - name: Fuzz target compile gate
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
 
@@ -76,6 +92,7 @@ jobs:
           cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000
           cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000
           SOAK_DURATION_SECS=86400 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh
+          PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh
           ./scripts/referral_alias_interop.sh
           ./scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate
           EOF
