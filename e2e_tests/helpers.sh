@@ -520,9 +520,19 @@ count_entries() {
   local base="$3"
   local filter="$4"
 
-  local count
-  count=$(search_entry "${host}" "${port}" "${base}" "${filter}" dn 2>/dev/null | \
-          awk '/^dn: / { count++ } END { print count + 0 }')
+  local search_output="" search_status=0 count=""
+  set +e
+  search_output=$(search_entry "${host}" "${port}" "${base}" "${filter}" dn 2>/dev/null)
+  search_status=$?
+  set -e
+
+  if [[ ${search_status} -ne 0 ]]; then
+    log_debug "Count search failed for ${base} ${filter} at ${host}:${port} with status ${search_status}"
+    echo "-1"
+    return 0
+  fi
+
+  count=$(printf "%s\n" "${search_output}" | awk '/^dn: / { count++ } END { print count + 0 }')
   # Remove any newlines or whitespace
   count=$(echo "$count" | tr -d '\n\r ' | head -c 10)
   echo "${count}"

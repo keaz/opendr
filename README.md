@@ -527,22 +527,22 @@ For production-readiness evidence, use
 ## Release Readiness
 
 The table below records the release gates and the artifact locations used by the
-current release candidate workflow. The main agent can update the status cells
-after the long-running gates finish.
+current release candidate workflow.
 
 | Gate | Command | Status | Artifact |
 | --- | --- | --- | --- |
-| Performance regression `regression-100k` | `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh` | pending | `target/perf/regression-candidate/regression-candidate/comparison-summary.md` |
-| 1-hour replication soak | `SOAK_DURATION_SECS=3600 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh` | pending | `target/replication-soak/release-candidate/summary.txt` |
-| Full release fuzz budget | `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh` | pending | `target/fuzz-gate/release-candidate/summary.md` |
+| Performance regression `regression-100k` | `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh` | passed | `target/perf/regression-candidate/20260416T073953Z/comparison-summary.md` |
+| 1-hour replication soak | `SOAK_DURATION_SECS=3600 SOAK_ARTIFACT_DIR=target/replication-soak/1h-20260416T080507Z ./e2e_tests/test_replication_soak.sh` | passed | `target/replication-soak/1h-20260416T080507Z/summary.txt` |
+| Full release fuzz budget | `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-20260416T090940Z ./scripts/fuzz_gate.sh` | passed | `target/fuzz-gate/release-20260416T090940Z/summary.md` |
 | TLS rotation | `TLS_ROTATION_ARTIFACT_DIR=target/tls-rotation-gate/release-candidate ./scripts/tls_rotation_gate.sh` | retained locally | `target/tls-rotation-gate/release-candidate/summary.md` |
 | Failure drills | `FAILURE_DRILL_MODE=release FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/release-candidate ./e2e_tests/test_replication_failure_drills.sh` | retained locally | `target/replication-failure-drills/release-candidate/summary.txt` |
 | Backup/restore drill | `BACKUP_DRILL_MODE=release BACKUP_DRILL_USERS=100000 BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate ./scripts/backup_restore_drill.sh` | retained locally | `target/backup-restore-drill/release-candidate/summary.md` |
 | Deployment rollback drill | `DEPLOYMENT_DRILL_MODE=release DEPLOYMENT_DRILL_OUTPUT_DIR=target/deployment-rollback-drill/release-candidate ./scripts/deployment_rollback_drill.sh` | retained locally | `target/deployment-rollback-drill/release-candidate/summary.md` |
 
 For the full release policy and pass criteria, keep `docs/PRODUCTION_READINESS_CHECKLIST.md`
-as the source of truth. Use the retained artifacts in `target/` to update the
-status column once the current long-running gates complete.
+as the source of truth. The 2026-04-16 release-candidate evidence retained
+locally includes a candidate-only performance pass, a 1-hour two-instance
+replication soak, and the full release fuzz budget.
 
 ## Production Deployment
 

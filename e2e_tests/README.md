@@ -188,6 +188,11 @@ SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate \
 The release-candidate run should retain `summary.txt`, server logs, and
 generated configs from `SOAK_ARTIFACT_DIR` with the release evidence.
 
+The 2026-04-16 v1.0.0 bounded soak evidence passed with artifacts in
+`target/replication-soak/1h-20260416T080507Z`: 3600 seconds, 294 rounds, 1470
+adds, 588 modifies, 98 deletes, and matching final provider/consumer entry
+counts of 1372.
+
 ### test_replication_failure_drills.sh
 
 **Purpose**: Validate operator recovery paths for provider/consumer failures and

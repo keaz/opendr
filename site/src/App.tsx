@@ -1349,10 +1349,10 @@ cargo build --release`}</code></pre>
               <p className="chapter-label">Chapter 6</p>
               <h2 id="readiness-title">Production Readiness</h2>
               <p>
-                Use this section as the release evidence checklist. The current
-                bounded verification runs are marked pending while they are
-                still executing, and the full release gates below remain the
-                final production signoff.
+                Use this section as the release evidence checklist. The
+                2026-04-16 bounded verification runs passed and the retained
+                artifacts below are the evidence for this release candidate.
+                Longer production signoff gates still use the checklist policy.
               </p>
 
               <div className="markdown-doc perf-results">

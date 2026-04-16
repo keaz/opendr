@@ -198,6 +198,41 @@ when a metric regresses beyond the threshold. The perf client JSON now includes
 `operation_failed`. These buckets should be reviewed first when c128, c256, or
 c1000 rows have non-zero failure rates.
 
+## Release Candidate Regression Evidence 2026-04-16
+
+The v1.0.0 release-candidate performance gate was rerun in release mode with
+the `regression-100k` Docker profile.
+
+Artifact:
+`target/perf/regression-candidate/20260416T073953Z/comparison-summary.md`
+
+Result: passed as a candidate-only run. The retained baseline file was not
+present at
+`target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json`,
+so this evidence records the candidate profile output but is not a true
+baseline-vs-candidate regression comparison.
+
+| Metric | Result |
+|---|---:|
+| Runtime | `68.24` seconds |
+| Preloaded users | `100,000` |
+| Records after setup | `100,005` |
+| DB size after setup | `252.38 MiB` |
+| OpenDR CPU avg / max | `90.43%` / `177.18%` |
+| OpenDR RSS avg / max | `175.87 MiB` / `268.50 MiB` |
+| Subtree search mean | `807.100 ms` |
+| Simple bind admin mean | `0.096 ms` |
+| Add / modify / delete mean | `1.614 ms` / `0.454 ms` / `1.254 ms` |
+| Peak concurrent bind success throughput | `18,833.41 ops/s` |
+| Max concurrent bind failure rate at 128 clients | `9.38%` |
+| Equality `uid` index mean | `0.182 ms` |
+| Peak concurrent index-search success throughput | `34,063.16 ops/s` |
+| Max concurrent index-search failure rate at 128 clients | `21.88%` |
+
+For production regression enforcement, retain a known-good
+`ldap-benchmark-results.json` baseline in the baseline path above and rerun the
+wrapper so the threshold comparison can fail the gate on regressions.
+
 For local macOS/Linux profiling without Docker, build optimized binaries and run
 the server/client pair directly:
 
