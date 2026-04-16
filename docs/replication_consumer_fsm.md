@@ -242,7 +242,7 @@ let mut consumer = ReplicationConsumerFsmImpl::new(
 
 // Start replication
 consumer.handle_event(ReplicationConsumerEvent::StartConsumption {
-    provider_url: "ldap://provider.example.com:389".to_string(),
+    provider_url: "ldaps://provider.example.com:636".to_string(),
     cookie: None, // First sync
 }).await?;
 ```
@@ -566,7 +566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start replication
     println!("Starting replication...");
     let result = consumer.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://provider.example.com:389".to_string(),
+        provider_url: "ldaps://provider.example.com:636".to_string(),
         cookie: None,
     }).await?;
     
@@ -630,7 +630,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Create production dependencies
     let provider_connection = Box::new(ProductionProviderConnection::new(
-        "ldap://primary.example.com:389",
+        "ldaps://primary.example.com:636",
         "cn=replicator,dc=example,dc=org",
         "secret_password"
     ));
@@ -665,7 +665,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start replication from last known state
     println!("Starting replication from cookie: {:?}", existing_cookie);
     consumer.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://primary.example.com:389".to_string(),
+        provider_url: "ldaps://primary.example.com:636".to_string(),
         cookie: existing_cookie,
     }).await?;
     
@@ -740,7 +740,7 @@ async fn run_replication_cycle(
 ) -> Result<(), ConsumerError> {
     // Start replication
     consumer.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://provider.example.com:389".to_string(),
+        provider_url: "ldaps://provider.example.com:636".to_string(),
         cookie: None,
     }).await?;
     
@@ -780,7 +780,7 @@ async fn test_complete_replication_flow() {
     
     // Test start consumption
     let result = fsm.handle_event(ReplicationConsumerEvent::StartConsumption {
-        provider_url: "ldap://test.com:389".to_string(),
+        provider_url: "ldaps://test.com:636".to_string(),
         cookie: None,
     }).await;
     assert!(result.is_ok());

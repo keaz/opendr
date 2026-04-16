@@ -396,6 +396,14 @@ pub struct ReplicationSettings {
     #[serde(default)]
     pub provider_url: Option<String>,
 
+    /// Allow simple bind credentials to be sent to an ldap:// provider.
+    ///
+    /// This is intended only for local development and loopback tests.
+    /// Production configurations must use ldaps:// until StartTLS replication
+    /// support is implemented and explicitly configurable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_insecure_provider_bind: bool,
+
     /// Replication bind DN
     #[serde(default, alias = "provider_bind_dn", alias = "replication_bind_dn")]
     pub bind_dn: Option<String>,
@@ -740,6 +748,9 @@ fn default_cert_file() -> PathBuf {
 fn default_key_file() -> PathBuf {
     PathBuf::from("certs/server.key")
 }
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 fn default_min_tls_version() -> String {
     "1.2".to_string()
 }
@@ -1051,6 +1062,7 @@ impl Default for ReplicationSettings {
             enabled: false,
             mode: default_replication_mode(),
             provider_url: None,
+            allow_insecure_provider_bind: false,
             bind_dn: None,
             bind_password: None,
             bind_password_env: None,
@@ -1279,6 +1291,10 @@ impl fmt::Debug for ReplicationSettings {
             .field("enabled", &self.enabled)
             .field("mode", &self.mode)
             .field("provider_url", &self.provider_url)
+            .field(
+                "allow_insecure_provider_bind",
+                &self.allow_insecure_provider_bind,
+            )
             .field("bind_dn", &self.bind_dn)
             .field(
                 "bind_password",
@@ -1351,6 +1367,49 @@ impl ServerConfig {
             self.replication.bind_password_env.as_deref(),
             self.replication.bind_password_file.as_deref(),
         )
+    }
+
+    /// Validate the transport policy for replication provider credentials.
+    pub fn validate_replication_provider_transport(&self) -> Result<(), ConfigError> {
+        let replication_mode = self.replication.mode.as_str();
+        if !self.replication.enabled
+            || (!replication_mode.eq_ignore_ascii_case("consumer")
+                && !replication_mode.eq_ignore_ascii_case("both"))
+        {
+            return Ok(());
+        }
+
+        let production_profile = self.security.profile.eq_ignore_ascii_case("production");
+
+        if production_profile && self.replication.allow_insecure_provider_bind {
+            return Err(ConfigError::ValidationError(
+                "replication.allow_insecure_provider_bind cannot be true when security.profile=production".to_string(),
+            ));
+        }
+
+        let Some(provider_url) = self.replication.provider_url.as_deref() else {
+            return Ok(());
+        };
+        let provider_url = provider_url.trim();
+        let uses_cleartext_ldap = provider_url
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ldap://"));
+        if !uses_cleartext_ldap {
+            return Ok(());
+        }
+
+        let has_bind_secret = self.replication.bind_password.is_some()
+            || self.replication.bind_password_env.is_some()
+            || self.replication.bind_password_file.is_some();
+
+        if (production_profile || has_bind_secret) && !self.replication.allow_insecure_provider_bind
+        {
+            return Err(ConfigError::ValidationError(
+                "replication.provider_url uses ldap:// with production settings or replication bind credentials; use ldaps://, or set replication.allow_insecure_provider_bind=true only for local development loopback tests".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Load the configured LDAP schema registry.
@@ -1854,6 +1913,7 @@ impl ServerConfig {
                     ));
                 }
                 let _ = self.resolved_replication_bind_password()?;
+                self.validate_replication_provider_transport()?;
             }
             if self.replication.sync_interval_secs == 0 {
                 return Err(ConfigError::ValidationError(
@@ -2084,6 +2144,115 @@ profile = "production"
     }
 
     #[test]
+    fn replication_bind_password_requires_secure_provider_transport_by_default() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:389"
+bind_password = "secret"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("replication.provider_url uses ldap://"));
+        assert!(error.contains("ldaps://"));
+    }
+
+    #[test]
+    fn replication_insecure_provider_bind_can_be_allowed_for_development() {
+        let config = ServerConfig::from_toml_str(
+            r#"
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://127.0.0.1:1389"
+allow_insecure_provider_bind = true
+bind_password = "secret"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn production_profile_rejects_insecure_replication_provider_override() {
+        let cert_file = NamedTempFile::new().unwrap();
+        let key_file = NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[security]
+profile = "production"
+
+[tls]
+enabled = true
+cert_file = "{}"
+key_file = "{}"
+
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldap://provider.example.com:389"
+allow_insecure_provider_bind = true
+"#,
+            cert_file.path().display(),
+            key_file.path().display()
+        );
+
+        let config = ServerConfig::from_toml_str(&toml).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("allow_insecure_provider_bind cannot be true"));
+    }
+
+    #[test]
+    fn replication_transport_validation_handles_programmatic_case_variants() {
+        let mut config = ServerConfig::default();
+        config.security.profile = "Production".to_string();
+        config.replication.enabled = true;
+        config.replication.mode = "Consumer".to_string();
+        config.replication.provider_url = Some("ldap://provider.example.com:389".to_string());
+        config.replication.allow_insecure_provider_bind = true;
+
+        let error = config
+            .validate_replication_provider_transport()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("allow_insecure_provider_bind cannot be true"));
+    }
+
+    #[test]
+    fn production_profile_accepts_ldaps_replication_provider_with_credentials() {
+        let cert_file = NamedTempFile::new().unwrap();
+        let key_file = NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[security]
+profile = "production"
+
+[tls]
+enabled = true
+cert_file = "{}"
+key_file = "{}"
+
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldaps://provider.example.com:636"
+bind_dn = "cn=replicator,dc=example,dc=com"
+bind_password = "secret"
+"#,
+            cert_file.path().display(),
+            key_file.path().display()
+        );
+
+        let config = ServerConfig::from_toml_str(&toml).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_config_validation_success() {
         let config = ServerConfig::default();
         assert!(config.validate().is_ok());
@@ -2216,7 +2385,7 @@ root_password_file = "{}"
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider.example.com:389"
+provider_url = "ldaps://provider.example.com:636"
 bind_password_env = "{env_name}"
 "#
         );

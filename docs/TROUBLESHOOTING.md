@@ -178,11 +178,27 @@ Check:
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider.example.com:1389"
+provider_url = "ldaps://provider.example.com:1636"
 enable_change_listening = true
 ```
 
 Consumer and both modes reject `enable_change_listening = false`.
+
+### Credentialed `ldap://` replication provider URL is rejected
+
+Check:
+
+```toml
+[replication]
+enabled = true
+mode = "consumer"
+provider_url = "ldaps://provider.example.com:1636"
+bind_password_file = "/run/secrets/opendr-replication-bind-password"
+```
+
+Use `ldaps://` for replication binds. The
+`allow_insecure_provider_bind = true` option is only for local development and
+loopback tests, and is rejected when `security.profile = "production"`.
 
 ### Provider URL is rejected
 

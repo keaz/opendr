@@ -227,6 +227,7 @@ lmdb_max_readers = 126
 enabled = true
 mode = "consumer"
 provider_url = "ldap://127.0.0.1:$PROVIDER_PORT"
+allow_insecure_provider_bind = true
 bind_dn = "cn=admin,dc=example,dc=com"
 bind_password = "provider_admin"
 max_retry_attempts = 3

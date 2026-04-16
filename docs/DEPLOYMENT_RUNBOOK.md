@@ -117,12 +117,12 @@ Use a hardened config as the starting point:
   data volume plus one full backup.
 - `replication.state_storage_path` on persistent storage for provider changelog
   and consumer cookies.
-
-Current caveat: issue #162 tracks mandatory secure transport enforcement for
-replication provider credentials. Until that is resolved, do not send
-replication bind credentials over an untrusted network. Scope the deployment to
-a protected channel or exclude the replication path from a full production-ready
-claim.
+- `replication.provider_url` uses `ldaps://` whenever replication bind
+  credentials are configured. The development-only
+  `allow_insecure_provider_bind` option is rejected under
+  `security.profile = "production"`.
+- The provider certificate chain is installed in the consumer host trust store
+  or signed by a CA already trusted by the consumer host.
 
 ## First Deployment
 

@@ -117,7 +117,7 @@ pub struct ProviderConfig {
 /// Consumer-specific replication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerConfig {
-    /// Provider server URL (e.g., "ldap://provider.example.com:389")
+    /// Provider server URL (e.g., "ldaps://provider.example.com:636")
     pub provider_url: String,
 
     /// Provider bind DN (optional, for authentication)
@@ -223,7 +223,7 @@ impl Default for ProviderConfig {
 impl Default for ConsumerConfig {
     fn default() -> Self {
         Self {
-            provider_url: "ldap://provider.example.com:389".to_string(),
+            provider_url: "ldaps://provider.example.com:636".to_string(),
             provider_bind_dn: None,
             provider_bind_password: None,
             provider_bind_password_env: None,
@@ -777,7 +777,7 @@ impl SetupHandler {
 
                 consumer_config.provider_url = self
                     .prompt_with_default(
-                        "Provider URL (e.g., ldap://provider.example.com:389)",
+                        "Provider URL (e.g., ldaps://provider.example.com:636)",
                         &consumer_config.provider_url,
                     )
                     .await?;
@@ -1600,7 +1600,7 @@ mod tests {
 
     fn consumer_config() -> ConsumerConfig {
         ConsumerConfig {
-            provider_url: "ldap://provider.example.com:1389".to_string(),
+            provider_url: "ldaps://provider.example.com:1636".to_string(),
             provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
             provider_bind_password: None,
             provider_bind_password_env: Some("OPENDR_REPLICATION_BIND_PASSWORD".to_string()),
@@ -1687,7 +1687,7 @@ mod tests {
         assert_eq!(server_config.replication.changelog_capacity, 50_000);
         assert_eq!(
             server_config.replication.provider_url.as_deref(),
-            Some("ldap://provider.example.com:1389")
+            Some("ldaps://provider.example.com:1636")
         );
         assert_eq!(
             server_config.replication.bind_dn.as_deref(),

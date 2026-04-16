@@ -479,7 +479,7 @@ async fn test_replication_config_consumer_serialization() {
             role: ReplicationRole::Consumer,
             provider: None,
             consumer: Some(ConsumerConfig {
-                provider_url: "ldap://provider.example.com:1389".to_string(),
+                provider_url: "ldaps://provider.example.com:1636".to_string(),
                 provider_bind_dn: Some("cn=replication".to_string()),
                 provider_bind_password: Some("secret".to_string()),
                 provider_bind_password_env: None,
@@ -567,7 +567,7 @@ enabled = true
 role = "Consumer"
 
 [replication.consumer]
-provider_url = "ldap://provider:1389"
+provider_url = "ldaps://provider:1636"
 sync_interval_secs = 60
 max_retry_attempts = 3
 retry_delay_secs = 10
@@ -681,7 +681,7 @@ async fn test_setup_handler_generates_canonical_consumer_replication_config() {
             role: ReplicationRole::Consumer,
             provider: None,
             consumer: Some(ConsumerConfig {
-                provider_url: "ldap://provider.example.com:1389".to_string(),
+                provider_url: "ldaps://provider.example.com:1636".to_string(),
                 provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
                 provider_bind_password: Some("replica-secret".to_string()),
                 provider_bind_password_env: None,
@@ -726,7 +726,7 @@ async fn test_setup_handler_generates_canonical_consumer_replication_config() {
     assert_eq!(loaded_config.replication.mode, "consumer");
     assert_eq!(
         loaded_config.replication.provider_url.as_deref(),
-        Some("ldap://provider.example.com:1389")
+        Some("ldaps://provider.example.com:1636")
     );
     assert_eq!(
         loaded_config.replication.bind_dn.as_deref(),
@@ -778,7 +778,7 @@ async fn test_setup_handler_generates_canonical_both_replication_config() {
                 consumer_timeout_secs: 360,
             }),
             consumer: Some(ConsumerConfig {
-                provider_url: "ldap://peer.example.com:1389".to_string(),
+                provider_url: "ldaps://peer.example.com:1636".to_string(),
                 provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
                 provider_bind_password: None,
                 provider_bind_password_env: Some("OPENDR_REPLICATION_BIND_PASSWORD".to_string()),
@@ -830,7 +830,7 @@ async fn test_setup_handler_generates_canonical_both_replication_config() {
     assert_eq!(loaded_config.replication.changelog_capacity, 200000);
     assert_eq!(
         loaded_config.replication.provider_url.as_deref(),
-        Some("ldap://peer.example.com:1389")
+        Some("ldaps://peer.example.com:1636")
     );
     assert_eq!(
         loaded_config.replication.bind_password_env.as_deref(),
@@ -996,7 +996,7 @@ async fn test_setup_consumer_file_secret_source_does_not_inline_secret() {
             role: ReplicationRole::Consumer,
             provider: None,
             consumer: Some(ConsumerConfig {
-                provider_url: "ldap://provider.example.com:1389".to_string(),
+                provider_url: "ldaps://provider.example.com:1636".to_string(),
                 provider_bind_dn: Some("cn=replication,dc=example,dc=com".to_string()),
                 provider_bind_password: None,
                 provider_bind_password_env: None,

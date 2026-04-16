@@ -240,7 +240,8 @@ Legacy runtime note: the shipped binary rejects non-default `burst_size` in
 [replication]
 enabled = false
 mode = "provider"
-provider_url = "ldap://provider.example.com:1389"
+provider_url = "ldaps://provider.example.com:1636"
+allow_insecure_provider_bind = false
 bind_dn = "cn=replication,dc=example,dc=com"
 bind_password_file = "/run/secrets/opendr-replication-bind-password"
 changelog_capacity = 10000
@@ -265,7 +266,8 @@ stream_port = 0
 | --- | --- | --- |
 | `enabled` | `false` | Enables provider, consumer, or both roles |
 | `mode` | `provider` | `provider`, `consumer`, or `both`; alias `role` |
-| `provider_url` | unset | Required for `consumer` and `both` |
+| `provider_url` | unset | Required for `consumer` and `both`; use `ldaps://` for credentialed or production replication |
+| `allow_insecure_provider_bind` | `false` | Development-only escape hatch for loopback `ldap://` replication binds; rejected with `security.profile = "production"` |
 | `bind_dn` | unset | Consumer bind DN; aliases `provider_bind_dn`, `replication_bind_dn` |
 | `bind_password` | unset | Inline secret; aliases accepted |
 | `bind_password_env` | unset | Environment secret source; aliases accepted |
@@ -289,7 +291,11 @@ stream_port = 0
 
 For consumer and both modes, use exactly one of `bind_password`,
 `bind_password_env`, or `bind_password_file` when a replication bind password is
-configured.
+configured. Credentialed replication over `ldap://` is rejected unless
+`allow_insecure_provider_bind = true` is set for local development or loopback
+tests. Production configurations must use `ldaps://` until replication StartTLS
+support is implemented. The provider certificate chain must validate through the
+consumer host trust store or a publicly trusted certificate authority.
 
 ## Monitoring
 
@@ -566,7 +572,7 @@ lmdb_max_readers = 256
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider.example.com:1389"
+provider_url = "ldaps://provider.example.com:1636"
 bind_dn = "cn=replication,dc=example,dc=com"
 bind_password_file = "/run/secrets/opendr-replication-bind-password"
 max_retry_attempts = 5

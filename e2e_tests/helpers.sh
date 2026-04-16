@@ -318,6 +318,7 @@ lmdb_max_readers = 126
 enabled = true
 mode = "consumer"
 provider_url = "ldap://127.0.0.1:PROVIDER_PORT_PLACEHOLDER"
+allow_insecure_provider_bind = true
 sync_interval_secs = SYNC_INT_PLACEHOLDER
 EXTRA_PLACEHOLDER
 

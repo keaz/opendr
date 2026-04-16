@@ -237,6 +237,9 @@ Important rules:
 - TLS validates certificate, key, and required CA file existence before startup.
 - Consumer and both replication modes require `provider_url` and
   `enable_change_listening = true`.
+- Credentialed replication provider URLs must use `ldaps://` unless
+  `replication.allow_insecure_provider_bind = true` is set for a local
+  development loopback test.
 - Poll-based consumer replication has been removed.
 - `access_control.rules_file` is loaded at startup when access control is
   enabled. See `docs/CONFIGURATION.md` for the TOML rule format.
@@ -459,7 +462,7 @@ replica_id = 2
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider.example.com:1389"
+provider_url = "ldaps://provider.example.com:1636"
 bind_dn = "cn=replication,dc=example,dc=com"
 bind_password_file = "/run/secrets/opendr-replication-bind-password"
 max_retry_attempts = 5
@@ -499,7 +502,7 @@ Operational notes:
 Verify replication:
 
 ```bash
-ldapadd -x -H ldap://provider.example.com:1389 \
+ldapadd -x -H ldaps://provider.example.com:1636 \
   -D "cn=manager,dc=example,dc=com" -w "$PROVIDER_PASSWORD" <<'LDIF'
 dn: uid=replication-test,ou=People,dc=example,dc=com
 objectClass: top
@@ -511,7 +514,7 @@ sn: Test
 uid: replication-test
 LDIF
 
-ldapsearch -x -H ldap://consumer.example.com:2389 \
+ldapsearch -x -H ldaps://consumer.example.com:2636 \
   -D "cn=manager,dc=example,dc=com" -w "$CONSUMER_PASSWORD" \
   -b "ou=People,dc=example,dc=com" "(uid=replication-test)"
 ```

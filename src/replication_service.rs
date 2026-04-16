@@ -589,6 +589,9 @@ impl ReplicationService {
             let provider_bind_password = config
                 .resolved_replication_bind_password()
                 .map_err(|err| err.to_string())?;
+            config
+                .validate_replication_provider_transport()
+                .map_err(|err| err.to_string())?;
 
             Some(ConsumerServiceConfig {
                 provider_url: provider_url.clone(),
@@ -1451,6 +1454,7 @@ mod tests {
         config.replication.sync_interval_secs = 60;
         config.replication.bind_dn = Some("cn=admin,dc=example,dc=com".to_string());
         config.replication.bind_password = Some("secret".to_string());
+        config.replication.allow_insecure_provider_bind = true;
         let backend = Arc::new(MockBackend::new());
 
         let service = ReplicationService::from_config(&config, backend).unwrap();
@@ -1478,6 +1482,7 @@ mod tests {
         config.replication.mode = "consumer".to_string();
         config.replication.provider_url = Some("ldap://provider:389".to_string());
         config.replication.bind_password_file = Some(secret_file.path().to_path_buf());
+        config.replication.allow_insecure_provider_bind = true;
         let backend = Arc::new(MockBackend::new());
 
         let service = ReplicationService::from_config(&config, backend).unwrap();
@@ -1491,6 +1496,41 @@ mod tests {
         let debug_output = format!("{consumer_cfg:?}");
         assert!(!debug_output.contains("file-backed-bind-password"));
         assert!(debug_output.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_consumer_config_rejects_credentialed_cleartext_provider_url() {
+        let mut config = create_test_config();
+        config.replication.mode = "consumer".to_string();
+        config.replication.provider_url = Some("ldap://provider:389".to_string());
+        config.replication.bind_password = Some("secret".to_string());
+        let backend = Arc::new(MockBackend::new());
+
+        let error = match ReplicationService::from_config(&config, backend) {
+            Ok(_) => panic!("credentialed cleartext replication should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("replication.provider_url uses ldap://"));
+        assert!(error.contains("ldaps://"));
+    }
+
+    #[test]
+    fn test_consumer_config_accepts_ldaps_provider_url_with_credentials() {
+        let mut config = create_test_config();
+        config.replication.mode = "consumer".to_string();
+        config.replication.provider_url = Some("ldaps://provider:636".to_string());
+        config.replication.bind_password = Some("secret".to_string());
+        let backend = Arc::new(MockBackend::new());
+
+        let service = ReplicationService::from_config(&config, backend).unwrap();
+        let consumer_cfg = service.consumer_config().unwrap();
+
+        assert_eq!(consumer_cfg.provider_url, "ldaps://provider:636");
+        assert_eq!(
+            consumer_cfg.provider_bind_password,
+            Some("secret".to_string())
+        );
     }
 
     #[test]

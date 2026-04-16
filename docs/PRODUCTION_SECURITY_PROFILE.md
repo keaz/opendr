@@ -63,6 +63,9 @@ controlled exception. SASL PLAIN still requires LDAPS or StartTLS even when
   secrets.
 - Rotate service and replication bind credentials through secret files or
   environment sources.
+- Use `ldaps://` provider URLs for credentialed replication. The
+  `replication.allow_insecure_provider_bind` development escape hatch is
+  rejected under the production profile.
 
 ## Audit And Authorization Checklist
 

@@ -277,7 +277,7 @@ fn test_validation_valid_replication_consumer() {
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider.example.com:389"
+provider_url = "ldaps://provider.example.com:636"
 bind_dn = "cn=replicator,dc=example,dc=com"
 bind_password = "secret"
 max_batch_size = 128
@@ -299,7 +299,7 @@ state_storage_path = "/var/lib/opendr/repl_state"
     assert_eq!(config.replication.mode, "consumer");
     assert_eq!(
         config.replication.provider_url.unwrap(),
-        "ldap://provider.example.com:389"
+        "ldaps://provider.example.com:636"
     );
     assert_eq!(config.replication.max_batch_size, 128);
     assert_eq!(config.replication.max_retry_attempts, 9);
@@ -360,7 +360,7 @@ fn test_validation_custom_replication_listening_config() {
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider.example.com:389"
+provider_url = "ldaps://provider.example.com:636"
 bind_dn = "cn=replicator,dc=example,dc=com"
 bind_password = "secret"
 sync_interval_secs = 15
@@ -426,7 +426,7 @@ fn test_validation_legacy_setup_role_alias_is_normalized() {
 [replication]
 enabled = true
 role = "Consumer"
-provider_url = "ldap://provider.example.com:389"
+provider_url = "ldaps://provider.example.com:636"
 bind_dn = "cn=replicator,dc=example,dc=com"
 bind_password = "secret"
     "#;

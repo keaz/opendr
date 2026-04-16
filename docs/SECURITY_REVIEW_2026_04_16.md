@@ -18,17 +18,16 @@ sources, audit logging, deny-by-default ACI support, and tests for many
 authentication and authorization paths.
 
 It is not ready to describe the default repository configuration as production
-safe. The main gaps are operational hardening and consistency issues: examples
-can send replication credentials over cleartext LDAP, committed/default root
-secrets are easy to reuse accidentally, root/admin DN handling is inconsistent,
-replication audit coverage is missing, and there is no single hardened config
-template/gate.
+safe. The main gaps are operational hardening and consistency issues:
+committed/default root secrets are easy to reuse accidentally, root/admin DN
+handling is inconsistent, replication audit coverage is missing, and there is no
+single hardened config template/gate.
 
 ## Follow-Up Issues
 
 | Issue | Severity | Finding |
 | --- | --- | --- |
-| [#162](https://github.com/keaz/opendr/issues/162) | High | Require secure transport for replication provider credentials. |
+| [#162](https://github.com/keaz/opendr/issues/162) | High | Require secure transport for replication provider credentials. Remediated by default validation policy. |
 | [#163](https://github.com/keaz/opendr/issues/163) | High | Remove committed/default root secret from production paths. |
 | [#164](https://github.com/keaz/opendr/issues/164) | Medium | Canonicalize root/admin DN handling across auth, ACI, and console. |
 | [#165](https://github.com/keaz/opendr/issues/165) | Medium | Add replication security audit events. |
@@ -77,6 +76,9 @@ Implemented controls:
 - StartTLS clears authentication state, so clients must bind again after the
   transport upgrade.
 - Password Modify requires a confidential channel and can be disabled by policy.
+- Credentialed replication provider URLs must use `ldaps://` by default. The
+  development-only `replication.allow_insecure_provider_bind` escape hatch is
+  rejected under `security.profile = "production"`.
 
 Coverage:
 
@@ -90,12 +92,10 @@ Gaps:
 
 - Development profile remains the default and intentionally allows cleartext
   simple bind and anonymous bind.
-- Replication consumer examples and docs use `ldap://` provider URLs while also
-  configuring replication bind credentials. The current consumer connection path
-  accepts `ldap://` and performs simple bind without StartTLS.
 
-Tracked remediation: [#162](https://github.com/keaz/opendr/issues/162) and
-[#166](https://github.com/keaz/opendr/issues/166).
+Tracked remediation: [#166](https://github.com/keaz/opendr/issues/166). Secure
+replication provider transport was remediated by
+[#162](https://github.com/keaz/opendr/issues/162).
 
 ### Root/Admin DN And Secret Handling
 
@@ -159,8 +159,8 @@ Before a deployment can claim production readiness, use or create a config with:
   ACI rules file.
 - `[rate_limit].enabled = true` with bind/search/write limits sized for the
   deployment.
-- Replication provider URLs using confidential transport for every configured
-  bind secret.
+- Replication provider URLs using `ldaps://` confidential transport for every
+  configured bind secret.
 - Separate runtime directories for data, logs, audit logs, replication state,
   backup artifacts, and TLS key material.
 
@@ -168,5 +168,5 @@ Before a deployment can claim production readiness, use or create a config with:
 
 OpenDR can claim partial production readiness for tested protocol behavior after
 the existing readiness gates pass. It should not claim full production readiness
-for default deployment posture until #162, #163, #164, #165, and #166 are
-resolved or explicitly scoped out of the release.
+for default deployment posture until #163, #164, #165, and #166 are resolved or
+explicitly scoped out of the release.

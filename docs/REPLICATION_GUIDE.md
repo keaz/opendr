@@ -74,7 +74,7 @@ lmdb_max_readers = 126
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider.example.com:1389"
+provider_url = "ldaps://provider.example.com:1636"
 bind_dn = "cn=replication,dc=example,dc=com"
 bind_password_file = "/run/secrets/opendr-replication-bind-password"
 max_retry_attempts = 3
@@ -84,7 +84,12 @@ heartbeat_interval_secs = 60
 state_storage_path = "./data/replication_state"
 ```
 
-`bind_dn` and `bind_password` are the canonical consumer authentication keys. The aliases `provider_bind_dn`, `provider_bind_password`, `replication_bind_dn`, and `replication_bind_password` are still accepted for older configs. Prefer `bind_password_env` or `bind_password_file` for production secrets.
+`bind_dn` and `bind_password` are the canonical consumer authentication keys. The aliases `provider_bind_dn`, `provider_bind_password`, `replication_bind_dn`, and `replication_bind_password` are still accepted for older configs. Prefer `bind_password_env` or `bind_password_file` for production secrets. Credentialed replication uses `ldaps://`; `ldap://` with bind credentials now requires the development-only `allow_insecure_provider_bind = true` escape hatch and is rejected under `security.profile = "production"`.
+
+Install the provider certificate chain in the consumer host trust store, or use
+a publicly trusted provider certificate. The replication client uses the LDAP
+client TLS verifier; do not rely on cleartext LDAP for production bind
+credentials.
 
 ## Start Instances
 
@@ -103,7 +108,7 @@ The consumer is on the listener path when it logs `Replication consumer entered 
 Add an entry on the provider:
 
 ```bash
-ldapadd -x -H ldap://provider.example.com:1389 \
+ldapadd -x -H ldaps://provider.example.com:1636 \
   -D "cn=manager,dc=example,dc=com" -w '<provider-root-password>' <<EOF
 dn: uid=listener-test,ou=People,dc=example,dc=com
 objectClass: top
@@ -119,7 +124,7 @@ EOF
 Query the consumer:
 
 ```bash
-ldapsearch -x -H ldap://consumer.example.com:2389 \
+ldapsearch -x -H ldaps://consumer.example.com:2636 \
   -D "cn=manager,dc=example,dc=com" -w '<consumer-root-password>' \
   -b "ou=People,dc=example,dc=com" "(uid=listener-test)"
 ```

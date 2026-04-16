@@ -57,7 +57,7 @@ pub trait ProviderConnection: Send + Sync {
     /// Connect to the replication provider
     ///
     /// # Arguments
-    /// * `url` - Provider server URL (e.g., "ldap://provider.example.com:389")
+    /// * `url` - Provider server URL (e.g., "ldaps://provider.example.com:636")
     ///
     /// # Returns
     /// * `Ok(())` - Connection established successfully

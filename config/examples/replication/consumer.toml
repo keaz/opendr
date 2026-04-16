@@ -23,7 +23,8 @@ indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou", "sn", "givenName
 [replication]
 enabled = true
 mode = "consumer"
-provider_url = "ldap://provider.example.com:1389"
+# Install the provider CA in the consumer host trust store before using ldaps://.
+provider_url = "ldaps://provider.example.com:1636"
 bind_dn = "cn=replication,dc=example,dc=com"
 bind_password_file = "/run/secrets/opendr-replication-bind-password"
 max_batch_size = 100

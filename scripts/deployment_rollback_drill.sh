@@ -352,6 +352,7 @@ enabled = false
 enabled = true
 mode = "consumer"
 provider_url = "ldap://127.0.0.1:${PROVIDER_PORT}"
+allow_insecure_provider_bind = true
 bind_dn = "${ROOT_DN}"
 bind_password = "${DEPLOYMENT_DRILL_PROVIDER_ROOT_PASSWORD}"
 sync_interval_secs = 1

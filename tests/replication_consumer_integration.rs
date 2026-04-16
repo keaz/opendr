@@ -25,6 +25,7 @@ fn create_consumer_config() -> ServerConfig {
     config.replication.enabled = true;
     config.replication.mode = "consumer".to_string();
     config.replication.provider_url = Some("ldap://provider.example.com:389".to_string());
+    config.replication.allow_insecure_provider_bind = true;
     config.replication.sync_interval_secs = 1; // Fast for testing
     config.replication.bind_dn = Some("cn=admin,dc=example,dc=com".to_string());
     config.replication.bind_password = Some("secret".to_string());
