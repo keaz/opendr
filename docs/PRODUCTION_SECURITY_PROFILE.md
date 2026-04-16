@@ -5,6 +5,10 @@ need RFC 4513-aligned authentication and transport behavior. The default
 `development` profile preserves local development behavior; production
 deployments should opt in explicitly and enable TLS.
 
+The 2026-04-16 security review in
+[`SECURITY_REVIEW_2026_04_16.md`](./SECURITY_REVIEW_2026_04_16.md) tracks
+remaining production-hardening gaps and linked remediation issues.
+
 ## Required Configuration
 
 ```toml

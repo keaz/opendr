@@ -17,6 +17,7 @@ operation behavior.
 | OpenLDAP CLI interoperability | `scripts/ldap_interop_gate.sh` | `ldapsearch`, `ldapadd`, `ldapmodify`, `ldapdelete`, `ldapcompare`, and `ldapmodrdn` cover Bind, StartTLS, Root DSE, Search, Add, Modify, Delete, ModifyDN, Compare, paged results, server-side sort, schema, and operational attributes. | Script log |
 | Python client interoperability | `scripts/ldap_interop_gate.sh` | Python `ldap3` binds over StartTLS and reads Root DSE/schema data. | Script log |
 | Rust client interoperability | `scripts/ldap_interop_gate.sh` | `ldap_ops_client` completes Bind, Root DSE, Search, Add, Modify, Delete, ModifyDN, Compare, WhoAmI, and Password Modify. | Script log |
+| Security review | Review `docs/SECURITY_REVIEW_2026_04_16.md` and linked follow-up issues | No open High or Medium security review finding remains unless the release notes explicitly scope out the affected feature or deployment path. | Review report and linked issues |
 | TLS certificate rotation | `TLS_ROTATION_ARTIFACT_DIR=target/tls-rotation-gate/release-candidate ./scripts/tls_rotation_gate.sh` | Restart-required certificate rotation is validated for LDAPS and StartTLS. Active trust succeeds, inactive and stale trust fail, file replacement without restart does not hot reload, and post-restart bind/search succeeds with the new trust anchor. | `target/tls-rotation-gate/release-candidate` |
 | Referral and alias interoperability | `scripts/referral_alias_interop.sh` | `ldapsearch` and optional Python `ldap3` cover referral URL, ManageDsaIT, and alias dereference behavior against a prepared fixture. | Script log |
 | Replication soak | `SOAK_DURATION_SECS=86400 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh` | Two isolated OpenDR instances maintain provider-consumer convergence while repeated ADD, MODIFY, and DELETE operations run for the configured duration. | `target/replication-soak/release-candidate` |
@@ -41,6 +42,9 @@ operation behavior.
 - TLS certificate rotation must use the documented restart-required workflow in
   `docs/TLS_ROTATION.md`; hot reload must not be assumed until a reload API has
   its own tests and operator documentation.
+- Open High or Medium findings from
+  `docs/SECURITY_REVIEW_2026_04_16.md` block a full production-ready claim
+  unless the release notes explicitly scope out that feature or deployment path.
 - Release notes must include the exact commands run, the commit SHA, and links
   to retained CI or local artifacts.
 

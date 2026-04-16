@@ -23,6 +23,7 @@ deploys the site.
 - [Replication guide](./REPLICATION_GUIDE.md)
 - [Fuzzing gate](./FUZZING.md)
 - [TLS certificate rotation](./TLS_ROTATION.md)
+- [Security review: 2026-04-16](./SECURITY_REVIEW_2026_04_16.md)
 - [LDAP referral and alias support](./LDAP_REFERRAL_ALIAS_SUPPORT.md)
 - [LDAP control and extension compatibility](./LDAP_CONTROL_EXTENSION_COMPATIBILITY.md)
 - [LDAP RFC compliance matrix](./LDAP_RFC_COMPLIANCE_MATRIX.md)
