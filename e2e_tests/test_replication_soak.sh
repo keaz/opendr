@@ -41,6 +41,10 @@ LAST_MODIFIED_MAIL=""
 LAST_MODIFIED_DESCRIPTION=""
 SOAK_STATUS="running"
 SOAK_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PROVIDER_AUDIT_LOG=""
+CONSUMER_AUDIT_LOG=""
+FINAL_PROVIDER_COUNT=""
+FINAL_CONSUMER_COUNT=""
 
 write_soak_summary() {
   mkdir -p "${SOAK_ARTIFACT_DIR}"
@@ -56,8 +60,39 @@ deletes: ${TOTAL_DELETES}
 expected_active_entries: ${ACTIVE_EXPECTED}
 provider_port: ${PROVIDER_PORT}
 consumer_port: ${CONSUMER_PORT}
+final_provider_entries: ${FINAL_PROVIDER_COUNT}
+final_consumer_entries: ${FINAL_CONSUMER_COUNT}
 sync_interval_secs: ${SYNC_INTERVAL_SECS}
 replication_timeout_secs: ${REPL_TIMEOUT_SECS}
+artifact_dir: ${SOAK_ARTIFACT_DIR}
+run_root: ${RUN_ROOT}
+provider_server_log_artifact: ${SOAK_ARTIFACT_DIR}/provider_${PROVIDER_PORT}.log
+consumer_server_log_artifact: ${SOAK_ARTIFACT_DIR}/consumer_${CONSUMER_PORT}.log
+provider_config_artifact: ${SOAK_ARTIFACT_DIR}/provider_${PROVIDER_PORT}.server.toml
+consumer_config_artifact: ${SOAK_ARTIFACT_DIR}/consumer_${CONSUMER_PORT}.server.toml
+provider_audit_log: ${PROVIDER_AUDIT_LOG}
+consumer_audit_log: ${CONSUMER_AUDIT_LOG}
+provider_audit_log_artifact: ${SOAK_ARTIFACT_DIR}/provider_${PROVIDER_PORT}.audit.log
+consumer_audit_log_artifact: ${SOAK_ARTIFACT_DIR}/consumer_${CONSUMER_PORT}.audit.log
+EOF
+}
+
+append_soak_audit_config() {
+  local cfg="$1"
+  local audit_file="$2"
+
+  cat >> "${cfg}" <<EOF
+
+[audit]
+enabled = true
+log_file = "${audit_file}"
+format = "json"
+level = "info"
+log_authentication = true
+log_authorization = true
+log_modifications = true
+log_connections = true
+log_replication = true
 EOF
 }
 
@@ -136,7 +171,7 @@ LDIF
 
 modify_soak_entry() {
   local id="$1"
-  local uid dn mail description
+  local uid="" dn="" mail="" description=""
   uid=$(soak_uid "${id}")
   dn=$(soak_dn "${uid}")
   mail="${uid}.round${ROUND_COUNT}@example.com"
@@ -160,7 +195,7 @@ LDIF
 
 delete_soak_entry() {
   local id="$1"
-  local uid dn
+  local uid="" dn=""
   uid=$(soak_uid "${id}")
   dn=$(soak_dn "${uid}")
 
@@ -195,6 +230,11 @@ log_step "Creating provider and consumer configurations"
 PV_CFG=$(create_provider_config "${PV_DIR}" "${PROVIDER_PORT}" "${BASE_DN}" "${BIND_RDN}" "${BIND_PW_HASH}")
 CS_CFG=$(create_consumer_config "${CS_DIR}" "${CONSUMER_PORT}" "${PROVIDER_PORT}" "${BASE_DN}" "${BIND_RDN}" \
   "${BIND_PW_HASH}" "${SYNC_INTERVAL_SECS}" "${BATCH_SIZE}")
+PROVIDER_AUDIT_LOG="${PV_DIR}/audit.log"
+CONSUMER_AUDIT_LOG="${CS_DIR}/audit.log"
+append_soak_audit_config "${PV_CFG}" "${PROVIDER_AUDIT_LOG}"
+append_soak_audit_config "${CS_CFG}" "${CONSUMER_AUDIT_LOG}"
+write_soak_summary
 
 log_step "Starting provider server on port ${PROVIDER_PORT}"
 start_server "provider:${PROVIDER_PORT}" "${PV_CFG}" "${PV_DIR}/server.log" "${PV_DIR}/server.pid"
@@ -253,10 +293,10 @@ done
 log_step "Final convergence verification"
 verify_convergence
 
-provider_count=$(count_entries "${LDAP_HOST}" "${PROVIDER_PORT}" "ou=people,${BASE_DN}" "(objectClass=inetOrgPerson)")
-consumer_count=$(count_entries "${LDAP_HOST}" "${CONSUMER_PORT}" "ou=people,${BASE_DN}" "(objectClass=inetOrgPerson)")
-assert_eq "${provider_count}" "${consumer_count}" "Final provider and consumer entry counts match"
-assert_eq "${ACTIVE_EXPECTED}" "${consumer_count}" "Final consumer count matches expected active entries"
+FINAL_PROVIDER_COUNT=$(count_entries "${LDAP_HOST}" "${PROVIDER_PORT}" "ou=people,${BASE_DN}" "(objectClass=inetOrgPerson)")
+FINAL_CONSUMER_COUNT=$(count_entries "${LDAP_HOST}" "${CONSUMER_PORT}" "ou=people,${BASE_DN}" "(objectClass=inetOrgPerson)")
+assert_eq "${FINAL_PROVIDER_COUNT}" "${FINAL_CONSUMER_COUNT}" "Final provider and consumer entry counts match"
+assert_eq "${ACTIVE_EXPECTED}" "${FINAL_CONSUMER_COUNT}" "Final consumer count matches expected active entries"
 
 SOAK_STATUS="passed"
 write_soak_summary

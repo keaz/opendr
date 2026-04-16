@@ -144,7 +144,12 @@ RUNTIME_DIR="${OUTPUT_DIR}/runtime"
 CONFIG_DIR="${RUNTIME_DIR}/config"
 DATA_DIR="${RUNTIME_DIR}/data"
 CERT_DIR="${RUNTIME_DIR}/certs"
-BIN_DIR="${REPO_ROOT}/target/${PROFILE}"
+TARGET_ROOT="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+case "${TARGET_ROOT}" in
+  /*) ;;
+  *) TARGET_ROOT="${REPO_ROOT}/${TARGET_ROOT}" ;;
+esac
+BIN_DIR="${TARGET_ROOT}/${PROFILE}"
 
 SERVER_LOG="${OUTPUT_DIR}/server.log"
 CLIENT_SUMMARY="${OUTPUT_DIR}/ldap-benchmark-summary.md"
@@ -440,6 +445,7 @@ cat > "${REPORT_MD}" <<EOF
 
 - Output directory: \`${OUTPUT_DIR}\`
 - Runtime directory: \`${RUNTIME_DIR}\`
+- Cargo target directory: \`${TARGET_ROOT}\`
 - Server log: \`${SERVER_LOG}\`
 - LDAP URL: \`ldap://127.0.0.1:${LDAP_PORT}\`
 - Server runtime: \`${SERVER_RUNTIME}\`

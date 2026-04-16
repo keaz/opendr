@@ -88,6 +88,12 @@ case "${DEPLOYMENT_DRILL_OUTPUT_DIR}" in
   *) DEPLOYMENT_DRILL_OUTPUT_DIR="${REPO_ROOT}/${DEPLOYMENT_DRILL_OUTPUT_DIR}" ;;
 esac
 
+TARGET_ROOT="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+case "${TARGET_ROOT}" in
+  /*) ;;
+  *) TARGET_ROOT="${REPO_ROOT}/${TARGET_ROOT}" ;;
+esac
+
 ARTIFACT_DIR="${DEPLOYMENT_DRILL_OUTPUT_DIR}"
 CONFIG_DIR="${ARTIFACT_DIR}/config"
 LOG_DIR="${ARTIFACT_DIR}/logs"
@@ -161,6 +167,7 @@ write_summary() {
 - Updated at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 - Mode: ${DEPLOYMENT_DRILL_MODE}
 - Cargo profile: ${DEPLOYMENT_DRILL_PROFILE}
+- Cargo target directory: \`${TARGET_ROOT}\`
 
 ## Topology
 
@@ -560,7 +567,7 @@ if [[ "${DEPLOYMENT_DRILL_BUILD}" == "1" ]]; then
   run_logged build cargo "${BUILD_ARGS[@]}"
 fi
 
-BIN_DIR="${REPO_ROOT}/target/${DEPLOYMENT_DRILL_PROFILE}"
+BIN_DIR="${TARGET_ROOT}/${DEPLOYMENT_DRILL_PROFILE}"
 OPENDR_BIN="${BIN_DIR}/opendr"
 SETUP_BIN="${BIN_DIR}/opendr-setup"
 BACKUP_BIN="${BIN_DIR}/opendr-backup"

@@ -547,7 +547,7 @@ wait_for_replication() {
   log_debug "Waiting for replication: ${expected} entries matching '${filter}' in ${base}"
   
   while true; do
-    local pc cc
+    local pc="" cc=""
     pc=$(count_entries "${ph}" "${pp}" "${base}" "${filter}")
     cc=$(count_entries "${ch}" "${cp}" "${base}" "${filter}")
     
@@ -707,6 +707,11 @@ cleanup_all() {
       if [[ -f "${dir}/config/server.toml" ]]; then
         cp -f "${dir}/config/server.toml" "${E2E_ARTIFACT_DIR}/${safe_name}.server.toml" || true
       fi
+
+      local audit_log=""
+      for audit_log in "${dir}"/*audit*.log(N) "${dir}"/logs/*audit*.log(N); do
+        cp -f "${audit_log}" "${E2E_ARTIFACT_DIR}/${safe_name}.$(basename "${audit_log}")" || true
+      done
     done
   fi
   

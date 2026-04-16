@@ -12,6 +12,11 @@ ARTIFACT_DIR="${TLS_ROTATION_ARTIFACT_DIR:-${ROOT_DIR}/target/tls-rotation-gate/
 if [[ "${ARTIFACT_DIR}" != /* ]]; then
   ARTIFACT_DIR="${ROOT_DIR}/${ARTIFACT_DIR}"
 fi
+TARGET_ROOT="${CARGO_TARGET_DIR:-${ROOT_DIR}/target}"
+if [[ "${TARGET_ROOT}" != /* ]]; then
+  TARGET_ROOT="${ROOT_DIR}/${TARGET_ROOT}"
+fi
+OPENDR_BIN="${TARGET_ROOT}/debug/opendr"
 
 SERVER_DIR="${ARTIFACT_DIR}/server"
 CERT_SOURCE_DIR="${ARTIFACT_DIR}/generated-certs"
@@ -236,7 +241,7 @@ start_server() {
   local stderr_log="${LOG_DIR}/server-${phase}.stderr.log"
 
   pushd "${SERVER_DIR}" >/dev/null
-  "${ROOT_DIR}/target/debug/opendr" --config config/server.toml --log-config config/log4rs.yml \
+  "${OPENDR_BIN}" --config config/server.toml --log-config config/log4rs.yml \
     >"${stdout_log}" 2>"${stderr_log}" &
   SERVER_PID="$!"
   popd >/dev/null
@@ -444,6 +449,7 @@ PY
   record ""
   record "- Artifact directory: ${ARTIFACT_DIR}"
   record "- Runtime: ${RUNTIME}"
+  record "- Cargo target directory: ${TARGET_ROOT}"
   record "- Rotation model under validation: certificate file replacement requires OpenDR restart."
 
   cargo build --bin opendr >/dev/null

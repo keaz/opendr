@@ -104,6 +104,12 @@ case "${BACKUP_DRILL_OUTPUT_DIR}" in
   *) BACKUP_DRILL_OUTPUT_DIR="${REPO_ROOT}/${BACKUP_DRILL_OUTPUT_DIR}" ;;
 esac
 
+TARGET_ROOT="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+case "${TARGET_ROOT}" in
+  /*) ;;
+  *) TARGET_ROOT="${REPO_ROOT}/${TARGET_ROOT}" ;;
+esac
+
 ROOT_DN="${BACKUP_DRILL_ROOT_RDN},${BACKUP_DRILL_BASE_DN}"
 USERS_OU_DN="ou=users,ou=${BACKUP_DRILL_NAME_PREFIX},${BACKUP_DRILL_BASE_DN}"
 FIRST_UID="${BACKUP_DRILL_NAME_PREFIX}-user-000000"
@@ -300,6 +306,7 @@ write_summary() {
 - Mode: ${BACKUP_DRILL_MODE}
 - Runtime: ${BACKUP_DRILL_RUNTIME}
 - Cargo profile: ${BACKUP_DRILL_PROFILE}
+- Cargo target directory: \`${TARGET_ROOT}\`
 
 ## Fixture
 
@@ -557,7 +564,7 @@ fi
 run_logged build cargo "${BUILD_ARGS[@]}"
 BUILD_DURATION_SECS=$((SECONDS - build_started))
 
-BIN_DIR="${REPO_ROOT}/target/${BACKUP_DRILL_PROFILE}"
+BIN_DIR="${TARGET_ROOT}/${BACKUP_DRILL_PROFILE}"
 OPENDR_BIN="${BIN_DIR}/opendr"
 SETUP_BIN="${BIN_DIR}/opendr-setup"
 BACKUP_BIN="${BIN_DIR}/opendr-backup"
