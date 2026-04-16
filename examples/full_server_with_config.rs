@@ -18,6 +18,7 @@
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_lmdb::LmdbBackend;
 use opendr::config::ServerConfig;
+use opendr::dn::dn_attribute_values;
 use opendr::shutdown::{ShutdownConfig, ShutdownCoordinator};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -324,14 +325,11 @@ async fn initialize_directory(
     backend.add_entry(base_entry, vec![]).await?;
 
     // Create admin user
-    let admin_dn = format!("{},{}", config.server.root_user_dn, config.server.base_dn);
-    let admin_cn = config
-        .server
-        .root_user_dn
-        .split('=')
-        .nth(1)
-        .unwrap_or("admin")
-        .to_string();
+    let admin_dn = config.canonical_root_dn()?;
+    let admin_cn = dn_attribute_values(&admin_dn, Some("cn"))?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "admin".to_string());
 
     let admin_entry = DirectoryEntry::new(
         &admin_dn,

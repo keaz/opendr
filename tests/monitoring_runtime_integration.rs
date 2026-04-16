@@ -307,7 +307,7 @@ async fn management_console_requires_root_session() {
     let (headers, body) = http_post(
         monitoring_port,
         "/console/login",
-        r#"{"dn":"cn=admin,dc=example,dc=org","password":"secret"}"#,
+        r#"{"dn":"CN = Admin , DC = Example , DC = ORG","password":"secret"}"#,
         &[],
     )
     .await;

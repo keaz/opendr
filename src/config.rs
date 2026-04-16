@@ -1372,6 +1372,17 @@ impl ServerConfig {
         })
     }
 
+    /// Return the canonical root/admin DN used for root binds, ACI bypass, and consoles.
+    pub fn canonical_root_dn(&self) -> Result<String, ConfigError> {
+        crate::dn::canonical_root_dn(&self.server.root_user_dn, &self.server.base_dn).map_err(
+            |err| {
+                ConfigError::ValidationError(format!(
+                    "server.root_user_dn/base_dn must form a valid root DN: {err}"
+                ))
+            },
+        )
+    }
+
     /// Resolve the configured replication bind password if one is configured.
     pub fn resolved_replication_bind_password(&self) -> Result<Option<String>, ConfigError> {
         resolve_secret_source(
@@ -1747,6 +1758,7 @@ impl ServerConfig {
                 "Base DN cannot be empty".to_string(),
             ));
         }
+        let _canonical_root_dn = self.canonical_root_dn()?;
         if !["legacy", "fsm"].contains(&self.server.runtime.as_str()) {
             return Err(ConfigError::ValidationError(format!(
                 "server.runtime must be one of: legacy, fsm (got {})",
@@ -2419,6 +2431,50 @@ root_password_file = "{}"
         let debug_output = format!("{config:?}");
         assert!(!debug_output.contains("file-backed-secret"));
         assert!(debug_output.contains("<redacted via file:"));
+    }
+
+    #[test]
+    fn canonical_root_dn_expands_rdn_configuration() {
+        let toml = r#"
+[server]
+base_dn = "dc=example,dc=com"
+root_user_dn = "cn=admin"
+"#;
+
+        let config = ServerConfig::from_toml_str(toml).unwrap();
+        assert_eq!(
+            config.canonical_root_dn().unwrap(),
+            "cn=admin,dc=example,dc=com"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn canonical_root_dn_does_not_suffix_full_dn_configuration() {
+        let toml = r#"
+[server]
+base_dn = "dc=example,dc=com"
+root_user_dn = "cn=admin,dc=example,dc=com"
+"#;
+
+        let config = ServerConfig::from_toml_str(toml).unwrap();
+        assert_eq!(
+            config.canonical_root_dn().unwrap(),
+            "cn=admin,dc=example,dc=com"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_empty_root_user_dn() {
+        let toml = r#"
+[server]
+root_user_dn = " "
+"#;
+
+        let config = ServerConfig::from_toml_str(toml).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("root user DN must not be empty"));
     }
 
     #[test]

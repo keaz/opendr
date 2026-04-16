@@ -185,6 +185,23 @@ pub fn canonicalize_dn(input: &str) -> Result<String, DnError> {
     parse_dn(input).map(|dn| dn.to_canonical_string())
 }
 
+pub fn canonical_root_dn(root_user_dn: &str, base_dn: &str) -> Result<String, DnError> {
+    let root_user_dn = root_user_dn.trim();
+    if root_user_dn.is_empty() {
+        return Err(DnError::new("root user DN must not be empty"));
+    }
+
+    let root_dn = parse_dn(root_user_dn)?;
+    if root_dn.rdns().len() == 1 && !base_dn.trim().is_empty() {
+        let base_dn = parse_dn(base_dn)?;
+        let mut rdns = root_dn.rdns().to_vec();
+        rdns.extend_from_slice(base_dn.rdns());
+        return Ok(LdapDn::from_rdns(rdns).to_canonical_string());
+    }
+
+    Ok(root_dn.to_canonical_string())
+}
+
 pub fn dn_eq(left: &str, right: &str) -> bool {
     match (parse_dn(left), parse_dn(right)) {
         (Ok(left), Ok(right)) => left.is_same_as(&right),
@@ -521,5 +538,26 @@ mod tests {
         assert!(parse_dn("cn=alice,,dc=example").is_err());
         assert!(parse_dn("=alice,dc=example").is_err());
         assert!(parse_dn("cn=#0,dc=example").is_err());
+    }
+
+    #[test]
+    fn canonical_root_dn_expands_rdn_with_base_dn() {
+        assert_eq!(
+            canonical_root_dn(" CN = Admin ", " DC = Example , DC = COM ").unwrap(),
+            "cn=admin,dc=example,dc=com"
+        );
+    }
+
+    #[test]
+    fn canonical_root_dn_preserves_full_dn_without_resuffixing() {
+        assert_eq!(
+            canonical_root_dn("CN=Admin,DC=Example,DC=COM", "dc=ignored").unwrap(),
+            "cn=admin,dc=example,dc=com"
+        );
+    }
+
+    #[test]
+    fn canonical_root_dn_rejects_empty_root_user_dn() {
+        assert!(canonical_root_dn(" ", "dc=example,dc=org").is_err());
     }
 }

@@ -34,6 +34,7 @@ use crate::backend::{
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
+use crate::dn::dn_eq;
 use crate::extended_ops::{
     encode_password_modify_response_value, oids, parse_cancel_request_value,
     parse_password_modify_request_value,
@@ -2473,7 +2474,7 @@ fn is_root_dn(session: &ConnectionSession, request_context: &RequestContext) -> 
         .security
         .as_ref()
         .and_then(|security| security.root_dn.as_deref())
-        .map(|root_dn| bound_dn.eq_ignore_ascii_case(root_dn))
+        .map(|root_dn| dn_eq(bound_dn, root_dn))
         .unwrap_or(false)
 }
 
@@ -7703,7 +7704,7 @@ async fn handle_extended_request_with_session_and_registry(
             .user_identity
             .clone()
             .unwrap_or_else(|| bound_dn.to_string());
-        let is_self_service = bound_dn.eq_ignore_ascii_case(&target_dn);
+        let is_self_service = dn_eq(bound_dn, &target_dn);
         let mode = if is_self_service {
             "self_service"
         } else {

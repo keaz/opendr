@@ -38,6 +38,7 @@ use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 
 const ADMIN_DN: &str = "cn=admin,dc=example,dc=org";
+const ADMIN_DN_WITH_SPACES: &str = "CN = Admin , DC = Example , DC = ORG";
 const ADMIN_PASSWORD: &str = "secret";
 const USER_DN: &str = "cn=user,dc=example,dc=org";
 const USER_PASSWORD: &str = "user-secret";
@@ -938,7 +939,7 @@ async fn ldaps_runtime_password_modify_admin_reset_returns_generated_password() 
 
     let bind_response = send_message(
         &mut stream,
-        &encode_simple_bind_request(1, ADMIN_DN, ADMIN_PASSWORD),
+        &encode_simple_bind_request(1, ADMIN_DN_WITH_SPACES, ADMIN_PASSWORD),
     )
     .await;
     assert_bind_success(&bind_response);
@@ -1144,6 +1145,57 @@ async fn restrictive_aci_denies_compare_in_live_runtime_and_audits_denial() {
         ],
     )
     .await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn root_dn_canonicalization_bypasses_restrictive_aci_in_live_runtime() {
+    let backend = MockBackend::from_credentials([
+        (ADMIN_DN.to_string(), ADMIN_PASSWORD.as_bytes().to_vec()),
+        (USER_DN.to_string(), USER_PASSWORD.as_bytes().to_vec()),
+    ]);
+    backend
+        .add_entry(
+            opendr::backend::DirectoryEntry::new(
+                COMPARE_TARGET_DN,
+                std::collections::HashMap::from([
+                    ("cn".to_string(), vec!["target".to_string()]),
+                    ("objectclass".to_string(), vec!["person".to_string()]),
+                ]),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let server = spawn_plain_runtime_server_with_backend(
+        Arc::new(backend),
+        Some(Arc::new(AciEngine::restrictive())),
+        Some(ADMIN_DN.to_string()),
+    )
+    .await;
+    let mut stream = connect_with_retry(server.port).await;
+
+    let bind_response = send_message(
+        &mut stream,
+        &encode_simple_bind_request(1, ADMIN_DN_WITH_SPACES, ADMIN_PASSWORD),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let compare_response = send_message(
+        &mut stream,
+        &encode_compare_request(2, COMPARE_TARGET_DN, "cn", "target"),
+    )
+    .await;
+    let (_, compare_messages) = parse_ldap_messages(&compare_response).unwrap();
+    match &compare_messages[0].protocol_op {
+        ProtocolOp::CompareResponse(compare_result) => {
+            assert_eq!(compare_result.result_code, ParserResultCode::CompareTrue);
+        }
+        other => panic!("unexpected compare response: {:?}", other),
+    }
 
     server.shutdown().await;
 }

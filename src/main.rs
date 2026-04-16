@@ -13,7 +13,7 @@ use opendr::config::ServerConfig;
 use opendr::fsm_server;
 use opendr::metrics::MetricsCollector;
 use opendr::monitoring_runtime::{
-    ComponentStatus, MonitoringRuntimeContext, RuntimeHealthRegistry, console_admin_dn,
+    ComponentStatus, MonitoringRuntimeContext, RuntimeHealthRegistry,
     spawn_monitoring_server_with_context,
 };
 use opendr::replication_service::ReplicationService;
@@ -122,13 +122,6 @@ async fn build_legacy_security_config(
     };
 
     let security_policy = config.security.effective_policy();
-    if audit_logger.is_none()
-        && access_control.is_none()
-        && security_policy == server::LegacySecurityPolicy::default()
-    {
-        return Ok(None);
-    }
-
     Ok(Some(Arc::new(server::LegacySecurityConfig {
         audit_logger,
         audit_config: server::LegacyAuditConfig {
@@ -138,7 +131,7 @@ async fn build_legacy_security_config(
             log_connections: config.audit.log_connections,
         },
         access_control,
-        root_dn: Some(config.server.root_user_dn.clone()),
+        root_dn: Some(config.canonical_root_dn()?),
         security_policy,
     })))
 }
@@ -488,10 +481,7 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
             health,
             MonitoringRuntimeContext {
                 console_backend: Some(backend.clone()),
-                console_admin_dn: Some(console_admin_dn(
-                    &config.server.root_user_dn,
-                    &config.server.base_dn,
-                )),
+                console_admin_dn: Some(config.canonical_root_dn()?),
                 replication_status: Some(replication_service.status()),
             },
             shutdown_clone.subscribe(),
@@ -703,12 +693,23 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn root_common_name(root_dn: &str) -> String {
+    opendr::dn::dn_attribute_values(root_dn, Some("cn"))
+        .ok()
+        .and_then(|values| values.into_iter().next())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "manager".to_string())
+}
+
 /// Initialize base directory structure
 async fn initialize_base_structure(
     backend: &mut dyn DirectoryBackend,
     config: &ServerConfig,
     root_password: &str,
 ) -> Result<(), Box<dyn Error>> {
+    let root_dn = config.canonical_root_dn()?;
+    let root_cn = root_common_name(&root_dn);
+
     // Add root DN entry
     let base_dn_entry = DirectoryEntry::new(
         &config.server.base_dn,
@@ -731,24 +732,13 @@ async fn initialize_base_structure(
 
     // Add root user entry with password
     let root_user_entry = DirectoryEntry::new(
-        format!("{},{}", config.server.root_user_dn, config.server.base_dn),
+        root_dn,
         HashMap::from([
             (
                 "objectClass".to_string(),
                 vec!["top".to_string(), "person".to_string()],
             ),
-            (
-                "cn".to_string(),
-                vec![
-                    config
-                        .server
-                        .root_user_dn
-                        .split('=')
-                        .nth(1)
-                        .unwrap_or("manager")
-                        .to_string(),
-                ],
-            ),
+            ("cn".to_string(), vec![root_cn]),
             ("sn".to_string(), vec!["Manager".to_string()]),
         ]),
     );
@@ -815,6 +805,9 @@ async fn initialize_lmdb_base_structure(
     config: &ServerConfig,
     root_password: &str,
 ) -> Result<(), Box<dyn Error>> {
+    let root_dn = config.canonical_root_dn()?;
+    let root_cn = root_common_name(&root_dn);
+
     // Add root DN entry
     let base_dn_entry = DirectoryEntry::new(
         &config.server.base_dn,
@@ -836,7 +829,6 @@ async fn initialize_lmdb_base_structure(
     backend.add_entry(base_dn_entry, vec![]).await?;
 
     // Add root user entry (without password initially)
-    let root_dn = format!("{},{}", config.server.root_user_dn, config.server.base_dn);
     let root_user_entry = DirectoryEntry::new(
         &root_dn,
         HashMap::from([
@@ -844,18 +836,7 @@ async fn initialize_lmdb_base_structure(
                 "objectClass".to_string(),
                 vec!["top".to_string(), "person".to_string()],
             ),
-            (
-                "cn".to_string(),
-                vec![
-                    config
-                        .server
-                        .root_user_dn
-                        .split('=')
-                        .nth(1)
-                        .unwrap_or("manager")
-                        .to_string(),
-                ],
-            ),
+            ("cn".to_string(), vec![root_cn]),
             ("sn".to_string(), vec!["Manager".to_string()]),
         ]),
     );
@@ -994,6 +975,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_initialize_base_structure_inmemory_full_root_dn() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.server.root_user_dn = "cn=manager,dc=example,dc=org".to_string();
+        config.server.root_password = "secret".to_string();
+        config.server.organization_name = "Example Org".to_string();
+        config.backend.backend_type = "memory".to_string();
+
+        let mut backend = MockBackend::new();
+        initialize_base_structure(&mut backend, &config, "secret")
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .get_entry("cn=manager,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .get_entry("cn=manager,dc=example,dc=org,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .authenticate("cn=manager,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn test_initialize_base_structure_lmdb() {
         let temp_dir = TempDir::new().unwrap();
         let mut config = ServerConfig::default();
@@ -1057,6 +1074,44 @@ mod tests {
         assert!(
             !backend
                 .authenticate("cn=admin,dc=test,dc=local", b"wrong")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_base_structure_lmdb_full_root_dn() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=test,dc=local".to_string();
+        config.server.root_user_dn = "cn=admin,dc=test,dc=local".to_string();
+        config.server.root_password = "AdminPass123".to_string();
+        config.server.organization_name = "Test Org".to_string();
+        config.backend.backend_type = "lmdb".to_string();
+        config.backend.data_directory = temp_dir.path().to_path_buf();
+
+        let mut backend = LmdbBackend::new(temp_dir.path(), 100, 1).unwrap();
+        initialize_base_structure(&mut backend, &config, "AdminPass123")
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .get_entry("cn=admin,dc=test,dc=local")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .get_entry("cn=admin,dc=test,dc=local,dc=test,dc=local")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .authenticate("cn=admin,dc=test,dc=local", b"AdminPass123")
                 .await
                 .unwrap()
         );
@@ -1145,6 +1200,32 @@ subject = {{ user = "cn=reader,dc=example,dc=com" }}
                 )
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_legacy_security_config_uses_canonical_root_dn() {
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=com".to_string();
+        config.server.root_user_dn = "cn=admin".to_string();
+
+        let security = build_legacy_security_config(&config)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            security.root_dn.as_deref(),
+            Some("cn=admin,dc=example,dc=com")
+        );
+
+        config.server.root_user_dn = "CN=Admin,DC=Example,DC=COM".to_string();
+        let security = build_legacy_security_config(&config)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            security.root_dn.as_deref(),
+            Some("cn=admin,dc=example,dc=com")
         );
     }
 }

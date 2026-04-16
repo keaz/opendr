@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::backend::DirectoryBackend;
 use crate::config::MonitoringSettings;
+use crate::dn::{DnError, canonical_root_dn, dn_eq};
 use crate::metrics::{HealthStatus, MetricsCollector, OperationType};
 use crate::replication_service::{ReplicationStatusRegistry, ReplicationStatusSnapshot};
 
@@ -229,7 +230,7 @@ impl ManagementConsole {
         let credentials: ConsoleLoginRequest =
             serde_json::from_slice(&request.body).map_err(invalid_http_request)?;
         let dn = credentials.dn.trim();
-        if !dn.eq_ignore_ascii_case(admin_dn) {
+        if !dn_eq(dn, admin_dn) {
             return json_response(
                 "401 Unauthorized",
                 &ErrorResponse {
@@ -396,13 +397,8 @@ enum Route {
     BadRequest,
 }
 
-pub fn console_admin_dn(root_user_dn: &str, base_dn: &str) -> String {
-    let root_user_dn = root_user_dn.trim();
-    if root_user_dn.contains(',') || base_dn.trim().is_empty() {
-        root_user_dn.to_string()
-    } else {
-        format!("{root_user_dn},{}", base_dn.trim())
-    }
+pub fn console_admin_dn(root_user_dn: &str, base_dn: &str) -> Result<String, DnError> {
+    canonical_root_dn(root_user_dn, base_dn)
 }
 
 pub fn spawn_monitoring_server(
@@ -1136,11 +1132,11 @@ mod tests {
     #[test]
     fn console_admin_dn_expands_rdn() {
         assert_eq!(
-            console_admin_dn("cn=admin", "dc=example,dc=org"),
+            console_admin_dn("cn=admin", "dc=example,dc=org").unwrap(),
             "cn=admin,dc=example,dc=org"
         );
         assert_eq!(
-            console_admin_dn("cn=admin,dc=example,dc=org", "dc=ignored"),
+            console_admin_dn("cn=admin,dc=example,dc=org", "dc=ignored").unwrap(),
             "cn=admin,dc=example,dc=org"
         );
     }
