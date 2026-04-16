@@ -169,6 +169,16 @@ SOAK_MIN_ACTIVE_BEFORE_DELETE=1 \
 
 **Release-candidate example**:
 ```bash
+SOAK_DURATION_SECS=3600 \
+SOAK_BATCH_SIZE=10 \
+SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate \
+./e2e_tests/test_replication_soak.sh
+```
+
+Use the 1-hour run for bounded release-candidate verification. Keep the full
+24-hour soak for final production signoff when schedule permits:
+
+```bash
 SOAK_DURATION_SECS=86400 \
 SOAK_BATCH_SIZE=10 \
 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate \

@@ -30,6 +30,22 @@ operation behavior.
 | Backup/restore drill | `BACKUP_DRILL_MODE=release BACKUP_DRILL_USERS=100000 BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate ./scripts/backup_restore_drill.sh` | Production-like LMDB fixture is backed up, inspected, dry-run restored, restored into a clean data directory, and validated through LDAP binds, indexed searches, operational attributes, and contextCSN evidence. | `target/backup-restore-drill/release-candidate` |
 | Deployment rollback drill | `DEPLOYMENT_DRILL_MODE=release DEPLOYMENT_DRILL_OUTPUT_DIR=target/deployment-rollback-drill/release-candidate ./scripts/deployment_rollback_drill.sh` | Isolated provider/consumer deployment, provider backup, failed deployment marker, provider restore, consumer rebootstrap, and post-rollback live replication all pass. | `target/deployment-rollback-drill/release-candidate` |
 
+## Current Release Candidate Evidence
+
+The rows below track the current bounded verification runs. Mark them complete
+only after the run finishes and the artifact directory contains the final
+summary file and logs.
+
+| Gate | Command | Status | Artifact | Notes |
+| --- | --- | --- | --- | --- |
+| Release performance regression-100k | `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh` | pending | `target/perf/regression-candidate/` | The prior candidate-only pass recorded 66.1s runtime, 100,000 preloaded users, and 265 MiB peak memory while the retained baseline file was missing. Depending on the entrypoint, retain either `regression-candidate/comparison-summary.md` from the Docker matrix or `perf-regression-report.md` from the wrapper. |
+| 1-hour replication soak | `SOAK_DURATION_SECS=3600 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh` | pending | `target/replication-soak/release-candidate` | Retain `summary.txt`, provider and consumer logs, audit logs, generated configs, and the exact command. |
+| Full release fuzz budget | `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh` | pending | `target/fuzz-gate/release-candidate` | Retain the full output directory, including logs, corpora, dictionaries, and crash artifacts. |
+
+The 24-hour soak gate in the required evidence table remains the stronger
+production signoff. The 1-hour row above is the bounded verification run the
+team is using while that longer run is still impractical.
+
 ## Release Decision Rules
 
 - A release may claim production readiness only for RFC rows marked `Supported`

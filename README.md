@@ -60,6 +60,17 @@ brew install openldap
 sudo yum install openldap-clients
 ```
 
+### Operator Path
+
+Use this path for a new install or a fresh validation run:
+
+1. Set up the runtime with `opendr-setup --config-dir ./config interactive`.
+2. Review `config/server.toml`, TLS material, replication settings, and index settings.
+3. Start the server with `opendr --config ./config/server.toml --log-config ./config/log4rs.yml`.
+4. Validate bind, search, add, modify, delete, StartTLS, and monitoring endpoints.
+5. Maintain the instance with systemd, logs, backup/restore, rollback, and index rebuilds.
+6. Prove release readiness with the gates in `docs/PRODUCTION_READINESS_CHECKLIST.md`.
+
 ### Set Up OpenDR
 
 ```bash
@@ -294,16 +305,23 @@ Listener mode is active when the consumer logs `Replication consumer entered lis
 - [Documentation Website](https://keaz.github.io/opendr/) - GitHub Pages developer documentation
 - [Documentation Site Source](site/) - React and Vite source for the GitHub Pages site
 - [Developer Operations Guide](docs/DEVELOPER_GUIDE.md) - Setup, runtime, TLS, replication, indexing, backup, and troubleshooting
+- [Production Readiness Checklist](docs/PRODUCTION_READINESS_CHECKLIST.md) - Canonical release gates, commands, and artifact paths
 - [Architecture Overview](docs/architecture-overview.md) - Current runtime and component architecture
 - [Configuration Guide](docs/CONFIGURATION.md) - Complete runtime configuration reference
+- [Performance Comparison](docs/PERFORMANCE_COMPARISON.md) - Benchmark methodology and retained comparison artifacts
+- [LDAP RFC Compliance Matrix](docs/LDAP_RFC_COMPLIANCE_MATRIX.md) - Protocol coverage and advertised capabilities
 
 ### Replication
 - [Replication Guide](docs/REPLICATION_GUIDE.md) - Listener-based replication setup and verification
 - [Consumer FSM](docs/replication_consumer_fsm.md) - Consumer replication state machine details
+- [Replication Production Guarantees](docs/REPLICATION_PRODUCTION_GUARANTEES.md) - Failure modes, audit expectations, and operational guarantees
 
 ### Operations
 - [Troubleshooting](docs/TROUBLESHOOTING.md) - Startup, bind, search, TLS, replication, backup, and monitoring diagnostics
 - [Backup and Restore](docs/BACKUP_RESTORE.md) - Online LMDB backup and offline restore runbook
+- [TLS Rotation](docs/TLS_ROTATION.md) - Restart-required certificate rotation procedure and validation gate
+- [Fuzzing](docs/FUZZING.md) - Smoke and release fuzz budgets with artifact retention
+- [Deployment Runbook](docs/DEPLOYMENT_RUNBOOK.md) - Release rollback and incident response procedure
 - [GitHub Pages Deployment](docs/GITHUB_PAGES.md) - Publishing the Vite docs site with GitHub Actions
 
 ### Development
@@ -451,6 +469,80 @@ The console accepts the configured root DN and password, for example
 SameSite cookies, and expire on restart or after the configured TTL.
 See [`docs/MANAGEMENT_CONSOLE.md`](docs/MANAGEMENT_CONSOLE.md) for the endpoint
 map, overview payload, and operating notes.
+
+## Operations
+
+Use the following commands for day-2 maintenance:
+
+```bash
+sudo systemctl stop opendr
+sudo systemctl restart opendr
+sudo systemctl status opendr
+sudo journalctl -u opendr -f
+```
+
+Monitor the runtime through the health and metrics endpoints:
+
+```bash
+curl http://127.0.0.1:9090/health
+curl http://127.0.0.1:9090/metrics
+open http://127.0.0.1:9090/console
+```
+
+Back up and restore LMDB data with the dedicated tools:
+
+```bash
+opendr-backup --config /etc/opendr/server.toml full \
+  --target /var/backups/opendr/full-20260412
+
+opendr-backup inspect --backup /var/backups/opendr/full-20260412
+
+opendr-restore \
+  --backup /var/backups/opendr/full-20260412 \
+  --target-data-dir /var/lib/opendr/data-restored \
+  --dry-run
+```
+
+For rollback, stop the provider and consumers, restore the last known-good
+provider backup, then re-bootstrap the consumers from a fresh full refresh.
+See [`docs/DEPLOYMENT_RUNBOOK.md`](docs/DEPLOYMENT_RUNBOOK.md) for the full
+procedure and [`docs/BACKUP_RESTORE.md`](docs/BACKUP_RESTORE.md) for the
+backup and restore workflow.
+
+Tune indexing in configuration, then restart the server to apply the new index
+set:
+
+```toml
+[backend]
+indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou"]
+
+[[backend.indexes]]
+attribute = "exampleScore"
+types = ["ordering"]
+```
+
+For production-readiness evidence, use
+[`docs/PRODUCTION_READINESS_CHECKLIST.md`](docs/PRODUCTION_READINESS_CHECKLIST.md).
+
+## Release Readiness
+
+The table below records the release gates and the artifact locations used by the
+current release candidate workflow. The main agent can update the status cells
+after the long-running gates finish.
+
+| Gate | Command | Status | Artifact |
+| --- | --- | --- | --- |
+| Performance regression `regression-100k` | `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh` | pending | `target/perf/regression-candidate/regression-candidate/comparison-summary.md` |
+| 1-hour replication soak | `SOAK_DURATION_SECS=3600 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh` | pending | `target/replication-soak/release-candidate/summary.txt` |
+| Full release fuzz budget | `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh` | pending | `target/fuzz-gate/release-candidate/summary.md` |
+| TLS rotation | `TLS_ROTATION_ARTIFACT_DIR=target/tls-rotation-gate/release-candidate ./scripts/tls_rotation_gate.sh` | retained locally | `target/tls-rotation-gate/release-candidate/summary.md` |
+| Failure drills | `FAILURE_DRILL_MODE=release FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/release-candidate ./e2e_tests/test_replication_failure_drills.sh` | retained locally | `target/replication-failure-drills/release-candidate/summary.txt` |
+| Backup/restore drill | `BACKUP_DRILL_MODE=release BACKUP_DRILL_USERS=100000 BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate ./scripts/backup_restore_drill.sh` | retained locally | `target/backup-restore-drill/release-candidate/summary.md` |
+| Deployment rollback drill | `DEPLOYMENT_DRILL_MODE=release DEPLOYMENT_DRILL_OUTPUT_DIR=target/deployment-rollback-drill/release-candidate ./scripts/deployment_rollback_drill.sh` | retained locally | `target/deployment-rollback-drill/release-candidate/summary.md` |
+
+For the full release policy and pass criteria, keep `docs/PRODUCTION_READINESS_CHECKLIST.md`
+as the source of truth. Use the retained artifacts in `target/` to update the
+status column once the current long-running gates complete.
 
 ## Production Deployment
 
@@ -626,11 +718,7 @@ Contributions are welcome! Please:
 
 ## Status
 
-**Phase 7 (Replication)**: 80% Complete ✅
-- ✅ Backend changelog integration
-- ✅ Provider integration
-- ✅ Consumer integration
-- ✅ End-to-end testing (84 tests)
-- 🚧 Documentation (in progress)
-
-**Overall**: Production-ready for testing and evaluation
+OpenDR is actively maintained as a release candidate with the operator and
+release evidence documented above. Keep `docs/PRODUCTION_READINESS_CHECKLIST.md`
+and the retained `target/` artifacts aligned with the current release run before
+claiming production readiness for a specific deployment.

@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import perfComparisonMarkdown from "../../docs/PERFORMANCE_COMPARISON.md?raw";
+import productionReadinessMarkdown from "../../docs/PRODUCTION_READINESS_CHECKLIST.md?raw";
 import {
   replicationFlowDiagram,
   requestFlowDiagram,
@@ -65,15 +66,16 @@ const chapters: ChapterNavItem[] = [
   { id: "architecture", number: "3", label: "Architecture" },
   { id: "runtimes", number: "4", label: "Runtimes" },
   { id: "performance", number: "5", label: "Performance Results" },
-  { id: "setup", number: "6", label: "Setup Command" },
-  { id: "configuration", number: "7", label: "Configuration" },
-  { id: "tls", number: "8", label: "TLS" },
-  { id: "replication", number: "9", label: "Replication" },
-  { id: "indexing", number: "10", label: "Indexing" },
-  { id: "backup", number: "11", label: "Backup and Restore" },
-  { id: "operations", number: "12", label: "Operations" },
-  { id: "troubleshooting", number: "13", label: "Troubleshooting" },
-  { id: "pages", number: "14", label: "GitHub Pages" },
+  { id: "readiness", number: "6", label: "Production Readiness" },
+  { id: "setup", number: "7", label: "Setup Command" },
+  { id: "configuration", number: "8", label: "Configuration" },
+  { id: "tls", number: "9", label: "TLS" },
+  { id: "replication", number: "10", label: "Replication" },
+  { id: "indexing", number: "11", label: "Indexing" },
+  { id: "backup", number: "12", label: "Backup and Restore" },
+  { id: "operations", number: "13", label: "Operations" },
+  { id: "troubleshooting", number: "14", label: "Troubleshooting" },
+  { id: "pages", number: "15", label: "GitHub Pages" },
 ];
 
 const runtimeRows = [
@@ -1343,8 +1345,48 @@ cargo build --release`}</code></pre>
               </div>
             </section>
 
-            <section className="chapter" id="setup" aria-labelledby="setup-title">
+            <section className="chapter" id="readiness" aria-labelledby="readiness-title">
               <p className="chapter-label">Chapter 6</p>
+              <h2 id="readiness-title">Production Readiness</h2>
+              <p>
+                Use this section as the release evidence checklist. The current
+                bounded verification runs are marked pending while they are
+                still executing, and the full release gates below remain the
+                final production signoff.
+              </p>
+
+              <div className="markdown-doc perf-results">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    table: ({ node: _node, children, ...props }) => (
+                      <div className="table-scroll">
+                        <table {...props}>{children}</table>
+                      </div>
+                    ),
+                    a: ({ node: _node, children, href, ...props }) => {
+                      const resolvedHref = markdownHref(href);
+                      const isExternal = Boolean(resolvedHref && /^(https?:|mailto:|tel:)/i.test(resolvedHref));
+                      return (
+                        <a
+                          {...props}
+                          href={resolvedHref}
+                          target={isExternal ? "_blank" : undefined}
+                          rel={isExternal ? "noreferrer" : undefined}
+                        >
+                          {children}
+                        </a>
+                      );
+                    },
+                  }}
+                >
+                  {productionReadinessMarkdown}
+                </ReactMarkdown>
+              </div>
+            </section>
+
+            <section className="chapter" id="setup" aria-labelledby="setup-title">
+              <p className="chapter-label">Chapter 7</p>
               <h2 id="setup-title">Setup Command</h2>
               <p>
                 <code>opendr-setup</code> is the supported first-run path. It
@@ -1370,7 +1412,7 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
             </section>
 
             <section className="chapter" id="configuration" aria-labelledby="configuration-title">
-              <p className="chapter-label">Chapter 7</p>
+              <p className="chapter-label">Chapter 8</p>
               <h2 id="configuration-title">Configuration</h2>
               <p>
                 Runtime configuration is TOML plus optional <code>OPENDR_*</code>{" "}
@@ -1420,7 +1462,7 @@ opendr --config config/server.toml schema explain exampleEmployeeNumber`}</code>
             </section>
 
             <section className="chapter" id="tls" aria-labelledby="tls-title">
-              <p className="chapter-label">Chapter 8</p>
+              <p className="chapter-label">Chapter 9</p>
               <h2 id="tls-title">TLS</h2>
               <p>
                 LDAPS and StartTLS share the rustls handler. TLS 1.2 and TLS 1.3
@@ -1444,7 +1486,7 @@ min_tls_version = "1.2"`}</code></pre>
             </section>
 
             <section className="chapter" id="replication" aria-labelledby="replication-title">
-              <p className="chapter-label">Chapter 9</p>
+              <p className="chapter-label">Chapter 10</p>
               <h2 id="replication-title">Replication</h2>
               <p>
                 OpenDR uses provider-owned LDAP Sync streams. A consumer performs
@@ -1477,7 +1519,7 @@ enable_change_listening = true`}</code></pre>
             </section>
 
             <section className="chapter" id="indexing" aria-labelledby="indexing-title">
-              <p className="chapter-label">Chapter 10</p>
+              <p className="chapter-label">Chapter 11</p>
               <h2 id="indexing-title">Indexing</h2>
               <p>
                 LMDB indexes are configured by attribute and index type. Startup
@@ -1506,7 +1548,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="backup" aria-labelledby="backup-title">
-              <p className="chapter-label">Chapter 11</p>
+              <p className="chapter-label">Chapter 12</p>
               <h2 id="backup-title">Backup and Restore</h2>
               <p>
                 Full backups are online LMDB environment copies with manifests.
@@ -1544,13 +1586,58 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="operations" aria-labelledby="operations-title">
-              <p className="chapter-label">Chapter 12</p>
-              <h2 id="operations-title">Operations Surface</h2>
+              <p className="chapter-label">Chapter 13</p>
+              <h2 id="operations-title">Operations and Maintenance</h2>
               <p>
-                These are the current server capabilities developers should know
-                before writing tests, diagnosing client behavior, or extending
-                the protocol layer.
+                Use this chapter for day-2 work: stop and restart the service,
+                monitor health, capture backups, restore a known-good provider,
+                and tune indexing. The protocol surface table stays here too so
+                the operator guide and the supported operation matrix remain in
+                one place.
               </p>
+
+              <div className="command-list">
+                <section>
+                  <h3>Stop and restart</h3>
+                  <pre><code>{`sudo systemctl stop opendr
+sudo systemctl restart opendr
+sudo systemctl status opendr
+sudo journalctl -u opendr -f`}</code></pre>
+                </section>
+                <section>
+                  <h3>Monitor health</h3>
+                  <pre><code>{`curl http://127.0.0.1:9090/health
+curl http://127.0.0.1:9090/metrics
+open http://127.0.0.1:9090/console`}</code></pre>
+                </section>
+                <section>
+                  <h3>Back up and restore</h3>
+                  <pre><code>{`opendr-backup --config /etc/opendr/server.toml full \\
+  --target /var/backups/opendr/full-20260412
+
+opendr-backup inspect --backup /var/backups/opendr/full-20260412
+
+opendr-restore \\
+  --backup /var/backups/opendr/full-20260412 \\
+  --target-data-dir /var/lib/opendr/data-restored \\
+  --dry-run`}</code></pre>
+                </section>
+                <section>
+                  <h3>Tune indexing</h3>
+                  <pre><code>{`[backend]
+indexed_attributes = ["cn", "uid", "mail", "objectClass", "ou"]
+
+[[backend.indexes]]
+attribute = "exampleScore"
+types = ["ordering"]`}</code></pre>
+                </section>
+              </div>
+
+              <div className="callout">
+                Rollback uses the deployment runbook: stop the provider and
+                consumers, restore the last known-good provider backup, and
+                re-bootstrap consumers with a fresh full refresh.
+              </div>
 
               <KeyValueTable headings={["Area", "Current behavior"]} rows={operationsRows} />
               <p>
@@ -1558,11 +1645,17 @@ types = ["ordering"]`}</code></pre>
                 default on the monitoring port and requires the configured root
                 DN and password.
               </p>
+              <p>
+                See <a className="text-link" href={docsHref("DEPLOYMENT_RUNBOOK.md")}>the deployment runbook</a> for
+                stop, restart, backup, restore, and rollback procedures, and
+                <a className="text-link" href={docsHref("TROUBLESHOOTING.md")}> the troubleshooting guide</a> for
+                startup, TLS, replication, and backup failure checks.
+              </p>
               <a className="text-link" href={docsHref("MANAGEMENT_CONSOLE.md")}>Read the management console runbook</a>
             </section>
 
             <section className="chapter" id="troubleshooting" aria-labelledby="troubleshooting-title">
-              <p className="chapter-label">Chapter 13</p>
+              <p className="chapter-label">Chapter 14</p>
               <h2 id="troubleshooting-title">Troubleshooting</h2>
               <p>
                 Start from the failing boundary. Most failures are caused by
@@ -1577,7 +1670,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="pages" aria-labelledby="pages-title">
-              <p className="chapter-label">Chapter 14</p>
+              <p className="chapter-label">Chapter 15</p>
               <h2 id="pages-title">GitHub Pages</h2>
               <p>
                 The documentation website is a React and Vite app in{" "}
