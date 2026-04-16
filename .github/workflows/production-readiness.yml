@@ -7,6 +7,7 @@ on:
       - ".github/workflows/production-readiness.yml"
       - "docs/LDAP_RFC_COMPLIANCE_MATRIX.md"
       - "docs/PRODUCTION_READINESS_CHECKLIST.md"
+      - "e2e_tests/**"
       - "fuzz/**"
       - "scripts/ldap_interop_gate.sh"
 
@@ -29,13 +30,16 @@ jobs:
       - name: Install external LDAP clients
         run: |
           sudo apt-get update
-          sudo apt-get install -y ldap-utils openssl python3-pip
+          sudo apt-get install -y ldap-utils openssl python3-pip zsh netcat-openbsd
           python3 -m pip install ldap3
 
       - name: Validate shell scripts
         run: |
           bash -n scripts/ldap_interop_gate.sh
           bash -n scripts/referral_alias_interop.sh
+          zsh -n e2e_tests/helpers.sh
+          zsh -n e2e_tests/test_single_provider_single_consumer.sh
+          zsh -n e2e_tests/test_replication_soak.sh
 
       - name: Core quality gate
         run: |
@@ -47,6 +51,20 @@ jobs:
       - name: External interoperability gate
         run: ./scripts/ldap_interop_gate.sh
 
+      - name: Replication soak smoke gate
+        run: |
+          cargo build --bin opendr
+          SERVER_BIN="$PWD/target/debug/opendr" \
+          PROVIDER_PORT=43910 \
+          CONSUMER_PORT=43911 \
+          SOAK_DURATION_SECS=10 \
+          SOAK_BATCH_SIZE=2 \
+          SOAK_MODIFY_PER_ROUND=1 \
+          SOAK_DELETE_EVERY_ROUNDS=1 \
+          SOAK_MIN_ACTIVE_BEFORE_DELETE=1 \
+          REPL_TIMEOUT_SECS=45 \
+          ./e2e_tests/test_replication_soak.sh
+
       - name: Fuzz target compile gate
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
 
@@ -57,6 +75,7 @@ jobs:
           rustup toolchain install nightly-2026-03-01 --profile minimal
           cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000
           cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000
+          SOAK_DURATION_SECS=86400 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh
           ./scripts/referral_alias_interop.sh
           ./scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate
           EOF

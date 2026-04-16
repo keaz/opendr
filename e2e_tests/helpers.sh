@@ -90,6 +90,7 @@ fi
 : "${SERVER_BIN:=}"
 : "${SERVER_BIN_HINTS:=target/release/opendr target/debug/opendr bin/opendr opendr}"
 : "${NC:=nc}"
+: "${E2E_ARTIFACT_DIR:=}"
 
 # Test state
 PASS_COUNT=0
@@ -658,6 +659,29 @@ cleanup_all() {
       fi
     done
   fi
+
+  # Preserve logs/configs for long-running gates when requested. Copy before
+  # removing RUN_ROOT so release artifacts survive normal cleanup.
+  if [[ -n "${E2E_ARTIFACT_DIR}" ]]; then
+    mkdir -p "${E2E_ARTIFACT_DIR}"
+
+    for ((i = 1; i <= ${#SERVER_LOGS[@]}; i++)); do
+      local log="${SERVER_LOGS[$i]}"
+      local name="${SERVER_NAMES[$i]}"
+      local dir="${SERVER_DIRS[$i]}"
+      [[ -n "${name}" ]] || name="unknown"
+
+      local safe_name="${name//:/_}"
+      safe_name="${safe_name//\//_}"
+
+      if [[ -f "${log}" ]]; then
+        cp -f "${log}" "${E2E_ARTIFACT_DIR}/${safe_name}.log" || true
+      fi
+      if [[ -f "${dir}/config/server.toml" ]]; then
+        cp -f "${dir}/config/server.toml" "${E2E_ARTIFACT_DIR}/${safe_name}.server.toml" || true
+      fi
+    done
+  fi
   
   # Stop all servers
   for ((i = 1; i <= ${#SERVER_PIDS[@]}; i++)); do
@@ -679,7 +703,7 @@ cleanup_all() {
   log_info "Total execution time: ${duration}s"
   
   # Exit with proper code
-  if [[ ${FAIL_COUNT} -gt 0 ]]; then
+  if [[ ${FAIL_COUNT} -gt 0 || ${exit_status} -ne 0 ]]; then
     exit 1
   else
     exit 0

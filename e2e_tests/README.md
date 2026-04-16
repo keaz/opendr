@@ -142,6 +142,42 @@ export RUN_ROOT=/tmp/my_test_dir
 ./e2e_tests/test_single_provider_single_consumer.sh
 ```
 
+### test_replication_soak.sh
+
+**Purpose**: Validate sustained provider-consumer convergence over repeated
+LDAP writes.
+
+**Tests**:
+- Starts one provider and one consumer in isolated temporary directories
+- Repeatedly adds batches of `inetOrgPerson` entries to the provider
+- Modifies recently added entries and waits for replicated attributes
+- Periodically deletes the oldest active entries and waits for deletion on the
+  consumer
+- Verifies provider and consumer entry counts during the run and at the end
+- Writes a summary plus provider/consumer logs/configs to an artifact directory
+
+**Default duration**: 60 seconds
+
+**Smoke example**:
+```bash
+SOAK_DURATION_SECS=15 \
+SOAK_BATCH_SIZE=2 \
+SOAK_DELETE_EVERY_ROUNDS=1 \
+SOAK_MIN_ACTIVE_BEFORE_DELETE=1 \
+./e2e_tests/test_replication_soak.sh
+```
+
+**Release-candidate example**:
+```bash
+SOAK_DURATION_SECS=86400 \
+SOAK_BATCH_SIZE=10 \
+SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate \
+./e2e_tests/test_replication_soak.sh
+```
+
+The release-candidate run should retain `summary.txt`, server logs, and
+generated configs from `SOAK_ARTIFACT_DIR` with the release evidence.
+
 ### test_schema_management.sh
 
 **Purpose**: Validate schema definition and validation behavior through LDAP clients
