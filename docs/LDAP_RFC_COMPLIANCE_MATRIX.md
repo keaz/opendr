@@ -39,7 +39,7 @@ release-gate test.
 | RFC 2891 | Server-Side Sort request control | `1.2.840.113556.1.4.473` | `supportedControl` | Supported | `src/server.rs`, `src/fsm_server.rs`, `docs/ROOT_DSE_CAPABILITIES.md` | `tests/server_side_sort_integration.rs`, `scripts/ldap_interop_gate.sh` |
 | RFC 3296 | ManageDsaIT request control | `2.16.840.1.113730.3.4.2` | `supportedControl` | Supported | `src/ldap_controls.rs`, `src/referral.rs`, `docs/LDAP_REFERRAL_ALIAS_SUPPORT.md` | `tests/referral_integration.rs`, `scripts/referral_alias_interop.sh` |
 | RFC 3909 | Cancel extended operation | `1.3.6.1.1.8` | `supportedExtension` | Supported | `src/extended_ops.rs`, `src/server.rs`, `src/fsm_server.rs` | `tests/security_integration.rs`, `server::tests::cancel_*`, `fsm_server::tests::cancel_*` |
-| RFC 4511 / RFC 4513 | StartTLS extended operation | `1.3.6.1.4.1.1466.20037` | `supportedExtension` | Supported | `src/tls.rs`, `src/server.rs`, `src/fsm_server.rs`, `docs/PRODUCTION_SECURITY_PROFILE.md` | `tests/tls_runtime_integration.rs`, `scripts/ldap_interop_gate.sh` |
+| RFC 4511 / RFC 4513 | StartTLS extended operation | `1.3.6.1.4.1.1466.20037` | `supportedExtension` | Supported | `src/tls.rs`, `src/server.rs`, `src/fsm_server.rs`, `docs/PRODUCTION_SECURITY_PROFILE.md`, `docs/TLS_ROTATION.md` | `tests/tls_runtime_integration.rs`, `scripts/ldap_interop_gate.sh`, `scripts/tls_rotation_gate.sh` |
 | RFC 4525 | Modify-Increment feature | `1.3.6.1.1.14` | `supportedFeatures` | Supported | `src/backend.rs`, `src/backend_lmdb.rs`, `src/server.rs`, `src/fsm_server.rs`, `docs/LDAP_CONTROL_EXTENSION_COMPATIBILITY.md` | `server::tests::modify_increment_*`, `tests/backend_lmdb_integration.rs` |
 | RFC 4527 | Pre-Read request control | `1.3.6.1.1.13.1` | `supportedControl` | Unsupported | `docs/LDAP_CONTROL_EXTENSION_COMPATIBILITY.md` | Critical/non-critical behavior covered by `server::tests::unsupported_expected_controls_follow_generic_criticality_semantics` |
 | RFC 4527 | Post-Read request control | `1.3.6.1.1.13.2` | `supportedControl` | Unsupported | `docs/LDAP_CONTROL_EXTENSION_COMPATIBILITY.md` | Critical/non-critical behavior covered by `server::tests::unsupported_expected_controls_follow_generic_criticality_semantics` |
@@ -62,9 +62,10 @@ these gates pass and their artifacts are retained:
 4. `cargo test --doc --quiet`
 5. `scripts/ldap_interop_gate.sh`
 6. `scripts/referral_alias_interop.sh` against a fixture with referral and alias entries
-7. `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh`
-8. Retain `target/fuzz-gate/release-candidate` logs, corpora, dictionaries, and crash artifacts
-9. `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh`
+7. `TLS_ROTATION_ARTIFACT_DIR=target/tls-rotation-gate/release-candidate ./scripts/tls_rotation_gate.sh`
+8. `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh`
+9. Retain `target/fuzz-gate/release-candidate` logs, corpora, dictionaries, and crash artifacts
+10. `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh`
 
 The manual GitHub workflow `Production Readiness Gate` runs the CI-friendly
 subset and documents the longer fuzz and soak commands that must be executed

@@ -62,6 +62,50 @@ OPENDR_BIND_PW=secret \
 - Python 3 with the `ldap3` package.
 - `openssl` when the script starts its own temporary server.
 
+### tls_rotation_gate.sh
+
+**Purpose**: Production-readiness TLS certificate rotation gate. The script
+starts an isolated OpenDR server, rotates temporary certificate material, and
+proves the documented restart-required rotation model for LDAPS and StartTLS.
+
+**What it covers**:
+1. LDAPS and StartTLS bind/search succeeds with the active trust anchor.
+2. LDAPS and StartTLS fails with the inactive or stale trust anchor.
+3. Replacing `tls.cert_file` and `tls.key_file` while the process is running
+   does not hot reload the certificate.
+4. Restarting OpenDR activates the new certificate for new LDAPS connections
+   and new StartTLS upgrades.
+
+**Usage**:
+```bash
+TLS_ROTATION_ARTIFACT_DIR=target/tls-rotation-gate/readiness-smoke \
+./scripts/tls_rotation_gate.sh
+```
+
+Use `TLS_ROTATION_PYTHON=/path/to/venv/bin/python` when `ldap3` is installed in
+a virtual environment.
+
+For release evidence:
+
+```bash
+TLS_ROTATION_ARTIFACT_DIR=target/tls-rotation-gate/release-candidate \
+./scripts/tls_rotation_gate.sh
+```
+
+**Artifacts**:
+- Summary: `target/tls-rotation-gate/.../summary.md`
+- Server logs: `target/tls-rotation-gate/.../logs/server-*.log`
+- LDAP client logs: `target/tls-rotation-gate/.../logs/*LDAPS*.log` and
+  `target/tls-rotation-gate/.../logs/*StartTLS*.log`
+- Temporary test certificates and keys:
+  `target/tls-rotation-gate/.../generated-certs/`
+
+**Prerequisites**:
+- Rust and Cargo.
+- Python 3 with the `ldap3` package for client validation and local port
+  allocation.
+- `openssl`.
+
 ### test_schema_validation.sh
 
 **Purpose**: End-to-end test for LDAP schema validation

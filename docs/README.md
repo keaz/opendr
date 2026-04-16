@@ -22,6 +22,7 @@ deploys the site.
 - [Backup and restore](./BACKUP_RESTORE.md)
 - [Replication guide](./REPLICATION_GUIDE.md)
 - [Fuzzing gate](./FUZZING.md)
+- [TLS certificate rotation](./TLS_ROTATION.md)
 - [LDAP referral and alias support](./LDAP_REFERRAL_ALIAS_SUPPORT.md)
 - [LDAP control and extension compatibility](./LDAP_CONTROL_EXTENSION_COMPATIBILITY.md)
 - [LDAP RFC compliance matrix](./LDAP_RFC_COMPLIANCE_MATRIX.md)

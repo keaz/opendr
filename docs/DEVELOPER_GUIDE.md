@@ -277,6 +277,13 @@ state. Clients must bind again after StartTLS.
 
 For mutual TLS, set `require_client_cert = true` and provide `ca_file`.
 
+Certificate rotation is restart-required. OpenDR reads `tls.cert_file` and
+`tls.key_file` when the TLS handler is created; replacing files on disk does
+not hot reload the running process. Stage the new material, replace the live
+paths, restart OpenDR, then validate LDAPS and StartTLS with the new trust
+bundle. See [TLS certificate rotation](./TLS_ROTATION.md) and run
+`./scripts/tls_rotation_gate.sh` for the release gate.
+
 Troubleshooting TLS:
 
 - `TLS certificate file not found`: fix `tls.cert_file` or the process working
@@ -285,6 +292,8 @@ Troubleshooting TLS:
 - `Client certificate verification requires a CA file`: set `ca_file`.
 - StartTLS already secure: the connection was already TLS/LDAPS.
 - Client bind fails after StartTLS: bind again after the upgrade.
+- Clients still see the old certificate after file replacement: restart OpenDR;
+  hot reload is not supported.
 
 ## LDAP Operations And Controls
 
