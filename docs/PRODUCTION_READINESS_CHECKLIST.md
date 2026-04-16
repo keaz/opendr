@@ -22,6 +22,7 @@ operation behavior.
 | BER fuzzing | `cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth. | Fuzz corpus and log |
 | Request-handler fuzzing | `cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000` | No panic, crash, timeout, or unbounded memory growth in parser/server request handling. | Fuzz corpus and log |
 | Load/performance regression | `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh` | Regression profile exits 0 and baseline validation stays within the documented threshold. | `target/perf/regression-candidate` |
+| Backup/restore drill | `BACKUP_DRILL_MODE=release BACKUP_DRILL_USERS=100000 BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate ./scripts/backup_restore_drill.sh` | Production-like LMDB fixture is backed up, inspected, dry-run restored, restored into a clean data directory, and validated through LDAP binds, indexed searches, operational attributes, and contextCSN evidence. | `target/backup-restore-drill/release-candidate` |
 
 ## Release Decision Rules
 

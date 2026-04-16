@@ -6,9 +6,11 @@ on:
     paths:
       - ".github/workflows/production-readiness.yml"
       - "docs/LDAP_RFC_COMPLIANCE_MATRIX.md"
+      - "docs/BACKUP_RESTORE.md"
       - "docs/PRODUCTION_READINESS_CHECKLIST.md"
       - "e2e_tests/**"
       - "fuzz/**"
+      - "scripts/backup_restore_drill.sh"
       - "scripts/ldap_interop_gate.sh"
       - "scripts/perf_regression_gate.sh"
 
@@ -39,6 +41,7 @@ jobs:
           bash -n scripts/ldap_interop_gate.sh
           bash -n scripts/referral_alias_interop.sh
           bash -n scripts/perf_regression_gate.sh
+          bash -n scripts/backup_restore_drill.sh
           zsh -n e2e_tests/helpers.sh
           zsh -n e2e_tests/test_single_provider_single_consumer.sh
           zsh -n e2e_tests/test_replication_soak.sh
@@ -81,6 +84,16 @@ jobs:
           PERF_GATE_MAX_P95_MS=5000 \
           ./scripts/perf_regression_gate.sh
 
+      - name: Backup restore smoke drill
+        run: |
+          BACKUP_DRILL_MODE=smoke \
+          BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/readiness-smoke \
+          BACKUP_DRILL_PROFILE=debug \
+          BACKUP_DRILL_USERS=50 \
+          BACKUP_DRILL_BATCH_SIZE=50 \
+          BACKUP_DRILL_PORT=43930 \
+          ./scripts/backup_restore_drill.sh
+
       - name: Fuzz target compile gate
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
 
@@ -93,6 +106,7 @@ jobs:
           cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000
           SOAK_DURATION_SECS=86400 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh
           PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh
+          BACKUP_DRILL_MODE=release BACKUP_DRILL_USERS=100000 BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate ./scripts/backup_restore_drill.sh
           ./scripts/referral_alias_interop.sh
           ./scripts/perf_docker_matrix.sh --products opendr --profile-set regression --output-dir target/perf/regression-candidate
           EOF

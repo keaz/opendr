@@ -320,6 +320,41 @@ PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate \
 - Release comparison report: `target/perf/.../perf-regression-report.md`
 - Release matrix artifacts under `target/perf/.../regression-candidate`
 
+### backup_restore_drill.sh
+
+**Purpose**: Production-readiness backup/restore drill for LMDB deployments.
+
+**What it does**:
+1. Builds the OpenDR server, setup, backup, restore, and fixture-loader
+   binaries.
+2. Creates an isolated LMDB fixture with indexed LDAP users.
+3. Runs a full backup, backup inspect, restore dry-run, and clean restore.
+4. Starts a restored OpenDR instance and validates admin bind, fixture user
+   bind, base-object search, indexed `uid` and `mail` searches, objectClass
+   count, operational attributes, and contextCSN evidence.
+
+**Usage**:
+```bash
+# Fast local smoke drill
+BACKUP_DRILL_MODE=smoke \
+BACKUP_DRILL_USERS=50 \
+BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/readiness-smoke \
+./scripts/backup_restore_drill.sh
+
+# Release-candidate drill
+BACKUP_DRILL_MODE=release \
+BACKUP_DRILL_USERS=100000 \
+BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate \
+./scripts/backup_restore_drill.sh
+```
+
+**Artifacts**:
+- Drill summary: `target/backup-restore-drill/.../summary.md`
+- Full backup: `target/backup-restore-drill/.../full-backup`
+- Command and server logs: `target/backup-restore-drill/.../logs`
+- Validation LDIF and contextCSN evidence:
+  `target/backup-restore-drill/.../validation`
+
 ### compare_perf_run.py
 
 **Purpose**: Compare two `ldap_perf_client` JSON reports and fail when key

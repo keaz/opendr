@@ -310,6 +310,54 @@ After restore:
   present.
 - Monitor startup logs for LMDB or schema errors.
 
+## Production Drill
+
+Use the backup/restore drill before a production-ready release and after
+material backup, LMDB, schema, index, or restore changes:
+
+```bash
+BACKUP_DRILL_MODE=release \
+BACKUP_DRILL_USERS=100000 \
+BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate \
+./scripts/backup_restore_drill.sh
+```
+
+The drill creates a production-like LMDB fixture with indexed `cn`, `uid`,
+`mail`, and `objectClass` attributes, runs a full backup, inspects the backup,
+performs a dry-run restore, restores into a clean data directory, starts a
+restored OpenDR instance, and validates:
+
+- admin bind to the restored server
+- fixture user bind using a restored `userPassword`
+- base-object search for the naming context
+- exact indexed searches by `uid` and `mail`
+- objectClass search count for all fixture users
+- operational attributes on a restored user entry
+- backup manifest and restore report contextCSN consistency
+- Root DSE contextCSN publication after restored startup
+
+Smoke mode is suitable for CI and local changes:
+
+```bash
+BACKUP_DRILL_MODE=smoke \
+BACKUP_DRILL_USERS=50 \
+BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/readiness-smoke \
+./scripts/backup_restore_drill.sh
+```
+
+Release mode defaults to 100,000 fixture users and an 8 GiB LMDB map. Override
+`BACKUP_DRILL_USERS` and `BACKUP_DRILL_LMDB_MAX_SIZE_BYTES` to match the largest
+production naming context and planned restore host. Retain the full artifact
+directory, especially:
+
+- `summary.md` for status, durations, source size, backup size, restored size,
+  and final contextCSN
+- `full-backup/` for the generated backup manifest and LMDB copy
+- `logs/full-backup.*.log`, `logs/backup-inspect.*.log`, and
+  `logs/restore.*.log`
+- `logs/restored-server.*.log`
+- `validation/*.ldif` and `validation/context-csn.json`
+
 ## Operational Notes
 
 - Full online backup can run while the LDAP server is serving reads and writes.
