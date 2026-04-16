@@ -234,6 +234,7 @@ bind_address = "127.0.0.1"
 ldap_port = PORT_PLACEHOLDER
 base_dn = "BASE_DN_PLACEHOLDER"
 root_user_dn = "ROOT_RDN_PLACEHOLDER"
+# E2E-only inline credential; production configs use root_password_file/env.
 root_password = "ROOT_PW_PLACEHOLDER"
 organization_name = "Test Organization"
 
@@ -305,6 +306,7 @@ bind_address = "127.0.0.1"
 ldap_port = PORT_PLACEHOLDER
 base_dn = "BASE_DN_PLACEHOLDER"
 root_user_dn = "ROOT_RDN_PLACEHOLDER"
+# E2E-only inline credential; production configs use root_password_file/env.
 root_password = "ROOT_PW_PLACEHOLDER"
 organization_name = "Test Organization"
 

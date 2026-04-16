@@ -44,8 +44,8 @@ BACKUP_DRILL_BATCH_SIZE="${BACKUP_DRILL_BATCH_SIZE:-${DEFAULT_BATCH_SIZE}}"
 BACKUP_DRILL_LMDB_MAX_SIZE_BYTES="${BACKUP_DRILL_LMDB_MAX_SIZE_BYTES:-${DEFAULT_LMDB_MAX_SIZE_BYTES}}"
 BACKUP_DRILL_BASE_DN="${BACKUP_DRILL_BASE_DN:-dc=example,dc=com}"
 BACKUP_DRILL_ROOT_RDN="${BACKUP_DRILL_ROOT_RDN:-cn=admin}"
-BACKUP_DRILL_ROOT_PASSWORD="${BACKUP_DRILL_ROOT_PASSWORD:-BackupRestoreRootSecret123!}"
-BACKUP_DRILL_USER_PASSWORD="${BACKUP_DRILL_USER_PASSWORD:-BackupRestoreUserSecret123!}"
+BACKUP_DRILL_ROOT_PASSWORD="${BACKUP_DRILL_ROOT_PASSWORD:-BackupRestoreRootSecret-${RANDOM}-$$}"
+BACKUP_DRILL_USER_PASSWORD="${BACKUP_DRILL_USER_PASSWORD:-BackupRestoreUserSecret-${RANDOM}-$$}"
 BACKUP_DRILL_NAME_PREFIX="${BACKUP_DRILL_NAME_PREFIX:-restoredrill}"
 BACKUP_DRILL_RUNTIME="${BACKUP_DRILL_RUNTIME:-fsm}"
 BACKUP_DRILL_PORT="${BACKUP_DRILL_PORT:-}"
@@ -226,6 +226,10 @@ write_server_config() {
   local ldap_port="$4"
   local ldaps_port="$5"
   local hashed_root_password="$6"
+  local root_password_file="${path}.root-password.hash"
+
+  printf '%s\n' "${hashed_root_password}" > "${root_password_file}"
+  chmod 600 "${root_password_file}"
 
   cat > "${path}" <<EOF
 [server]
@@ -235,7 +239,7 @@ ldap_port = ${ldap_port}
 ldaps_port = ${ldaps_port}
 base_dn = "${BACKUP_DRILL_BASE_DN}"
 root_user_dn = "${BACKUP_DRILL_ROOT_RDN}"
-root_password = "${hashed_root_password}"
+root_password_file = "$(toml_escape "${root_password_file}")"
 organization_name = "OpenDR Backup Restore Drill"
 replica_id = 1
 

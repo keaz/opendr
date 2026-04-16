@@ -43,6 +43,7 @@ bind_address = "127.0.0.1"
 ldap_port = 1389
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=admin"
+# Demo-only inline credential; production profile rejects inline root_password.
 root_password = "secret"
 
 [backend]

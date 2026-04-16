@@ -699,6 +699,19 @@ fn default_root_user_dn() -> String {
 fn default_root_password() -> String {
     "secret".to_string()
 }
+const KNOWN_INSECURE_PRODUCTION_ROOT_SECRETS: &[&str] = &[
+    "secret",
+    "admin",
+    "Admin@123",
+    "CHANGE_THIS_PASSWORD_IMMEDIATELY",
+    "{SSHA512}IGnV9r5/VOlp0+ZSngWNwB5gGGuO3Gabd3cg6Y7U4oLhnCHANopw+/Ki4pAc06uzB1OI3NQ8rURaYkaxndQ25Nl25fkdYjSbyYYzZFIIJl4=",
+    "{SSHA512}oK/PhUnnw4cEzgmDsMdgE0nul/IinenDeOrqYjHSsfkMEOrsdYYd1I6v6R3x5LymynZ8gW3MXk9haWe4N3Q9tqDmK+kA9Sqbe59ITDgKZuM=",
+];
+
+fn is_known_insecure_production_root_secret(secret: &str) -> bool {
+    let secret = secret.trim();
+    KNOWN_INSECURE_PRODUCTION_ROOT_SECRETS.contains(&secret)
+}
 fn default_organization_name() -> String {
     "Example Organization".to_string()
 }
@@ -1369,6 +1382,29 @@ impl ServerConfig {
         )
     }
 
+    fn validate_production_root_secret_source(
+        &self,
+        resolved_root_password: &str,
+    ) -> Result<(), ConfigError> {
+        if self.security.profile != "production" {
+            return Ok(());
+        }
+
+        if !self.server.root_password.trim().is_empty() {
+            return Err(ConfigError::ValidationError(
+                "security.profile=production requires server.root_password_env or server.root_password_file; inline server.root_password is not allowed".to_string(),
+            ));
+        }
+
+        if is_known_insecure_production_root_secret(resolved_root_password) {
+            return Err(ConfigError::ValidationError(
+                "security.profile=production rejects known default or sample root credentials; rotate the root password and configure server.root_password_env or server.root_password_file".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Validate the transport policy for replication provider credentials.
     pub fn validate_replication_provider_transport(&self) -> Result<(), ConfigError> {
         let replication_mode = self.replication.mode.as_str();
@@ -1717,7 +1753,7 @@ impl ServerConfig {
                 self.server.runtime
             )));
         }
-        let _ = self.resolved_root_password()?;
+        let resolved_root_password = self.resolved_root_password()?;
         if self.server.replica_id == 0 {
             return Err(ConfigError::ValidationError(
                 "replica_id must be between 1 and 65535".to_string(),
@@ -1892,6 +1928,7 @@ impl ServerConfig {
                 "security.profile=production requires tls.enabled=true".to_string(),
             ));
         }
+        self.validate_production_root_secret_source(&resolved_root_password)?;
 
         // Validate replication settings
         if self.replication.enabled {
@@ -2182,8 +2219,13 @@ bind_password = "secret"
     fn production_profile_rejects_insecure_replication_provider_override() {
         let cert_file = NamedTempFile::new().unwrap();
         let key_file = NamedTempFile::new().unwrap();
+        let mut root_password_file = NamedTempFile::new().unwrap();
+        writeln!(root_password_file, "{{SSHA512}}production-root-password").unwrap();
         let toml = format!(
             r#"
+[server]
+root_password_file = "{}"
+
 [security]
 profile = "production"
 
@@ -2198,6 +2240,7 @@ mode = "consumer"
 provider_url = "ldap://provider.example.com:389"
 allow_insecure_provider_bind = true
 "#,
+            root_password_file.path().display(),
             cert_file.path().display(),
             key_file.path().display()
         );
@@ -2227,8 +2270,13 @@ allow_insecure_provider_bind = true
     fn production_profile_accepts_ldaps_replication_provider_with_credentials() {
         let cert_file = NamedTempFile::new().unwrap();
         let key_file = NamedTempFile::new().unwrap();
+        let mut root_password_file = NamedTempFile::new().unwrap();
+        writeln!(root_password_file, "{{SSHA512}}production-root-password").unwrap();
         let toml = format!(
             r#"
+[server]
+root_password_file = "{}"
+
 [security]
 profile = "production"
 
@@ -2244,6 +2292,7 @@ provider_url = "ldaps://provider.example.com:636"
 bind_dn = "cn=replicator,dc=example,dc=com"
 bind_password = "secret"
 "#,
+            root_password_file.path().display(),
             cert_file.path().display(),
             key_file.path().display()
         );
@@ -2370,6 +2419,129 @@ root_password_file = "{}"
         let debug_output = format!("{config:?}");
         assert!(!debug_output.contains("file-backed-secret"));
         assert!(debug_output.contains("<redacted via file:"));
+    }
+
+    #[test]
+    fn production_profile_rejects_inline_default_root_password() {
+        let cert_file = NamedTempFile::new().unwrap();
+        let key_file = NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[server]
+root_password = "secret"
+
+[security]
+profile = "production"
+
+[tls]
+enabled = true
+cert_file = "{}"
+key_file = "{}"
+"#,
+            cert_file.path().display(),
+            key_file.path().display()
+        );
+
+        let config = ServerConfig::from_toml_str(&toml).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("inline server.root_password is not allowed"));
+    }
+
+    #[test]
+    fn production_profile_rejects_known_committed_root_hash_from_file() {
+        let cert_file = NamedTempFile::new().unwrap();
+        let key_file = NamedTempFile::new().unwrap();
+        let mut secret_file = NamedTempFile::new().unwrap();
+        writeln!(
+            secret_file,
+            "{{SSHA512}}IGnV9r5/VOlp0+ZSngWNwB5gGGuO3Gabd3cg6Y7U4oLhnCHANopw+/Ki4pAc06uzB1OI3NQ8rURaYkaxndQ25Nl25fkdYjSbyYYzZFIIJl4="
+        )
+        .unwrap();
+        let toml = format!(
+            r#"
+[server]
+root_password_file = "{}"
+
+[security]
+profile = "production"
+
+[tls]
+enabled = true
+cert_file = "{}"
+key_file = "{}"
+"#,
+            secret_file.path().display(),
+            cert_file.path().display(),
+            key_file.path().display()
+        );
+
+        let config = ServerConfig::from_toml_str(&toml).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("known default or sample root credentials"));
+    }
+
+    #[test]
+    fn production_profile_accepts_root_password_file() {
+        let cert_file = NamedTempFile::new().unwrap();
+        let key_file = NamedTempFile::new().unwrap();
+        let mut secret_file = NamedTempFile::new().unwrap();
+        writeln!(secret_file, "{{SSHA512}}production-file-backed-secret").unwrap();
+        let toml = format!(
+            r#"
+[server]
+root_password_file = "{}"
+
+[security]
+profile = "production"
+
+[tls]
+enabled = true
+cert_file = "{}"
+key_file = "{}"
+"#,
+            secret_file.path().display(),
+            cert_file.path().display(),
+            key_file.path().display()
+        );
+
+        let config = ServerConfig::from_toml_str(&toml).unwrap();
+        assert_eq!(config.server.root_password, "");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn production_profile_accepts_root_password_env() {
+        let _guard = env_lock().lock().unwrap();
+        let env_name = format!("OPENDR_TEST_ROOT_PASSWORD_{}", std::process::id());
+        unsafe {
+            std::env::set_var(&env_name, "{SSHA512}production-env-backed-secret");
+        }
+        let cert_file = NamedTempFile::new().unwrap();
+        let key_file = NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[server]
+root_password_env = "{env_name}"
+
+[security]
+profile = "production"
+
+[tls]
+enabled = true
+cert_file = "{}"
+key_file = "{}"
+"#,
+            cert_file.path().display(),
+            key_file.path().display()
+        );
+
+        let config = ServerConfig::from_toml_str(&toml).unwrap();
+        assert_eq!(config.server.root_password, "");
+        assert!(config.validate().is_ok());
+
+        unsafe {
+            std::env::remove_var(&env_name);
+        }
     }
 
     #[test]

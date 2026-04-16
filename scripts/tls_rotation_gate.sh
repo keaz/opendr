@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BASE_DN="${TLS_ROTATION_BASE_DN:-dc=example,dc=org}"
 BIND_DN="${TLS_ROTATION_BIND_DN:-cn=admin,${BASE_DN}}"
-BIND_PW="${TLS_ROTATION_BIND_PW:-secret}"
+BIND_PW="${TLS_ROTATION_BIND_PW:-TlsRotationSecret-${RANDOM}-$$}"
 RUNTIME="${TLS_ROTATION_RUNTIME:-fsm}"
 PYTHON_BIN="${TLS_ROTATION_PYTHON:-python3}"
 ARTIFACT_DIR="${TLS_ROTATION_ARTIFACT_DIR:-${ROOT_DIR}/target/tls-rotation-gate/$(date +%Y%m%d-%H%M%S)}"
@@ -36,7 +36,7 @@ Environment:
   TLS_ROTATION_RUNTIME        Server runtime to test. Defaults to fsm.
   TLS_ROTATION_BASE_DN        LDAP base DN. Defaults to dc=example,dc=org.
   TLS_ROTATION_BIND_DN        Bind DN. Defaults to cn=admin,<base DN>.
-  TLS_ROTATION_BIND_PW        Bind password. Defaults to secret.
+  TLS_ROTATION_BIND_PW        Bind password. Defaults to a per-run local value.
   TLS_ROTATION_PYTHON         Python executable with ldap3 installed. Defaults to python3.
 EOF
 }
@@ -183,6 +183,7 @@ ldap_port = ${LDAP_PORT}
 ldaps_port = ${LDAPS_PORT}
 base_dn = "${BASE_DN}"
 root_user_dn = "cn=admin"
+# Gate-local inline credential; production profile rejects inline root_password.
 root_password = "${BIND_PW}"
 
 [backend]

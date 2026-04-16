@@ -176,6 +176,7 @@ ldap_port = $PROVIDER_PORT
 replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=admin"
+# Demo-only inline credential; production configs use root_password_file/env.
 root_password = "provider_admin"
 organization_name = "Example Provider"
 
@@ -214,6 +215,7 @@ ldap_port = $CONSUMER_PORT
 replica_id = 2
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=admin"
+# Demo-only inline credential; production configs use root_password_file/env.
 root_password = "consumer_admin"
 organization_name = "Example Consumer"
 

@@ -7,7 +7,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 
 BASE_DN="dc=example,dc=com"
 ROOT_RDN="cn=admin"
-ROOT_PASSWORD="PerfRootSecret123!"
+ROOT_PASSWORD="${ROOT_PASSWORD:-PerfRootSecret-${RANDOM}-$$}"
 PRELOADED_USERS=1000
 READ_ITERATIONS=200
 WRITE_ITERATIONS=100
@@ -211,8 +211,16 @@ dir_size_bytes() {
   du -sk "${dir}" 2>/dev/null | awk '{print $1 * 1024}'
 }
 
+toml_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 write_server_config() {
   local hashed_root_password="$1"
+  local root_password_file="${CONFIG_DIR}/root-password.hash"
+
+  printf '%s\n' "${hashed_root_password}" > "${root_password_file}"
+  chmod 600 "${root_password_file}"
 
   cat > "${CONFIG_DIR}/server.toml" <<EOF
 [server]
@@ -222,7 +230,7 @@ ldap_port = ${LDAP_PORT}
 ldaps_port = ${LDAPS_PORT}
 base_dn = "${BASE_DN}"
 root_user_dn = "${ROOT_RDN}"
-root_password = "${hashed_root_password}"
+root_password_file = "$(toml_escape "${root_password_file}")"
 organization_name = "OpenDR Perf Benchmark"
 
 [backend]

@@ -28,7 +28,7 @@ single hardened config template/gate.
 | Issue | Severity | Finding |
 | --- | --- | --- |
 | [#162](https://github.com/keaz/opendr/issues/162) | High | Require secure transport for replication provider credentials. Remediated by default validation policy. |
-| [#163](https://github.com/keaz/opendr/issues/163) | High | Remove committed/default root secret from production paths. |
+| [#163](https://github.com/keaz/opendr/issues/163) | High | Remove committed/default root secret from production paths. Remediated by production root-secret validation and sample cleanup. |
 | [#164](https://github.com/keaz/opendr/issues/164) | Medium | Canonicalize root/admin DN handling across auth, ACI, and console. |
 | [#165](https://github.com/keaz/opendr/issues/165) | Medium | Add replication security audit events. |
 | [#166](https://github.com/keaz/opendr/issues/166) | Medium | Ship a production-hardening config template and gate. |
@@ -44,22 +44,20 @@ Implemented controls:
 
 - `ServerConfig` supports `root_password`, `root_password_env`, and
   `root_password_file`, and validation rejects multiple root secret sources.
+- `security.profile = "production"` rejects inline root passwords and known
+  default/sample root credentials, and accepts operator-provided
+  `root_password_env` or `root_password_file` sources.
 - Replication bind secrets support inline, environment, and file sources.
 - TLS configuration validates certificate, key, and CA file existence when
   enabled.
 - Code defaults enable audit, access control, and rate limiting, with
   deny-by-default ACI policy when access control is enabled.
 
-Gaps:
+Gap:
 
-- `ServerConfig::default()` still uses `root_password = "secret"`.
-- The committed `config/server.toml` contains an inline root password hash and
-  does not set `security.profile = "production"`.
-- The same committed config disables access control and rate limiting.
 - There is no production config gate that rejects disabled hardening controls.
 
-Tracked remediation: [#163](https://github.com/keaz/opendr/issues/163) and
-[#166](https://github.com/keaz/opendr/issues/166).
+Tracked remediation: [#166](https://github.com/keaz/opendr/issues/166).
 
 ### Bind Policy And TLS
 

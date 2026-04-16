@@ -51,7 +51,7 @@ OPENDR_INTEROP_START_SERVER=0 \
 OPENDR_LDAP_URL=ldap://127.0.0.1:1389 \
 OPENDR_BASE_DN=dc=example,dc=org \
 OPENDR_BIND_DN=cn=admin,dc=example,dc=org \
-OPENDR_BIND_PW=secret \
+OPENDR_BIND_PW="$LOCAL_TEST_BIND_PASSWORD" \
 ./scripts/ldap_interop_gate.sh
 ```
 

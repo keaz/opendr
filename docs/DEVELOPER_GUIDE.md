@@ -145,7 +145,9 @@ opendr-setup hash-password 'StrongPass123'
 
 The command prints a complete `{SSHA512}...` value. For LMDB,
 `root_password_file` should contain that complete value, not the cleartext
-password.
+password. `opendr-setup` output is development-profile by default; before using
+it in production, set `security.profile = "production"` and move the generated
+root hash into `root_password_file` or `root_password_env`.
 
 Run interactive setup:
 

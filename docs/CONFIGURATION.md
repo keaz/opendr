@@ -26,7 +26,7 @@ runtime = "fsm"
 replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=admin"
-root_password = "secret"
+root_password_file = "/run/secrets/opendr-root-password-hash"
 organization_name = "Example Organization"
 read_buffer_size = 4096
 operation_timeout_secs = 300
@@ -44,7 +44,7 @@ max_concurrent_operations = 100
 | `replica_id` | `1` | Must be non-zero and unique per replicated node |
 | `base_dn` | `dc=example,dc=com` | Base naming context |
 | `root_user_dn` | `cn=admin` | RDN or DN prefix used with `base_dn` during initialization |
-| `root_password` | `secret` | Inline secret; prefer `_env` or `_file` |
+| `root_password` | `secret` | Development-only inline secret; rejected by the production profile |
 | `root_password_env` | unset | Environment variable containing the root secret |
 | `root_password_file` | unset | File containing the root secret |
 | `organization_name` | `Example Organization` | Used during base initialization |
@@ -56,6 +56,9 @@ max_concurrent_operations = 100
 Secret rule: set exactly one of `root_password`, `root_password_env`, or
 `root_password_file`. When using LMDB and a password file, store the full
 `{SSHA512}...` hash produced by `opendr-setup hash-password`.
+`security.profile = "production"` rejects inline `root_password`; production
+configs must use `root_password_env` or `root_password_file`, and known sample
+credentials are rejected even when supplied through those sources.
 
 ## Backend
 

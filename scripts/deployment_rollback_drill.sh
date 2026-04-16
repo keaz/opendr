@@ -36,8 +36,8 @@ DEPLOYMENT_DRILL_OUTPUT_DIR="${DEPLOYMENT_DRILL_OUTPUT_DIR:-${REPO_ROOT}/target/
 DEPLOYMENT_DRILL_PROFILE="${DEPLOYMENT_DRILL_PROFILE:-${DEFAULT_PROFILE}}"
 DEPLOYMENT_DRILL_BASE_DN="${DEPLOYMENT_DRILL_BASE_DN:-dc=example,dc=org}"
 DEPLOYMENT_DRILL_ROOT_RDN="${DEPLOYMENT_DRILL_ROOT_RDN:-cn=manager}"
-DEPLOYMENT_DRILL_PROVIDER_ROOT_PASSWORD="${DEPLOYMENT_DRILL_PROVIDER_ROOT_PASSWORD:-DeploymentProviderSecret123!}"
-DEPLOYMENT_DRILL_CONSUMER_ROOT_PASSWORD="${DEPLOYMENT_DRILL_CONSUMER_ROOT_PASSWORD:-DeploymentConsumerSecret123!}"
+DEPLOYMENT_DRILL_PROVIDER_ROOT_PASSWORD="${DEPLOYMENT_DRILL_PROVIDER_ROOT_PASSWORD:-DeploymentProviderSecret-${RANDOM}-$$}"
+DEPLOYMENT_DRILL_CONSUMER_ROOT_PASSWORD="${DEPLOYMENT_DRILL_CONSUMER_ROOT_PASSWORD:-DeploymentConsumerSecret-${RANDOM}-$$}"
 DEPLOYMENT_DRILL_LMDB_MAX_SIZE_BYTES="${DEPLOYMENT_DRILL_LMDB_MAX_SIZE_BYTES:-${DEFAULT_LMDB_MAX_SIZE_BYTES}}"
 DEPLOYMENT_DRILL_PROVIDER_PORT="${DEPLOYMENT_DRILL_PROVIDER_PORT:-}"
 DEPLOYMENT_DRILL_CONSUMER_PORT="${DEPLOYMENT_DRILL_CONSUMER_PORT:-}"
@@ -259,6 +259,10 @@ EOF
 
 write_provider_config() {
   local hashed_root_password="$1"
+  local root_password_file="${PROVIDER_CONFIG}.root-password.hash"
+
+  printf '%s\n' "${hashed_root_password}" > "${root_password_file}"
+  chmod 600 "${root_password_file}"
 
   cat > "${PROVIDER_CONFIG}" <<EOF
 [server]
@@ -267,7 +271,7 @@ bind_address = "127.0.0.1"
 ldap_port = ${PROVIDER_PORT}
 base_dn = "${DEPLOYMENT_DRILL_BASE_DN}"
 root_user_dn = "${DEPLOYMENT_DRILL_ROOT_RDN}"
-root_password = "${hashed_root_password}"
+root_password_file = "$(toml_escape "${root_password_file}")"
 organization_name = "OpenDR Deployment Rollback Drill Provider"
 replica_id = 1
 
@@ -319,6 +323,10 @@ EOF
 
 write_consumer_config() {
   local hashed_root_password="$1"
+  local root_password_file="${CONSUMER_CONFIG}.root-password.hash"
+
+  printf '%s\n' "${hashed_root_password}" > "${root_password_file}"
+  chmod 600 "${root_password_file}"
 
   cat > "${CONSUMER_CONFIG}" <<EOF
 [server]
@@ -327,7 +335,7 @@ bind_address = "127.0.0.1"
 ldap_port = ${CONSUMER_PORT}
 base_dn = "${DEPLOYMENT_DRILL_BASE_DN}"
 root_user_dn = "${DEPLOYMENT_DRILL_ROOT_RDN}"
-root_password = "${hashed_root_password}"
+root_password_file = "$(toml_escape "${root_password_file}")"
 organization_name = "OpenDR Deployment Rollback Drill Consumer"
 replica_id = 2
 

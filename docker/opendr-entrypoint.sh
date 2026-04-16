@@ -15,7 +15,8 @@ mkdir -p "${CONFIG_DIR}" "${CERT_DIR}" "${DATA_DIR}"
 : "${OPENDR_RUNTIME:=legacy}"
 : "${OPENDR_BASE_DN:=dc=example,dc=com}"
 : "${OPENDR_ROOT_USER_DN:=cn=admin}"
-: "${OPENDR_ROOT_PASSWORD:=PerfRootSecret123!}"
+: "${OPENDR_ROOT_PASSWORD:=}"
+: "${OPENDR_ROOT_PASSWORD_HASH_FILE:=}"
 : "${OPENDR_ORGANIZATION_NAME:=OpenDR Docker}"
 : "${OPENDR_LMDB_MAX_SIZE:=1073741824}"
 : "${OPENDR_LMDB_MAX_READERS:=256}"
@@ -51,7 +52,17 @@ if [[ ! -f "${CERT_DIR}/server.crt" || ! -f "${CERT_DIR}/server.key" ]]; then
     >/dev/null 2>&1
 fi
 
-ROOT_PASSWORD_HASH=$(/usr/local/bin/opendr-setup hash-password "${OPENDR_ROOT_PASSWORD}" | tail -n 1)
+ROOT_PASSWORD_FILE="${CONFIG_DIR}/root-password.hash"
+if [[ -n "${OPENDR_ROOT_PASSWORD_HASH_FILE}" ]]; then
+  ROOT_PASSWORD_HASH="$(<"${OPENDR_ROOT_PASSWORD_HASH_FILE}")"
+elif [[ -n "${OPENDR_ROOT_PASSWORD}" ]]; then
+  ROOT_PASSWORD_HASH=$(/usr/local/bin/opendr-setup hash-password "${OPENDR_ROOT_PASSWORD}" | tail -n 1)
+else
+  echo "OPENDR_ROOT_PASSWORD or OPENDR_ROOT_PASSWORD_HASH_FILE must be set" >&2
+  exit 1
+fi
+umask 077
+printf '%s\n' "${ROOT_PASSWORD_HASH}" > "${ROOT_PASSWORD_FILE}"
 
 cat > "${CONFIG_DIR}/server.toml" <<EOF
 [server]
@@ -61,7 +72,7 @@ ldap_port = ${OPENDR_LDAP_PORT}
 ldaps_port = ${OPENDR_LDAPS_PORT}
 base_dn = "${OPENDR_BASE_DN}"
 root_user_dn = "${OPENDR_ROOT_USER_DN}"
-root_password = "${ROOT_PASSWORD_HASH}"
+root_password_file = "${ROOT_PASSWORD_FILE}"
 organization_name = "${OPENDR_ORGANIZATION_NAME}"
 
 [backend]

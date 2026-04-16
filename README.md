@@ -320,7 +320,7 @@ ldap_port = 389
 replica_id = 1
 base_dn = "dc=example,dc=com"
 root_user_dn = "cn=manager"
-root_password = "{SSHA512}<generated-hash>"
+root_password_file = "/run/secrets/opendr-root-password-hash"
 organization_name = "Example Org"
 
 [backend]

@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BASE_DN="${OPENDR_BASE_DN:-dc=example,dc=org}"
 BIND_DN="${OPENDR_BIND_DN:-cn=admin,${BASE_DN}}"
-BIND_PW="${OPENDR_BIND_PW:-secret}"
+BIND_PW="${OPENDR_BIND_PW:-InteropSecret-${RANDOM}-$$}"
 RUNTIME="${OPENDR_RUNTIME:-fsm}"
 START_SERVER="${OPENDR_INTEROP_START_SERVER:-1}"
 LDAP_URL="${OPENDR_LDAP_URL:-}"
@@ -122,6 +122,7 @@ ldap_port = ${ldap_port}
 ldaps_port = ${ldaps_port}
 base_dn = "${BASE_DN}"
 root_user_dn = "cn=admin"
+# Gate-local inline credential; production profile rejects inline root_password.
 root_password = "${BIND_PW}"
 
 [backend]

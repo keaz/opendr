@@ -4,5 +4,6 @@ objectClass: organizationalPerson
 objectClass: inetOrgPerson
 cn: manager
 sn: Administrator
-userPassword: {SSHA512}IGnV9r5/VOlp0+ZSngWNwB5gGGuO3Gabd3cg6Y7U4oLhnCHANopw+/Ki4pAc06uzB1OI3NQ8rURaYkaxndQ25Nl25fkdYjSbyYYzZFIIJl4=
+# No reusable root password is committed. Generate a deployment-specific hash with:
+#   opendr-setup hash-password '<strong-password>'
 description: Root Administrator Account

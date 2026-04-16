@@ -1,8 +1,0 @@
-dn: cn=manager
-objectClass: person
-objectClass: organizationalPerson
-objectClass: inetOrgPerson
-cn: manager
-sn: Administrator
-userPassword: {SSHA512}oK/PhUnnw4cEzgmDsMdgE0nul/IinenDeOrqYjHSsfkMEOrsdYYd1I6v6R3x5LymynZ8gW3MXk9haWe4N3Q9tqDmK+kA9Sqbe59ITDgKZuM=
-description: Root Administrator Account

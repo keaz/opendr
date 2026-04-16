@@ -30,6 +30,8 @@ use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 
 const MANAGE_DSA_IT_OID: &str = "2.16.840.1.113730.3.4.2";
+const DEFAULT_TEST_ROOT_PASSWORD: &str = "secret";
+const PRODUCTION_TEST_ROOT_PASSWORD: &str = "TlsRuntimeProductionRootSecret123!";
 
 struct TestBinaryServer {
     _tempdir: TempDir,
@@ -96,6 +98,17 @@ fn write_tls_fixture(tempdir: &TempDir, fixture: &TlsFixtureConfig<'_>) {
     fs::write(cert_dir.join("server.crt"), fixture.cert_pem).unwrap();
     fs::write(cert_dir.join("server.key"), fixture.key_pem).unwrap();
 
+    let production_profile = fixture
+        .security_profile
+        .is_some_and(|profile| profile.eq_ignore_ascii_case("production"));
+    let root_password_toml = if production_profile {
+        let root_password_file = config_dir.join("root-password.txt");
+        fs::write(&root_password_file, PRODUCTION_TEST_ROOT_PASSWORD).unwrap();
+        r#"root_password_file = "config/root-password.txt""#.to_string()
+    } else {
+        format!(r#"root_password = "{DEFAULT_TEST_ROOT_PASSWORD}""#)
+    };
+
     let security_toml = fixture
         .security_profile
         .map(|profile| {
@@ -117,7 +130,7 @@ ldap_port = {ldap_port}
 ldaps_port = {ldaps_port}
 base_dn = "dc=example,dc=org"
 root_user_dn = "cn=admin"
-root_password = "secret"
+{root_password_toml}
 
 [backend]
 backend_type = "memory"
@@ -144,6 +157,7 @@ enabled = false
         ldap_port = fixture.ldap_port,
         ldaps_port = fixture.ldaps_port,
         tls_enabled = fixture.tls_enabled,
+        root_password_toml = root_password_toml,
         security_toml = security_toml,
     );
     fs::write(config_dir.join("server.toml"), server_toml).unwrap();
@@ -263,10 +277,21 @@ async fn send_bind_request<S>(stream: &mut S, message_id: u32) -> Vec<u8>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    send_bind_request_with_password(stream, message_id, DEFAULT_TEST_ROOT_PASSWORD).await
+}
+
+async fn send_bind_request_with_password<S>(
+    stream: &mut S,
+    message_id: u32,
+    password: &str,
+) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let bind_request = RasnBindRequest::new(
         3,
         b"cn=admin,dc=example,dc=org".to_vec().into(),
-        RasnAuthChoice::Simple(b"secret".to_vec().into()),
+        RasnAuthChoice::Simple(password.as_bytes().to_vec().into()),
     );
     let bind_message =
         rasn_ldap::LdapMessage::new(message_id, rasn_ldap::ProtocolOp::BindRequest(bind_request));
@@ -541,7 +566,8 @@ async fn assert_production_security_profile(runtime: &str) {
         .connect(localhost_server_name(), stream)
         .await
         .expect("StartTLS upgrade should complete with trusted server certificate");
-    let response = send_bind_request(&mut tls_stream, 4).await;
+    let response =
+        send_bind_request_with_password(&mut tls_stream, 4, PRODUCTION_TEST_ROOT_PASSWORD).await;
     assert_bind_success(&response);
 }
 

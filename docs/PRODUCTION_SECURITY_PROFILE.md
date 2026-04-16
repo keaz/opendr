@@ -23,7 +23,9 @@ profile = "production"
 ```
 
 `security.profile = "production"` requires `tls.enabled = true` at config
-validation time.
+validation time. It also rejects inline `server.root_password`; use
+`server.root_password_file` or `server.root_password_env` with an
+operator-provided secret.
 
 ## Profile Defaults
 
@@ -59,8 +61,9 @@ controlled exception. SASL PLAIN still requires LDAPS or StartTLS even when
 - Use `min_tls_version = "1.2"` or `"1.3"`.
 - Set `require_client_cert = true` and `ca_file` when mutual TLS is required.
 - Keep private keys readable only by the OpenDR service account.
-- Prefer `server.root_password_env` or `server.root_password_file` over inline
-  secrets.
+- Use `server.root_password_env` or `server.root_password_file`; inline
+  `server.root_password` is development-only and rejected by the production
+  profile.
 - Rotate service and replication bind credentials through secret files or
   environment sources.
 - Use `ldaps://` provider URLs for credentialed replication. The
