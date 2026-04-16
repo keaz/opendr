@@ -399,6 +399,42 @@ BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate \
 - Validation LDIF and contextCSN evidence:
   `target/backup-restore-drill/.../validation`
 
+### deployment_rollback_drill.sh
+
+**Purpose**: Production-readiness deployment rollback drill for a provider and
+consumer pair.
+
+**What it does**:
+1. Builds the OpenDR server, setup, backup, and restore binaries.
+2. Starts an isolated provider and consumer with separate LMDB data and
+   replication state directories.
+3. Adds a baseline entry, takes a provider full backup, and validates backup
+   inspect plus restore dry-run.
+4. Adds a failed-deployment marker and proves it replicates to the consumer.
+5. Stops both nodes, moves failed data and replication state aside, restores the
+   provider backup, and reboots the consumer from a clean state.
+6. Verifies the baseline entry exists, the failed marker is absent, and a new
+   post-rollback entry replicates live.
+
+**Usage**:
+```bash
+# Fast local smoke drill
+DEPLOYMENT_DRILL_OUTPUT_DIR=target/deployment-rollback-drill/readiness-smoke \
+./scripts/deployment_rollback_drill.sh
+
+# Release-candidate drill
+DEPLOYMENT_DRILL_MODE=release \
+DEPLOYMENT_DRILL_OUTPUT_DIR=target/deployment-rollback-drill/release-candidate \
+./scripts/deployment_rollback_drill.sh
+```
+
+**Artifacts**:
+- Drill summary: `target/deployment-rollback-drill/.../summary.md`
+- Provider backup: `target/deployment-rollback-drill/.../provider-full-backup`
+- Failed data and replication state moved aside under the artifact directory
+- Command and server logs: `target/deployment-rollback-drill/.../logs`
+- Validation LDIF files: `target/deployment-rollback-drill/.../validation`
+
 ### fuzz_gate.sh
 
 **Purpose**: Production-readiness fuzz wrapper for LDAP BER parsing and request

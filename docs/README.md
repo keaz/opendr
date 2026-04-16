@@ -19,6 +19,7 @@ deploys the site.
 - [Configuration reference](./CONFIGURATION.md)
 - [Management console](./MANAGEMENT_CONSOLE.md)
 - [Troubleshooting guide](./TROUBLESHOOTING.md)
+- [Deployment runbook](./DEPLOYMENT_RUNBOOK.md)
 - [Backup and restore](./BACKUP_RESTORE.md)
 - [Replication guide](./REPLICATION_GUIDE.md)
 - [Fuzzing gate](./FUZZING.md)

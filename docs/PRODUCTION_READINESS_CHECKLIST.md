@@ -26,6 +26,7 @@ operation behavior.
 | Request-handler fuzzing | `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh` | `ldap_request_handler` completes the release fuzz budget with no panic, crash, timeout, sanitizer finding, or unbounded memory growth. | `target/fuzz-gate/release-candidate` |
 | Load/performance regression | `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh` | Regression profile exits 0 and baseline validation stays within the documented threshold. | `target/perf/regression-candidate` |
 | Backup/restore drill | `BACKUP_DRILL_MODE=release BACKUP_DRILL_USERS=100000 BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate ./scripts/backup_restore_drill.sh` | Production-like LMDB fixture is backed up, inspected, dry-run restored, restored into a clean data directory, and validated through LDAP binds, indexed searches, operational attributes, and contextCSN evidence. | `target/backup-restore-drill/release-candidate` |
+| Deployment rollback drill | `DEPLOYMENT_DRILL_MODE=release DEPLOYMENT_DRILL_OUTPUT_DIR=target/deployment-rollback-drill/release-candidate ./scripts/deployment_rollback_drill.sh` | Isolated provider/consumer deployment, provider backup, failed deployment marker, provider restore, consumer rebootstrap, and post-rollback live replication all pass. | `target/deployment-rollback-drill/release-candidate` |
 
 ## Release Decision Rules
 
@@ -45,6 +46,9 @@ operation behavior.
 - Open High or Medium findings from
   `docs/SECURITY_REVIEW_2026_04_16.md` block a full production-ready claim
   unless the release notes explicitly scope out that feature or deployment path.
+- The deployment runbook in `docs/DEPLOYMENT_RUNBOOK.md` must be followed for
+  release-candidate rollback evidence, and `summary.md` from the rollback drill
+  must be retained with the release artifacts.
 - Release notes must include the exact commands run, the commit SHA, and links
   to retained CI or local artifacts.
 
