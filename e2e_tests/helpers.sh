@@ -257,14 +257,26 @@ enabled = false
 EOF
 
   # Now do the replacements using awk to avoid shell interpretation issues
-  awk -v port="${port}" -v base="${base}" -v rootrdn="${rootrdn}" -v rootpw="${rootpw}" -v dir="${dir}" -v extra="${extra}" '
+  EXTRA_CONTENT="${extra}" awk -v port="${port}" -v base="${base}" -v rootrdn="${rootrdn}" -v rootpw="${rootpw}" -v dir="${dir}" '
+  BEGIN {
+    extra = ENVIRON["EXTRA_CONTENT"]
+  }
   {
     gsub(/PORT_PLACEHOLDER/, port)
     gsub(/BASE_DN_PLACEHOLDER/, base)
     gsub(/ROOT_RDN_PLACEHOLDER/, rootrdn)
     gsub(/ROOT_PW_PLACEHOLDER/, rootpw)
     gsub(/DIR_PLACEHOLDER/, dir)
-    gsub(/EXTRA_PLACEHOLDER/, extra)
+    if ($0 ~ /EXTRA_PLACEHOLDER/) {
+      gsub(/EXTRA_PLACEHOLDER/, "")
+      if (length($0) > 0) {
+        print
+      }
+      if (length(extra) > 0) {
+        printf "%s\n", extra
+      }
+      next
+    }
     print
   }' "${dir}/server.toml" > "${dir}/server.toml.tmp" && mv "${dir}/server.toml.tmp" "${dir}/server.toml"
   
@@ -317,7 +329,10 @@ enabled = false
 EOF
 
   # Now do the replacements using awk to avoid shell interpretation issues
-  awk -v port="${port}" -v base="${base}" -v rootrdn="${rootrdn}" -v rootpw="${rootpw}" -v dir="${dir}" -v provider_port="${provider_port}" -v sync_int="${sync_int}" -v extra="${extra}" '
+  EXTRA_CONTENT="${extra}" awk -v port="${port}" -v base="${base}" -v rootrdn="${rootrdn}" -v rootpw="${rootpw}" -v dir="${dir}" -v provider_port="${provider_port}" -v sync_int="${sync_int}" '
+  BEGIN {
+    extra = ENVIRON["EXTRA_CONTENT"]
+  }
   {
     gsub(/PROVIDER_PORT_PLACEHOLDER/, provider_port)
     gsub(/PORT_PLACEHOLDER/, port)
@@ -326,7 +341,16 @@ EOF
     gsub(/ROOT_PW_PLACEHOLDER/, rootpw)
     gsub(/DIR_PLACEHOLDER/, dir)
     gsub(/SYNC_INT_PLACEHOLDER/, sync_int)
-    gsub(/EXTRA_PLACEHOLDER/, extra)
+    if ($0 ~ /EXTRA_PLACEHOLDER/) {
+      gsub(/EXTRA_PLACEHOLDER/, "")
+      if (length($0) > 0) {
+        print
+      }
+      if (length(extra) > 0) {
+        printf "%s\n", extra
+      }
+      next
+    }
     print
   }' "${dir}/server.toml" > "${dir}/server.toml.tmp" && mv "${dir}/server.toml.tmp" "${dir}/server.toml"
   
@@ -495,7 +519,7 @@ count_entries() {
 
   local count
   count=$(search_entry "${host}" "${port}" "${base}" "${filter}" dn 2>/dev/null | \
-          grep -cE "^dn: " || echo "0")
+          awk '/^dn: / { count++ } END { print count + 0 }')
   # Remove any newlines or whitespace
   count=$(echo "$count" | tr -d '\n\r ' | head -c 10)
   echo "${count}"

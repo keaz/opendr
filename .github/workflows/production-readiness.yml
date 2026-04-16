@@ -8,6 +8,7 @@ on:
       - "docs/LDAP_RFC_COMPLIANCE_MATRIX.md"
       - "docs/BACKUP_RESTORE.md"
       - "docs/PRODUCTION_READINESS_CHECKLIST.md"
+      - "docs/REPLICATION_PRODUCTION_GUARANTEES.md"
       - "e2e_tests/**"
       - "fuzz/**"
       - "scripts/backup_restore_drill.sh"
@@ -45,6 +46,7 @@ jobs:
           zsh -n e2e_tests/helpers.sh
           zsh -n e2e_tests/test_single_provider_single_consumer.sh
           zsh -n e2e_tests/test_replication_soak.sh
+          zsh -n e2e_tests/test_replication_failure_drills.sh
 
       - name: Core quality gate
         run: |
@@ -69,6 +71,16 @@ jobs:
           SOAK_MIN_ACTIVE_BEFORE_DELETE=1 \
           REPL_TIMEOUT_SECS=45 \
           ./e2e_tests/test_replication_soak.sh
+
+      - name: Replication failure drill smoke gate
+        run: |
+          SERVER_BIN="$PWD/target/debug/opendr" \
+          PROVIDER_PORT=43912 \
+          CONSUMER_PORT=43913 \
+          FAILURE_DRILL_MODE=smoke \
+          FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/readiness-smoke \
+          REPL_TIMEOUT_SECS=45 \
+          ./e2e_tests/test_replication_failure_drills.sh
 
       - name: Performance regression smoke gate
         run: |
@@ -105,6 +117,7 @@ jobs:
           cargo +nightly-2026-03-01 fuzz run ber_decoder -- -runs=10000
           cargo +nightly-2026-03-01 fuzz run ldap_request_handler -- -runs=10000
           SOAK_DURATION_SECS=86400 SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate ./e2e_tests/test_replication_soak.sh
+          FAILURE_DRILL_MODE=release FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/release-candidate ./e2e_tests/test_replication_failure_drills.sh
           PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh
           BACKUP_DRILL_MODE=release BACKUP_DRILL_USERS=100000 BACKUP_DRILL_OUTPUT_DIR=target/backup-restore-drill/release-candidate ./scripts/backup_restore_drill.sh
           ./scripts/referral_alias_interop.sh

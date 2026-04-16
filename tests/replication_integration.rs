@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::backend_changelog_wrapper::ChangelogBackendWrapper;
+use opendr::csn::Csn;
 use opendr::fsm::{
     ReplicationConsumerEvent, ReplicationConsumerFsm, ReplicationConsumerState, ReplicationPhase,
     ReplicationProviderEvent, ReplicationProviderFsm, ReplicationProviderState, StateMachine,
@@ -363,6 +364,42 @@ async fn test_changelog_provider_requires_full_refresh_when_backend_context_ahea
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn test_changelog_provider_treats_cookie_inside_backend_gap_as_stale() {
+    let backend = Arc::new(MockBackend::new());
+    let tracker = ChangelogTracker::new();
+    let latest_retained = tracker.record_change(
+        ChangeType::Add,
+        "cn=retained,dc=example,dc=org".to_string(),
+        Vec::new(),
+    );
+    let cookie_csn = Csn::with_values(
+        latest_retained.timestamp_us() + 1,
+        latest_retained.replica_id(),
+        0,
+        0,
+    );
+    let backend_context = Csn::with_values(
+        latest_retained.timestamp_us() + 2,
+        latest_retained.replica_id(),
+        0,
+        0,
+    );
+    backend.set_context_csn(backend_context).await.unwrap();
+
+    let provider = ChangelogProviderImpl::new(tracker, backend);
+    let gap_cookie = format!("csn-{cookie_csn}");
+
+    let validation_error = provider.validate_cookie(&gap_cookie).await.unwrap_err();
+    assert!(validation_error.contains("Stale replication cookie"));
+
+    let replay_error = provider
+        .get_changelog_since(Some(&gap_cookie), 100)
+        .await
+        .unwrap_err();
+    assert!(replay_error.contains("Stale replication cookie"));
 }
 
 #[tokio::test]

@@ -178,6 +178,38 @@ SOAK_ARTIFACT_DIR=target/replication-soak/release-candidate \
 The release-candidate run should retain `summary.txt`, server logs, and
 generated configs from `SOAK_ARTIFACT_DIR` with the release evidence.
 
+### test_replication_failure_drills.sh
+
+**Purpose**: Validate operator recovery paths for provider/consumer failures and
+stale replication state.
+
+**Tests**:
+- Provider restart with persisted backend and changelog state
+- Consumer restart with persisted cookie resume
+- Provider network interruption while the consumer keeps running
+- Stale consumer cookie with a truncated provider changelog
+- Operator recovery by deleting the stale consumer cookie and forcing a full
+  refresh
+
+**Default mode**: `smoke`
+
+**Smoke example**:
+```bash
+FAILURE_DRILL_MODE=smoke \
+FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/local-smoke \
+./e2e_tests/test_replication_failure_drills.sh
+```
+
+**Release-candidate example**:
+```bash
+FAILURE_DRILL_MODE=release \
+FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/release-candidate \
+./e2e_tests/test_replication_failure_drills.sh
+```
+
+The release-candidate run should retain `summary.txt`, server logs, consumer
+cookies, and provider changelog excerpts from `FAILURE_DRILL_ARTIFACT_DIR`.
+
 ### test_schema_management.sh
 
 **Purpose**: Validate schema definition and validation behavior through LDAP clients
@@ -296,6 +328,8 @@ e2e_tests/
 ├── README.md                                 # This file
 ├── helpers.sh                                # Shared utility library
 ├── test_single_provider_single_consumer.sh  # Basic replication
+├── test_replication_soak.sh                 # Sustained convergence
+├── test_replication_failure_drills.sh       # Failure and recovery drills
 ├── test_multi_consumer.sh                   # Multi-consumer
 ├── test_provider_failover.sh                # Provider restart
 ├── test_consumer_failover.sh                # Consumer restart

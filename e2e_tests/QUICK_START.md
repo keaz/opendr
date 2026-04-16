@@ -93,6 +93,7 @@ After your first test passes:
 
 1. **Explore other tests** (when implemented):
    - `test_replication_soak.sh` - Sustained provider/consumer convergence
+   - `test_replication_failure_drills.sh` - Provider/consumer restart, network interruption, stale-cookie recovery
    - `test_multi_consumer.sh` - Multiple consumers
    - `test_provider_failover.sh` - Provider restart
    - `test_consumer_failover.sh` - Consumer catchup

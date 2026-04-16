@@ -5057,7 +5057,8 @@ fn current_sync_cookie(changelog: &crate::replication::ChangelogTracker) -> Vec<
     changelog.generate_context_cookie().into_bytes()
 }
 
-fn validate_sync_cookie(
+async fn validate_sync_cookie(
+    backend: &dyn DirectoryBackend,
     changelog: &crate::replication::ChangelogTracker,
     cookie: Option<&str>,
 ) -> Result<Option<crate::csn::Csn>, SyncRequestError> {
@@ -5080,6 +5081,33 @@ fn validate_sync_cookie(
         return Err(SyncRequestError::InvalidCookie(format!(
             "stale sync cookie {cookie}"
         )));
+    }
+
+    let backend_context = backend.get_context_csn().await.map_err(|err| {
+        SyncRequestError::InvalidCookie(format!("sync cookie validation failed: {err}"))
+    })?;
+
+    if let Some(backend_context) = backend_context {
+        let changelog_context = changelog.get_context_csn();
+        if csn > backend_context
+            && changelog_context
+                .as_ref()
+                .is_none_or(|latest| &csn > latest)
+        {
+            return Err(SyncRequestError::InvalidCookie(format!(
+                "invalid sync cookie {cookie}"
+            )));
+        }
+
+        if csn < backend_context
+            && changelog_context
+                .as_ref()
+                .is_none_or(|latest| latest < &backend_context)
+        {
+            return Err(SyncRequestError::InvalidCookie(format!(
+                "stale sync cookie {cookie} requires a full refresh"
+            )));
+        }
     }
 
     if let Some(latest) = changelog.get_context_csn()
@@ -5368,7 +5396,7 @@ pub(crate) async fn handle_sync_search_request(
             return Ok(());
         }
     };
-    let cookie_csn = match validate_sync_cookie(&changelog, cookie_text.as_deref()) {
+    let cookie_csn = match validate_sync_cookie(backend, &changelog, cookie_text.as_deref()).await {
         Ok(cookie_csn) => cookie_csn,
         Err(error) => {
             reject_sync_request(session.socket, message_id, base_dn, &error).await?;
@@ -11667,6 +11695,50 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
             }
             other => panic!("unexpected response: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn sync_cookie_validation_rejects_backend_context_without_changelog_window() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=before-truncation,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["before-truncation".to_string()]),
+                        ("sn".to_string(), vec!["Before".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let stale_cookie = format!("csn-{}", backend.get_context_csn().await.unwrap().unwrap());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=after-truncation,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["after-truncation".to_string()]),
+                        ("sn".to_string(), vec!["After".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let empty_changelog = crate::replication::ChangelogTracker::with_capacity(25);
+        let result = validate_sync_cookie(&backend, &empty_changelog, Some(&stale_cookie)).await;
+
+        assert!(matches!(
+            result,
+            Err(SyncRequestError::InvalidCookie(message))
+                if message.contains("stale sync cookie")
+                    && message.contains("requires a full refresh")
+        ));
     }
 
     #[tokio::test]

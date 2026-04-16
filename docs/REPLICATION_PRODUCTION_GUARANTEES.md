@@ -110,11 +110,32 @@ Missing changelog segment:
   required error.
 - The consumer health snapshot increments `replay_gap_errors` and
   `full_refresh_required`.
+- Operators must retain the provider and consumer logs, consumer cookie, and
+  provider changelog excerpt from `test_replication_failure_drills.sh` as release
+  evidence when validating this path.
 
 Unsupported conflicts:
 
 - Concurrent writes on more than one node are outside the production contract.
 - The supported conflict policy is single-writer CSN ordering on the provider.
+
+## Failure Drill Gate
+
+Run the smoke drill in CI and the release drill before declaring a production
+candidate:
+
+```bash
+FAILURE_DRILL_MODE=release \
+FAILURE_DRILL_ARTIFACT_DIR=target/replication-failure-drills/release-candidate \
+./e2e_tests/test_replication_failure_drills.sh
+```
+
+The drill starts isolated provider and consumer instances, verifies convergence
+after provider restart, consumer restart, provider network interruption, stale
+consumer cookie with truncated provider changelog, and operator full-refresh
+recovery. A release candidate fails the replication gate if any scenario lacks
+a diagnostic, if the consumer exits unexpectedly while the provider is
+unreachable, or if the final full refresh does not converge.
 
 ## Health Signals
 

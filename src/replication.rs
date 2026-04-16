@@ -827,8 +827,15 @@ impl ChangelogProviderImpl {
 
     async fn classify_cookie(&self, cookie: &str) -> Result<ChangelogCookieStatus, String> {
         let status = self.tracker.classify_cookie(cookie);
-        let ChangelogCookieStatus::Valid(Some(cookie_csn)) = status else {
-            return Ok(status);
+        let cookie_csn = match &status {
+            ChangelogCookieStatus::Valid(Some(cookie_csn)) => cookie_csn.clone(),
+            ChangelogCookieStatus::Invalid => match self.tracker.parse_cookie(cookie) {
+                Some(cookie_csn) => cookie_csn,
+                None => return Ok(ChangelogCookieStatus::Invalid),
+            },
+            ChangelogCookieStatus::Valid(None) | ChangelogCookieStatus::Stale => {
+                return Ok(status);
+            }
         };
 
         let backend_context = self
@@ -859,7 +866,7 @@ impl ChangelogProviderImpl {
             return Ok(ChangelogCookieStatus::Stale);
         }
 
-        Ok(ChangelogCookieStatus::Valid(Some(cookie_csn)))
+        Ok(status)
     }
 }
 
