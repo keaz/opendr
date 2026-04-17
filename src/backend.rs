@@ -1509,7 +1509,7 @@ fn plan_dn_renames(
         planned.push((current_key.clone(), next_key, next_dn));
     }
 
-    planned.sort_by(|a, b| a.0.len().cmp(&b.0.len()));
+    planned.sort_by_key(|entry| entry.0.len());
 
     for (_, target_key, _) in &planned {
         if entries.contains_key(target_key)

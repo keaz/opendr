@@ -508,7 +508,7 @@ impl AciEngine {
         let mut rules = self.rules.write().await;
         rules.push(rule);
         // Sort by priority (highest first)
-        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
     }
 
     /// Load ACI rules from a TOML file and append them to the active rule set.
@@ -538,7 +538,7 @@ impl AciEngine {
         let count = parsed_rules.len();
         let mut rules = self.rules.write().await;
         rules.extend(parsed_rules);
-        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         Ok(count)
     }
 

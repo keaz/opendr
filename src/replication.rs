@@ -553,7 +553,7 @@ fn replication_replace_modifications(
     }
 
     let mut desired_attributes: Vec<_> = desired.attributes.iter().collect();
-    desired_attributes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    desired_attributes.sort_by_key(|(attribute, _)| *attribute);
     for (attribute, values) in desired_attributes {
         modifications.push(Modification {
             operation: ModifyOperation::Replace,

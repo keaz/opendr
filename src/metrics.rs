@@ -228,11 +228,7 @@ impl OperationMetrics {
         let max_latency_ns = self.max_latency_ns.load(Ordering::Relaxed);
         let active = self.active.load(Ordering::Relaxed);
 
-        let avg_latency_ns = if count > 0 {
-            total_latency_ns / count
-        } else {
-            0
-        };
+        let avg_latency_ns = total_latency_ns.checked_div(count).unwrap_or(0);
 
         OperationStats {
             count,

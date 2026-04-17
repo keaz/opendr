@@ -2159,7 +2159,7 @@ impl LmdbBackend {
             }
         }
 
-        plans.sort_by(|left, right| left.old_dn.len().cmp(&right.old_dn.len()));
+        plans.sort_by_key(|plan| plan.old_dn.len());
         Ok(plans)
     }
 
@@ -2698,7 +2698,7 @@ impl LmdbBackend {
                 (char_len >= SUBSTRING_INDEX_TOKEN_LEN).then_some((char_len, value.as_str()))
             })
             .collect::<Vec<_>>();
-        segments.sort_by(|left, right| right.0.cmp(&left.0));
+        segments.sort_by_key(|segment| std::cmp::Reverse(segment.0));
 
         let mut unique = HashSet::new();
         let mut tokens = Vec::new();
