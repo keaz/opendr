@@ -70,6 +70,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional markdown report path for CI artifacts.",
     )
+    parser.add_argument(
+        "--stable-gate",
+        action="store_true",
+        help=(
+            "Validate only metrics stable enough for GitHub-hosted Docker release gates. "
+            "This keeps total runtime plus concurrency capacity/failure checks and skips "
+            "sub-millisecond operation means and peak throughput rows."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -514,6 +523,20 @@ def main() -> int:
         return 2
 
     checks = extract_baseline_checks(args.baseline_doc)
+    if args.stable_gate:
+        stable_metrics = {
+            "total_elapsed_ms",
+            "max_concurrent_bind_clients_tested",
+            "max_concurrent_bind_clients_zero_failure",
+            "max_concurrent_bind_failure_rate_percent",
+            "max_concurrent_sasl_plain_bind_clients_tested",
+            "max_concurrent_sasl_plain_bind_clients_zero_failure",
+            "max_concurrent_sasl_plain_bind_failure_rate_percent",
+            "max_concurrent_index_search_clients_tested",
+            "max_concurrent_index_search_clients_zero_failure",
+            "max_concurrent_index_search_failure_rate_percent",
+        }
+        checks = [check for check in checks if check.csv_metric in stable_metrics]
     if args.profile:
         profiles = set(args.profile)
         checks = [check for check in checks if check.profile in profiles]

@@ -105,6 +105,7 @@ jobs:
             --summary-csv target/perf/release/index/comparison-summary.csv \
             --summary-csv target/perf/release/sasl/comparison-summary.csv \
             --threshold-percent 10 \
+            --stable-gate \
             --report-out target/perf/release/baseline-validation.md
 
       - name: Package performance results

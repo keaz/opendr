@@ -680,7 +680,10 @@ uses `scripts/validate_docker_perf_baseline.py` to compare the generated
 document and fails when a lower-is-better latency/failure metric regresses by
 more than 10%, or a higher-is-better throughput/capacity metric drops by more
 than 10%. The GitHub Actions run used for this baseline and the local comparison
-commands both run with `--cpu 2 --memory 4g`.
+commands both run with `--cpu 2 --memory 4g`. The release gate uses
+`--stable-gate`, which validates total runtime plus concurrency capacity/failure
+metrics and leaves sub-millisecond operation means and peak-throughput rows as
+diagnostic evidence because they vary materially on shared GitHub runners.
 
 Full latency run:
 
