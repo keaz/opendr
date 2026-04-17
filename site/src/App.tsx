@@ -63,19 +63,20 @@ const chapters: ChapterNavItem[] = [
   { id: "overview", number: "0", label: "Overview" },
   { id: "quickstart", number: "1", label: "Quickstart" },
   { id: "build-source", number: "2", label: "Build From Source" },
-  { id: "architecture", number: "3", label: "Architecture" },
-  { id: "runtimes", number: "4", label: "Runtimes" },
-  { id: "performance", number: "5", label: "Performance Results" },
-  { id: "readiness", number: "6", label: "Production Readiness" },
-  { id: "setup", number: "7", label: "Setup Command" },
-  { id: "configuration", number: "8", label: "Configuration" },
-  { id: "tls", number: "9", label: "TLS" },
-  { id: "replication", number: "10", label: "Replication" },
-  { id: "indexing", number: "11", label: "Indexing" },
-  { id: "backup", number: "12", label: "Backup and Restore" },
-  { id: "operations", number: "13", label: "Operations" },
-  { id: "troubleshooting", number: "14", label: "Troubleshooting" },
-  { id: "pages", number: "15", label: "GitHub Pages" },
+  { id: "testing", number: "3", label: "Testing" },
+  { id: "architecture", number: "4", label: "Architecture" },
+  { id: "runtimes", number: "5", label: "Runtimes" },
+  { id: "performance", number: "6", label: "Performance Results" },
+  { id: "readiness", number: "7", label: "Production Readiness" },
+  { id: "setup", number: "8", label: "Setup Command" },
+  { id: "configuration", number: "9", label: "Configuration" },
+  { id: "tls", number: "10", label: "TLS" },
+  { id: "replication", number: "11", label: "Replication" },
+  { id: "indexing", number: "12", label: "Indexing" },
+  { id: "backup", number: "13", label: "Backup and Restore" },
+  { id: "operations", number: "14", label: "Operations" },
+  { id: "troubleshooting", number: "15", label: "Troubleshooting" },
+  { id: "pages", number: "16", label: "GitHub Pages" },
 ];
 
 const runtimeRows = [
@@ -800,8 +801,159 @@ cargo build --release`}</code></pre>
               </div>
             </section>
 
-            <section className="chapter" id="architecture" aria-labelledby="architecture-title">
+            <section className="chapter" id="testing" aria-labelledby="testing-title">
               <p className="chapter-label">Chapter 3</p>
+              <h2 id="testing-title">Testing</h2>
+              <p>
+                OpenDR release validation combines fast Rust checks, Docker-based
+                parity runs, replication drills, performance gates, fuzzing, and
+                documentation-site checks. A production release needs passing
+                test and release workflows, not only local unit tests.
+              </p>
+
+              <h3>Prerequisites</h3>
+              <ul>
+                <li>Rust stable with <code>cargo</code>, <code>rustfmt</code>, and <code>clippy</code>.</li>
+                <li>Docker for macOS parity checks, release performance gates, and isolated Linux test runs.</li>
+                <li><code>pnpm</code> for documentation-site checks and builds.</li>
+                <li><code>lsof</code>, <code>nc</code>, and <code>rg</code> for shell-driven e2e and performance scripts.</li>
+                <li>Enough free disk space for LMDB data, Docker layers, fuzz corpora, and retained artifacts.</li>
+              </ul>
+
+              <div className="command-list">
+                <section>
+                  <h3>Fast Rust validation</h3>
+                  <pre><code>{`cargo fmt --check
+cargo test --workspace --no-fail-fast
+cargo test --doc --quiet
+cargo clippy --workspace --all-targets --all-features -- -D warnings`}</code></pre>
+                  <p>
+                    Run this group before pushing code. It covers formatting,
+                    unit tests, integration tests, doctests, and lint regressions.
+                  </p>
+                </section>
+
+                <section>
+                  <h3>Docker test run</h3>
+                  <pre><code>{`HOST_UID=$(id -u) HOST_GID=$(id -g) docker run --rm \\
+  -v "$PWD":"$PWD" -w "$PWD" rust:1.94-bookworm bash -lc '
+set -e
+export PATH=/usr/local/cargo/bin:$PATH
+apt-get -o Acquire::Retries=5 update >/dev/null
+apt-get -o Acquire::Retries=5 install -y --no-install-recommends \\
+  pkg-config libssl-dev ca-certificates >/dev/null
+CARGO_TARGET_DIR=target/docker-test \\
+CARGO_HOME=target/docker-cargo-home \\
+cargo test --workspace --no-fail-fast
+chown -R '"$HOST_UID:$HOST_GID"' target/docker-test target/docker-cargo-home 2>/dev/null || true
+'`}</code></pre>
+                  <p>
+                    Use Docker when macOS dynamic-loader or filesystem behavior
+                    makes a local test result unclear. The online backup restore
+                    integration test passed in this path for the release evidence.
+                  </p>
+                </section>
+
+                <section>
+                  <h3>Targeted replication checks</h3>
+                  <pre><code>{`cargo test replication
+cargo test --test replication_e2e
+SOAK_DURATION_SECS=3600 \\
+  SOAK_ARTIFACT_DIR=target/replication-soak/1h-$(date -u +%Y%m%dT%H%M%SZ) \\
+  ./e2e_tests/test_replication_soak.sh`}</code></pre>
+                  <p>
+                    The soak script starts provider and consumer instances,
+                    mutates LDAP entries, waits for convergence, and retains
+                    server logs, audit logs, generated configs, and a summary.
+                  </p>
+                </section>
+
+                <section>
+                  <h3>Release performance and fuzz gates</h3>
+                  <pre><code>{`PERF_GATE_MODE=release \\
+PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json \\
+PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate \\
+./scripts/perf_regression_gate.sh
+
+FUZZ_GATE_MODE=release \\
+FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-$(date -u +%Y%m%dT%H%M%SZ) \\
+./scripts/fuzz_gate.sh`}</code></pre>
+                  <p>
+                    Performance gates protect latency, throughput, memory, and
+                    baseline regressions. The release fuzz gate runs{" "}
+                    <code>ber_decoder</code> and <code>ldap_request_handler</code>{" "}
+                    with the full configured budget.
+                  </p>
+                </section>
+
+                <section>
+                  <h3>Documentation-site validation</h3>
+                  <pre><code>{`cd site
+pnpm install
+pnpm check
+pnpm build`}</code></pre>
+                  <p>
+                    Run these checks whenever site content, Markdown imports,
+                    diagrams, or docs-linked navigation changes.
+                  </p>
+                </section>
+              </div>
+
+              <h3>Current release evidence</h3>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Gate</th>
+                      <th>Latest result</th>
+                      <th>Evidence</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>Docker unit and integration tests</td>
+                      <td>Passed locally</td>
+                      <td>Full workspace test run completed in Docker, including online backup restore coverage.</td>
+                    </tr>
+                    <tr>
+                      <td>GitHub Rust workflow</td>
+                      <td>Blocked</td>
+                      <td>Tests and doctests passed on <code>e99da4b</code>; Rust 1.95 clippy reports new denied warnings that must be fixed.</td>
+                    </tr>
+                    <tr>
+                      <td>Release performance candidate</td>
+                      <td>Passed locally, blocked in GitHub release validation</td>
+                      <td>Local <code>regression-100k</code> completed with 100,000 preloaded users; GitHub release baseline validation is red against the documented 10% threshold.</td>
+                    </tr>
+                    <tr>
+                      <td>1-hour replication soak</td>
+                      <td>Passed</td>
+                      <td>3600 seconds, 294 rounds, 1470 adds, 588 modifies, 98 deletes, and matching provider/consumer counts.</td>
+                    </tr>
+                    <tr>
+                      <td>Full release fuzz budget</td>
+                      <td>Passed</td>
+                      <td><code>ber_decoder</code> and <code>ldap_request_handler</code> each ran 21601 seconds with no crash artifacts.</td>
+                    </tr>
+                    <tr>
+                      <td>Site checks</td>
+                      <td>Passed locally and in Pages</td>
+                      <td><code>pnpm check</code>, <code>pnpm build</code>, and the latest Pages deploy completed successfully.</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="callout warning">
+                <strong>Release rule:</strong> a tagged release is
+                production-ready only after Rust, release performance, release
+                asset publishing, and documentation checks are green for the
+                release commit.
+              </div>
+            </section>
+
+            <section className="chapter" id="architecture" aria-labelledby="architecture-title">
+              <p className="chapter-label">Chapter 4</p>
               <h2 id="architecture-title">Architecture</h2>
               <p>
                 The shared entrypoint validates configuration, creates the
@@ -915,7 +1067,7 @@ cargo build --release`}</code></pre>
             </section>
 
             <section className="chapter" id="runtimes" aria-labelledby="runtimes-title">
-              <p className="chapter-label">Chapter 4</p>
+              <p className="chapter-label">Chapter 5</p>
               <h2 id="runtimes-title">Runtimes</h2>
               <p>
                 Choose <code>fsm</code> for normal development and new
@@ -955,7 +1107,7 @@ cargo build --release`}</code></pre>
             </section>
 
             <section className="chapter" id="performance" aria-labelledby="performance-title">
-              <p className="chapter-label">Chapter 5</p>
+              <p className="chapter-label">Chapter 6</p>
               <h2 id="performance-title">Performance Results</h2>
               <p>
                 The site includes the complete benchmark report from{" "}
@@ -1346,7 +1498,7 @@ cargo build --release`}</code></pre>
             </section>
 
             <section className="chapter" id="readiness" aria-labelledby="readiness-title">
-              <p className="chapter-label">Chapter 6</p>
+              <p className="chapter-label">Chapter 7</p>
               <h2 id="readiness-title">Production Readiness</h2>
               <p>
                 Use this section as the release evidence checklist. The
@@ -1386,7 +1538,7 @@ cargo build --release`}</code></pre>
             </section>
 
             <section className="chapter" id="setup" aria-labelledby="setup-title">
-              <p className="chapter-label">Chapter 7</p>
+              <p className="chapter-label">Chapter 8</p>
               <h2 id="setup-title">Setup Command</h2>
               <p>
                 <code>opendr-setup</code> is the supported first-run path. It
@@ -1412,7 +1564,7 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
             </section>
 
             <section className="chapter" id="configuration" aria-labelledby="configuration-title">
-              <p className="chapter-label">Chapter 8</p>
+              <p className="chapter-label">Chapter 9</p>
               <h2 id="configuration-title">Configuration</h2>
               <p>
                 Runtime configuration is TOML plus optional <code>OPENDR_*</code>{" "}
@@ -1462,7 +1614,7 @@ opendr --config config/server.toml schema explain exampleEmployeeNumber`}</code>
             </section>
 
             <section className="chapter" id="tls" aria-labelledby="tls-title">
-              <p className="chapter-label">Chapter 9</p>
+              <p className="chapter-label">Chapter 10</p>
               <h2 id="tls-title">TLS</h2>
               <p>
                 LDAPS and StartTLS share the rustls handler. TLS 1.2 and TLS 1.3
@@ -1486,7 +1638,7 @@ min_tls_version = "1.2"`}</code></pre>
             </section>
 
             <section className="chapter" id="replication" aria-labelledby="replication-title">
-              <p className="chapter-label">Chapter 10</p>
+              <p className="chapter-label">Chapter 11</p>
               <h2 id="replication-title">Replication</h2>
               <p>
                 OpenDR uses provider-owned LDAP Sync streams. A consumer performs
@@ -1519,7 +1671,7 @@ enable_change_listening = true`}</code></pre>
             </section>
 
             <section className="chapter" id="indexing" aria-labelledby="indexing-title">
-              <p className="chapter-label">Chapter 11</p>
+              <p className="chapter-label">Chapter 12</p>
               <h2 id="indexing-title">Indexing</h2>
               <p>
                 LMDB indexes are configured by attribute and index type. Startup
@@ -1548,7 +1700,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="backup" aria-labelledby="backup-title">
-              <p className="chapter-label">Chapter 12</p>
+              <p className="chapter-label">Chapter 13</p>
               <h2 id="backup-title">Backup and Restore</h2>
               <p>
                 Full backups are online LMDB environment copies with manifests.
@@ -1586,7 +1738,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="operations" aria-labelledby="operations-title">
-              <p className="chapter-label">Chapter 13</p>
+              <p className="chapter-label">Chapter 14</p>
               <h2 id="operations-title">Operations and Maintenance</h2>
               <p>
                 Use this chapter for day-2 work: stop and restart the service,
@@ -1655,7 +1807,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="troubleshooting" aria-labelledby="troubleshooting-title">
-              <p className="chapter-label">Chapter 14</p>
+              <p className="chapter-label">Chapter 15</p>
               <h2 id="troubleshooting-title">Troubleshooting</h2>
               <p>
                 Start from the failing boundary. Most failures are caused by
@@ -1670,7 +1822,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="pages" aria-labelledby="pages-title">
-              <p className="chapter-label">Chapter 15</p>
+              <p className="chapter-label">Chapter 16</p>
               <h2 id="pages-title">GitHub Pages</h2>
               <p>
                 The documentation website is a React and Vite app in{" "}
