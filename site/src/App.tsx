@@ -79,6 +79,12 @@ const chapters: ChapterNavItem[] = [
   { id: "pages", number: "16", label: "GitHub Pages" },
 ];
 
+const latestReleaseUrl = "https://github.com/keaz/opendr/releases/latest";
+const latestLinuxDownloadUrl =
+  "https://github.com/keaz/opendr/releases/latest/download/opendr-linux-x86_64.tar.gz";
+const latestMacosDownloadUrl =
+  "https://github.com/keaz/opendr/releases/latest/download/opendr-macos-universal.tar.gz";
+
 const runtimeRows = [
   {
     runtime: "`fsm`",
@@ -660,7 +666,8 @@ function App() {
           <a href={docsHref("CONFIGURATION.md")}>Configuration</a>
           <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Management Console</a>
           <a href={docsHref("TROUBLESHOOTING.md")}>Troubleshooting</a>
-          <a className="topbar-cta" href="https://github.com/keaz/opendr">GitHub</a>
+          <a href="https://github.com/keaz/opendr">GitHub</a>
+          <a className="topbar-cta" href={latestReleaseUrl}>Download</a>
         </nav>
       </header>
 
@@ -717,6 +724,7 @@ function App() {
               </div>
 
               <div className="chapter-links">
+                <a href={latestReleaseUrl}>Download latest release</a>
                 <a href={docsHref("DEVELOPER_GUIDE.md")}>Open full developer guide</a>
                 <a href={docsHref("CONFIGURATION.md")}>Open configuration reference</a>
                 <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Open management console guide</a>
@@ -732,6 +740,12 @@ function App() {
                 binaries are already installed or available on <code>PATH</code>;
                 building from source is covered in the next chapter.
               </p>
+
+              <div className="chapter-links" aria-label="Latest release downloads">
+                <a href={latestLinuxDownloadUrl}>Download Linux tarball</a>
+                <a href={latestMacosDownloadUrl}>Download macOS tarball</a>
+                <a href={latestReleaseUrl}>Open latest GitHub release</a>
+              </div>
 
               <div className="command-list">
                 <section>
@@ -922,8 +936,8 @@ pnpm build`}</code></pre>
                     </tr>
                     <tr>
                       <td>Release performance candidate</td>
-                      <td>Passed locally, blocked in GitHub release validation</td>
-                      <td>Local <code>regression-100k</code> completed with 100,000 preloaded users; GitHub release baseline validation is red against the documented 10% threshold.</td>
+                      <td>Passed in GitHub release validation</td>
+                      <td>The tagged release Docker performance gate completed with Linux, macOS, and retained performance artifacts.</td>
                     </tr>
                     <tr>
                       <td>1-hour replication soak</td>
