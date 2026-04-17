@@ -43,6 +43,8 @@ jobs:
             --products opendr \
             --opendr-runtime fsm \
             --benchmark-timeout 240 \
+            --cpu 2 \
+            --memory 4g \
             --output-dir target/perf/release/full
 
       - name: Run simple-bind concurrency profile
@@ -52,6 +54,8 @@ jobs:
             --products opendr \
             --opendr-runtime fsm \
             --benchmark-timeout 240 \
+            --cpu 2 \
+            --memory 4g \
             --concurrent-bind-clients 1,4,8,10,12,16,32,64,128 \
             --concurrent-bind-iterations 20 \
             --concurrent-bind-warmup-iterations 1 \
@@ -65,6 +69,8 @@ jobs:
             --products opendr \
             --opendr-runtime fsm \
             --benchmark-timeout 240 \
+            --cpu 2 \
+            --memory 4g \
             --concurrent-index-search-clients 1,4,8,16,32 \
             --concurrent-index-search-iterations 20 \
             --concurrent-index-search-warmup-iterations 1 \
@@ -79,6 +85,8 @@ jobs:
             --products opendr \
             --opendr-runtime fsm \
             --benchmark-timeout 240 \
+            --cpu 2 \
+            --memory 4g \
             --concurrent-bind-clients 1,4,8,16,32,64,128 \
             --concurrent-bind-iterations 20 \
             --concurrent-bind-warmup-iterations 1 \
