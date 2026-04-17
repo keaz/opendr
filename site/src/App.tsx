@@ -79,11 +79,12 @@ const chapters: ChapterNavItem[] = [
   { id: "pages", number: "16", label: "GitHub Pages" },
 ];
 
-const latestReleaseUrl = "https://github.com/keaz/opendr/releases/latest";
+const latestReleaseVersion = "v1.0.1";
+const latestReleaseUrl = `https://github.com/keaz/opendr/releases/tag/${latestReleaseVersion}`;
 const latestLinuxDownloadUrl =
-  "https://github.com/keaz/opendr/releases/latest/download/opendr-linux-x86_64.tar.gz";
+  `https://github.com/keaz/opendr/releases/download/${latestReleaseVersion}/opendr-linux-x86_64.tar.gz`;
 const latestMacosDownloadUrl =
-  "https://github.com/keaz/opendr/releases/latest/download/opendr-macos-universal.tar.gz";
+  `https://github.com/keaz/opendr/releases/download/${latestReleaseVersion}/opendr-macos-universal.tar.gz`;
 
 const runtimeRows = [
   {
