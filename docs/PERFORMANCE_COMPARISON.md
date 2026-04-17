@@ -679,8 +679,8 @@ uses `scripts/validate_docker_perf_baseline.py` to compare the generated
 `comparison-summary.csv` files against the OpenDR baseline values in this
 document and fails when a lower-is-better latency/failure metric regresses by
 more than 10%, or a higher-is-better throughput/capacity metric drops by more
-than 10%. The local rerun used for this baseline and the GitHub Docker perf
-gate both run with `--cpu 2 --memory 4g`.
+than 10%. The GitHub Actions run used for this baseline and the local comparison
+commands both run with `--cpu 2 --memory 4g`.
 
 Full latency run:
 
@@ -692,7 +692,7 @@ Full latency run:
   --benchmark-timeout 240 \
   --cpu 2 \
   --memory 4g \
-  --output-dir target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/full
+  --output-dir target/perf/release/full
 ```
 
 Simple-bind concurrency run:
@@ -709,7 +709,7 @@ Simple-bind concurrency run:
   --concurrent-bind-iterations 20 \
   --concurrent-bind-warmup-iterations 1 \
   --concurrent-bind-operation-timeout-ms 5000 \
-  --output-dir target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/concurrency
+  --output-dir target/perf/release/concurrency
 ```
 
 Index search run:
@@ -727,7 +727,7 @@ Index search run:
   --concurrent-index-search-warmup-iterations 1 \
   --concurrent-index-search-operation-timeout-ms 5000 \
   --perf-client-image opendr:docker-perf-client \
-  --output-dir target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/index
+  --output-dir target/perf/release/index
 ```
 
 SASL PLAIN concurrency run:
@@ -747,7 +747,7 @@ SASL PLAIN concurrency run:
   --sasl-plain-authcid-format rdn-value \
   --skip-sasl-plain-admin-benchmark \
   --perf-client-image opendr:docker-perf-client \
-  --output-dir target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/sasl
+  --output-dir target/perf/release/sasl
 ```
 
 1M OpenDR preload run:
@@ -781,50 +781,50 @@ The completed 1M serial and concurrency result artifacts reused that preserved f
 
 ## Full Profile Results
 
-OpenDR rows are from `target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/full/`.
-OpenDJ rows are from `target/perf/local-opendj-2cpu-4g-20260417T031957Z/full/`.
+OpenDR rows are from GitHub Actions run `24546834381` at `target/perf/release/full/`.
+OpenDJ rows are from the local comparison artifact `target/perf/local-opendj-2cpu-4g-20260417T031957Z/full/`.
 
 | Product / runtime | Profile | Status | Total runtime ms | Records after setup | Avg CPU % | Avg memory | DB after | Subtree search mean ms | Simple bind mean ms | Add mean ms | Modify mean ms | Delete mean ms | Password modify mean ms |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| OpenDR FSM | light | success | 393.314 | 109 | 15.38 | 3.79 MiB | 440.00 KiB | 0.934 | 0.081 | 0.614 | 0.305 | 0.515 | 0.291 |
+| OpenDR FSM | light | success | 711.760 | 109 | 33.22 | 3.86 MiB | 412.00 KiB | 2.467 | 0.165 | 0.783 | 0.449 | 0.629 | 0.504 |
 | OpenDJ | light | success | 922.100 | 105 | 172.35 | 1020.00 MiB | 1.14 MiB | 4.914 | 0.385 | 1.056 | 0.429 | 1.488 | 0.700 |
-| OpenDR FSM | moderate | success | 637.618 | 509 | 23.53 | 3.79 MiB | 2.04 MiB | 3.700 | 0.099 | 0.812 | 0.292 | 0.951 | 0.323 |
+| OpenDR FSM | moderate | success | 1,079.653 | 509 | 44.48 | 3.96 MiB | 1.13 MiB | 10.421 | 0.157 | 1.090 | 0.436 | 0.771 | 0.418 |
 | OpenDJ | moderate | success | 1,176.522 | 505 | 100.25 | 807.20 MiB | 10.14 MiB | 15.707 | 0.301 | 0.915 | 0.387 | 1.346 | 0.634 |
-| OpenDR FSM | heavy | success | 937.516 | 1009 | 20.34 | 3.96 MiB | 2.04 MiB | 7.301 | 0.067 | 0.938 | 0.306 | 0.852 | 0.363 |
+| OpenDR FSM | heavy | success | 1,818.704 | 1009 | 17.62 | 3.80 MiB | 1.87 MiB | 18.984 | 0.164 | 0.997 | 0.430 | 0.896 | 0.469 |
 | OpenDJ | heavy | success | 1,732.826 | 1005 | 103.09 | 806.40 MiB | 31.14 MiB | 26.703 | 0.273 | 1.108 | 0.426 | 2.140 | 0.711 |
-| OpenDR FSM | stress | success | 2,797.432 | 2509 | 31.71 | 3.64 MiB | 5.04 MiB | 17.951 | 0.123 | 0.996 | 0.317 | 0.944 | 0.576 |
+| OpenDR FSM | stress | success | 4,523.397 | 2509 | 34.21 | 3.68 MiB | 4.14 MiB | 45.689 | 0.179 | 1.155 | 0.451 | 1.171 | 0.431 |
 | OpenDJ | stress | success | 4,294.361 | 2505 | 131.70 | 797.73 MiB | 176.77 MiB | 57.185 | 0.268 | 1.713 | 0.487 | 3.235 | 0.999 |
 
 OpenDR FSM was faster on every listed full-profile latency metric in these rows, while also using substantially less memory and disk.
 
 ## Simple Bind Concurrency
 
-OpenDR rows are from `target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/concurrency/`.
+OpenDR rows are from GitHub Actions run `24546834381` at `target/perf/release/concurrency/`.
 The same OpenDJ profile at `target/perf/local-opendj-2cpu-4g-20260417T031957Z/concurrency/`
 timed out under the same `--cpu 2 --memory 4g` Docker limits.
 
 | Product / runtime | Profile | Status | Timeout budget | Max tested clients | Max 0% failure clients | Failure rate at max tested | Peak success ops/s | CPU avg / max | Memory avg / max |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| OpenDR FSM | auth-concurrency | success | 240s | 128 | 128 | 0.000% | 35,202.22 | 13.90% / 28.99% | 9.38 MiB / 15.41 MiB |
+| OpenDR FSM | auth-concurrency | success | 240s | 128 | 128 | 0.000% | 11,584.12 | 13.65% / 33.89% | 9.34 MiB / 15.58 MiB |
 | OpenDJ | auth-concurrency | timeout | 240s | n/a | n/a | n/a | n/a | 11.66% / 199.47% | 859.77 MiB / 1005.00 MiB |
 
 OpenDR simple-bind per-level results:
 
 | Clients | Successes / attempts | Failure % | Success ops/s | Mean ms | P95 ms | P99 ms |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 20 / 20 | 0.00 | 12,771.73 | 0.071 | 0.084 | 0.084 |
-| 4 | 80 / 80 | 0.00 | 35,202.22 | 0.075 | 0.125 | 0.258 |
-| 8 | 160 / 160 | 0.00 | 17,516.25 | 0.349 | 0.526 | 0.809 |
-| 10 | 200 / 200 | 0.00 | 11,931.81 | 0.700 | 0.977 | 1.236 |
-| 12 | 240 / 240 | 0.00 | 29,722.89 | 0.196 | 0.729 | 1.669 |
-| 16 | 320 / 320 | 0.00 | 21,454.37 | 0.458 | 0.618 | 0.830 |
-| 32 | 640 / 640 | 0.00 | 12,022.02 | 2.135 | 2.497 | 4.362 |
-| 64 | 1280 / 1280 | 0.00 | 12,265.30 | 4.236 | 5.517 | 7.828 |
-| 128 | 2560 / 2560 | 0.00 | 10,900.24 | 9.433 | 10.409 | 22.448 |
+| 1 | 20 / 20 | 0.00 | 5,672.30 | 0.162 | 0.173 | 0.230 |
+| 4 | 80 / 80 | 0.00 | 9,861.43 | 0.260 | 0.494 | 2.190 |
+| 8 | 160 / 160 | 0.00 | 9,231.89 | 0.664 | 1.111 | 2.128 |
+| 10 | 200 / 200 | 0.00 | 8,872.92 | 0.916 | 1.299 | 1.843 |
+| 12 | 240 / 240 | 0.00 | 11,584.12 | 0.733 | 1.343 | 2.178 |
+| 16 | 320 / 320 | 0.00 | 8,477.33 | 1.475 | 2.169 | 4.861 |
+| 32 | 640 / 640 | 0.00 | 8,944.34 | 2.738 | 3.630 | 6.645 |
+| 64 | 1280 / 1280 | 0.00 | 8,558.13 | 5.763 | 6.808 | 17.986 |
+| 128 | 2560 / 2560 | 0.00 | 8,382.59 | 11.252 | 13.601 | 27.003 |
 
 ## SASL PLAIN Results
 
-OpenDR rows are from `target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/sasl/`.
+OpenDR rows are from GitHub Actions run `24546834381` at `target/perf/release/sasl/`.
 OpenDJ rows are from `target/perf/local-opendj-2cpu-4g-20260417T031957Z/sasl/`.
 OpenDJ accepts fixture-user SASL PLAIN binds when the SASL `authcid` is the
 fixture user's RDN value. The admin SASL probe is skipped for the OpenDR-vs-OpenDJ
@@ -833,20 +833,20 @@ with invalid credentials in this harness.
 
 | Product / runtime | Max tested clients | Max 0% failure clients | Failure rate at max tested | Peak SASL success ops/s | Fixture-user mean ms | CPU avg / max | Memory avg / max |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| OpenDR FSM | 128 | 128 | 0.000% | 92,969.20 | 0.075 | 4.69% / 25.99% | 10.96 MiB / 19.19 MiB |
+| OpenDR FSM | 128 | 128 | 0.000% | 32,090.00 | 0.084 | 11.22% / 31.17% | 10.67 MiB / 18.84 MiB |
 | OpenDJ | 128 | 128 | 0.000% | 13,492.43 | 0.215 | 48.98% / 183.65% | 842.24 MiB / 971.80 MiB |
 
 Per-level concurrent SASL PLAIN fixture-user bind results:
 
 | Product / runtime | Clients | Successes / attempts | Failure % | Success ops/s | Mean ms | P95 ms | P99 ms |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| OpenDR FSM | 1 | 20 / 20 | 0.00 | 14,512.04 | 0.065 | 0.074 | 0.076 |
-| OpenDR FSM | 4 | 80 / 80 | 0.00 | 50,600.89 | 0.067 | 0.103 | 0.125 |
-| OpenDR FSM | 8 | 160 / 160 | 0.00 | 84,121.98 | 0.080 | 0.176 | 0.225 |
-| OpenDR FSM | 16 | 320 / 320 | 0.00 | 78,117.85 | 0.183 | 0.294 | 0.323 |
-| OpenDR FSM | 32 | 640 / 640 | 0.00 | 55,936.93 | 0.541 | 0.727 | 1.054 |
-| OpenDR FSM | 64 | 1280 / 1280 | 0.00 | 92,969.20 | 0.575 | 0.947 | 1.150 |
-| OpenDR FSM | 128 | 2560 / 2560 | 0.00 | 87,202.87 | 1.246 | 1.913 | 2.327 |
+| OpenDR FSM | 1 | 20 / 20 | 0.00 | 12,456.31 | 0.075 | 0.102 | 0.103 |
+| OpenDR FSM | 4 | 80 / 80 | 0.00 | 22,627.58 | 0.091 | 0.129 | 0.235 |
+| OpenDR FSM | 8 | 160 / 160 | 0.00 | 30,899.32 | 0.229 | 0.419 | 0.651 |
+| OpenDR FSM | 16 | 320 / 320 | 0.00 | 29,047.64 | 0.495 | 0.794 | 0.987 |
+| OpenDR FSM | 32 | 640 / 640 | 0.00 | 32,090.00 | 0.890 | 1.397 | 1.820 |
+| OpenDR FSM | 64 | 1280 / 1280 | 0.00 | 28,361.15 | 2.075 | 2.540 | 2.758 |
+| OpenDR FSM | 128 | 2560 / 2560 | 0.00 | 29,585.77 | 3.890 | 6.106 | 6.795 |
 | OpenDJ | 1 | 20 / 20 | 0.00 | 3,339.83 | 0.295 | 0.381 | 0.471 |
 | OpenDJ | 4 | 80 / 80 | 0.00 | 9,511.73 | 0.399 | 0.624 | 0.941 |
 | OpenDJ | 8 | 160 / 160 | 0.00 | 13,492.43 | 0.550 | 1.139 | 1.955 |
@@ -857,7 +857,7 @@ Per-level concurrent SASL PLAIN fixture-user bind results:
 
 ## Index Type Results
 
-OpenDR rows are from `target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/index/`.
+OpenDR rows are from GitHub Actions run `24546834381` at `target/perf/release/index/`.
 The same OpenDJ index profile at `target/perf/local-opendj-2cpu-4g-20260417T031957Z/index/`
 timed out under the same `--cpu 2 --memory 4g` Docker limits and did not
 produce complete scalar or mixed index-search benchmark JSON.
@@ -876,38 +876,38 @@ Index-profile top line:
 
 | Product / runtime | Profile | Status | Timeout budget | Total runtime ms | Records after setup | Avg CPU % | Avg memory | DB after | Subtree search mean ms | Add mean ms | Modify mean ms | Delete mean ms |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| OpenDR FSM | index | success | 240s | 7,755.515 | 1009 | 29.48 | 7.16 MiB | 4.05 MiB | 7.517 | 0.664 | 0.266 | 0.685 |
+| OpenDR FSM | index | success | 240s | 8,090.759 | 1009 | 49.15 | 6.65 MiB | 3.28 MiB | 18.627 | 1.015 | 0.417 | 0.934 |
 | OpenDJ | index | timeout | 240s | n/a | n/a | 15.62 | 413.63 MiB | 16.14 MiB | n/a | n/a | n/a | n/a |
 
 OpenDR indexed search latency:
 
 | Search probe | Mean ms | P95 ms | P99 ms |
 |---|---:|---:|---:|
-| Equality `uid` | 0.155 | 0.164 | 0.168 |
-| Presence `mail` | 10.448 | 11.578 | 13.217 |
-| Substring `description` | 5.636 | 5.673 | 5.673 |
-| Ordering `benchmarkOrder >=` | 5.399 | 5.487 | 5.494 |
-| Ordering `benchmarkOrder <=` | 5.412 | 5.497 | 5.524 |
+| Equality `uid` | 0.198 | 0.212 | 0.229 |
+| Presence `mail` | 23.660 | 26.701 | 29.068 |
+| Substring `description` | 11.543 | 12.288 | 12.426 |
+| Ordering `benchmarkOrder >=` | 12.192 | 13.206 | 13.212 |
+| Ordering `benchmarkOrder <=` | 12.852 | 14.135 | 14.440 |
 
 Scalar index comparison:
 
 | Search probe | OpenDR mean ms | OpenDJ mean ms |
 |---|---:|---:|
-| Equality `uid` | 0.155 | n/a |
-| Presence `mail` | 10.448 | n/a |
-| Substring `description` | 5.636 | n/a |
-| Ordering `benchmarkOrder >=` | 5.399 | n/a |
-| Ordering `benchmarkOrder <=` | 5.412 | n/a |
+| Equality `uid` | 0.198 | n/a |
+| Presence `mail` | 23.660 | n/a |
+| Substring `description` | 11.543 | n/a |
+| Ordering `benchmarkOrder >=` | 12.192 | n/a |
+| Ordering `benchmarkOrder <=` | 12.852 | n/a |
 
 OpenDR mixed concurrent index-search results:
 
 | Clients | Successes / attempts | Failure % | Success ops/s | Mean ms | P95 ms | P99 ms |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 20 / 20 | 0.00 | 9,605.57 | 0.096 | 0.106 | 0.108 |
-| 4 | 80 / 80 | 0.00 | 22,436.20 | 0.161 | 0.220 | 0.369 |
-| 8 | 160 / 160 | 0.00 | 30,607.61 | 0.211 | 0.422 | 0.757 |
-| 16 | 320 / 320 | 0.00 | 31,836.70 | 0.383 | 0.576 | 0.645 |
-| 32 | 640 / 640 | 0.00 | 31,611.31 | 0.786 | 1.362 | 1.873 |
+| 1 | 20 / 20 | 0.00 | 4,787.44 | 0.194 | 0.240 | 0.246 |
+| 4 | 80 / 80 | 0.00 | 6,691.65 | 0.509 | 0.852 | 1.308 |
+| 8 | 160 / 160 | 0.00 | 9,810.09 | 0.615 | 1.196 | 1.883 |
+| 16 | 320 / 320 | 0.00 | 12,251.69 | 0.980 | 1.717 | 4.019 |
+| 32 | 640 / 640 | 0.00 | 11,272.71 | 2.137 | 4.340 | 6.515 |
 
 ## 1M OpenDR Results
 
@@ -998,10 +998,10 @@ The 1M concurrency artifact is `target/perf/opendr-million-concurrency-20260414-
 ## Key Findings
 
 - OpenDR FSM remains ahead of OpenDJ on the full-profile latency and footprint rows under this Docker harness.
-- With the same `--cpu 2 --memory 4g` Docker limits used by the GitHub gate, OpenDR completed the dedicated simple-bind concurrency profile through 128 clients at 0% failure and peaked at `35,202.22` successful binds/sec.
+- With the same `--cpu 2 --memory 4g` Docker limits used by the GitHub gate, OpenDR completed the dedicated simple-bind concurrency profile through 128 clients at 0% failure and peaked at `11,584.12` successful binds/sec.
 - OpenDJ timed out in the dedicated simple-bind concurrency profile under the same `--cpu 2 --memory 4g` Docker limits.
-- OpenDR SASL PLAIN fixture-user binds were faster than OpenDJ in the guarded serial row and reached about `6.89x` higher peak successful SASL PLAIN bind throughput in the `sasl-auth` profile.
-- OpenDR completed the index profile and reached 0% failures through 32 mixed concurrent index-search clients, peaking at `31,836.70` successful mixed index searches/sec.
+- OpenDR SASL PLAIN fixture-user binds were faster than OpenDJ in the guarded serial row and reached about `2.38x` higher peak successful SASL PLAIN bind throughput in the `sasl-auth` profile.
+- OpenDR completed the index profile and reached 0% failures through 32 mixed concurrent index-search clients, peaking at `12,251.69` successful mixed index searches/sec.
 - OpenDJ timed out in the index profile under the same `--cpu 2 --memory 4g` Docker limits, so the latest local comparison did not produce complete OpenDJ scalar or mixed index-search metrics.
 - The OpenDR 1M fixture required a 16 GiB LMDB map and produced a 3.20 GiB data directory.
 - The OpenDR 1M auth concurrency artifact reached 0% failures through 128 clients for both simple bind and SASL PLAIN, peaking at `17,008.19` simple binds/sec and `48,469.70` SASL PLAIN binds/sec.
@@ -1009,10 +1009,10 @@ The 1M concurrency artifact is `target/perf/opendr-million-concurrency-20260414-
 
 ## Artifacts
 
-- OpenDR full profile: `target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/full/comparison-summary.md`
-- OpenDR simple-bind concurrency profile: `target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/concurrency/comparison-summary.md`
-- OpenDR index profile: `target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/index/comparison-summary.md`
-- OpenDR SASL PLAIN concurrency profile: `target/perf/local-opendr-after-opendj-2cpu-4g-20260417T033113Z/sasl/comparison-summary.md`
+- OpenDR full profile: `target/perf/release/full/comparison-summary.md` from GitHub Actions run `24546834381`
+- OpenDR simple-bind concurrency profile: `target/perf/release/concurrency/comparison-summary.md` from GitHub Actions run `24546834381`
+- OpenDR index profile: `target/perf/release/index/comparison-summary.md` from GitHub Actions run `24546834381`
+- OpenDR SASL PLAIN concurrency profile: `target/perf/release/sasl/comparison-summary.md` from GitHub Actions run `24546834381`
 - OpenDJ comparison profiles: `target/perf/local-opendj-2cpu-4g-20260417T031957Z/`
 - OpenDR 1M preload and serial run artifact: `target/perf/opendr-million-16g-20260414-103048/`
 - OpenDR 1M serial result: `target/perf/opendr-million-reuse-skipcounts-20260414-111120/opendr/million/ldap-benchmark-results.json`

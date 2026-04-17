@@ -115,6 +115,7 @@ jobs:
             mkdir -p target/perf/release
             printf 'Performance results were not produced before the job failed.\n' > target/perf/release/README.txt
           fi
+          sudo find target/perf/release -type f \( -name data.mdb -o -name lock.mdb \) -delete
           tar -czf target/perf/opendr-release-perf-results.tar.gz -C target/perf release
 
       - name: Upload performance results
