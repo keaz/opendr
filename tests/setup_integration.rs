@@ -46,6 +46,37 @@ async fn test_non_interactive_setup() {
 }
 
 #[tokio::test]
+async fn test_setup_creates_missing_config_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join("nested").join("config");
+    let handler = SetupHandler::new(&config_dir);
+
+    let config = SetupConfig {
+        base_dn: "dc=test,dc=org".to_string(),
+        root_user_dn: "cn=admin".to_string(),
+        root_password: "TestPass123".to_string(),
+        ldap_port: 1389,
+        ldaps_port: 1636,
+        tls: TlsConfig::default(),
+        hostname: "localhost".to_string(),
+        organization_name: "Test Org".to_string(),
+        replica_id: 1,
+        backend_type: BackendType::InMemory,
+        data_directory: temp_dir.path().join("data"),
+        import_sample_data: false,
+        replication: ReplicationConfig::default(),
+    };
+
+    handler.run_non_interactive_setup(config).await.unwrap();
+
+    assert!(config_dir.is_dir());
+    assert!(config_dir.join("server.toml").is_file());
+    assert!(config_dir.join("log4rs.yml").is_file());
+    assert!(config_dir.join("admin.ldif").is_file());
+    assert!(config_dir.join("base.ldif").is_file());
+}
+
+#[tokio::test]
 async fn test_setup_with_sample_data() {
     let temp_dir = TempDir::new().unwrap();
     let handler = SetupHandler::new(temp_dir.path());
@@ -629,6 +660,15 @@ async fn test_setup_handler_generates_loadable_config() {
         "Config file should be created at {:?}",
         config_path
     );
+    let log_config_path = config_dir.join("log4rs.yml");
+    assert!(
+        log_config_path.exists(),
+        "Log config file should be created at {:?}",
+        log_config_path
+    );
+    let log_config_content = tokio::fs::read_to_string(&log_config_path).await.unwrap();
+    assert!(log_config_content.contains("kind: console"));
+    assert!(log_config_content.contains("root:"));
 
     // Load the generated config file
     let config_content = tokio::fs::read_to_string(&config_path).await.unwrap();

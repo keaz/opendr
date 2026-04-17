@@ -78,9 +78,9 @@ mkdir -p ./config ./logs
 opendr-setup --config-dir ./config interactive
 ```
 
-The setup wizard writes `config/server.toml`, setup state, LDIF scaffolding,
-and the configured data directories. Provide a log4rs YAML file at
-`config/log4rs.yml`, or point `--log-config` at the packaged logging config.
+The setup wizard creates the config directory when needed, then writes
+`config/server.toml`, `config/log4rs.yml`, setup state, LDIF scaffolding, and
+the configured data directories.
 
 ### Run OpenDR
 

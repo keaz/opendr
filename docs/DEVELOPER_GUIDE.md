@@ -123,9 +123,9 @@ Start the server:
 opendr --config ./config/server.toml --log-config ./config/log4rs.yml
 ```
 
-The setup command writes `server.toml`, setup state, LDIF scaffolding, and data
-directories. The server still needs a log4rs YAML file; use the packaged file or
-copy the repository `config/log4rs.yml` beside the generated server config.
+The setup command creates the config directory when needed, then writes
+`server.toml`, `log4rs.yml`, setup state, LDIF scaffolding, and data
+directories.
 
 Validate with LDAP tools:
 
@@ -634,8 +634,7 @@ Resource management limits:
 
 Startup fails:
 
-- Confirm the process can read `config/log4rs.yml`; the entrypoint currently
-  unwraps logging initialization.
+- Confirm the process can read `config/log4rs.yml`.
 - Confirm the config path passed to `--config` exists.
 - Confirm secret source exclusivity for root and replication passwords.
 - Confirm TLS files exist when TLS is enabled.

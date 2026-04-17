@@ -8,6 +8,18 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+const DEFAULT_LOG4RS_CONFIG: &str = r#"refresh_rate: 5 seconds
+appenders:
+  stdout:
+    kind: console
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S)} | {({l}):5.5} | {f}:{L} - {m}{n}"
+root:
+  level: info
+  appenders:
+    - stdout
+"#;
+
 /// Setup configuration for first-time server initialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupConfig {
@@ -470,6 +482,14 @@ impl SetupHandler {
         }
     }
 
+    fn config_dir(&self) -> &Path {
+        self.config_path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    fn log_config_path(&self) -> PathBuf {
+        self.config_dir().join("log4rs.yml")
+    }
+
     /// Check if server has been set up
     pub async fn is_configured(&self) -> Result<bool, String> {
         if !self.state_path.exists() {
@@ -531,6 +551,25 @@ impl SetupHandler {
         fs::write(&self.config_path, content)
             .await
             .map_err(|e| format!("Failed to write config: {}", e))
+    }
+
+    async fn save_log_config(&self) -> Result<(), String> {
+        let log_config_path = self.log_config_path();
+        if let Some(parent) = log_config_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create config directory: {}", e))?;
+        }
+
+        fs::write(&log_config_path, DEFAULT_LOG4RS_CONFIG)
+            .await
+            .map_err(|e| format!("Failed to write log config: {}", e))
+    }
+
+    async fn create_config_dir(&self) -> Result<(), String> {
+        fs::create_dir_all(self.config_dir())
+            .await
+            .map_err(|e| format!("Failed to create config directory: {}", e))
     }
 
     /// Run interactive setup
@@ -1024,7 +1063,14 @@ impl SetupHandler {
     async fn perform_setup(&self, config: &SetupConfig) -> Result<(), String> {
         println!("\n🔧 Performing setup...\n");
 
-        // 1. Create data directory if needed
+        // 1. Create config directory first because setup writes LDIF scaffolding before server.toml.
+        println!(
+            "  ✓ Creating config directory: {}",
+            self.config_dir().display()
+        );
+        self.create_config_dir().await?;
+
+        // 2. Create data directory if needed
         if config.backend_type != BackendType::InMemory {
             println!(
                 "  ✓ Creating data directory: {}",
@@ -1035,7 +1081,7 @@ impl SetupHandler {
                 .map_err(|e| format!("Failed to create data directory: {}", e))?;
         }
 
-        // 1b. Create replication state directory if replication is enabled.
+        // 2b. Create replication state directory if replication is enabled.
         if let Some(replication_state_path) = config.replication_state_storage_path() {
             println!(
                 "  ✓ Creating replication state directory: {}",
@@ -1046,32 +1092,36 @@ impl SetupHandler {
                 .map_err(|e| format!("Failed to create replication state directory: {}", e))?;
         }
 
-        // 2. Initialize backend
+        // 3. Initialize backend
         println!("  ✓ Initializing {:?} backend", config.backend_type);
         self.initialize_backend(config).await?;
 
-        // 3. Create root user entry
+        // 4. Create root user entry
         println!(
             "  ✓ Creating root administrator account: {}",
             config.root_user_dn
         );
         self.create_root_user(config).await?;
 
-        // 4. Create base DN structure
+        // 5. Create base DN structure
         println!("  ✓ Creating directory structure for: {}", config.base_dn);
         self.create_base_structure(config).await?;
 
-        // 5. Import sample data if requested
+        // 6. Import sample data if requested
         if config.import_sample_data {
             println!("  ✓ Importing sample data");
             self.import_sample_data(config).await?;
         }
 
-        // 6. Save configuration
+        // 7. Save configuration
         println!("  ✓ Saving configuration");
         self.save_config(config).await?;
 
-        // 7. Mark as configured
+        // 7b. Save default logging configuration
+        println!("  ✓ Saving logging configuration");
+        self.save_log_config().await?;
+
+        // 8. Mark as configured
         let state = SetupState {
             is_configured: true,
             setup_timestamp: Some(chrono::Utc::now().to_rfc3339()),
@@ -1082,7 +1132,11 @@ impl SetupHandler {
 
         println!("\n✨ Setup completed successfully!\n");
         println!("You can now start the server with:");
-        println!("  opendr --config {}\n", self.config_path.display());
+        println!(
+            "  opendr --config {} --log-config {}\n",
+            self.config_path.display(),
+            self.log_config_path().display()
+        );
 
         Ok(())
     }
@@ -1321,7 +1375,7 @@ description: Root Administrator Account
         );
 
         // Store this in a special admin.ldif file
-        let admin_file = self.config_path.parent().unwrap().join("admin.ldif");
+        let admin_file = self.config_dir().join("admin.ldif");
 
         fs::write(admin_file, ldif)
             .await
@@ -1393,7 +1447,7 @@ description: {} container
         }
 
         // Write to base.ldif
-        let base_file = self.config_path.parent().unwrap().join("base.ldif");
+        let base_file = self.config_dir().join("base.ldif");
 
         let ldif_content = entries.join("\n");
         fs::write(base_file, ldif_content)
@@ -1449,7 +1503,7 @@ description: Standard users group
             config.base_dn
         );
 
-        let sample_file = self.config_path.parent().unwrap().join("sample.ldif");
+        let sample_file = self.config_dir().join("sample.ldif");
 
         fs::write(sample_file, sample_data)
             .await

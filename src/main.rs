@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -152,6 +152,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.block_on(run(args, config))
 }
 
+fn init_logging(log_config: &Path) -> Result<(), Box<dyn Error>> {
+    if !log_config.is_file() {
+        return Err(format!(
+            "log config file not found at {}. Pass --log-config with a readable log4rs YAML file, or run opendr-setup to generate one.",
+            log_config.display()
+        )
+        .into());
+    }
+
+    log4rs::init_file(log_config, Default::default())
+        .map(|_| ())
+        .map_err(|err| {
+            format!(
+                "failed to initialize logging from {}: {}",
+                log_config.display(),
+                err
+            )
+            .into()
+        })
+}
+
 fn run_cli_command(mut config: ServerConfig, command: Command) -> Result<(), Box<dyn Error>> {
     match command {
         Command::Schema { command } => {
@@ -210,7 +231,7 @@ fn run_cli_command(mut config: ServerConfig, command: Command) -> Result<(), Box
 }
 
 async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
-    log4rs::init_file(&args.log_config, Default::default()).unwrap();
+    init_logging(&args.log_config)?;
 
     if let Some(command) = args.command {
         return run_cli_command(config, command);
@@ -912,6 +933,17 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_init_logging_reports_missing_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing_config = temp_dir.path().join("missing-log4rs.yml");
+
+        let err = init_logging(&missing_config).unwrap_err().to_string();
+
+        assert!(err.contains("log config file not found"));
+        assert!(err.contains("missing-log4rs.yml"));
+    }
 
     #[tokio::test]
     async fn test_initialize_base_structure_inmemory() {

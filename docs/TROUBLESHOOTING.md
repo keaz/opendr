@@ -15,11 +15,10 @@ opendr --config /etc/opendr/server.toml --log-config /etc/opendr/log4rs.yml
 
 The default is `config/server.toml` relative to the current working directory.
 
-### Logging panics or exits at startup
+### Logging exits at startup
 
-The entrypoint initializes `log4rs` from `--log-config` and currently unwraps
-that initialization. Check that the log config path exists and that log
-directories are writable.
+The entrypoint initializes `log4rs` from `--log-config`. Check that the log
+config path exists, is readable, and points to valid log4rs YAML.
 
 ### Secret source validation fails
 
