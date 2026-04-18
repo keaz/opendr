@@ -63,7 +63,22 @@ strict_validation = true
 allow_online_updates = false
 ```
 
-The server loads supported files from `schema_dir` in lexical order. Supported extensions are `.ldif`, `.schema`, and `.conf`.
+The server loads built-in schema bundles before supported files from
+`schema_dir` in lexical order. Supported built-ins are `core` and the optional
+RFC 2307 `posix` bundle. Supported file extensions are `.ldif`, `.schema`, and
+`.conf`.
+
+Enable POSIX account and group schema when clients need `posixAccount`,
+`posixGroup`, `uidNumber`, `gidNumber`, or `memberUid`:
+
+```toml
+[schema]
+load_builtin = ["core", "posix"]
+```
+
+The example fixture
+[schema_examples/standard-directory.ldif](schema_examples/standard-directory.ldif)
+contains entries that validate against `load_builtin = ["core", "posix"]`.
 
 ### External Schema Files
 
@@ -216,21 +231,46 @@ The schema includes these core object classes from RFC 4519:
 
 - **organizationalPerson** (Structural)
   - Superior: person
-  - Optional: ou, mail
+  - Optional: title, registeredAddress, telephoneNumber, street, postOfficeBox, postalCode, postalAddress, physicalDeliveryOfficeName, st, l, ou, mail
 
 - **inetOrgPerson** (Structural)
   - Superior: organizationalPerson
-  - Optional: uid, givenName, mail
+  - Optional: businessCategory, carLicense, departmentNumber, displayName, employeeNumber, employeeType, uid, givenName, homePhone, homePostalAddress, initials, jpegPhoto, labeledURI, mail, manager, mobile, o, pager, preferredLanguage, roomNumber, secretary
 
 - **organization** (Structural)
   - Superior: top
   - Required: o
-  - Optional: description
+  - Optional: userPassword, seeAlso, businessCategory, telephoneNumber, street, postOfficeBox, postalCode, postalAddress, registeredAddress, physicalDeliveryOfficeName, st, l, description
 
 - **organizationalUnit** (Structural)
   - Superior: top
   - Required: ou
-  - Optional: description
+  - Optional: userPassword, seeAlso, businessCategory, telephoneNumber, street, postOfficeBox, postalCode, postalAddress, registeredAddress, physicalDeliveryOfficeName, st, l, description
+
+- **groupOfNames** (Structural)
+  - Superior: top
+  - Required: cn
+  - Optional: member, businessCategory, seeAlso, owner, description, o, ou
+  - OpenDR permits empty `groupOfNames` entries for OpenDJ-style static group compatibility.
+
+- **groupOfUniqueNames** (Structural)
+  - Superior: top
+  - Required: cn, uniqueMember
+  - Optional: businessCategory, seeAlso, owner, description, o, ou
+
+### POSIX Object Classes
+
+The optional `posix` built-in bundle includes these RFC 2307 classes:
+
+- **posixAccount** (Auxiliary)
+  - Superior: top
+  - Required: cn, uid, uidNumber, gidNumber, homeDirectory
+  - Optional: userPassword, loginShell, gecos, description
+
+- **posixGroup** (Structural)
+  - Superior: top
+  - Required: cn, gidNumber
+  - Optional: userPassword, memberUid, description
 
 ### Core Attributes
 
@@ -242,8 +282,45 @@ The schema includes these core object classes from RFC 4519:
 - **uid** (userid): User ID
 - **mail** (rfc822Mailbox): Email address
 - **userPassword**: User password
+- **member**: Group member DN
+- **uniqueMember**: Unique group member DN
+- **seeAlso**: Related entry DN
+- **owner**: Owner entry DN
 - **description**: Description
 - **givenName**: Given name
+- **displayName**: Display name
+- **initials**: Initials
+- **carLicense**: Vehicle license or registration plate
+- **departmentNumber**: Department number
+- **employeeNumber**: Employee number, single-value
+- **employeeType**: Employee type
+- **homePhone**: Home telephone number
+- **homePostalAddress**: Home postal address
+- **jpegPhoto**: JPEG photograph
+- **labeledURI**: Labeled URI
+- **manager**: Manager entry DN
+- **mobile**: Mobile telephone number
+- **pager**: Pager telephone number
+- **preferredLanguage**: Preferred language, single-value
+- **roomNumber**: Room number
+- **secretary**: Secretary entry DN
+- **l** (localityName): Locality name
+- **st** (stateOrProvinceName): State or province name
+- **street**: Street address
+- **postalAddress**: Postal address
+- **registeredAddress**: Registered address
+- **postalCode**: Postal code
+- **postOfficeBox**: Post office box
+- **physicalDeliveryOfficeName**: Physical delivery office name
+
+### POSIX Attributes
+
+- **uidNumber**: Integer user ID, single-value
+- **gidNumber**: Integer group ID, single-value
+- **gecos**: POSIX GECOS field, IA5 single-value
+- **homeDirectory**: Absolute home directory path, IA5 single-value
+- **loginShell**: Login shell path, IA5 single-value
+- **memberUid**: POSIX group member login name, IA5 multi-value
 
 ## Validation Rules
 

@@ -24,9 +24,16 @@ readiness checklist in sync with code changes.
 | RFC 4514 | DN string representation | Supported | `src/dn.rs`, `docs/LDAP_REFERRAL_ALIAS_SUPPORT.md` | `dn::tests::*`, `tests/referral_integration.rs` | DN parsing and canonicalization are shared by scope matching, ACI, referrals, and ModifyDN validation. |
 | RFC 4515 | Search filter string representation | Partial | `src/parser.rs`, `src/ldap_filter_eval.rs`, `src/search_adapters/` | `tests/search_adapters_integration.rs`, `tests/indexing_integration.rs`, `tests/real_time_propagation_tests.rs` | Common equality, presence, substring, ordering, and boolean filters are covered. Unsupported matching-rule variants must remain explicit in docs/tests before advertisement. |
 | RFC 4516 | LDAP URL format | Supported | `src/ldap_url.rs`, `docs/LDAP_REFERRAL_ALIAS_SUPPORT.md` | `ldap_url::*` unit tests, `tests/referral_integration.rs`, `scripts/referral_alias_interop.sh` | LDAP and LDAPS URLs are parsed, validated, rendered, and used by referral handling. |
-| RFC 4517 | Syntaxes and matching rules | Partial | `src/schema.rs`, `docs/LDAP_SYNTAX_MATCHING_SUPPORT.md` | `tests/schema_integration.rs`, `tests/config_integration.rs`, `tests/indexing_integration.rs` | DN, directory string, IA5 string, boolean, integer, generalized time, and binary handling are covered where documented. |
+| RFC 4517 | Syntaxes and matching rules | Partial | `src/schema.rs`, `docs/LDAP_SYNTAX_MATCHING_SUPPORT.md` | `tests/schema_integration.rs`, `tests/config_integration.rs`, `tests/indexing_integration.rs` | DN, directory string, IA5 string, boolean, integer, generalized time, JPEG, and binary handling are covered where documented. |
 | RFC 4518 | Internationalized string preparation | Partial | `src/schema.rs`, `docs/LDAP_SYNTAX_MATCHING_SUPPORT.md` | `tests/schema_integration.rs`, `tests/indexing_integration.rs` | Case folding and normalization are implemented for documented matching rules; complete stringprep coverage remains partial. |
 | RFC 4519 | User application schema | Partial | Built-in schema registry in `src/schema.rs`, `docs/schema_integration.md` | `tests/schema_integration.rs`, `tests/schema_adapter_integration.rs`, `e2e_tests/test_schema_management.sh` | Common user and organization classes are available; full RFC 4519 schema parity is tracked as partial until every class/attribute is covered. |
+
+## Application Schema RFCs
+
+| RFC | Area | Status | Implementation and docs | Coverage and gate | Notes |
+| --- | --- | --- | --- | --- | --- |
+| RFC 2798 | `inetOrgPerson` object class | Partial | Built-in schema registry in `src/schema.rs`, `docs/schema_integration.md`, `docs/schema_alignment.md` | `tests/schema_integration.rs` | Common employee/contact attributes are built in; certificate, bit-string, and uncommon telephony syntaxes remain outside the documented subset. |
+| RFC 2307 | POSIX/NIS account and group schema | Partial | Optional `posix` built-in schema bundle in `src/schema.rs`, `docs/schema_integration.md`, `docs/schema_alignment.md` | `tests/schema_integration.rs`, `tests/config_integration.rs` | `posixAccount`, `posixGroup`, numeric IDs, home directory, login shell, GECOS, and `memberUid` are covered. Broader NIS maps, shadow, hosts, and network classes remain outside the documented subset. |
 
 ## Advertised Controls, Extensions, and Features
 

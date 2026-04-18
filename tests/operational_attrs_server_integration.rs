@@ -41,6 +41,10 @@ async fn test_e2e_add_and_search_with_operational_attrs() {
         result.attributes.contains_key("entrycsn"),
         "Should have entryCSN"
     );
+    assert_eq!(
+        result.attributes.get("entryDN"),
+        Some(&vec!["cn=Test User,ou=users,dc=example,dc=com".to_string()])
+    );
     assert!(
         result.attributes.contains_key("createtimestamp"),
         "Should have createTimestamp"
@@ -58,6 +62,38 @@ async fn test_e2e_add_and_search_with_operational_attrs() {
     assert!(
         !result.attributes.contains_key("mail"),
         "Should not have user attrs with only '+'"
+    );
+}
+
+#[tokio::test]
+async fn test_specific_entry_dn_operational_attribute_is_searchable() {
+    let backend = Arc::new(MockBackend::new());
+    let dn = "uid=auth-user,ou=users,dc=example,dc=com";
+
+    let mut attributes = HashMap::new();
+    attributes.insert("cn".to_string(), vec!["Auth User".to_string()]);
+    attributes.insert("uid".to_string(), vec!["auth-user".to_string()]);
+    attributes.insert("objectclass".to_string(), vec!["person".to_string()]);
+    backend
+        .add_entry(DirectoryEntry::new(dn, attributes), b"password".to_vec())
+        .await
+        .unwrap();
+
+    let adapter = SearchBackendAdapter::new(backend);
+    let requested_attrs = vec!["entryDN".to_string()];
+    let result = adapter
+        .get_entry(dn, &requested_attrs)
+        .await
+        .unwrap()
+        .expect("Entry should exist");
+
+    assert_eq!(
+        result.attributes.get("entryDN"),
+        Some(&vec![dn.to_string()])
+    );
+    assert!(
+        !result.attributes.contains_key("cn"),
+        "Specific entryDN request should not include user attributes"
     );
 }
 

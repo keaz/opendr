@@ -791,6 +791,23 @@ attributeTypes: ( 1.3.6.1.4.1.55555.50.1 NAME 'exampleNumber' EQUALITY integerMa
 }
 
 #[test]
+fn test_load_posix_builtin_schema_bundle() {
+    let toml = r#"
+[schema]
+load_builtin = ["core", "posix"]
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    config.validate().unwrap();
+
+    let schema = config.load_schema().unwrap();
+    assert!(schema.get_object_class("posixAccount").is_some());
+    assert!(schema.get_object_class("posixGroup").is_some());
+    assert!(schema.get_attribute_type("uidNumber").is_some());
+    assert!(schema.get_attribute_type("memberUid").is_some());
+}
+
+#[test]
 fn test_schema_index_validation_rejects_missing_substring_rule() {
     let toml = r#"
 [backend]

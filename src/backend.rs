@@ -170,6 +170,7 @@ impl OperationalAttributes {
             || attr_name.eq_ignore_ascii_case("modifytimestamp")
             || attr_name.eq_ignore_ascii_case("creatorsname")
             || attr_name.eq_ignore_ascii_case("modifiersname")
+            || attr_name.eq_ignore_ascii_case("entrydn")
             || attr_name.eq_ignore_ascii_case("subschemasubentry")
             || attr_name.eq_ignore_ascii_case("hassubordinates")
             || attr_name.eq_ignore_ascii_case("numsubordinates")
@@ -261,6 +262,7 @@ impl ProjectedDirectoryEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryAttributeProjection {
+    requested_attributes: Vec<String>,
     requested_lower: Vec<String>,
     include_user: bool,
     include_all_user: bool,
@@ -280,6 +282,7 @@ impl DirectoryAttributeProjection {
             || requested_lower.iter().any(|attribute| attribute == "*");
 
         Self {
+            requested_attributes: requested_attributes.to_vec(),
             requested_lower,
             include_user,
             include_all_user,
@@ -294,7 +297,7 @@ impl DirectoryAttributeProjection {
 
     pub fn project_attributes(
         &self,
-        _dn: &str,
+        dn: &str,
         attributes: &HashMap<String, Vec<String>>,
         operational_attributes: &OperationalAttributes,
     ) -> Vec<(String, Vec<String>)> {
@@ -311,13 +314,22 @@ impl DirectoryAttributeProjection {
                         .iter()
                         .any(|requested| requested.eq_ignore_ascii_case(name))
                 {
-                    selected.push((name.clone(), values.clone()));
+                    selected.push((
+                        crate::operational_attrs::response_user_attribute_name(
+                            name,
+                            &self.requested_attributes,
+                        ),
+                        values.clone(),
+                    ));
                 }
             }
         }
 
         if self.include_all_operational || !self.specific_operational.is_empty() {
-            for (name, values) in operational_attributes.to_attributes() {
+            let mut operational = operational_attributes.to_attributes();
+            operational.insert("entryDN".to_string(), vec![dn.to_string()]);
+
+            for (name, values) in operational {
                 if self.include_all_operational
                     || self
                         .specific_operational

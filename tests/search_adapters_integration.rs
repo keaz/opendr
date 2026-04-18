@@ -135,6 +135,57 @@ async fn production_entry_formatter_projects_and_encodes_entries() {
 }
 
 #[tokio::test]
+async fn production_entry_formatter_synthesizes_entry_dn() {
+    let mut formatter = ProductionEntryFormatter::with_message_id(42);
+    let entry = test_search_entry();
+
+    let encoded = formatter
+        .format_entry(&entry, &["entryDN".to_string()])
+        .await
+        .unwrap();
+
+    let (_, messages) = parse_ldap_messages(&encoded).unwrap();
+    assert_eq!(messages.len(), 1);
+
+    match &messages[0].protocol_op {
+        ProtocolOp::SearchResultEntry(response) => {
+            assert_eq!(response.attributes.len(), 1);
+            let attribute = &response.attributes[0];
+            assert_eq!(attribute.attr_type.0.as_ref(), "entryDN");
+            assert_eq!(
+                attribute.attr_vals[0].0.as_ref(),
+                b"cn=alice,dc=example,dc=org"
+            );
+        }
+        other => panic!("unexpected protocol op: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn production_entry_formatter_preserves_requested_user_attribute_spelling() {
+    let mut formatter = ProductionEntryFormatter::with_message_id(43);
+    let entry = test_search_entry();
+
+    let encoded = formatter
+        .format_entry(&entry, &["objectClass".to_string()])
+        .await
+        .unwrap();
+
+    let (_, messages) = parse_ldap_messages(&encoded).unwrap();
+    assert_eq!(messages.len(), 1);
+
+    match &messages[0].protocol_op {
+        ProtocolOp::SearchResultEntry(response) => {
+            assert_eq!(response.attributes.len(), 1);
+            let attribute = &response.attributes[0];
+            assert_eq!(attribute.attr_type.0.as_ref(), "objectClass");
+            assert_eq!(attribute.attr_vals[0].0.as_ref(), b"person");
+        }
+        other => panic!("unexpected protocol op: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn production_search_metrics_update_metrics_collector() {
     let metrics = MetricsCollector::new();
     let adapter = ProductionSearchMetrics::new(metrics.clone());

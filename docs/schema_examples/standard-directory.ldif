@@ -1,0 +1,70 @@
+# Example directory entries for OpenDR's built-in core and optional posix schema bundles.
+# Load with:
+#   [schema]
+#   load_builtin = ["core", "posix"]
+
+dn: dc=example,dc=com
+objectClass: top
+objectClass: domain
+dc: example
+description: Example naming context
+
+dn: ou=people,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: people
+description: People
+
+dn: ou=groups,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: groups
+description: Groups
+
+dn: uid=alice,ou=people,dc=example,dc=com
+objectClass: top
+objectClass: person
+objectClass: organizationalPerson
+objectClass: inetOrgPerson
+objectClass: posixAccount
+cn: Alice Example
+sn: Example
+uid: alice
+mail: alice@example.com
+displayName: Alice Example
+employeeNumber: 1001
+departmentNumber: Engineering
+preferredLanguage: en-US
+mobile: +1 555 0101
+uidNumber: 1001
+gidNumber: 1000
+homeDirectory: /home/alice
+loginShell: /bin/zsh
+gecos: Alice Example
+
+dn: cn=developers,ou=groups,dc=example,dc=com
+objectClass: top
+objectClass: groupOfNames
+cn: developers
+description: Developers group
+member: uid=alice,ou=people,dc=example,dc=com
+
+dn: cn=empty-static-group,ou=groups,dc=example,dc=com
+objectClass: top
+objectClass: groupOfNames
+cn: empty-static-group
+description: OpenDJ-compatible empty static group
+
+dn: cn=unique-admins,ou=groups,dc=example,dc=com
+objectClass: top
+objectClass: groupOfUniqueNames
+cn: unique-admins
+description: Administrators group with unique DN-valued members
+uniqueMember: uid=alice,ou=people,dc=example,dc=com
+
+dn: cn=posix-developers,ou=groups,dc=example,dc=com
+objectClass: top
+objectClass: posixGroup
+cn: posix-developers
+gidNumber: 1000
+memberUid: alice

@@ -14,6 +14,7 @@ rejected during schema validation instead of being silently accepted.
 | Generalized Time | `1.3.6.1.4.1.1466.115.121.1.24` | Supported | Accepts `YYYYMMDDHH[MM[SS]][.fraction](Z/+HHMM/-HHMM)` and validates date, time, fraction, and offset ranges. |
 | IA5 String | `1.3.6.1.4.1.1466.115.121.1.26` | Supported | Requires ASCII and rejects control characters. |
 | Integer | `1.3.6.1.4.1.1466.115.121.1.27` | Supported | Accepts RFC-style decimal integers without leading zeroes; values are normalized within the supported `i128` range. |
+| JPEG | `1.3.6.1.4.1.1466.115.121.1.28` | Supported | Accepts stored JPEG bytes exposed through the server string boundary. |
 | OID | `1.3.6.1.4.1.1466.115.121.1.38` | Supported | Accepts descriptors or numeric OIDs with valid first and second arcs. |
 | Octet String | `1.3.6.1.4.1.1466.115.121.1.40` | Supported | Accepts arbitrary stored octets exposed through the server string boundary. |
 | Postal Address | `1.3.6.1.4.1.1466.115.121.1.41` | Supported | Requires one or more non-empty Directory String lines separated by `$`. |
@@ -37,7 +38,9 @@ rejected during schema validation instead of being silently accepted.
 | `telephoneNumberSubstringsMatch` | `2.5.13.21` | Supported | Uses telephone-number normalization for substring fragments. |
 | `generalizedTimeMatch` | `2.5.13.27` | Supported | Normalizes offsets to UTC before comparison. |
 | `generalizedTimeOrderingMatch` | `2.5.13.28` | Supported | Uses UTC fixed-fraction keys for ordering and indexes. |
+| `caseExactIA5Match` | `1.3.6.1.4.1.1466.109.114.1` | Supported | Requires IA5 syntax and collapses whitespace without case folding. |
 | `caseIgnoreIA5Match` | `1.3.6.1.4.1.1466.109.114.2` | Supported | Requires IA5 syntax, collapses whitespace, and lowercases ASCII. |
+| `caseIgnoreIA5SubstringsMatch` | `1.3.6.1.4.1.1466.109.114.3` | Supported | Uses the same preparation as `caseIgnoreIA5Match` for substring fragments. |
 
 Unsupported matching rules are rejected as inappropriate matching during filter
 validation, compare validation, or index planning. Approximate matching is not

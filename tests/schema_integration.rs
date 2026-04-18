@@ -2,6 +2,33 @@
 use opendr::schema::{AttributeType, LdapSchema, ObjectClass, ObjectClassKind, SchemaError};
 use std::collections::HashMap;
 
+fn parse_simple_entry_ldif(contents: &str) -> Vec<HashMap<String, Vec<String>>> {
+    contents
+        .split("\n\n")
+        .filter_map(|entry| {
+            let mut attributes: HashMap<String, Vec<String>> = HashMap::new();
+            for line in entry.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with("dn:") {
+                    continue;
+                }
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                attributes
+                    .entry(name.trim().to_string())
+                    .or_default()
+                    .push(value.trim_start().to_string());
+            }
+            if attributes.is_empty() {
+                None
+            } else {
+                Some(attributes)
+            }
+        })
+        .collect()
+}
+
 #[test]
 fn test_full_person_entry_validation() {
     let schema = LdapSchema::with_core_schema();
@@ -107,6 +134,153 @@ fn test_inet_org_person_full_attributes() {
 }
 
 #[test]
+fn test_inet_org_person_allows_expanded_rfc2798_attributes() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Carol Example".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Example".to_string()]);
+    attributes.insert("uid".to_string(), vec!["carol".to_string()]);
+    attributes.insert("givenName".to_string(), vec!["Carol".to_string()]);
+    attributes.insert("displayName".to_string(), vec!["Carol Example".to_string()]);
+    attributes.insert("initials".to_string(), vec!["CE".to_string()]);
+    attributes.insert("businessCategory".to_string(), vec!["Research".to_string()]);
+    attributes.insert("carLicense".to_string(), vec!["WP-1234".to_string()]);
+    attributes.insert("departmentNumber".to_string(), vec!["RND".to_string()]);
+    attributes.insert("employeeNumber".to_string(), vec!["1001".to_string()]);
+    attributes.insert("employeeType".to_string(), vec!["Employee".to_string()]);
+    attributes.insert("homePhone".to_string(), vec!["+1 555 0101".to_string()]);
+    attributes.insert(
+        "homePostalAddress".to_string(),
+        vec!["10 Home Road$Colombo".to_string()],
+    );
+    attributes.insert("jpegPhoto".to_string(), vec!["jpeg bytes".to_string()]);
+    attributes.insert(
+        "labeledURI".to_string(),
+        vec!["https://example.com Carol Example".to_string()],
+    );
+    attributes.insert(
+        "manager".to_string(),
+        vec!["uid=manager,ou=people,dc=example,dc=com".to_string()],
+    );
+    attributes.insert("mobile".to_string(), vec!["+1 555 0102".to_string()]);
+    attributes.insert("o".to_string(), vec!["Example Corporation".to_string()]);
+    attributes.insert("pager".to_string(), vec!["+1 555 0103".to_string()]);
+    attributes.insert("preferredLanguage".to_string(), vec!["en-US".to_string()]);
+    attributes.insert("roomNumber".to_string(), vec!["A-101".to_string()]);
+    attributes.insert(
+        "secretary".to_string(),
+        vec!["uid=assistant,ou=people,dc=example,dc=com".to_string()],
+    );
+    attributes.insert("title".to_string(), vec!["Engineer".to_string()]);
+    attributes.insert("l".to_string(), vec!["Colombo".to_string()]);
+    attributes.insert("st".to_string(), vec!["Western Province".to_string()]);
+    attributes.insert("street".to_string(), vec!["100 Main Street".to_string()]);
+    attributes.insert("postalCode".to_string(), vec!["00100".to_string()]);
+    attributes.insert(
+        "postalAddress".to_string(),
+        vec!["100 Main Street$Colombo".to_string()],
+    );
+    attributes.insert(
+        "registeredAddress".to_string(),
+        vec!["200 Registered Road$Colombo".to_string()],
+    );
+    attributes.insert(
+        "physicalDeliveryOfficeName".to_string(),
+        vec!["Head Office".to_string()],
+    );
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "inetOrgPerson should allow common RFC2798 employee and contact attributes"
+    );
+}
+
+#[test]
+fn test_inet_org_person_manager_requires_dn_syntax() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Carol Example".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Example".to_string()]);
+    attributes.insert("manager".to_string(), vec!["not a dn".to_string()]);
+
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "manager"
+    ));
+}
+
+#[test]
+fn test_inet_org_person_mobile_requires_telephone_syntax() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Carol Example".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Example".to_string()]);
+    attributes.insert("mobile".to_string(), vec!["+1_555".to_string()]);
+
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "mobile"
+    ));
+}
+
+#[test]
+fn test_inet_org_person_employee_number_is_single_value() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Carol Example".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Example".to_string()]);
+    attributes.insert(
+        "employeeNumber".to_string(),
+        vec!["1001".to_string(), "1002".to_string()],
+    );
+
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::SingleValueViolation(attribute)) if attribute == "employeeNumber"
+    ));
+}
+
+#[test]
 fn test_organization_entry() {
     let schema = LdapSchema::with_core_schema();
 
@@ -123,6 +297,52 @@ fn test_organization_entry() {
 
     let result = schema.validate_entry(&attributes);
     assert!(result.is_ok(), "Valid organization entry should validate");
+}
+
+#[test]
+fn test_organization_allows_expanded_rfc4519_contact_attributes() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "organization".to_string()],
+    );
+    attributes.insert("o".to_string(), vec!["Example Corporation".to_string()]);
+    attributes.insert("l".to_string(), vec!["Colombo".to_string()]);
+    attributes.insert("st".to_string(), vec!["Western Province".to_string()]);
+    attributes.insert("street".to_string(), vec!["100 Main Street".to_string()]);
+    attributes.insert("postalCode".to_string(), vec!["00100".to_string()]);
+    attributes.insert("postOfficeBox".to_string(), vec!["PO Box 42".to_string()]);
+    attributes.insert(
+        "physicalDeliveryOfficeName".to_string(),
+        vec!["Head Office".to_string()],
+    );
+    attributes.insert(
+        "postalAddress".to_string(),
+        vec!["100 Main Street$Colombo".to_string()],
+    );
+    attributes.insert(
+        "registeredAddress".to_string(),
+        vec!["200 Registered Road$Colombo".to_string()],
+    );
+    attributes.insert(
+        "telephoneNumber".to_string(),
+        vec!["+94 11 555 0100".to_string()],
+    );
+    attributes.insert(
+        "seeAlso".to_string(),
+        vec!["ou=people,dc=example,dc=com".to_string()],
+    );
+    attributes.insert(
+        "businessCategory".to_string(),
+        vec!["Technology".to_string()],
+    );
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "Organization should allow common RFC4519 contact attributes"
+    );
 }
 
 #[test]
@@ -145,6 +365,356 @@ fn test_organizational_unit_entry() {
         result.is_ok(),
         "Valid organizationalUnit entry should validate"
     );
+}
+
+#[test]
+fn test_organizational_unit_allows_expanded_rfc4519_contact_attributes() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "organizationalUnit".to_string()],
+    );
+    attributes.insert("ou".to_string(), vec!["Groups".to_string()]);
+    attributes.insert("l".to_string(), vec!["Colombo".to_string()]);
+    attributes.insert("st".to_string(), vec!["Western Province".to_string()]);
+    attributes.insert("street".to_string(), vec!["100 Main Street".to_string()]);
+    attributes.insert("postalCode".to_string(), vec!["00100".to_string()]);
+    attributes.insert(
+        "postalAddress".to_string(),
+        vec!["100 Main Street$Colombo".to_string()],
+    );
+    attributes.insert(
+        "registeredAddress".to_string(),
+        vec!["200 Registered Road$Colombo".to_string()],
+    );
+    attributes.insert(
+        "telephoneNumber".to_string(),
+        vec!["+94 11 555 0100".to_string()],
+    );
+    attributes.insert(
+        "seeAlso".to_string(),
+        vec!["ou=people,dc=example,dc=com".to_string()],
+    );
+    attributes.insert(
+        "businessCategory".to_string(),
+        vec!["Directory container".to_string()],
+    );
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "Organizational units should allow common RFC4519 contact attributes"
+    );
+}
+
+#[test]
+fn test_group_of_names_allows_empty_open_dj_style_group() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "groupOfNames".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["empty-group".to_string()]);
+    attributes.insert("ou".to_string(), vec!["dc=example,dc=com".to_string()]);
+    attributes.insert("description".to_string(), vec!["Empty group".to_string()]);
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "OpenDJ-style empty groupOfNames entries should validate"
+    );
+}
+
+#[test]
+fn test_group_of_names_allows_standard_optional_attributes() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "groupOfNames".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["operators".to_string()]);
+    attributes.insert(
+        "member".to_string(),
+        vec!["uid=user1,ou=people,dc=example,dc=com".to_string()],
+    );
+    attributes.insert(
+        "owner".to_string(),
+        vec!["uid=owner,ou=people,dc=example,dc=com".to_string()],
+    );
+    attributes.insert(
+        "seeAlso".to_string(),
+        vec!["cn=auditors,ou=groups,dc=example,dc=com".to_string()],
+    );
+    attributes.insert("businessCategory".to_string(), vec!["Access".to_string()]);
+    attributes.insert("o".to_string(), vec!["Example Corporation".to_string()]);
+    attributes.insert("ou".to_string(), vec!["Security".to_string()]);
+    attributes.insert("description".to_string(), vec!["Operators".to_string()]);
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "groupOfNames should allow the standard optional attributes OpenDR supports"
+    );
+}
+
+#[test]
+fn test_group_of_names_allows_member_values() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "groupOfNames".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["users".to_string()]);
+    attributes.insert(
+        "member".to_string(),
+        vec!["uid=user1,ou=people,dc=example,dc=com".to_string()],
+    );
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "groupOfNames entries with members should still validate"
+    );
+}
+
+#[test]
+fn test_group_of_unique_names_entry() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "groupOfUniqueNames".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["admins".to_string()]);
+    attributes.insert(
+        "uniqueMember".to_string(),
+        vec!["uid=alice,ou=people,dc=example,dc=com".to_string()],
+    );
+    attributes.insert(
+        "owner".to_string(),
+        vec!["uid=owner,ou=people,dc=example,dc=com".to_string()],
+    );
+    attributes.insert(
+        "description".to_string(),
+        vec!["Administrators".to_string()],
+    );
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "groupOfUniqueNames should validate with DN-valued uniqueMember"
+    );
+}
+
+#[test]
+fn test_group_of_unique_names_requires_unique_member() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "groupOfUniqueNames".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["admins".to_string()]);
+
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::MissingRequiredAttribute(attribute)) if attribute == "uniqueMember"
+    ));
+}
+
+#[test]
+fn test_unique_member_requires_dn_syntax() {
+    let schema = LdapSchema::with_core_schema();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "groupOfUniqueNames".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["admins".to_string()]);
+    attributes.insert("uniqueMember".to_string(), vec!["not a dn".to_string()]);
+
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "uniqueMember"
+    ));
+}
+
+#[test]
+fn test_posix_group_entry() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "posixGroup".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["developers".to_string()]);
+    attributes.insert("gidNumber".to_string(), vec!["1000".to_string()]);
+    attributes.insert(
+        "memberUid".to_string(),
+        vec!["alice".to_string(), "bob".to_string()],
+    );
+    attributes.insert("description".to_string(), vec!["Developers".to_string()]);
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "posixGroup should validate with login-name memberUid values"
+    );
+}
+
+#[test]
+fn test_posix_account_auxiliary_entry() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+            "posixAccount".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Alice Example".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Example".to_string()]);
+    attributes.insert("uid".to_string(), vec!["alice".to_string()]);
+    attributes.insert("uidNumber".to_string(), vec!["1001".to_string()]);
+    attributes.insert("gidNumber".to_string(), vec!["1000".to_string()]);
+    attributes.insert("homeDirectory".to_string(), vec!["/home/alice".to_string()]);
+    attributes.insert("loginShell".to_string(), vec!["/bin/zsh".to_string()]);
+    attributes.insert("gecos".to_string(), vec!["Alice Example".to_string()]);
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "posixAccount should work as an auxiliary class on a normal person entry"
+    );
+}
+
+#[test]
+fn test_posix_account_requires_integer_uid_number() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+            "posixAccount".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Alice Example".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Example".to_string()]);
+    attributes.insert("uid".to_string(), vec!["alice".to_string()]);
+    attributes.insert("uidNumber".to_string(), vec!["01001".to_string()]);
+    attributes.insert("gidNumber".to_string(), vec!["1000".to_string()]);
+    attributes.insert("homeDirectory".to_string(), vec!["/home/alice".to_string()]);
+
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "uidNumber"
+    ));
+}
+
+#[test]
+fn test_posix_account_requires_home_directory() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+            "posixAccount".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Alice Example".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Example".to_string()]);
+    attributes.insert("uid".to_string(), vec!["alice".to_string()]);
+    attributes.insert("uidNumber".to_string(), vec!["1001".to_string()]);
+    attributes.insert("gidNumber".to_string(), vec!["1000".to_string()]);
+
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::MissingRequiredAttribute(attribute)) if attribute == "homeDirectory"
+    ));
+}
+
+#[test]
+fn test_posix_group_member_uid_is_not_a_dn() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "posixGroup".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["developers".to_string()]);
+    attributes.insert("gidNumber".to_string(), vec!["1000".to_string()]);
+    attributes.insert("memberUid".to_string(), vec!["alice".to_string()]);
+
+    assert!(
+        schema.validate_entry(&attributes).is_ok(),
+        "memberUid should accept POSIX login names, not require DN syntax"
+    );
+}
+
+#[test]
+fn test_posix_group_member_uid_requires_ia5_syntax() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec!["top".to_string(), "posixGroup".to_string()],
+    );
+    attributes.insert("cn".to_string(), vec!["developers".to_string()]);
+    attributes.insert("gidNumber".to_string(), vec!["1000".to_string()]);
+    attributes.insert("memberUid".to_string(), vec!["álîçé".to_string()]);
+
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "memberUid"
+    ));
+}
+
+#[test]
+fn test_standard_directory_ldif_fixture_validates() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let entries = parse_simple_entry_ldif(include_str!(
+        "../docs/schema_examples/standard-directory.ldif"
+    ));
+    assert!(!entries.is_empty(), "fixture should contain entries");
+
+    for (index, attributes) in entries.iter().enumerate() {
+        assert!(
+            schema.validate_entry(attributes).is_ok(),
+            "fixture entry {} should validate: {:?}",
+            index + 1,
+            attributes
+        );
+    }
 }
 
 #[test]

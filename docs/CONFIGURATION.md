@@ -468,9 +468,12 @@ allow_online_updates = false
 | --- | --- | --- |
 | `enabled` | `true` | Loads the built-in and external LDAP schema registry |
 | `schema_dir` | `config/schema` | Directory containing `.ldif`, `.schema`, or `.conf` schema definition files |
-| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files |
+| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files. Supported values are `core` and optional RFC 2307 `posix`. |
 | `strict_validation` | `true` | Treats malformed schema files as startup errors |
 | `allow_online_updates` | `false` | Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into `schema_dir/99-online.ldif` |
+
+Use `load_builtin = ["core", "posix"]` when clients need `posixAccount`,
+`posixGroup`, `uidNumber`, `gidNumber`, or `memberUid`.
 
 Schema files use RFC-style subschema attributes:
 

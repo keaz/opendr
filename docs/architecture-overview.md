@@ -214,6 +214,7 @@ Backend writes maintain operational attributes such as:
 
 - `entryCSN`
 - `entryUUID`
+- `entryDN`
 - create and modify timestamps
 - creators and modifiers names
 - `contextCSN`
@@ -222,7 +223,8 @@ Backend writes maintain operational attributes such as:
 - `failedLoginCount`
 
 Operational attributes are hidden from normal search results unless the client
-requests `+` or explicit operational attribute names.
+requests `+` or explicit operational attribute names. `entryDN` is synthesized
+from the entry name for OpenDJ-compatible clients.
 Simple bind and SASL PLAIN update account authentication metadata on the target
 entry. Failed binds increment `failedLoginCount`; a successful bind sets
 `lastSuccessfulLogin` and resets `failedLoginCount` to `0`. Clients cannot add

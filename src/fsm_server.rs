@@ -7311,7 +7311,7 @@ mod tests {
                     b"cn".to_vec().into(),
                     b"alice".to_vec().into(),
                 )),
-                &["cn"],
+                &["cn", "objectClass"],
                 false,
             ))
             .await
@@ -7324,10 +7324,89 @@ mod tests {
         match &messages[0].protocol_op {
             ProtocolOp::SearchResultEntry(entry) => {
                 assert_eq!(entry.object_name.0.as_ref(), "cn=alice,dc=example,dc=org");
+                assert_eq!(entry.attributes.len(), 2);
+                let attrs = entry
+                    .attributes
+                    .iter()
+                    .map(|attribute| {
+                        (
+                            attribute.attr_type.0.as_ref(),
+                            attribute
+                                .attr_vals
+                                .iter()
+                                .map(|value| value.0.as_ref())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                assert_eq!(attrs.get("cn"), Some(&vec![b"alice".as_slice()]));
+                assert_eq!(attrs.get("objectClass"), Some(&vec![b"person".as_slice()]));
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        match &messages[1].protocol_op {
+            ProtocolOp::SearchResultDone(done) => {
+                assert_eq!(done.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_returns_requested_entry_dn_operational_attribute() {
+        let backend = Arc::new(MockBackend::default());
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "uid=auth-user,dc=example,dc=org",
+                    HashMap::from([
+                        ("objectClass".to_string(), vec!["person".to_string()]),
+                        ("cn".to_string(), vec!["auth-user".to_string()]),
+                        ("uid".to_string(), vec!["auth-user".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                    ]),
+                ),
+                b"secret".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                15,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::EqualityMatch(RasnAttributeValueAssertion::new(
+                    b"uid".to_vec().into(),
+                    b"auth-user".to_vec().into(),
+                )),
+                &["entryDN"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0].protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => {
+                assert_eq!(
+                    entry.object_name.0.as_ref(),
+                    "uid=auth-user,dc=example,dc=org"
+                );
                 assert_eq!(entry.attributes.len(), 1);
-                assert_eq!(entry.attributes[0].attr_type.0.as_ref(), "cn");
-                assert_eq!(entry.attributes[0].attr_vals.len(), 1);
-                assert_eq!(entry.attributes[0].attr_vals[0].0.as_ref(), b"alice");
+                assert_eq!(entry.attributes[0].attr_type.0.as_ref(), "entryDN");
+                assert_eq!(
+                    entry.attributes[0].attr_vals[0].0.as_ref(),
+                    b"uid=auth-user,dc=example,dc=org"
+                );
             }
             other => panic!("unexpected response: {:?}", other),
         }

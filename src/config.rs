@@ -1466,17 +1466,18 @@ impl ServerConfig {
 
     /// Load the configured LDAP schema registry.
     pub fn load_schema(&self) -> Result<crate::schema::LdapSchema, ConfigError> {
-        let mut schema = if self.schema.enabled
-            && self
-                .schema
-                .load_builtin
-                .iter()
-                .any(|bundle| bundle.eq_ignore_ascii_case("core"))
-        {
-            crate::schema::LdapSchema::with_core_schema()
-        } else {
-            crate::schema::LdapSchema::new()
-        };
+        let mut schema = crate::schema::LdapSchema::new();
+
+        if self.schema.enabled {
+            for bundle in &self.schema.load_builtin {
+                schema.load_builtin_schema(bundle).map_err(|err| {
+                    ConfigError::ValidationError(format!(
+                        "failed to load builtin schema bundle {}: {}",
+                        bundle, err
+                    ))
+                })?;
+            }
+        }
 
         if self.schema.enabled
             && let Err(err) = schema.load_schema_dir(&self.schema.schema_dir)
@@ -1818,7 +1819,10 @@ impl ServerConfig {
             ));
         }
         for builtin in &self.schema.load_builtin {
-            if !["core"].contains(&builtin.as_str()) {
+            if !["core", "posix"]
+                .iter()
+                .any(|supported| builtin.eq_ignore_ascii_case(supported))
+            {
                 return Err(ConfigError::ValidationError(format!(
                     "unsupported builtin schema bundle: {}",
                     builtin

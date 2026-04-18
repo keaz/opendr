@@ -7,7 +7,7 @@ use crate::backend::{DirectoryBackend, DirectoryEntry, OperationalAttributes};
 use crate::fsm::SearchResultCode;
 use crate::ldap_filter_eval::{CompiledLdapFilter, PreparedLdapFilter};
 use crate::metrics::{FsmType, MetricsCollector, OperationType};
-use crate::operational_attrs::parse_attribute_request;
+use crate::operational_attrs::{parse_attribute_request, response_user_attribute_name};
 use crate::parser::encode_search_entry_parts_with_controls;
 use crate::schema::LdapSchema;
 use crate::search_fsm::{
@@ -438,7 +438,7 @@ fn project_search_entry_attributes(
     entry: &SearchEntry,
     projection: &AttributeProjection,
 ) -> Vec<(String, Vec<String>)> {
-    entry
+    let mut selected = entry
         .attributes
         .iter()
         .filter(|(name, _)| {
@@ -460,8 +460,29 @@ fn project_search_entry_attributes(
                         .any(|requested| requested.eq_ignore_ascii_case(name))
             }
         })
-        .map(|(name, values)| (name.clone(), values.clone()))
-        .collect()
+        .map(|(name, values)| {
+            let response_name = if OperationalAttributes::is_operational(name) {
+                name.clone()
+            } else {
+                response_user_attribute_name(name, &projection.requested_attributes)
+            };
+            (response_name, values.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let requests_entry_dn = projection.include_all_operational
+        || projection
+            .specific_operational
+            .iter()
+            .any(|requested| requested.eq_ignore_ascii_case("entrydn"));
+    let already_selected = selected
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("entrydn"));
+    if requests_entry_dn && !already_selected {
+        selected.push(("entryDN".to_string(), vec![entry.dn.clone()]));
+    }
+
+    selected
 }
 
 #[cfg(test)]

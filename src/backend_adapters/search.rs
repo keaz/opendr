@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::backend::DirectoryBackend;
 use crate::operational_attrs::{
     filter_operational_attributes, filter_user_attributes, merge_attributes,
+    parse_attribute_request,
 };
 use crate::search_fsm::{SearchBackend, SearchEntry};
 
@@ -52,8 +53,17 @@ impl SearchBackend for SearchBackendAdapter {
 
         Ok(entry.map(|entry| {
             let user_attrs = filter_user_attributes(&entry.attributes, attributes);
-            let operational =
+            let mut operational =
                 filter_operational_attributes(&entry.operational_attributes, attributes);
+            let (_, include_all_operational, specific_operational) =
+                parse_attribute_request(attributes);
+            if include_all_operational
+                || specific_operational
+                    .iter()
+                    .any(|attribute| attribute.eq_ignore_ascii_case("entrydn"))
+            {
+                operational.insert("entryDN".to_string(), vec![entry.dn.clone()]);
+            }
             let combined_attrs = merge_attributes(user_attrs, operational);
 
             Arc::new(SearchEntry {

@@ -342,6 +342,9 @@ Schema validation:
 - The core schema includes common LDAP classes such as `top`, `person`,
   `organizationalPerson`, `inetOrgPerson`, `organization`, and
   `organizationalUnit`.
+- The optional `posix` built-in schema bundle adds RFC 2307 `posixAccount`,
+  `posixGroup`, numeric ID attributes, home directory, login shell, GECOS, and
+  `memberUid`.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active
@@ -656,7 +659,7 @@ Search fails:
 - Bad paged cookies are rejected.
 - Subtree and one-level scope use the shared RFC 4514 DN parser and
   canonicalization path, including escaped separators and multi-valued RDNs.
-- Request `+` or explicit operational attributes for `entryCSN`, `entryUUID`,
+- Request `+` or explicit operational attributes for `entryCSN`, `entryUUID`, `entryDN`,
   `lastSuccessfulLogin`, `lastFailedLogin`, `failedLoginCount`, and other
   operational values.
 

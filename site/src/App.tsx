@@ -394,7 +394,7 @@ allow_online_updates = false`,
     options: [
       ["enabled", "Loads the built-in and external LDAP schema registry at startup."],
       ["schema_dir", "Directory for RFC-style LDIF schema files with `.ldif`, `.schema`, or `.conf` extensions."],
-      ["load_builtin", "Built-in schema bundle names loaded before external files."],
+      ["load_builtin", "Built-in schema bundle names loaded before external files. Use core by default, or add posix for RFC 2307 account and group entries."],
       ["strict_validation", "Treats malformed schema files as startup errors."],
       ["allow_online_updates", "Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into the configured schema directory."],
     ],
@@ -463,7 +463,7 @@ const troubleshootingRows = [
   ["Startup exits before listener", "Config path, log4rs path, secret source exclusivity, TLS file existence, and port conflicts."],
   ["LMDB root bind fails", "`root_password_file` must contain the full `{SSHA512}` hash, and the bind DN includes the base DN."],
   ["StartTLS bind fails", "Bind again after StartTLS because authentication state is reset."],
-  ["Search misses operational attributes", "Request `+` or explicit names such as `entryCSN`, `entryUUID`, `lastSuccessfulLogin`, and `failedLoginCount`."],
+  ["Search misses operational attributes", "Request `+` or explicit names such as `entryCSN`, `entryUUID`, `entryDN`, `lastSuccessfulLogin`, and `failedLoginCount`."],
   ["Replication stalls", "Provider changelog, consumer cookie, provider URL, bind credentials, listener mode, and retry logs."],
   ["Incremental backup fails", "Provider or both mode, persistent changelog path, changelog capacity, and parent checkpoint."],
 ];

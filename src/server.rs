@@ -8459,7 +8459,10 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
                 .iter()
                 .any(|attribute| attribute.eq_ignore_ascii_case(name))
         {
-            selected.push((name.clone(), values.clone()));
+            selected.push((
+                crate::operational_attrs::response_user_attribute_name(name, requested),
+                values.clone(),
+            ));
         }
     }
 
@@ -8468,7 +8471,10 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
             .iter()
             .any(|attr| OperationalAttributes::is_operational(attr))
     {
-        for (name, values) in entry.operational_attributes.to_attributes() {
+        let mut operational = entry.operational_attributes.to_attributes();
+        operational.insert("entryDN".to_string(), vec![entry.dn.clone()]);
+
+        for (name, values) in operational {
             if include_all_operational
                 || requested
                     .iter()

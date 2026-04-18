@@ -64,6 +64,23 @@ pub fn parse_attribute_request(requested_attrs: &[String]) -> (bool, bool, Vec<S
     (include_user, include_all_operational, specific_operational)
 }
 
+/// Return the client-requested spelling for a user attribute when one was
+/// explicitly requested. Storage keys are normalized, but LDAP clients can be
+/// case-sensitive after deserializing search results.
+pub fn response_user_attribute_name(stored_name: &str, requested_attrs: &[String]) -> String {
+    requested_attrs
+        .iter()
+        .find(|requested| {
+            let requested = requested.as_str();
+            requested != "*"
+                && requested != "+"
+                && !OperationalAttributes::is_operational(requested)
+                && requested.eq_ignore_ascii_case(stored_name)
+        })
+        .cloned()
+        .unwrap_or_else(|| stored_name.to_string())
+}
+
 /// Filter operational attributes based on request
 ///
 /// # Arguments
@@ -130,13 +147,20 @@ pub fn filter_user_attributes(
 
     user_attrs
         .iter()
-        .filter(|(key, _)| {
+        .filter_map(|(key, value)| {
             let key_lower = key.to_ascii_lowercase();
             // Include if requested and not operational
-            requested_lower.contains(&key_lower)
+            if requested_lower.contains(&key_lower)
                 && !OperationalAttributes::is_operational(&key_lower)
+            {
+                Some((
+                    response_user_attribute_name(key, requested_attrs),
+                    value.clone(),
+                ))
+            } else {
+                None
+            }
         })
-        .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
 
@@ -292,6 +316,20 @@ mod tests {
             !result.contains_key("createtimestamp"),
             "Should not include non-requested attr"
         );
+    }
+
+    #[test]
+    fn test_filter_user_preserves_requested_attribute_spelling() {
+        let mut user_attrs = HashMap::new();
+        user_attrs.insert("objectclass".to_string(), vec!["person".to_string()]);
+        user_attrs.insert("uid".to_string(), vec!["alice".to_string()]);
+
+        let requested = vec!["objectClass".to_string(), "uid".to_string()];
+        let result = filter_user_attributes(&user_attrs, &requested);
+
+        assert_eq!(result.get("objectClass"), Some(&vec!["person".to_string()]));
+        assert_eq!(result.get("uid"), Some(&vec!["alice".to_string()]));
+        assert!(!result.contains_key("objectclass"));
     }
 
     #[test]
