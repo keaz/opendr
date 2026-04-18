@@ -67,12 +67,13 @@ these gates pass and their artifacts are retained:
 2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 3. `cargo test --workspace --no-fail-fast`
 4. `cargo test --doc --quiet`
-5. `scripts/ldap_interop_gate.sh`
-6. `scripts/referral_alias_interop.sh` against a fixture with referral and alias entries
-7. `TLS_ROTATION_ARTIFACT_DIR=target/tls-rotation-gate/release-candidate ./scripts/tls_rotation_gate.sh`
-8. `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh`
-9. Retain `target/fuzz-gate/release-candidate` logs, corpora, dictionaries, and crash artifacts
-10. `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh`
+5. `cargo test --test rfc_compliance_matrix_integration`
+6. `scripts/ldap_interop_gate.sh`
+7. `scripts/referral_alias_interop.sh` against a fixture with referral and alias entries
+8. `TLS_ROTATION_ARTIFACT_DIR=target/tls-rotation-gate/release-candidate ./scripts/tls_rotation_gate.sh`
+9. `FUZZ_GATE_MODE=release FUZZ_GATE_OUTPUT_DIR=target/fuzz-gate/release-candidate ./scripts/fuzz_gate.sh`
+10. Retain `target/fuzz-gate/release-candidate` logs, corpora, dictionaries, and crash artifacts
+11. `PERF_GATE_MODE=release PERF_GATE_BASELINE_JSON=target/perf/regression-baseline/opendr/regression-100k/ldap-benchmark-results.json PERF_GATE_OUTPUT_DIR=target/perf/regression-candidate ./scripts/perf_regression_gate.sh`
 
 The manual GitHub workflow `Production Readiness Gate` runs the CI-friendly
 subset and documents the longer fuzz and soak commands that must be executed

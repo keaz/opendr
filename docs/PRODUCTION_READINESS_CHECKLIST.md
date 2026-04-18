@@ -13,7 +13,7 @@ operation behavior.
 | Rust tests | `cargo test --workspace --no-fail-fast` | All unit, integration, binary, and doctest-linked workspace targets pass. | CI log |
 | Doctests | `cargo test --doc --quiet` | All doctests pass or remain explicitly ignored. | CI log |
 | Clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | No warnings. | CI log |
-| RFC matrix review | Review `docs/LDAP_RFC_COMPLIANCE_MATRIX.md` and `docs/ROOT_DSE_CAPABILITIES.md` | Every advertised Root DSE capability has a supported or partial matrix row with coverage links. Unsupported rows are not advertised. | Release notes checklist |
+| RFC matrix review | `cargo test --test rfc_compliance_matrix_integration` | Every advertised Root DSE capability has a matrix row with coverage links. Unsupported or deferred rows are not advertised. | CI log |
 | OpenLDAP CLI interoperability | `scripts/ldap_interop_gate.sh` | `ldapsearch`, `ldapadd`, `ldapmodify`, `ldapdelete`, `ldapcompare`, and `ldapmodrdn` cover Bind, StartTLS, Root DSE, Search, Add, Modify, Delete, ModifyDN, Compare, paged results, server-side sort, schema, and operational attributes. | Script log |
 | Python client interoperability | `scripts/ldap_interop_gate.sh` | Python `ldap3` binds over StartTLS and reads Root DSE/schema data. | Script log |
 | Rust client interoperability | `scripts/ldap_interop_gate.sh` | `ldap_ops_client` completes Bind, Root DSE, Search, Add, Modify, Delete, ModifyDN, Compare, WhoAmI, and Password Modify. | Script log |
