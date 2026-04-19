@@ -4705,6 +4705,11 @@ enum X509GserValueAssertion {
         hw_type: String,
         hw_serial_num: String,
     },
+    KerberosPrincipalName {
+        realm: String,
+        name_type: String,
+        name_string: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -5504,6 +5509,16 @@ fn der_value_matches_gser_assertion(
             let candidate = parse_der_hardware_module_name(value)?;
             Ok(candidate.hw_type == *hw_type && candidate.hw_serial_num == *hw_serial_num)
         }
+        X509GserValueAssertion::KerberosPrincipalName {
+            realm,
+            name_type,
+            name_string,
+        } if type_id == "1.3.6.1.5.2.2" => {
+            let candidate = parse_der_kerberos_principal_name(value)?;
+            Ok(candidate.realm == *realm
+                && candidate.name_type == *name_type
+                && candidate.name_string == *name_string)
+        }
         _ => Ok(false),
     }
 }
@@ -5518,6 +5533,39 @@ struct X509PermanentIdentifierAssertion {
 struct X509HardwareModuleNameAssertion {
     hw_type: String,
     hw_serial_num: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509KerberosPrincipalNameAssertion {
+    realm: String,
+    name_type: String,
+    name_string: Vec<String>,
+}
+
+struct X509OtherNameOpenTypeParser {
+    oid: &'static str,
+    parse_assertion: fn(&str) -> Result<X509GserValueAssertion, String>,
+}
+
+const X509_OTHER_NAME_OPEN_TYPE_PARSERS: &[X509OtherNameOpenTypeParser] = &[
+    X509OtherNameOpenTypeParser {
+        oid: "1.3.6.1.5.5.7.8.3",
+        parse_assertion: parse_permanent_identifier_assertion,
+    },
+    X509OtherNameOpenTypeParser {
+        oid: "1.3.6.1.5.5.7.8.4",
+        parse_assertion: parse_hardware_module_name_assertion,
+    },
+    X509OtherNameOpenTypeParser {
+        oid: "1.3.6.1.5.2.2",
+        parse_assertion: parse_kerberos_principal_name_assertion,
+    },
+];
+
+fn x509_other_name_open_type_parser(type_id: &str) -> Option<&'static X509OtherNameOpenTypeParser> {
+    X509_OTHER_NAME_OPEN_TYPE_PARSERS
+        .iter()
+        .find(|parser| parser.oid == type_id)
 }
 
 fn parse_der_permanent_identifier(
@@ -5591,6 +5639,99 @@ fn parse_der_hardware_module_name(
         hw_type: decode_der_oid(hw_type.content)?,
         hw_serial_num: normalize_hex_bytes(hw_serial_num.content),
     })
+}
+
+fn parse_der_kerberos_principal_name(
+    value: &DerTlv<'_>,
+) -> Result<X509KerberosPrincipalNameAssertion, String> {
+    if value.tag != 0x30 {
+        return Err("KRB5PrincipalName otherName value must be a DER SEQUENCE".to_string());
+    }
+
+    let (remaining, realm_field) = read_der_tlv(value.content)?;
+    if realm_field.tag != 0xa0 {
+        return Err("KRB5PrincipalName realm must be explicit [0]".to_string());
+    }
+    let realm = explicit_der_string_value(&realm_field, "KRB5PrincipalName realm")?;
+
+    let (remaining, principal_field) = read_der_tlv(remaining)?;
+    if principal_field.tag != 0xa1 {
+        return Err("KRB5PrincipalName principalName must be explicit [1]".to_string());
+    }
+    if !remaining.is_empty() {
+        return Err("KRB5PrincipalName contains trailing DER data".to_string());
+    }
+    let (principal_remainder, principal_sequence) = read_der_tlv(principal_field.content)?;
+    if !principal_remainder.is_empty() {
+        return Err(
+            "KRB5PrincipalName principalName explicit value contains trailing DER data".to_string(),
+        );
+    }
+    if principal_sequence.tag != 0x30 {
+        return Err("KRB5PrincipalName principalName must contain a DER SEQUENCE".to_string());
+    }
+
+    let (remaining, name_type_field) = read_der_tlv(principal_sequence.content)?;
+    if name_type_field.tag != 0xa0 {
+        return Err("PrincipalName name-type must be explicit [0]".to_string());
+    }
+    let name_type = explicit_der_integer_decimal(&name_type_field, "PrincipalName name-type")?;
+
+    let (remaining, name_string_field) = read_der_tlv(remaining)?;
+    if name_string_field.tag != 0xa1 {
+        return Err("PrincipalName name-string must be explicit [1]".to_string());
+    }
+    if !remaining.is_empty() {
+        return Err("PrincipalName contains trailing DER data".to_string());
+    }
+    let (name_string_remainder, name_string_sequence) = read_der_tlv(name_string_field.content)?;
+    if !name_string_remainder.is_empty() {
+        return Err(
+            "PrincipalName name-string explicit value contains trailing DER data".to_string(),
+        );
+    }
+    if name_string_sequence.tag != 0x30 {
+        return Err("PrincipalName name-string must contain a DER SEQUENCE OF".to_string());
+    }
+
+    let mut name_string = Vec::new();
+    let mut remaining = name_string_sequence.content;
+    while !remaining.is_empty() {
+        let (next, component) = read_der_tlv(remaining)?;
+        name_string.push(
+            der_tlv_string_value(&component)
+                .map_err(|err| format!("PrincipalName name-string component: {err}"))?,
+        );
+        remaining = next;
+    }
+    if name_string.is_empty() {
+        return Err("PrincipalName name-string must contain at least one component".to_string());
+    }
+
+    Ok(X509KerberosPrincipalNameAssertion {
+        realm,
+        name_type,
+        name_string,
+    })
+}
+
+fn explicit_der_string_value(field: &DerTlv<'_>, label: &str) -> Result<String, String> {
+    let (remainder, value) = read_der_tlv(field.content)?;
+    if !remainder.is_empty() {
+        return Err(format!("{label} explicit value contains trailing DER data"));
+    }
+    der_tlv_string_value(&value).map_err(|err| format!("{label}: {err}"))
+}
+
+fn explicit_der_integer_decimal(field: &DerTlv<'_>, label: &str) -> Result<String, String> {
+    let (remainder, value) = read_der_tlv(field.content)?;
+    if !remainder.is_empty() {
+        return Err(format!("{label} explicit value contains trailing DER data"));
+    }
+    if value.tag != 0x02 {
+        return Err(format!("{label} must contain a DER INTEGER"));
+    }
+    der_integer_decimal(value.content).map_err(|err| format!("{label}: {err}"))
 }
 
 fn der_tlv_string_value(value: &DerTlv<'_>) -> Result<String, String> {
@@ -7655,11 +7796,12 @@ fn parse_other_name_value_assertion(
     type_id: &str,
     value: &str,
 ) -> Result<X509GserValueAssertion, String> {
-    match type_id {
-        "1.3.6.1.5.5.7.8.3" => parse_permanent_identifier_assertion(value),
-        "1.3.6.1.5.5.7.8.4" => parse_hardware_module_name_assertion(value),
-        _ => parse_gser_value_assertion(value),
-    }
+    let parse_assertion = if let Some(parser) = x509_other_name_open_type_parser(type_id) {
+        parser.parse_assertion
+    } else {
+        parse_gser_value_assertion
+    };
+    parse_assertion(value)
 }
 
 fn parse_permanent_identifier_assertion(value: &str) -> Result<X509GserValueAssertion, String> {
@@ -7713,6 +7855,74 @@ fn parse_hardware_module_name_assertion(value: &str) -> Result<X509GserValueAsse
         hw_serial_num: hw_serial_num
             .ok_or_else(|| "HardwareModuleName requires hwSerialNum".to_string())?,
     })
+}
+
+fn parse_kerberos_principal_name_assertion(value: &str) -> Result<X509GserValueAssertion, String> {
+    let components = parse_gser_sequence_fields(value, "KRB5PrincipalName")?;
+    let mut realm = None;
+    let mut principal_name = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "realm" if realm.is_none() => {
+                realm = Some(unquote_gser_dquote_string(rest)?);
+            }
+            "principalName" if principal_name.is_none() => {
+                principal_name = Some(parse_kerberos_principal_name_components(rest)?);
+            }
+            "realm" | "principalName" => {
+                return Err(format!("duplicate KRB5PrincipalName component {keyword}"));
+            }
+            other => return Err(format!("unknown KRB5PrincipalName component {other}")),
+        }
+    }
+
+    let (name_type, name_string) =
+        principal_name.ok_or_else(|| "KRB5PrincipalName requires principalName".to_string())?;
+
+    Ok(X509GserValueAssertion::KerberosPrincipalName {
+        realm: realm.ok_or_else(|| "KRB5PrincipalName requires realm".to_string())?,
+        name_type,
+        name_string,
+    })
+}
+
+fn parse_kerberos_principal_name_components(value: &str) -> Result<(String, Vec<String>), String> {
+    let components = parse_gser_sequence_fields(value, "PrincipalName")?;
+    let mut name_type = None;
+    let mut name_string = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "name-type" if name_type.is_none() => {
+                name_type = Some(normalize_signed_decimal_integer(rest)?);
+            }
+            "name-string" if name_string.is_none() => {
+                name_string = Some(parse_kerberos_name_string(rest)?);
+            }
+            "name-type" | "name-string" => {
+                return Err(format!("duplicate PrincipalName component {keyword}"));
+            }
+            other => return Err(format!("unknown PrincipalName component {other}")),
+        }
+    }
+
+    Ok((
+        name_type.ok_or_else(|| "PrincipalName requires name-type".to_string())?,
+        name_string.ok_or_else(|| "PrincipalName requires name-string".to_string())?,
+    ))
+}
+
+fn parse_kerberos_name_string(value: &str) -> Result<Vec<String>, String> {
+    let inner = braced_inner(value, "PrincipalName name-string")?;
+    let components = split_gser_components(inner)?;
+    if components.is_empty() {
+        return Err("PrincipalName name-string must contain at least one component".to_string());
+    }
+    components
+        .into_iter()
+        .map(unquote_gser_dquote_string)
+        .collect()
 }
 
 fn parse_gser_value_assertion(value: &str) -> Result<X509GserValueAssertion, String> {
@@ -9986,6 +10196,32 @@ mod tests {
             "1.3.6.1.5.5.7.8.4",
             wrap_der_value(0x30, &hardware_module_name),
             "{ hwType 1.2.3.5, hwSerialNum 'DEADBEEF'H }"
+        ));
+
+        let name_strings = [
+            wrap_der_value(0x1b, b"alice"),
+            wrap_der_value(0x1b, b"admin"),
+        ]
+        .concat();
+        let principal_name = [
+            wrap_der_value(0xa0, &wrap_der_value(0x02, &[1])),
+            wrap_der_value(0xa1, &wrap_der_value(0x30, &name_strings)),
+        ]
+        .concat();
+        let kerberos_principal_name = [
+            wrap_der_value(0xa0, &wrap_der_value(0x1b, b"EXAMPLE.COM")),
+            wrap_der_value(0xa1, &wrap_der_value(0x30, &principal_name)),
+        ]
+        .concat();
+        assert!(matches_other_name(
+            "1.3.6.1.5.2.2",
+            wrap_der_value(0x30, &kerberos_principal_name),
+            r#"{ realm "EXAMPLE.COM", principalName { name-type 1, name-string { "alice", "admin" } } }"#
+        ));
+        assert!(!matches_other_name(
+            "1.3.6.1.5.2.2",
+            wrap_der_value(0x30, &kerberos_principal_name),
+            r#"{ realm "EXAMPLE.COM", principalName { name-type 2, name-string { "alice", "admin" } } }"#
         ));
     }
 

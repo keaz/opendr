@@ -141,6 +141,29 @@ fn other_name_general_name_der(oid: &[u64], value: Vec<u8>) -> Vec<u8> {
     test_der_wrap(0xa0, &content)
 }
 
+fn kerberos_principal_name_other_name_value_der(
+    realm: &str,
+    name_type: u8,
+    name_string: &[&str],
+) -> Vec<u8> {
+    let mut name_string_der = Vec::new();
+    for component in name_string {
+        name_string_der.extend(test_der_wrap(0x1b, component.as_bytes()));
+    }
+
+    let mut principal_name = Vec::new();
+    principal_name.extend(test_der_wrap(
+        0xa0,
+        &test_der_wrap(0x02, &test_der_unsigned_integer_content(name_type)),
+    ));
+    principal_name.extend(test_der_wrap(0xa1, &test_der_wrap(0x30, &name_string_der)));
+
+    let mut value = Vec::new();
+    value.extend(test_der_wrap(0xa0, &test_der_wrap(0x1b, realm.as_bytes())));
+    value.extend(test_der_wrap(0xa1, &test_der_wrap(0x30, &principal_name)));
+    test_der_wrap(0x30, &value)
+}
+
 fn edi_party_name_general_name_der(name_assigner: Option<&str>, party_name: &str) -> Vec<u8> {
     let mut content = Vec::new();
     if let Some(name_assigner) = name_assigner {
@@ -343,6 +366,14 @@ fn name_constraints_extension_content() -> Vec<u8> {
             None,
         )
     };
+    let permitted_other_name_kerberos_principal = general_subtree_der(
+        other_name_general_name_der(
+            &[1, 3, 6, 1, 5, 2, 2],
+            kerberos_principal_name_other_name_value_der("EXAMPLE.COM", 1, &["alice", "admin"]),
+        ),
+        None,
+        None,
+    );
     let permitted_edi_party_name = general_subtree_der(
         edi_party_name_general_name_der(Some("Example EDI"), "Directory Gateway"),
         None,
@@ -377,6 +408,7 @@ fn name_constraints_extension_content() -> Vec<u8> {
     permitted_subtrees.extend(permitted_other_name_bit_string);
     permitted_subtrees.extend(permitted_other_name_permanent_identifier);
     permitted_subtrees.extend(permitted_other_name_hardware_module_name);
+    permitted_subtrees.extend(permitted_other_name_kerberos_principal);
     permitted_subtrees.extend(permitted_edi_party_name);
     permitted_subtrees.extend(permitted_x400_address);
     permitted_subtrees.extend(permitted_x400_psap_address);
@@ -1933,6 +1965,22 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .values_equal(
                 &cert_pem,
                 "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.3.6.1.5.5.7.8.4, value { hwType 1.2.3.5, hwSerialNum 'DEADBEEF'H } } } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                r#"{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.3.6.1.5.2.2, value { realm "EXAMPLE.COM", principalName { name-type 1, name-string { "alice", "admin" } } } } } } } }"#,
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                r#"{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.3.6.1.5.2.2, value { realm "EXAMPLE.COM", principalName { name-type 2, name-string { "alice", "admin" } } } } } } } }"#,
             )
             .unwrap()
     );

@@ -545,17 +545,19 @@ path-to-name checks against certificate NameConstraints, plus name-constraint
 assertions including asserted GeneralSubtree minimum/maximum bounds and
 `otherName` BOOLEAN, INTEGER, BIT STRING, NULL, object identifier, string,
 OCTET STRING, RFC 4043 `permanentIdentifier`, and RFC 4108
-`hardwareModuleName` values, `ediPartyName` values, X.400 ORAddress built-in standard
-attributes (`C`, `ADMD`, `PRMD`, `X121`, `T-ID`, `O`, `OU`, `UA-ID`, `S`, `G`,
-`I`, `GQ`), domain-defined `DD.<type>` attributes, and RFC 2156-renderable
-extension attributes (`CN`, physical-delivery keys, `NET-NUM`, `NET-SUB`,
-`NET-PSAP`, `T-TY`) rendered in RFC 2156 string form in GeneralSubtree bases;
-certificate pair issued-to and issued-by assertions that delegate to those
-certificate components; and CRL issuer, date-and-time, CRL-number range,
-authority key identifier, reason-flag, full-name distribution point, and
-name-relative-to-CRL-issuer distribution point assertions. The remaining RFC
-4523 components, including schema-specific `otherName` open-type values without
-a registered parser, are rejected explicitly until implemented.
+`hardwareModuleName` values, RFC 4556 Kerberos `id-pkinit-san`
+`KRB5PrincipalName` values, `ediPartyName` values, X.400 ORAddress built-in
+standard attributes (`C`, `ADMD`, `PRMD`, `X121`, `T-ID`, `O`, `OU`, `UA-ID`,
+`S`, `G`, `I`, `GQ`), domain-defined `DD.<type>` attributes, and RFC
+2156-renderable extension attributes (`CN`, physical-delivery keys, `NET-NUM`,
+`NET-SUB`, `NET-PSAP`, `T-TY`) rendered in RFC 2156 string form in
+GeneralSubtree bases; certificate pair issued-to and issued-by assertions that
+delegate to those certificate components; and CRL issuer, date-and-time,
+CRL-number range, authority key identifier, reason-flag, full-name distribution
+point, and name-relative-to-CRL-issuer distribution point assertions.
+Additional constructed `otherName` OIDs are rejected explicitly until a
+type-specific parser is registered, which keeps OpenDR from guessing ASN.1
+open-type semantics.
 
 ### Core Attributes
 

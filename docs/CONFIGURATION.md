@@ -494,12 +494,14 @@ they use the implemented certificate serial, issuer, subject, key identifiers,
 validity, private-key validity, subject-public-key algorithm, key usage, subject
 alternative name type, certificate policy, name constraints including asserted
 GeneralSubtree minimum/maximum bounds, `otherName` primitive values, RFC 4043
-`permanentIdentifier`, RFC 4108 `hardwareModuleName`, `ediPartyName` values,
-X.400 ORAddress built-in standard, domain-defined, and RFC 2156-renderable
-extension attributes including `NET-PSAP` presentation addresses, CRL issuer,
-CRL date, CRL-number range, CRL authority key identifier, reason-flag, full-name
+`permanentIdentifier`, RFC 4108 `hardwareModuleName`, RFC 4556 Kerberos
+`id-pkinit-san` `KRB5PrincipalName`, `ediPartyName` values, X.400 ORAddress
+built-in standard, domain-defined, and RFC 2156-renderable extension attributes
+including `NET-PSAP` presentation addresses, CRL issuer, CRL date,
+CRL-number range, CRL authority key identifier, reason-flag, full-name
 distribution point, or name-relative-to-CRL-issuer distribution point
-components.
+components. Additional constructed `otherName` OIDs fail closed until a
+type-specific parser is registered.
 
 Generate bundled schema files when a deployment needs file-based schema
 artifacts instead of relying only on `load_builtin`:
