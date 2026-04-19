@@ -157,6 +157,12 @@ fn test_component_certificate_pem() -> String {
         rcgen::KeyUsagePurpose::DigitalSignature,
         rcgen::KeyUsagePurpose::KeyEncipherment,
     ];
+    params.name_constraints = Some(rcgen::NameConstraints {
+        permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("example.org".to_string())],
+        excluded_subtrees: vec![rcgen::GeneralSubtree::Rfc822Name(
+            "blocked@example.org".to_string(),
+        )],
+    });
     params
         .custom_extensions
         .push(rcgen::CustomExtension::from_oid_content(
@@ -1470,7 +1476,9 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .values_equal(
                 &cert_pem,
                 &format!(
-                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, privateKeyValid 20240601000000Z, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }} }}"
+                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, privateKeyValid 20240601000000Z, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }}, nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{} }} }}, excludedSubtrees {{ {{ base rfc822Name:{} }} }} }} }}",
+                    gser_quote("example.org"),
+                    gser_quote("blocked@example.org")
                 ),
             )
             .unwrap()
@@ -1498,6 +1506,17 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
     assert!(
         !certificate_component_rule
             .values_equal(&cert_pem, "{ privateKeyValid 20260101000000Z }")
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{} }} }} }} }}",
+                    gser_quote("other.org")
+                )
+            )
             .unwrap()
     );
 

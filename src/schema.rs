@@ -5682,6 +5682,7 @@ struct X509CertificateAssertion {
     key_usage_flags: Option<u16>,
     subject_alt_name: Option<X509AltNameTypeAssertion>,
     policy_oids: Option<Vec<String>>,
+    name_constraints: Option<X509NameConstraintsAssertion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -5749,6 +5750,17 @@ enum X509GeneralNameAssertion {
     UniformResourceIdentifier(String),
     IpAddress(String),
     RegisteredId(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct X509NameConstraintsAssertion {
+    permitted_subtrees: Option<Vec<X509GeneralSubtreeAssertion>>,
+    excluded_subtrees: Option<Vec<X509GeneralSubtreeAssertion>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct X509GeneralSubtreeAssertion {
+    base: X509GeneralNameAssertion,
 }
 
 fn normalize_x509_certificate_exact_match_value(value: &str) -> Result<String, String> {
@@ -6127,6 +6139,19 @@ fn x509_certificate_der_matches_assertion(
             return Ok(false);
         }
     }
+    if let Some(asserted_name_constraints) = assertion.name_constraints.as_ref() {
+        let Some(name_constraints) = certificate.iter_extensions().find_map(|extension| {
+            match extension.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::NameConstraints(value) => Some(value),
+                _ => None,
+            }
+        }) else {
+            return Ok(false);
+        };
+        if !name_constraints_match(name_constraints, asserted_name_constraints) {
+            return Ok(false);
+        }
+    }
 
     Ok(true)
 }
@@ -6240,6 +6265,37 @@ fn distribution_point_name_matches(
         }
     }
     Ok(true)
+}
+
+fn name_constraints_match(
+    candidate: &x509_parser::extensions::NameConstraints<'_>,
+    assertion: &X509NameConstraintsAssertion,
+) -> bool {
+    if let Some(asserted_permitted) = assertion.permitted_subtrees.as_ref()
+        && !general_subtrees_match(candidate.permitted_subtrees.as_deref(), asserted_permitted)
+    {
+        return false;
+    }
+    if let Some(asserted_excluded) = assertion.excluded_subtrees.as_ref()
+        && !general_subtrees_match(candidate.excluded_subtrees.as_deref(), asserted_excluded)
+    {
+        return false;
+    }
+    true
+}
+
+fn general_subtrees_match(
+    candidate: Option<&[x509_parser::extensions::GeneralSubtree<'_>]>,
+    assertion: &[X509GeneralSubtreeAssertion],
+) -> bool {
+    let Some(candidate) = candidate else {
+        return assertion.is_empty();
+    };
+    assertion.iter().all(|asserted_subtree| {
+        candidate.iter().any(|candidate_subtree| {
+            general_name_matches(&candidate_subtree.base, &asserted_subtree.base)
+        })
+    })
 }
 
 fn general_name_matches(
@@ -6536,6 +6592,7 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
         key_usage_flags: None,
         subject_alt_name: None,
         policy_oids: None,
+        name_constraints: None,
     };
 
     for (keyword, rest) in components {
@@ -6575,6 +6632,9 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
             "policy" if assertion.policy_oids.is_none() => {
                 assertion.policy_oids = Some(parse_cert_policy_set(rest)?);
             }
+            "nameConstraints" if assertion.name_constraints.is_none() => {
+                assertion.name_constraints = Some(parse_name_constraints_assertion(rest)?);
+            }
             "serialNumber"
             | "issuer"
             | "subjectKeyIdentifier"
@@ -6585,12 +6645,13 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
             | "subjectPublicKeyAlgID"
             | "keyUsage"
             | "subjectAltName"
-            | "policy" => {
+            | "policy"
+            | "nameConstraints" => {
                 return Err(format!(
                     "duplicate CertificateAssertion component {keyword}"
                 ));
             }
-            "pathToName" | "nameConstraints" => {
+            "pathToName" => {
                 return Err(format!(
                     "unsupported CertificateAssertion component {keyword}"
                 ));
@@ -6963,6 +7024,76 @@ fn parse_cert_policy_set(value: &str) -> Result<Vec<String>, String> {
         normalized.push(policy);
     }
     Ok(normalized)
+}
+
+fn parse_name_constraints_assertion(value: &str) -> Result<X509NameConstraintsAssertion, String> {
+    let components = parse_gser_sequence_fields(value, "NameConstraints")?;
+    let mut assertion = X509NameConstraintsAssertion {
+        permitted_subtrees: None,
+        excluded_subtrees: None,
+    };
+
+    for (keyword, rest) in components {
+        match keyword {
+            "permittedSubtrees" if assertion.permitted_subtrees.is_none() => {
+                assertion.permitted_subtrees = Some(parse_general_subtrees(rest)?);
+            }
+            "excludedSubtrees" if assertion.excluded_subtrees.is_none() => {
+                assertion.excluded_subtrees = Some(parse_general_subtrees(rest)?);
+            }
+            "permittedSubtrees" | "excludedSubtrees" => {
+                return Err(format!("duplicate NameConstraints component {keyword}"));
+            }
+            other => return Err(format!("unknown NameConstraints component {other}")),
+        }
+    }
+
+    Ok(assertion)
+}
+
+fn parse_general_subtrees(value: &str) -> Result<Vec<X509GeneralSubtreeAssertion>, String> {
+    let inner = braced_inner(value, "GeneralSubtrees")?;
+    let subtrees = split_gser_components(inner)?;
+    if subtrees.is_empty() {
+        return Err("GeneralSubtrees must contain at least one GeneralSubtree".to_string());
+    }
+    subtrees
+        .into_iter()
+        .map(parse_general_subtree)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn parse_general_subtree(value: &str) -> Result<X509GeneralSubtreeAssertion, String> {
+    let components = parse_gser_sequence_fields(value, "GeneralSubtree")?;
+    let mut base = None;
+    let mut minimum_seen = false;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "base" if base.is_none() => base = Some(parse_general_name(rest)?),
+            "minimum" if !minimum_seen => {
+                minimum_seen = true;
+                let minimum = normalize_unsigned_decimal_integer(rest)?;
+                if minimum != "0" {
+                    return Err(
+                        "GeneralSubtree minimum values other than 0 are not supported yet"
+                            .to_string(),
+                    );
+                }
+            }
+            "maximum" => {
+                return Err("GeneralSubtree maximum is not supported yet".to_string());
+            }
+            "base" | "minimum" => {
+                return Err(format!("duplicate GeneralSubtree component {keyword}"));
+            }
+            other => return Err(format!("unknown GeneralSubtree component {other}")),
+        }
+    }
+
+    Ok(X509GeneralSubtreeAssertion {
+        base: base.ok_or_else(|| "GeneralSubtree requires a base component".to_string())?,
+    })
 }
 
 fn parse_distribution_point_name(
