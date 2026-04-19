@@ -4671,6 +4671,14 @@ enum X509GserValueAssertion {
     ObjectIdentifier(String),
     String(String),
     OctetString(String),
+    PermanentIdentifier {
+        identifier_value: Option<String>,
+        assigner: Option<String>,
+    },
+    HardwareModuleName {
+        hw_type: String,
+        hw_serial_num: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -5370,7 +5378,7 @@ fn general_name_matches(
             X509GeneralNameAssertion::OtherName { type_id, value },
         ) => {
             candidate_oid.to_id_string() == *type_id
-                && other_name_value_matches(candidate_value, value).unwrap_or(false)
+                && other_name_value_matches(candidate_value, type_id, value).unwrap_or(false)
         }
         (
             x509_parser::extensions::GeneralName::RFC822Name(candidate),
@@ -5410,6 +5418,7 @@ fn general_name_matches(
 
 fn other_name_value_matches(
     candidate: &[u8],
+    type_id: &str,
     assertion: &X509GserValueAssertion,
 ) -> Result<bool, String> {
     let (remainder, explicit_value) = read_der_tlv(candidate)?;
@@ -5424,10 +5433,11 @@ fn other_name_value_matches(
     if !remainder.is_empty() {
         return Err("otherName explicit value contains trailing DER data".to_string());
     }
-    der_value_matches_gser_assertion(&value, assertion)
+    der_value_matches_gser_assertion(type_id, &value, assertion)
 }
 
 fn der_value_matches_gser_assertion(
+    type_id: &str,
     value: &DerTlv<'_>,
     assertion: &X509GserValueAssertion,
 ) -> Result<bool, String> {
@@ -5454,8 +5464,107 @@ fn der_value_matches_gser_assertion(
         X509GserValueAssertion::OctetString(asserted) if value.tag == 0x04 => {
             Ok(normalize_hex_bytes(value.content) == *asserted)
         }
+        X509GserValueAssertion::PermanentIdentifier {
+            identifier_value,
+            assigner,
+        } if type_id == "1.3.6.1.5.5.7.8.3" => {
+            let candidate = parse_der_permanent_identifier(value)?;
+            Ok(candidate.identifier_value == *identifier_value && candidate.assigner == *assigner)
+        }
+        X509GserValueAssertion::HardwareModuleName {
+            hw_type,
+            hw_serial_num,
+        } if type_id == "1.3.6.1.5.5.7.8.4" => {
+            let candidate = parse_der_hardware_module_name(value)?;
+            Ok(candidate.hw_type == *hw_type && candidate.hw_serial_num == *hw_serial_num)
+        }
         _ => Ok(false),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509PermanentIdentifierAssertion {
+    identifier_value: Option<String>,
+    assigner: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509HardwareModuleNameAssertion {
+    hw_type: String,
+    hw_serial_num: String,
+}
+
+fn parse_der_permanent_identifier(
+    value: &DerTlv<'_>,
+) -> Result<X509PermanentIdentifierAssertion, String> {
+    if value.tag != 0x30 {
+        return Err("permanentIdentifier otherName value must be a DER SEQUENCE".to_string());
+    }
+
+    let mut identifier_value = None;
+    let mut assigner = None;
+    let mut remaining = value.content;
+    while !remaining.is_empty() {
+        let (next, field) = read_der_tlv(remaining)?;
+        match field.tag {
+            0x0c if identifier_value.is_none() => {
+                identifier_value = Some(
+                    der_tlv_string_value(&field)
+                        .map_err(|err| format!("permanentIdentifier identifierValue: {err}"))?,
+                );
+            }
+            0x06 if assigner.is_none() => {
+                if !der_oid_content_is_valid(field.content) {
+                    return Err("permanentIdentifier assigner DER OID is invalid".to_string());
+                }
+                assigner = Some(decode_der_oid(field.content)?);
+            }
+            0x0c => {
+                return Err("permanentIdentifier contains duplicate identifierValue".to_string());
+            }
+            0x06 => return Err("permanentIdentifier contains duplicate assigner".to_string()),
+            other => {
+                return Err(format!(
+                    "permanentIdentifier contains unexpected DER tag 0x{other:02x}"
+                ));
+            }
+        }
+        remaining = next;
+    }
+
+    Ok(X509PermanentIdentifierAssertion {
+        identifier_value,
+        assigner,
+    })
+}
+
+fn parse_der_hardware_module_name(
+    value: &DerTlv<'_>,
+) -> Result<X509HardwareModuleNameAssertion, String> {
+    if value.tag != 0x30 {
+        return Err("hardwareModuleName otherName value must be a DER SEQUENCE".to_string());
+    }
+
+    let (remaining, hw_type) = read_der_tlv(value.content)?;
+    if hw_type.tag != 0x06 {
+        return Err("hardwareModuleName hwType must be a DER OBJECT IDENTIFIER".to_string());
+    }
+    if !der_oid_content_is_valid(hw_type.content) {
+        return Err("hardwareModuleName hwType DER OID is invalid".to_string());
+    }
+
+    let (remaining, hw_serial_num) = read_der_tlv(remaining)?;
+    if hw_serial_num.tag != 0x04 {
+        return Err("hardwareModuleName hwSerialNum must be a DER OCTET STRING".to_string());
+    }
+    if !remaining.is_empty() {
+        return Err("hardwareModuleName contains trailing DER data".to_string());
+    }
+
+    Ok(X509HardwareModuleNameAssertion {
+        hw_type: decode_der_oid(hw_type.content)?,
+        hw_serial_num: normalize_hex_bytes(hw_serial_num.content),
+    })
 }
 
 fn der_tlv_string_value(value: &DerTlv<'_>) -> Result<String, String> {
@@ -7499,7 +7608,7 @@ fn parse_other_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
                 type_id = Some(parse_object_identifier_component(rest)?);
             }
             "value" if other_name_value.is_none() => {
-                other_name_value = Some(parse_gser_value_assertion(rest)?);
+                other_name_value = Some(rest);
             }
             "type-id" | "value" => {
                 return Err(format!("duplicate OtherName component {keyword}"));
@@ -7508,9 +7617,75 @@ fn parse_other_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
         }
     }
 
-    Ok(X509GeneralNameAssertion::OtherName {
-        type_id: type_id.ok_or_else(|| "OtherName requires type-id".to_string())?,
-        value: other_name_value.ok_or_else(|| "OtherName requires value".to_string())?,
+    let type_id = type_id.ok_or_else(|| "OtherName requires type-id".to_string())?;
+    let other_name_value =
+        other_name_value.ok_or_else(|| "OtherName requires value".to_string())?;
+    let value = parse_other_name_value_assertion(&type_id, other_name_value)?;
+
+    Ok(X509GeneralNameAssertion::OtherName { type_id, value })
+}
+
+fn parse_other_name_value_assertion(
+    type_id: &str,
+    value: &str,
+) -> Result<X509GserValueAssertion, String> {
+    match type_id {
+        "1.3.6.1.5.5.7.8.3" => parse_permanent_identifier_assertion(value),
+        "1.3.6.1.5.5.7.8.4" => parse_hardware_module_name_assertion(value),
+        _ => parse_gser_value_assertion(value),
+    }
+}
+
+fn parse_permanent_identifier_assertion(value: &str) -> Result<X509GserValueAssertion, String> {
+    let components = parse_gser_sequence_fields(value, "PermanentIdentifier")?;
+    let mut identifier_value = None;
+    let mut assigner = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "identifierValue" if identifier_value.is_none() => {
+                identifier_value = Some(unquote_gser_dquote_string(rest)?);
+            }
+            "assigner" if assigner.is_none() => {
+                assigner = Some(parse_object_identifier_component(rest)?);
+            }
+            "identifierValue" | "assigner" => {
+                return Err(format!("duplicate PermanentIdentifier component {keyword}"));
+            }
+            other => return Err(format!("unknown PermanentIdentifier component {other}")),
+        }
+    }
+
+    Ok(X509GserValueAssertion::PermanentIdentifier {
+        identifier_value,
+        assigner,
+    })
+}
+
+fn parse_hardware_module_name_assertion(value: &str) -> Result<X509GserValueAssertion, String> {
+    let components = parse_gser_sequence_fields(value, "HardwareModuleName")?;
+    let mut hw_type = None;
+    let mut hw_serial_num = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "hwType" if hw_type.is_none() => {
+                hw_type = Some(parse_object_identifier_component(rest)?);
+            }
+            "hwSerialNum" if hw_serial_num.is_none() => {
+                hw_serial_num = Some(parse_octet_string_hex(rest)?);
+            }
+            "hwType" | "hwSerialNum" => {
+                return Err(format!("duplicate HardwareModuleName component {keyword}"));
+            }
+            other => return Err(format!("unknown HardwareModuleName component {other}")),
+        }
+    }
+
+    Ok(X509GserValueAssertion::HardwareModuleName {
+        hw_type: hw_type.ok_or_else(|| "HardwareModuleName requires hwType".to_string())?,
+        hw_serial_num: hw_serial_num
+            .ok_or_else(|| "HardwareModuleName requires hwSerialNum".to_string())?,
     })
 }
 
@@ -9716,7 +9891,7 @@ mod tests {
             let (remainder, value) = read_der_tlv(der).unwrap();
             assert!(remainder.is_empty());
             let assertion = parse_gser_value_assertion(gser).unwrap();
-            der_value_matches_gser_assertion(&value, &assertion).unwrap()
+            der_value_matches_gser_assertion("1.2.3.4", &value, &assertion).unwrap()
         }
 
         assert!(matches_gser(&wrap_der_value(0x01, &[0xff]), "TRUE"));
@@ -9743,6 +9918,48 @@ mod tests {
         assert!(!matches_gser(
             &wrap_der_value(0x04, &[0xde, 0xad]),
             "'BEEF'H"
+        ));
+    }
+
+    #[test]
+    fn rfc4523_other_name_known_constructed_values_match_der() {
+        fn matches_other_name(type_id: &str, der_value: Vec<u8>, gser_value: &str) -> bool {
+            let assertion =
+                parse_other_name(&format!("{{ type-id {type_id}, value {gser_value} }}")).unwrap();
+            let X509GeneralNameAssertion::OtherName { type_id, value } = assertion else {
+                panic!("expected otherName assertion");
+            };
+            other_name_value_matches(&wrap_der_value(0xa0, &der_value), &type_id, &value).unwrap()
+        }
+
+        let mut permanent_identifier = Vec::new();
+        permanent_identifier.extend(wrap_der_value(0x0c, b"employee-123"));
+        permanent_identifier.extend(wrap_der_value(0x06, &[0x2a, 0x03, 0x04]));
+        assert!(matches_other_name(
+            "1.3.6.1.5.5.7.8.3",
+            wrap_der_value(0x30, &permanent_identifier),
+            r#"{ identifierValue "employee-123", assigner 1.2.3.4 }"#
+        ));
+        assert!(!matches_other_name(
+            "1.3.6.1.5.5.7.8.3",
+            wrap_der_value(0x30, &permanent_identifier),
+            r#"{ identifierValue "employee-999", assigner 1.2.3.4 }"#
+        ));
+
+        let hardware_module_name = [
+            wrap_der_value(0x06, &[0x2a, 0x03, 0x04]),
+            wrap_der_value(0x04, &[0xde, 0xad, 0xbe, 0xef]),
+        ]
+        .concat();
+        assert!(matches_other_name(
+            "1.3.6.1.5.5.7.8.4",
+            wrap_der_value(0x30, &hardware_module_name),
+            "{ hwType 1.2.3.4, hwSerialNum 'DEADBEEF'H }"
+        ));
+        assert!(!matches_other_name(
+            "1.3.6.1.5.5.7.8.4",
+            wrap_der_value(0x30, &hardware_module_name),
+            "{ hwType 1.2.3.5, hwSerialNum 'DEADBEEF'H }"
         ));
     }
 

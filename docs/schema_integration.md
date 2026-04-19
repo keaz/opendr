@@ -543,8 +543,9 @@ certificate-valid time, private-key-valid time, subject-public-key algorithm,
 key usage, subject alternative name type, certificate policy, and
 path-to-name checks against certificate NameConstraints, plus name-constraint
 assertions including asserted GeneralSubtree minimum/maximum bounds and
-`otherName` BOOLEAN, INTEGER, BIT STRING, NULL, object identifier, string, and
-OCTET STRING values, `ediPartyName` values, X.400 ORAddress built-in standard
+`otherName` BOOLEAN, INTEGER, BIT STRING, NULL, object identifier, string,
+OCTET STRING, RFC 4043 `permanentIdentifier`, and RFC 4108
+`hardwareModuleName` values, `ediPartyName` values, X.400 ORAddress built-in standard
 attributes (`C`, `ADMD`, `PRMD`, `X121`, `T-ID`, `O`, `OU`, `UA-ID`, `S`, `G`,
 `I`, `GQ`), domain-defined `DD.<type>` attributes, and RFC 2156-renderable
 extension attributes (`CN`, physical-delivery keys, `NET-NUM`, `NET-SUB`,
@@ -553,8 +554,8 @@ certificate pair issued-to and issued-by assertions that delegate to those
 certificate components; and CRL issuer, date-and-time, CRL-number range,
 authority key identifier, reason-flag, full-name distribution point, and
 name-relative-to-CRL-issuer distribution point assertions. The remaining RFC
-4523 components, including constructed or schema-specific open-type `otherName`
-values, are rejected explicitly until implemented.
+4523 components, including schema-specific `otherName` open-type values without
+a registered parser, are rejected explicitly until implemented.
 
 ### Core Attributes
 

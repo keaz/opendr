@@ -374,7 +374,8 @@ Schema validation:
   usage, subject alternative name type, certificate policy, and name-constraint
   assertions including asserted GeneralSubtree minimum/maximum bounds;
   `otherName` BOOLEAN, INTEGER, BIT STRING, NULL, object identifier, string,
-  and OCTET STRING values plus `ediPartyName` values and X.400 ORAddress
+  OCTET STRING, RFC 4043 `permanentIdentifier`, and RFC 4108
+  `hardwareModuleName` values plus `ediPartyName` values and X.400 ORAddress
   built-in standard attributes (`C`, `ADMD`, `PRMD`, `X121`, `T-ID`, `O`, `OU`,
   `UA-ID`, `S`, `G`, `I`, `GQ`), domain-defined `DD.<type>` attributes, and
   RFC 2156-renderable extension attributes (`CN`, PDS keys, `NET-NUM`,
@@ -383,8 +384,8 @@ Schema validation:
   component matching delegates to those certificate components; CRL component
   matching covers issuer, date, CRL-number ranges, authority key identifier,
   reason flags, full-name distribution points, and name-relative-to-CRL-issuer
-  distribution points. The remaining RFC 4523 constructed or schema-specific
-  open-type `otherName` values remain tracked follow-up work.
+  distribution points. Remaining schema-specific `otherName` open-type values
+  without a registered parser remain tracked follow-up work.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active

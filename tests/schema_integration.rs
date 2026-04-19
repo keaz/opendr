@@ -323,6 +323,26 @@ fn name_constraints_extension_content() -> Vec<u8> {
         None,
         None,
     );
+    let permitted_other_name_permanent_identifier = {
+        let mut value = Vec::new();
+        value.extend(test_der_wrap(0x0c, b"employee-123"));
+        value.extend(test_der_oid(&[1, 2, 3, 4]));
+        general_subtree_der(
+            other_name_general_name_der(&[1, 3, 6, 1, 5, 5, 7, 8, 3], test_der_wrap(0x30, &value)),
+            None,
+            None,
+        )
+    };
+    let permitted_other_name_hardware_module_name = {
+        let mut value = Vec::new();
+        value.extend(test_der_oid(&[1, 2, 3, 4]));
+        value.extend(test_der_wrap(0x04, &[0xde, 0xad, 0xbe, 0xef]));
+        general_subtree_der(
+            other_name_general_name_der(&[1, 3, 6, 1, 5, 5, 7, 8, 4], test_der_wrap(0x30, &value)),
+            None,
+            None,
+        )
+    };
     let permitted_edi_party_name = general_subtree_der(
         edi_party_name_general_name_der(Some("Example EDI"), "Directory Gateway"),
         None,
@@ -355,6 +375,8 @@ fn name_constraints_extension_content() -> Vec<u8> {
     permitted_subtrees.extend(permitted_other_name_integer);
     permitted_subtrees.extend(permitted_other_name_oid);
     permitted_subtrees.extend(permitted_other_name_bit_string);
+    permitted_subtrees.extend(permitted_other_name_permanent_identifier);
+    permitted_subtrees.extend(permitted_other_name_hardware_module_name);
     permitted_subtrees.extend(permitted_edi_party_name);
     permitted_subtrees.extend(permitted_x400_address);
     permitted_subtrees.extend(permitted_x400_psap_address);
@@ -1879,6 +1901,38 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .values_equal(
                 &cert_pem,
                 "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.2.3.8, value '1010'B } } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                r#"{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.3.6.1.5.5.7.8.3, value { identifierValue "employee-123", assigner 1.2.3.4 } } } } } }"#,
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                r#"{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.3.6.1.5.5.7.8.3, value { identifierValue "employee-999", assigner 1.2.3.4 } } } } } }"#,
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.3.6.1.5.5.7.8.4, value { hwType 1.2.3.4, hwSerialNum 'DEADBEEF'H } } } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.3.6.1.5.5.7.8.4, value { hwType 1.2.3.5, hwSerialNum 'DEADBEEF'H } } } } } }",
             )
             .unwrap()
     );
