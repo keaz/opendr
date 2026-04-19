@@ -504,9 +504,10 @@ artifacts instead of relying only on `load_builtin`:
 opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
-The command writes files such as `config/schema/core/rfc3672.ldif`,
-`config/schema/core/rfc3671.ldif`, `config/schema/posix/rfc2307.ldif`,
-`config/schema/cosine/rfc4524.ldif`, and `config/schema/x509/rfc4523.ldif`.
+The command writes files such as `config/schema/core/rfc2798.ldif`,
+`config/schema/core/rfc3672.ldif`, `config/schema/core/rfc3671.ldif`,
+`config/schema/posix/rfc2307.ldif`, `config/schema/cosine/rfc4524.ldif`, and
+`config/schema/x509/rfc4523.ldif`.
 Keep generated standard files unchanged unless you intentionally fork
 compatibility behavior.
 

@@ -107,9 +107,10 @@ for inspection, packaging, or controlled customization:
 opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
-This writes bundled schema files such as `config/schema/core/rfc3672.ldif`,
-`config/schema/core/rfc3671.ldif`, `config/schema/posix/rfc2307.ldif`,
-`config/schema/cosine/rfc4524.ldif`, and `config/schema/x509/rfc4523.ldif`.
+This writes bundled schema files such as `config/schema/core/rfc2798.ldif`,
+`config/schema/core/rfc3672.ldif`, `config/schema/core/rfc3671.ldif`,
+`config/schema/posix/rfc2307.ldif`, `config/schema/cosine/rfc4524.ldif`, and
+`config/schema/x509/rfc4523.ldif`.
 The generated files are the same LDIF that backs the built-in bundles. If both
 `load_builtin` and generated files are enabled for the same bundle, compatible
 duplicate standard definitions are merged idempotently.

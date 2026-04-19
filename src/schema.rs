@@ -19,6 +19,7 @@ use crate::dn::{canonicalize_dn, parse_dn, parse_rdn, rdn_attribute_values};
 
 const RFC3671_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc3671.ldif");
 const RFC3672_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc3672.ldif");
+const RFC2798_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc2798.ldif");
 const RFC2307_SCHEMA_LDIF: &str = include_str!("../resources/schema/posix/rfc2307.ldif");
 const RFC4524_SCHEMA_LDIF: &str = include_str!("../resources/schema/cosine/rfc4524.ldif");
 const RFC4523_SCHEMA_LDIF: &str = include_str!("../resources/schema/x509/rfc4523.ldif");
@@ -439,6 +440,11 @@ pub fn bundled_schema_files(bundle: &str) -> Result<Vec<BuiltinSchemaFile>, Sche
         "core" => Ok(vec![
             BuiltinSchemaFile {
                 bundle: "core",
+                relative_path: "core/rfc2798.ldif",
+                contents: RFC2798_SCHEMA_LDIF,
+            },
+            BuiltinSchemaFile {
+                bundle: "core",
                 relative_path: "core/rfc3672.ldif",
                 contents: RFC3672_SCHEMA_LDIF,
             },
@@ -593,14 +599,6 @@ impl LdapSchema {
                 single_value: false,
             },
             AttributeType {
-                oid: "0.9.2342.19200300.100.1.3".to_string(),
-                names: vec!["mail".to_string(), "rfc822Mailbox".to_string()],
-                description: Some("Email address".to_string()),
-                equality: Some("caseIgnoreIA5Match".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.26".to_string(), // IA5 String
-                single_value: false,
-            },
-            AttributeType {
                 oid: "2.5.4.35".to_string(),
                 names: vec!["userPassword".to_string()],
                 description: Some("User password".to_string()),
@@ -710,158 +708,6 @@ impl LdapSchema {
                 description: Some("International ISDN number".to_string()),
                 equality: Some("numericStringMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.36".to_string(), // Numeric String
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.55".to_string(),
-                names: vec!["audio".to_string()],
-                description: Some("Audio recording".to_string()),
-                equality: Some("octetStringMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.40{250000}".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "2.16.840.1.113730.3.1.241".to_string(),
-                names: vec!["displayName".to_string()],
-                description: Some("Display name".to_string()),
-                equality: Some("caseIgnoreMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
-                single_value: true,
-            },
-            AttributeType {
-                oid: "2.16.840.1.113730.3.1.1".to_string(),
-                names: vec!["carLicense".to_string()],
-                description: Some("Vehicle license or registration plate".to_string()),
-                equality: Some("caseIgnoreMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "2.16.840.1.113730.3.1.2".to_string(),
-                names: vec!["departmentNumber".to_string()],
-                description: Some("Department number".to_string()),
-                equality: Some("caseIgnoreMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "2.16.840.1.113730.3.1.3".to_string(),
-                names: vec!["employeeNumber".to_string()],
-                description: Some("Employee number".to_string()),
-                equality: Some("caseIgnoreMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
-                single_value: true,
-            },
-            AttributeType {
-                oid: "2.16.840.1.113730.3.1.4".to_string(),
-                names: vec!["employeeType".to_string()],
-                description: Some("Employee type".to_string()),
-                equality: Some("caseIgnoreMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "2.16.840.1.113730.3.1.39".to_string(),
-                names: vec!["preferredLanguage".to_string()],
-                description: Some("Preferred language".to_string()),
-                equality: Some("caseIgnoreMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
-                single_value: true,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.6".to_string(),
-                names: vec!["roomNumber".to_string()],
-                description: Some("Room number".to_string()),
-                equality: Some("caseIgnoreMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.10".to_string(),
-                names: vec!["manager".to_string()],
-                description: Some("Manager".to_string()),
-                equality: Some("distinguishedNameMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.12".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.20".to_string(),
-                names: vec!["homePhone".to_string()],
-                description: Some("Home telephone number".to_string()),
-                equality: Some("telephoneNumberMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.50".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.21".to_string(),
-                names: vec!["secretary".to_string()],
-                description: Some("Secretary".to_string()),
-                equality: Some("distinguishedNameMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.12".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.39".to_string(),
-                names: vec!["homePostalAddress".to_string()],
-                description: Some("Home postal address".to_string()),
-                equality: Some("caseIgnoreListMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.41".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.41".to_string(),
-                names: vec!["mobile".to_string()],
-                description: Some("Mobile telephone number".to_string()),
-                equality: Some("telephoneNumberMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.50".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.42".to_string(),
-                names: vec!["pager".to_string()],
-                description: Some("Pager telephone number".to_string()),
-                equality: Some("telephoneNumberMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.50".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.7".to_string(),
-                names: vec!["photo".to_string()],
-                description: Some("G3 fax encoded photograph".to_string()),
-                equality: None,
-                syntax: "1.3.6.1.4.1.1466.115.121.1.23".to_string(), // Fax
-                single_value: false,
-            },
-            AttributeType {
-                oid: "0.9.2342.19200300.100.1.60".to_string(),
-                names: vec!["jpegPhoto".to_string()],
-                description: Some("JPEG photograph".to_string()),
-                equality: None,
-                syntax: "1.3.6.1.4.1.1466.115.121.1.28".to_string(),
-                single_value: false,
-            },
-            AttributeType {
-                oid: "2.16.840.1.113730.3.1.40".to_string(),
-                names: vec!["userSMIMECertificate".to_string()],
-                description: Some("PKCS#7 SignedData used to support S/MIME".to_string()),
-                equality: None,
-                syntax: "1.3.6.1.4.1.1466.115.121.1.5".to_string(), // Binary
-                single_value: false,
-            },
-            AttributeType {
-                oid: "2.16.840.1.113730.3.1.216".to_string(),
-                names: vec!["userPKCS12".to_string()],
-                description: Some("PKCS #12 PFX PDU".to_string()),
-                equality: None,
-                syntax: "1.3.6.1.4.1.1466.115.121.1.5".to_string(), // Binary
-                single_value: false,
-            },
-            AttributeType {
-                oid: "1.3.6.1.4.1.250.1.57".to_string(),
-                names: vec!["labeledURI".to_string()],
-                description: Some("Labeled URI".to_string()),
-                equality: Some("caseExactMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
                 single_value: false,
             },
             AttributeType {
@@ -1061,13 +907,6 @@ impl LdapSchema {
             "initials",
             "generationQualifier",
             "houseIdentifier",
-            "displayName",
-            "carLicense",
-            "departmentNumber",
-            "employeeNumber",
-            "employeeType",
-            "preferredLanguage",
-            "roomNumber",
             "dc",
             "title",
             "businessCategory",
@@ -1080,9 +919,6 @@ impl LdapSchema {
         ] {
             self.set_attribute_substring_rule(attr_name, "caseIgnoreSubstringsMatch");
         }
-        self.set_attribute_substring_rule("mail", "caseIgnoreIA5SubstringsMatch");
-        self.set_attribute_substring_rule("labeledURI", "caseExactSubstringsMatch");
-        self.set_attribute_substring_rule("homePostalAddress", "caseIgnoreListSubstringsMatch");
         self.set_attribute_substring_rule("postalAddress", "caseIgnoreListSubstringsMatch");
         self.set_attribute_substring_rule("registeredAddress", "caseIgnoreListSubstringsMatch");
         self.set_attribute_substring_rule(
@@ -1091,9 +927,6 @@ impl LdapSchema {
         );
         self.set_attribute_substring_rule("x121Address", "numericStringSubstringsMatch");
         self.set_attribute_substring_rule("telephoneNumber", "telephoneNumberSubstringsMatch");
-        self.set_attribute_substring_rule("homePhone", "telephoneNumberSubstringsMatch");
-        self.set_attribute_substring_rule("mobile", "telephoneNumberSubstringsMatch");
-        self.set_attribute_substring_rule("pager", "telephoneNumberSubstringsMatch");
 
         // Core object classes
         let core_classes = vec![
@@ -1143,42 +976,6 @@ impl LdapSchema {
                     "st".to_string(),
                     "l".to_string(),
                     "ou".to_string(),
-                ],
-            },
-            ObjectClass {
-                oid: "2.16.840.1.113730.3.2.2".to_string(),
-                names: vec!["inetOrgPerson".to_string()],
-                sup: vec!["organizationalPerson".to_string()],
-                kind: ObjectClassKind::Structural,
-                must: vec![],
-                may: vec![
-                    "businessCategory".to_string(),
-                    "audio".to_string(),
-                    "carLicense".to_string(),
-                    "departmentNumber".to_string(),
-                    "displayName".to_string(),
-                    "employeeNumber".to_string(),
-                    "employeeType".to_string(),
-                    "uid".to_string(),
-                    "givenName".to_string(),
-                    "homePhone".to_string(),
-                    "homePostalAddress".to_string(),
-                    "initials".to_string(),
-                    "jpegPhoto".to_string(),
-                    "labeledURI".to_string(),
-                    "mail".to_string(),
-                    "manager".to_string(),
-                    "mobile".to_string(),
-                    "o".to_string(),
-                    "pager".to_string(),
-                    "photo".to_string(),
-                    "preferredLanguage".to_string(),
-                    "roomNumber".to_string(),
-                    "secretary".to_string(),
-                    "userCertificate".to_string(),
-                    "x500UniqueIdentifier".to_string(),
-                    "userSMIMECertificate".to_string(),
-                    "userPKCS12".to_string(),
                 ],
             },
             ObjectClass {
@@ -1413,6 +1210,8 @@ impl LdapSchema {
     }
 
     fn load_core_schema_files(&mut self) {
+        self.load_ldif_str(RFC2798_SCHEMA_LDIF)
+            .expect("bundled RFC 2798 schema must load");
         self.load_ldif_str(RFC3672_SCHEMA_LDIF)
             .expect("bundled RFC 3672 schema must load");
         self.load_ldif_str(RFC3671_SCHEMA_LDIF)

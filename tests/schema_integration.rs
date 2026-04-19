@@ -666,6 +666,18 @@ fn test_inet_org_person_employee_number_is_single_value() {
 }
 
 #[test]
+fn test_rfc2798_inetorgperson_schema_loads_from_bundled_ldif_file() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(include_str!("../resources/schema/core/rfc2798.ldif"))
+        .unwrap();
+
+    assert!(schema.get_attribute_type("employeeNumber").is_some());
+    assert!(schema.get_attribute_type("userSMIMECertificate").is_some());
+    assert!(schema.get_object_class("inetOrgPerson").is_some());
+}
+
+#[test]
 fn test_organization_entry() {
     let schema = LdapSchema::with_core_schema();
 

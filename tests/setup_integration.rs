@@ -89,6 +89,7 @@ async fn test_setup_generates_bundled_schema_files() {
         .await
         .unwrap();
 
+    let core_inetorgperson_schema = schema_dir.join("core").join("rfc2798.ldif");
     let core_subentry_schema = schema_dir.join("core").join("rfc3672.ldif");
     let core_collective_schema = schema_dir.join("core").join("rfc3671.ldif");
     let posix_schema = schema_dir.join("posix").join("rfc2307.ldif");
@@ -97,6 +98,7 @@ async fn test_setup_generates_bundled_schema_files() {
     assert_eq!(
         written,
         vec![
+            core_inetorgperson_schema.clone(),
             core_subentry_schema.clone(),
             core_collective_schema.clone(),
             posix_schema.clone(),
@@ -104,6 +106,7 @@ async fn test_setup_generates_bundled_schema_files() {
             x509_schema.clone()
         ]
     );
+    assert!(core_inetorgperson_schema.is_file());
     assert!(core_subentry_schema.is_file());
     assert!(core_collective_schema.is_file());
     assert!(posix_schema.is_file());
@@ -112,6 +115,7 @@ async fn test_setup_generates_bundled_schema_files() {
 
     let mut schema = LdapSchema::with_core_schema();
     schema.load_schema_dir(&schema_dir).unwrap();
+    assert!(schema.get_object_class("inetOrgPerson").is_some());
     assert!(schema.get_object_class("subentry").is_some());
     assert!(
         schema

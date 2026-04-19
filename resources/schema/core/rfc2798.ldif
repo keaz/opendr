@@ -1,0 +1,25 @@
+# RFC 2798 inetOrgPerson schema bundle for OpenDR.
+# Definitions are data-loaded as part of the built-in `core` bundle.
+
+dn: cn=schema
+attributeTypes: ( 0.9.2342.19200300.100.1.3 NAME ( 'mail' 'rfc822Mailbox' ) DESC 'Email address' EQUALITY caseIgnoreIA5Match SUBSTR caseIgnoreIA5SubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 )
+attributeTypes: ( 0.9.2342.19200300.100.1.55 NAME 'audio' DESC 'Audio recording' EQUALITY octetStringMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.40{250000} )
+attributeTypes: ( 2.16.840.1.113730.3.1.241 NAME 'displayName' DESC 'Display name' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+attributeTypes: ( 2.16.840.1.113730.3.1.1 NAME 'carLicense' DESC 'Vehicle license or registration plate' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+attributeTypes: ( 2.16.840.1.113730.3.1.2 NAME 'departmentNumber' DESC 'Department number' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+attributeTypes: ( 2.16.840.1.113730.3.1.3 NAME 'employeeNumber' DESC 'Employee number' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+attributeTypes: ( 2.16.840.1.113730.3.1.4 NAME 'employeeType' DESC 'Employee type' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+attributeTypes: ( 2.16.840.1.113730.3.1.39 NAME 'preferredLanguage' DESC 'Preferred language' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+attributeTypes: ( 0.9.2342.19200300.100.1.6 NAME 'roomNumber' DESC 'Room number' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+attributeTypes: ( 0.9.2342.19200300.100.1.10 NAME 'manager' DESC 'Manager' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 )
+attributeTypes: ( 0.9.2342.19200300.100.1.20 NAME 'homePhone' DESC 'Home telephone number' EQUALITY telephoneNumberMatch SUBSTR telephoneNumberSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.50 )
+attributeTypes: ( 0.9.2342.19200300.100.1.21 NAME 'secretary' DESC 'Secretary' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 )
+attributeTypes: ( 0.9.2342.19200300.100.1.39 NAME 'homePostalAddress' DESC 'Home postal address' EQUALITY caseIgnoreListMatch SUBSTR caseIgnoreListSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.41 )
+attributeTypes: ( 0.9.2342.19200300.100.1.41 NAME 'mobile' DESC 'Mobile telephone number' EQUALITY telephoneNumberMatch SUBSTR telephoneNumberSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.50 )
+attributeTypes: ( 0.9.2342.19200300.100.1.42 NAME 'pager' DESC 'Pager telephone number' EQUALITY telephoneNumberMatch SUBSTR telephoneNumberSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.50 )
+attributeTypes: ( 0.9.2342.19200300.100.1.7 NAME 'photo' DESC 'G3 fax encoded photograph' SYNTAX 1.3.6.1.4.1.1466.115.121.1.23 )
+attributeTypes: ( 0.9.2342.19200300.100.1.60 NAME 'jpegPhoto' DESC 'JPEG photograph' SYNTAX 1.3.6.1.4.1.1466.115.121.1.28 )
+attributeTypes: ( 2.16.840.1.113730.3.1.40 NAME 'userSMIMECertificate' DESC 'PKCS#7 SignedData used to support S/MIME' SYNTAX 1.3.6.1.4.1.1466.115.121.1.5 )
+attributeTypes: ( 2.16.840.1.113730.3.1.216 NAME 'userPKCS12' DESC 'PKCS #12 PFX PDU' SYNTAX 1.3.6.1.4.1.1466.115.121.1.5 )
+attributeTypes: ( 1.3.6.1.4.1.250.1.57 NAME 'labeledURI' DESC 'Labeled URI' EQUALITY caseExactMatch SUBSTR caseExactSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+objectClasses: ( 2.16.840.1.113730.3.2.2 NAME 'inetOrgPerson' SUP organizationalPerson STRUCTURAL MAY ( businessCategory $ audio $ carLicense $ departmentNumber $ displayName $ employeeNumber $ employeeType $ uid $ givenName $ homePhone $ homePostalAddress $ initials $ jpegPhoto $ labeledURI $ mail $ manager $ mobile $ o $ pager $ photo $ preferredLanguage $ roomNumber $ secretary $ userCertificate $ x500UniqueIdentifier $ userSMIMECertificate $ userPKCS12 ) )

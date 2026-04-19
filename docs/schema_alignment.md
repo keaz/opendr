@@ -12,8 +12,8 @@ OpenDR aligns with the common LDAP model in these areas:
   `ou=people` and `ou=groups`.
 - `groupOfNames` is the right object class for DN-valued static groups using
   the `member` attribute.
-- `person`, `organizationalPerson`, and `inetOrgPerson` are available for user
-  entries, including the full RFC 2798 `inetOrgPerson` attribute set.
+- `person`, `organizationalPerson`, and file-backed `inetOrgPerson` are
+  available for user entries, including the full RFC 2798 attribute set.
 - RFC 2307 POSIX/NIS account, group, shadow, host, network, service, protocol,
   RPC, netgroup, map, IEEE 802 device, and bootable device schema is available
   through the optional `posix` built-in schema bundle.
@@ -187,7 +187,7 @@ for a complete conformance example that uses `core` plus `posix`.
 | RFC 4519 user schema | Supported | RFC 4519 user attributes and object classes are registered and validated, including strict `groupOfNames`. |
 | RFC 4519 `groupOfNames` | Supported | Both `cn` and `member` are required. |
 | RFC 4519 `groupOfUniqueNames` | Supported | `uniqueMember` is required and validated with Name and Optional UID syntax. |
-| RFC 2798 `inetOrgPerson` | Supported | Full RFC 2798 MAY attribute set is available, including audio/photo, binary/certificate attributes, and `preferredLanguage` validation. |
+| RFC 2798 `inetOrgPerson` | Supported | File-backed in `resources/schema/core/rfc2798.ldif`; the full RFC 2798 MAY attribute set is available, including audio/photo, binary/certificate attributes, and `preferredLanguage` validation. |
 | RFC 2307 POSIX/NIS | Optional built-in bundle | Load with `load_builtin = ["core", "posix"]` for the full RFC 2307 object class and attribute set, including shadow accounts, hosts, networks, services, protocols, RPCs, netgroups, NIS maps, IEEE 802 devices, and bootable devices. |
 | RFC 3671 collective attributes | Supported | The core bundle registers collective attribute subentries, `collectiveAttributeSubentries`, `collectiveExclusions`, and RFC collective attribute types. Values stored on collective subentries are projected virtually into matching search results, filters, and Compare operations, with per-entry exclusions. |
 | RFC 3672 LDAP subentries | Supported | The core bundle registers `subentry`, `administrativeRole`, and `subtreeSpecification`, validates subtree specifications, advertises the Subentries request control, and applies RFC 3672 search visibility rules. |
