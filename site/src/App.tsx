@@ -1641,7 +1641,7 @@ opendr-setup --config-dir ./config generate-schema --bundle all --overwrite`}</c
                       ["core", "RFC 4519 core user schema plus file-backed RFC 3672 LDAP subentries and RFC 3671 collective attributes."],
                       ["posix", "RFC 2307 POSIX/NIS account, group, shadow, host, network, service, protocol, RPC, netgroup, map, IEEE 802 device, and bootable device schema."],
                       ["cosine", "RFC 4524 COSINE account, document, domain, domain-related object, friendly country, RFC 822 local part, room, and simple security object schema."],
-                      ["x509", "RFC 4523 X.509 certificate, CRL, certificate pair, supported algorithm, PKI user, PKI CA, and CRL distribution point schema. DER-backed values are validated, and exact GSER equality assertions cover certificate serial/issuer, CRL issuer/thisUpdate, certificate pairs, and algorithm OIDs."],
+                      ["x509", "RFC 4523 X.509 certificate, CRL, certificate pair, supported algorithm, PKI user, PKI CA, and CRL distribution point schema. DER-backed values are validated; exact and component GSER assertions cover certificate identity, validity, key usage, CRL date/range, certificate pairs, and algorithm OIDs."],
                     ]}
                   />
                 </section>

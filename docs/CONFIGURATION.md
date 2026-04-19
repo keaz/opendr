@@ -488,7 +488,11 @@ certificate entries such as `pkiUser`, `pkiCA`, `cRLDistributionPoint`,
 `certificationAuthority`, or `certificationAuthority-V2`. Exact RFC 4523
 certificate serial/issuer, CRL issuer/thisUpdate, certificate-pair issued-to and
 issued-by, and supported-algorithm OID equality assertions are available for
-search filters and Compare operations.
+search filters and Compare operations. Component assertions are also available
+for `certificateMatch`, `certificatePairMatch`, and `certificateListMatch` when
+they use the implemented certificate serial, issuer, subject, validity,
+subject-public-key algorithm, key-usage, CRL issuer, date, or CRL-number range
+components.
 
 Generate bundled schema files when a deployment needs file-based schema
 artifacts instead of relying only on `load_builtin`:

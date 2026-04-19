@@ -368,7 +368,13 @@ Schema validation:
   supported-algorithm entries. DER-backed values are validated; exact GSER
   assertion matching works for certificate serial/issuer, CRL issuer/thisUpdate,
   certificate-pair issued-to and issued-by, and supported-algorithm OID equality
-  rules. Broader RFC 4523 component matching remains tracked follow-up work.
+  rules. Component matching works for certificate serial, issuer, subject,
+  validity, subject-public-key algorithm, and key-usage assertions; certificate
+  pair component matching delegates to those certificate components; CRL
+  component matching covers issuer, date, and CRL-number ranges. The remaining
+  RFC 4523 identifier, name constraint, policy, alternate-name, distribution
+  point, reason-flag, and private-key-validity components remain tracked
+  follow-up work.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active

@@ -1144,19 +1144,19 @@ fn test_rfc4523_x509_bundle_defines_full_schema() {
             .is_supported()
     );
     assert!(
-        !schema
+        schema
             .resolve_matching_rule("certificateMatch")
             .unwrap()
             .is_supported()
     );
     assert!(
-        !schema
+        schema
             .resolve_matching_rule("certificateListMatch")
             .unwrap()
             .is_supported()
     );
     assert!(
-        !schema
+        schema
             .resolve_matching_rule("certificatePairMatch")
             .unwrap()
             .is_supported()
@@ -1323,6 +1323,51 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .unwrap()
     );
 
+    let (_, certificate) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
+    let subject = gser_quote(&certificate.subject().to_string());
+    let valid_time = certificate.validity().not_before.to_datetime();
+    let valid_time_assertion = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}Z",
+        valid_time.year(),
+        u8::from(valid_time.month()),
+        valid_time.day(),
+        valid_time.hour(),
+        valid_time.minute(),
+        valid_time.second()
+    );
+    let subject_public_key_alg_id = certificate
+        .tbs_certificate
+        .subject_pki
+        .algorithm
+        .algorithm
+        .to_id_string();
+    let certificate_component_rule = schema.resolve_matching_rule("certificateMatch").unwrap();
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, subjectPublicKeyAlgID {subject_public_key_alg_id} }}"
+                ),
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(&cert_pem, "{ serialNumber 999999999 }")
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(&cert_pem, &format!("{{ issuer rdnSequence:{subject} }}"))
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(&cert_pem, "{ subjectAltName dNSName:cert.example.org }")
+            .is_err()
+    );
+
     let crl_pem = test_crl_pem();
     let crl_der = der_from_pem(&crl_pem, "X509 CRL");
     let certificate_list_rule = schema
@@ -1331,6 +1376,21 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
     assert!(
         certificate_list_rule
             .values_equal(&crl_pem, &certificate_list_exact_assertion(&crl_der))
+            .unwrap()
+    );
+    let (_, certificate_list) = x509_parser::parse_x509_crl(&crl_der).unwrap();
+    let certificate_list_component_rule = schema
+        .resolve_matching_rule("certificateListMatch")
+        .unwrap();
+    assert!(
+        certificate_list_component_rule
+            .values_equal(
+                &crl_pem,
+                &format!(
+                    "{{ issuer rdnSequence:{}, dateAndTime generalizedTime:20240101000000Z }}",
+                    gser_quote(&certificate_list.issuer().to_string())
+                )
+            )
             .unwrap()
     );
 
@@ -1346,6 +1406,17 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .values_equal(
                 &certificate_pair_base64(&cert_der),
                 &certificate_pair_assertion
+            )
+            .unwrap()
+    );
+    let certificate_pair_component_rule = schema
+        .resolve_matching_rule("certificatePairMatch")
+        .unwrap();
+    assert!(
+        certificate_pair_component_rule
+            .values_equal(
+                &certificate_pair_base64(&cert_der),
+                &format!("{{ issuedToThisCAAssertion {{ subject rdnSequence:{subject} }} }}"),
             )
             .unwrap()
     );
@@ -1369,18 +1440,6 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             )
             .unwrap()
     );
-
-    for matching_rule in [
-        "certificateMatch",
-        "certificatePairMatch",
-        "certificateListMatch",
-    ] {
-        let rule = schema.resolve_matching_rule(matching_rule).unwrap();
-        assert!(
-            !rule.is_supported(),
-            "RFC 4523 component matching rule {matching_rule} should stay unadvertised until full component semantics are implemented"
-        );
-    }
 }
 
 #[test]

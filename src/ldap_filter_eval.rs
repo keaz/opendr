@@ -1566,6 +1566,16 @@ mod tests {
         )
     }
 
+    fn certificate_subject_assertion(cert_pem: &str) -> String {
+        let (remainder, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).unwrap();
+        assert!(remainder.iter().all(u8::is_ascii_whitespace));
+        let (_, certificate) = x509_parser::parse_x509_certificate(&pem.contents).unwrap();
+        format!(
+            "{{ subject rdnSequence:\"{}\" }}",
+            certificate.subject().to_string().replace('"', "\"\"")
+        )
+    }
+
     #[test]
     fn compile_filter_parses_and_matches_compound_filters() {
         let filter = compile_filter("(&(objectClass=person)(cn=Alice*))").unwrap();
@@ -1702,6 +1712,7 @@ attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMa
             rcgen::generate_simple_self_signed(vec!["cert.example.org".to_string()]).unwrap();
         let cert_pem = cert.pem();
         let assertion = certificate_exact_assertion(&cert_pem);
+        let subject_assertion = certificate_subject_assertion(&cert_pem);
 
         let mut entry = test_entry("cn=carol,dc=example,dc=com", "person", "Carol Example");
         entry
@@ -1720,6 +1731,14 @@ attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMa
         assert!(
             compile_filter(&format!(
                 "(userCertificate:certificateExactMatch:={assertion})"
+            ))
+            .unwrap()
+            .matches_with_schema(&entry, &schema)
+            .unwrap()
+        );
+        assert!(
+            compile_filter(&format!(
+                "(userCertificate:certificateMatch:={subject_assertion})"
             ))
             .unwrap()
             .matches_with_schema(&entry, &schema)

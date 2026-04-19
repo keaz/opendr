@@ -16,9 +16,11 @@ use opendr::replication_consumer_fsm::*;
 use opendr::replication_provider_fsm::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCAL_PROVIDER_URL: &str = "in-memory://provider.example.com";
+static NEXT_STATE_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
 // Helper to create mock backend with test data
 async fn create_test_backend() -> MockBackend {
@@ -73,8 +75,12 @@ fn unique_state_path() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let id = NEXT_STATE_PATH_ID.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir()
-        .join(format!("opendr-repl-state-{}-{nanos}", std::process::id()))
+        .join(format!(
+            "opendr-repl-state-{}-{nanos}-{id}",
+            std::process::id()
+        ))
         .to_string_lossy()
         .into_owned()
 }
