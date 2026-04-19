@@ -5753,6 +5753,7 @@ enum X509GeneralNameAssertion {
     },
     Rfc822Name(String),
     DnsName(String),
+    EdiPartyName(X509EdiPartyNameAssertion),
     DirectoryName(String),
     UniformResourceIdentifier(String),
     IpAddress(String),
@@ -5763,6 +5764,18 @@ enum X509GeneralNameAssertion {
 enum X509GserValueAssertion {
     String(String),
     OctetString(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct X509EdiPartyNameAssertion {
+    name_assigner: Option<String>,
+    party_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509EdiPartyNameCandidate {
+    name_assigner: Option<String>,
+    party_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -6461,6 +6474,10 @@ fn general_name_matches(
             X509GeneralNameAssertion::DnsName(asserted),
         ) => candidate.eq_ignore_ascii_case(asserted),
         (
+            x509_parser::extensions::GeneralName::EDIPartyName(candidate),
+            X509GeneralNameAssertion::EdiPartyName(asserted),
+        ) => edi_party_name_der_matches_assertion(candidate.data, asserted).unwrap_or(false),
+        (
             x509_parser::extensions::GeneralName::DirectoryName(candidate),
             X509GeneralNameAssertion::DirectoryName(asserted),
         ) => normalize_x509_name(candidate).as_deref() == Ok(asserted.as_str()),
@@ -6504,11 +6521,9 @@ fn der_value_matches_gser_assertion(
     assertion: &X509GserValueAssertion,
 ) -> Result<bool, String> {
     match assertion {
-        X509GserValueAssertion::String(asserted) if der_tlv_is_string_value(value) => {
-            let candidate = std::str::from_utf8(value.content)
-                .map_err(|_| "otherName string value is not UTF-8".to_string())?;
-            Ok(candidate == asserted)
-        }
+        X509GserValueAssertion::String(asserted) => der_tlv_string_value(value)
+            .map(|candidate| candidate == *asserted)
+            .or(Ok(false)),
         X509GserValueAssertion::OctetString(asserted) if value.tag == 0x04 => {
             Ok(normalize_hex_bytes(value.content) == *asserted)
         }
@@ -6516,16 +6531,97 @@ fn der_value_matches_gser_assertion(
     }
 }
 
-fn der_tlv_is_string_value(value: &DerTlv<'_>) -> bool {
-    matches!(
-        value.tag,
+fn der_tlv_string_value(value: &DerTlv<'_>) -> Result<String, String> {
+    match value.tag {
         0x0c // UTF8String
-            | 0x13 // PrintableString
-            | 0x14 // TeletexString
-            | 0x16 // IA5String
-            | 0x1a // VisibleString
-            | 0x1b // GeneralString
-    )
+        | 0x13 // PrintableString
+        | 0x14 // TeletexString
+        | 0x16 // IA5String
+        | 0x1a // VisibleString
+        | 0x1b // GeneralString
+        => std::str::from_utf8(value.content)
+            .map(str::to_string)
+            .map_err(|_| "string value is not UTF-8".to_string()),
+        0x1e => der_bmp_string_value(value.content),
+        0x1c => der_universal_string_value(value.content),
+        other => Err(format!("unsupported DER string tag 0x{other:02x}")),
+    }
+}
+
+fn der_bmp_string_value(content: &[u8]) -> Result<String, String> {
+    if !content.len().is_multiple_of(2) {
+        return Err("BMPString content length must be even".to_string());
+    }
+    let code_units = content
+        .chunks_exact(2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&code_units).map_err(|_| "BMPString content is invalid UTF-16".to_string())
+}
+
+fn der_universal_string_value(content: &[u8]) -> Result<String, String> {
+    if !content.len().is_multiple_of(4) {
+        return Err("UniversalString content length must be a multiple of four".to_string());
+    }
+    let mut output = String::new();
+    for bytes in content.chunks_exact(4) {
+        let code_point = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let Some(ch) = char::from_u32(code_point) else {
+            return Err("UniversalString content contains an invalid code point".to_string());
+        };
+        output.push(ch);
+    }
+    Ok(output)
+}
+
+fn edi_party_name_der_matches_assertion(
+    value: &[u8],
+    assertion: &X509EdiPartyNameAssertion,
+) -> Result<bool, String> {
+    let candidate = parse_edi_party_name_der(value)?;
+    Ok(candidate.name_assigner == assertion.name_assigner
+        && candidate.party_name == assertion.party_name)
+}
+
+fn parse_edi_party_name_der(value: &[u8]) -> Result<X509EdiPartyNameCandidate, String> {
+    let mut remaining = value;
+    let mut name_assigner = None;
+    let mut party_name = None;
+
+    while !remaining.is_empty() {
+        let (next, field) = read_der_tlv(remaining)?;
+        match field.tag {
+            0xa0 if name_assigner.is_none() => {
+                name_assigner = Some(parse_explicit_directory_string(
+                    field.content,
+                    "EDIPartyName nameAssigner",
+                )?);
+            }
+            0xa1 if party_name.is_none() => {
+                party_name = Some(parse_explicit_directory_string(
+                    field.content,
+                    "EDIPartyName partyName",
+                )?);
+            }
+            0xa0 => return Err("duplicate EDIPartyName nameAssigner".to_string()),
+            0xa1 => return Err("duplicate EDIPartyName partyName".to_string()),
+            other => return Err(format!("unexpected EDIPartyName DER tag 0x{other:02x}")),
+        }
+        remaining = next;
+    }
+
+    Ok(X509EdiPartyNameCandidate {
+        name_assigner,
+        party_name: party_name.ok_or_else(|| "EDIPartyName requires partyName".to_string())?,
+    })
+}
+
+fn parse_explicit_directory_string(value: &[u8], label: &str) -> Result<String, String> {
+    let (remainder, string_value) = read_der_tlv(value)?;
+    if !remainder.is_empty() {
+        return Err(format!("{label} contains trailing DER data"));
+    }
+    der_tlv_string_value(&string_value).map_err(|err| format!("{label} is invalid: {err}"))
 }
 
 fn certificate_exact_key_from_der(value: &[u8]) -> Result<X509CertificateExactKey, String> {
@@ -7454,6 +7550,9 @@ fn parse_general_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
         "dNSName" => Ok(X509GeneralNameAssertion::DnsName(
             unquote_gser_dquote_string(rest)?,
         )),
+        "ediPartyName" => Ok(X509GeneralNameAssertion::EdiPartyName(
+            parse_edi_party_name(rest)?,
+        )),
         "directoryName" => Ok(X509GeneralNameAssertion::DirectoryName(parse_rfc4523_name(
             rest,
         )?)),
@@ -7466,9 +7565,35 @@ fn parse_general_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
         "registeredID" => Ok(X509GeneralNameAssertion::RegisteredId(
             parse_object_identifier_component(rest)?,
         )),
-        "x400Address" | "ediPartyName" => Err(format!("unsupported GeneralName form {kind}")),
+        "x400Address" => Err(format!("unsupported GeneralName form {kind}")),
         other => Err(format!("unknown GeneralName form {other}")),
     }
+}
+
+fn parse_edi_party_name(value: &str) -> Result<X509EdiPartyNameAssertion, String> {
+    let components = parse_gser_sequence_fields(value, "EDIPartyName")?;
+    let mut name_assigner = None;
+    let mut party_name = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "nameAssigner" if name_assigner.is_none() => {
+                name_assigner = Some(unquote_gser_dquote_string(rest.trim())?);
+            }
+            "partyName" if party_name.is_none() => {
+                party_name = Some(unquote_gser_dquote_string(rest.trim())?);
+            }
+            "nameAssigner" | "partyName" => {
+                return Err(format!("duplicate EDIPartyName component {keyword}"));
+            }
+            other => return Err(format!("unknown EDIPartyName component {other}")),
+        }
+    }
+
+    Ok(X509EdiPartyNameAssertion {
+        name_assigner,
+        party_name: party_name.ok_or_else(|| "EDIPartyName requires partyName".to_string())?,
+    })
 }
 
 fn parse_other_name(value: &str) -> Result<X509GeneralNameAssertion, String> {

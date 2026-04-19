@@ -541,13 +541,14 @@ certificate-valid time, private-key-valid time, subject-public-key algorithm,
 key usage, subject alternative name type, certificate policy, and
 path-to-name checks against certificate NameConstraints, plus name-constraint
 assertions including asserted GeneralSubtree minimum/maximum bounds and
-`otherName` string/OCTET STRING values in GeneralSubtree bases;
+`otherName` string/OCTET STRING values and `ediPartyName` values in
+GeneralSubtree bases;
 certificate pair issued-to and issued-by assertions that delegate to those
 certificate components; and CRL issuer, date-and-time, CRL-number range,
 authority key identifier, reason-flag, full-name distribution point, and
 name-relative-to-CRL-issuer distribution point assertions. The remaining RFC
 4523 components, including unsupported open-type `otherName` values and
-X.400/EDI general names, are rejected explicitly until implemented.
+X.400 general names, are rejected explicitly until implemented.
 
 ### Core Attributes
 

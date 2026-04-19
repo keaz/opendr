@@ -141,6 +141,21 @@ fn other_name_general_name_der(oid: &[u64], value: Vec<u8>) -> Vec<u8> {
     test_der_wrap(0xa0, &content)
 }
 
+fn edi_party_name_general_name_der(name_assigner: Option<&str>, party_name: &str) -> Vec<u8> {
+    let mut content = Vec::new();
+    if let Some(name_assigner) = name_assigner {
+        content.extend(test_der_wrap(
+            0xa0,
+            &test_der_wrap(0x0c, name_assigner.as_bytes()),
+        ));
+    }
+    content.extend(test_der_wrap(
+        0xa1,
+        &test_der_wrap(0x0c, party_name.as_bytes()),
+    ));
+    test_der_wrap(0xa5, &content)
+}
+
 fn certificate_policy_extension_content(policy_oid: &[u64]) -> Vec<u8> {
     let policy_information = test_der_wrap(0x30, &test_der_oid(policy_oid));
     test_der_wrap(0x30, &policy_information)
@@ -193,6 +208,11 @@ fn name_constraints_extension_content() -> Vec<u8> {
         None,
         None,
     );
+    let permitted_edi_party_name = general_subtree_der(
+        edi_party_name_general_name_der(Some("Example EDI"), "Directory Gateway"),
+        None,
+        None,
+    );
     let excluded = general_subtree_der(test_der_wrap(0x81, b"blocked@example.org"), Some(1), None);
     let excluded_directory = general_subtree_der(
         directory_name_general_name_der(&[
@@ -206,6 +226,7 @@ fn name_constraints_extension_content() -> Vec<u8> {
     let mut permitted_subtrees = permitted;
     permitted_subtrees.extend(permitted_directory);
     permitted_subtrees.extend(permitted_other_name);
+    permitted_subtrees.extend(permitted_edi_party_name);
     let mut excluded_subtrees = excluded;
     excluded_subtrees.extend(excluded_directory);
     content.extend(test_der_wrap(0xa0, &permitted_subtrees));
@@ -1662,6 +1683,30 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
                 &format!(
                     "{{ nameConstraints {{ permittedSubtrees {{ {{ base otherName:{{ type-id 1.2.3.4, value {} }} }} }} }} }}",
                     gser_quote("Other namespace")
+                )
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ nameConstraints {{ permittedSubtrees {{ {{ base ediPartyName:{{ nameAssigner {}, partyName {} }} }} }} }} }}",
+                    gser_quote("Example EDI"),
+                    gser_quote("Directory Gateway")
+                )
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ nameConstraints {{ permittedSubtrees {{ {{ base ediPartyName:{{ nameAssigner {}, partyName {} }} }} }} }} }}",
+                    gser_quote("Example EDI"),
+                    gser_quote("Other Gateway")
                 )
             )
             .unwrap()
