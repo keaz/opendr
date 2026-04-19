@@ -5747,12 +5747,22 @@ struct X509DistributionPointNameAssertion {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum X509GeneralNameAssertion {
+    OtherName {
+        type_id: String,
+        value: X509GserValueAssertion,
+    },
     Rfc822Name(String),
     DnsName(String),
     DirectoryName(String),
     UniformResourceIdentifier(String),
     IpAddress(String),
     RegisteredId(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+enum X509GserValueAssertion {
+    String(String),
+    OctetString(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -6436,6 +6446,13 @@ fn general_name_matches(
 ) -> bool {
     match (candidate, assertion) {
         (
+            x509_parser::extensions::GeneralName::OtherName(candidate_oid, candidate_value),
+            X509GeneralNameAssertion::OtherName { type_id, value },
+        ) => {
+            candidate_oid.to_id_string() == *type_id
+                && other_name_value_matches(candidate_value, value).unwrap_or(false)
+        }
+        (
             x509_parser::extensions::GeneralName::RFC822Name(candidate),
             X509GeneralNameAssertion::Rfc822Name(asserted),
         ) => *candidate == asserted,
@@ -6461,6 +6478,54 @@ fn general_name_matches(
         ) => candidate.to_id_string() == *asserted,
         _ => false,
     }
+}
+
+fn other_name_value_matches(
+    candidate: &[u8],
+    assertion: &X509GserValueAssertion,
+) -> Result<bool, String> {
+    let (remainder, explicit_value) = read_der_tlv(candidate)?;
+    if !remainder.is_empty() {
+        return Err("otherName value has trailing DER data".to_string());
+    }
+    if explicit_value.tag != 0xa0 {
+        return Err("otherName value must be encoded as explicit [0]".to_string());
+    }
+
+    let (remainder, value) = read_der_tlv(explicit_value.content)?;
+    if !remainder.is_empty() {
+        return Err("otherName explicit value contains trailing DER data".to_string());
+    }
+    der_value_matches_gser_assertion(&value, assertion)
+}
+
+fn der_value_matches_gser_assertion(
+    value: &DerTlv<'_>,
+    assertion: &X509GserValueAssertion,
+) -> Result<bool, String> {
+    match assertion {
+        X509GserValueAssertion::String(asserted) if der_tlv_is_string_value(value) => {
+            let candidate = std::str::from_utf8(value.content)
+                .map_err(|_| "otherName string value is not UTF-8".to_string())?;
+            Ok(candidate == asserted)
+        }
+        X509GserValueAssertion::OctetString(asserted) if value.tag == 0x04 => {
+            Ok(normalize_hex_bytes(value.content) == *asserted)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn der_tlv_is_string_value(value: &DerTlv<'_>) -> bool {
+    matches!(
+        value.tag,
+        0x0c // UTF8String
+            | 0x13 // PrintableString
+            | 0x14 // TeletexString
+            | 0x16 // IA5String
+            | 0x1a // VisibleString
+            | 0x1b // GeneralString
+    )
 }
 
 fn certificate_exact_key_from_der(value: &[u8]) -> Result<X509CertificateExactKey, String> {
@@ -7382,6 +7447,7 @@ fn parse_general_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
     };
     let rest = rest.trim();
     match kind.trim() {
+        "otherName" => parse_other_name(rest),
         "rfc822Name" => Ok(X509GeneralNameAssertion::Rfc822Name(
             unquote_gser_dquote_string(rest)?,
         )),
@@ -7400,11 +7466,53 @@ fn parse_general_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
         "registeredID" => Ok(X509GeneralNameAssertion::RegisteredId(
             parse_object_identifier_component(rest)?,
         )),
-        "otherName" | "x400Address" | "ediPartyName" => {
-            Err(format!("unsupported GeneralName form {kind}"))
-        }
+        "x400Address" | "ediPartyName" => Err(format!("unsupported GeneralName form {kind}")),
         other => Err(format!("unknown GeneralName form {other}")),
     }
+}
+
+fn parse_other_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
+    let components = parse_gser_sequence_fields(value, "OtherName")?;
+    let mut type_id = None;
+    let mut other_name_value = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "type-id" if type_id.is_none() => {
+                type_id = Some(parse_object_identifier_component(rest)?);
+            }
+            "value" if other_name_value.is_none() => {
+                other_name_value = Some(parse_gser_value_assertion(rest)?);
+            }
+            "type-id" | "value" => {
+                return Err(format!("duplicate OtherName component {keyword}"));
+            }
+            other => return Err(format!("unknown OtherName component {other}")),
+        }
+    }
+
+    Ok(X509GeneralNameAssertion::OtherName {
+        type_id: type_id.ok_or_else(|| "OtherName requires type-id".to_string())?,
+        value: other_name_value.ok_or_else(|| "OtherName requires value".to_string())?,
+    })
+}
+
+fn parse_gser_value_assertion(value: &str) -> Result<X509GserValueAssertion, String> {
+    let value = value.trim();
+    if value.starts_with('"') {
+        return Ok(X509GserValueAssertion::String(unquote_gser_dquote_string(
+            value,
+        )?));
+    }
+    if value.starts_with('\'') {
+        return Ok(X509GserValueAssertion::OctetString(parse_octet_string_hex(
+            value,
+        )?));
+    }
+    Err(
+        "OtherName Value currently supports GSER string values and OCTET STRING hstring values"
+            .to_string(),
+    )
 }
 
 fn parse_object_identifier_component(value: &str) -> Result<String, String> {

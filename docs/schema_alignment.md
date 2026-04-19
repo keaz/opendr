@@ -30,11 +30,12 @@ OpenDR aligns with the common LDAP model in these areas:
   key identifiers, validity, private-key validity, subject-public-key algorithm,
   key usage, subject alternative name type, certificate policy, path-to-name
   checks against certificate NameConstraints, name constraints including asserted
-  GeneralSubtree minimum/maximum bounds, certificate-pair component assertions,
-  CRL issuer, CRL date, CRL-number ranges, CRL authority key identifier, reason
+  GeneralSubtree minimum/maximum bounds and `otherName` string/OCTET STRING
+  values in GeneralSubtree bases, certificate-pair component assertions, CRL
+  issuer, CRL date, CRL-number ranges, CRL authority key identifier, reason
   flags, full-name distribution points, and name-relative-to-CRL-issuer
-  distribution points. Remaining RFC 4523 `otherName` value and X.400/EDI
-  general-name components remain deferred.
+  distribution points. Remaining RFC 4523 unsupported open-type `otherName`
+  values and X.400/EDI general-name components remain deferred.
 - `entryDN` is synthesized as an operational attribute for OpenDJ-compatible
   clients that request it explicitly.
 - Search responses preserve explicitly requested user attribute spelling, so a
@@ -69,7 +70,8 @@ Tracked follow-up work:
 - GitHub issue #198: partially completed RFC 4523 X.509 certificate schema
   coverage with file-backed definitions, DER-backed value validation, exact GSER
   assertion matching, and a component-matching subset; remaining work is
-  `otherName` value and X.400/EDI general-name component matching.
+  unsupported open-type `otherName` values and X.400/EDI general-name component
+  matching.
 - GitHub issue #200: move all built-in standard schema definitions from Rust
   literals into bundled schema files while keeping only the schema engine and
   runtime behavior in Rust.
@@ -188,5 +190,5 @@ for a complete conformance example that uses `core` plus `posix`.
 | RFC 2307 POSIX/NIS | Optional built-in bundle | Load with `load_builtin = ["core", "posix"]` for the full RFC 2307 object class and attribute set, including shadow accounts, hosts, networks, services, protocols, RPCs, netgroups, NIS maps, IEEE 802 devices, and bootable devices. |
 | RFC 3671 collective attributes | Supported | The core bundle registers collective attribute subentries, `collectiveAttributeSubentries`, `collectiveExclusions`, and RFC collective attribute types. Values stored on collective subentries are projected virtually into matching search results, filters, and Compare operations, with per-entry exclusions. |
 | RFC 3672 LDAP subentries | Supported | The core bundle registers `subentry`, `administrativeRole`, and `subtreeSpecification`, validates subtree specifications, advertises the Subentries request control, and applies RFC 3672 search visibility rules. |
-| RFC 4523 X.509 certificate schema | Optional built-in bundle, partial runtime matching | Load with `load_builtin = ["core", "x509"]` for the RFC 4523 attribute, object class, syntax, and matching-rule definitions. Certificate, CRL, certificate-pair, and supported-algorithm values are validated as DER, PEM, or base64 DER. Exact GSER assertion equality rules are executed for certificate serial/issuer, CRL issuer/thisUpdate, certificate-pair issued-to and issued-by, and supported-algorithm OID matching. Component matching executes certificate serial, issuer, subject, key identifiers, validity, private-key validity, subject-public-key algorithm, key usage, subject alternative name type, certificate policy, path-to-name checks against certificate NameConstraints, name constraints including asserted GeneralSubtree minimum/maximum bounds, certificate-pair component, CRL issuer, CRL date, CRL-number range, CRL authority key identifier, reason-flag, full-name distribution point, and name-relative-to-CRL-issuer distribution point assertions; remaining component types are deferred. |
+| RFC 4523 X.509 certificate schema | Optional built-in bundle, partial runtime matching | Load with `load_builtin = ["core", "x509"]` for the RFC 4523 attribute, object class, syntax, and matching-rule definitions. Certificate, CRL, certificate-pair, and supported-algorithm values are validated as DER, PEM, or base64 DER. Exact GSER assertion equality rules are executed for certificate serial/issuer, CRL issuer/thisUpdate, certificate-pair issued-to and issued-by, and supported-algorithm OID matching. Component matching executes certificate serial, issuer, subject, key identifiers, validity, private-key validity, subject-public-key algorithm, key usage, subject alternative name type, certificate policy, path-to-name checks against certificate NameConstraints, name constraints including asserted GeneralSubtree minimum/maximum bounds and `otherName` string/OCTET STRING values, certificate-pair component, CRL issuer, CRL date, CRL-number range, CRL authority key identifier, reason-flag, full-name distribution point, and name-relative-to-CRL-issuer distribution point assertions; remaining component types are deferred. |
 | RFC 4524 COSINE LDAP/X.500 | Optional built-in bundle | Load with `load_builtin = ["core", "cosine"]` for the full COSINE attribute and object class set, including account, document, domain, domain-related object, friendly country, RFC 822 local part, room, and simple security object entries. |

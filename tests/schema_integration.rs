@@ -135,6 +135,12 @@ fn directory_name_general_name_der(rdns: &[(&[u64], &str)]) -> Vec<u8> {
     test_der_wrap(0xa4, &x509_name_der(rdns))
 }
 
+fn other_name_general_name_der(oid: &[u64], value: Vec<u8>) -> Vec<u8> {
+    let mut content = test_der_oid(oid);
+    content.extend(test_der_wrap(0xa0, &value));
+    test_der_wrap(0xa0, &content)
+}
+
 fn certificate_policy_extension_content(policy_oid: &[u64]) -> Vec<u8> {
     let policy_information = test_der_wrap(0x30, &test_der_oid(policy_oid));
     test_der_wrap(0x30, &policy_information)
@@ -182,6 +188,11 @@ fn name_constraints_extension_content() -> Vec<u8> {
         Some(1),
         Some(2),
     );
+    let permitted_other_name = general_subtree_der(
+        other_name_general_name_der(&[1, 2, 3, 4], test_der_wrap(0x0c, b"Directory namespace")),
+        None,
+        None,
+    );
     let excluded = general_subtree_der(test_der_wrap(0x81, b"blocked@example.org"), Some(1), None);
     let excluded_directory = general_subtree_der(
         directory_name_general_name_der(&[
@@ -194,6 +205,7 @@ fn name_constraints_extension_content() -> Vec<u8> {
     let mut content = Vec::new();
     let mut permitted_subtrees = permitted;
     permitted_subtrees.extend(permitted_directory);
+    permitted_subtrees.extend(permitted_other_name);
     let mut excluded_subtrees = excluded;
     excluded_subtrees.extend(excluded_directory);
     content.extend(test_der_wrap(0xa0, &permitted_subtrees));
@@ -1628,6 +1640,28 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
                 &format!(
                     "{{ pathToName rdnSequence:{} }}",
                     gser_quote("ou=Allowed,o=Example")
+                )
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ nameConstraints {{ permittedSubtrees {{ {{ base otherName:{{ type-id 1.2.3.4, value {} }} }} }} }} }}",
+                    gser_quote("Directory namespace")
+                )
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ nameConstraints {{ permittedSubtrees {{ {{ base otherName:{{ type-id 1.2.3.4, value {} }} }} }} }} }}",
+                    gser_quote("Other namespace")
                 )
             )
             .unwrap()
