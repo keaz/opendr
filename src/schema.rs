@@ -5741,6 +5741,7 @@ struct X509AltNameTypeAssertion {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct X509DistributionPointNameAssertion {
     full_name: Option<Vec<X509GeneralNameAssertion>>,
+    name_relative_to_crl_issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -6277,6 +6278,16 @@ fn distribution_point_name_matches(
             {
                 return Ok(false);
             }
+        }
+    }
+    if let Some(asserted_name) = assertion.name_relative_to_crl_issuer.as_ref() {
+        let x509_parser::extensions::DistributionPointName::NameRelativeToCRLIssuer(candidate_name) =
+            candidate
+        else {
+            return Ok(false);
+        };
+        if normalize_x509_relative_distinguished_name(candidate_name)? != *asserted_name {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -6888,6 +6899,13 @@ fn parse_rfc4523_name(value: &str) -> Result<String, String> {
     canonicalize_dn(&dn).map_err(|err| format!("invalid RDNSequence name {dn}: {err}"))
 }
 
+fn parse_rfc4523_relative_distinguished_name(value: &str) -> Result<String, String> {
+    let rdn = unquote_gser_dquote_string(value.trim())?;
+    parse_rdn(&rdn)
+        .map(|rdn| rdn.to_canonical_string())
+        .map_err(|err| format!("invalid RelativeDistinguishedName {rdn}: {err}"))
+}
+
 fn parse_rfc4523_time(value: &str) -> Result<String, String> {
     let value = value.trim();
     let time = if let Some(generalized_time) = value.strip_prefix("generalizedTime:") {
@@ -7241,14 +7259,24 @@ fn parse_distribution_point_name(
     value: &str,
 ) -> Result<X509DistributionPointNameAssertion, String> {
     let value = value.trim();
-    let Some(general_names) = value.strip_prefix("fullName:") else {
-        return Err(
-            "only distributionPoint fullName:<GeneralNames> is currently supported".to_string(),
-        );
-    };
-    Ok(X509DistributionPointNameAssertion {
-        full_name: Some(parse_general_names(general_names.trim())?),
-    })
+    if let Some(general_names) = value.strip_prefix("fullName:") {
+        return Ok(X509DistributionPointNameAssertion {
+            full_name: Some(parse_general_names(general_names.trim())?),
+            name_relative_to_crl_issuer: None,
+        });
+    }
+    if let Some(relative_name) = value.strip_prefix("nameRelativeToCRLIssuer:") {
+        return Ok(X509DistributionPointNameAssertion {
+            full_name: None,
+            name_relative_to_crl_issuer: Some(parse_rfc4523_relative_distinguished_name(
+                relative_name.trim(),
+            )?),
+        });
+    }
+    Err(
+        "distributionPoint must use fullName:<GeneralNames> or nameRelativeToCRLIssuer:<RelativeDistinguishedName>"
+            .to_string(),
+    )
 }
 
 fn parse_general_names(value: &str) -> Result<Vec<X509GeneralNameAssertion>, String> {
@@ -7534,6 +7562,16 @@ fn normalize_unsigned_decimal_integer(value: &str) -> Result<String, String> {
 fn normalize_x509_name(name: &x509_parser::x509::X509Name<'_>) -> Result<String, String> {
     let rendered = name.to_string();
     canonicalize_dn(&rendered).map_err(|err| format!("invalid X.509 name {rendered}: {err}"))
+}
+
+fn normalize_x509_relative_distinguished_name(
+    rdn: &x509_parser::x509::RelativeDistinguishedName<'_>,
+) -> Result<String, String> {
+    let name = x509_parser::x509::X509Name::from_iter(std::iter::once(rdn.clone()));
+    let rendered = name.to_string();
+    parse_rdn(&rendered)
+        .map(|rdn| rdn.to_canonical_string())
+        .map_err(|err| format!("invalid X.509 relative distinguished name {rendered}: {err}"))
 }
 
 fn unquote_gser_dquote_string(value: &str) -> Result<String, String> {
@@ -9405,6 +9443,33 @@ mod tests {
             (1 << 1) | (1 << 2)
         );
         assert_eq!(parse_reason_flags("'60'H").unwrap(), (1 << 1) | (1 << 2));
+    }
+
+    #[test]
+    fn rfc4523_distribution_point_name_matches_name_relative_to_crl_issuer() {
+        let common_name_oid = [0x06, 0x03, 0x55, 0x04, 0x03];
+        let common_name_value = wrap_der_value(0x0c, b"Root CRL");
+        let mut attribute = common_name_oid.to_vec();
+        attribute.extend(common_name_value);
+        let attribute = wrap_der_value(0x30, &attribute);
+        let rdn_der = wrap_der_value(0x31, &attribute);
+        let (_, rdn) = x509_parser::x509::RelativeDistinguishedName::from_der(&rdn_der).unwrap();
+        let candidate =
+            x509_parser::extensions::DistributionPointName::NameRelativeToCRLIssuer(rdn);
+
+        let assertion =
+            parse_distribution_point_name(r#"nameRelativeToCRLIssuer:"cn=Root CRL""#).unwrap();
+        assert!(distribution_point_name_matches(&candidate, &assertion).unwrap());
+
+        let negative =
+            parse_distribution_point_name(r#"nameRelativeToCRLIssuer:"cn=Other CRL""#).unwrap();
+        assert!(!distribution_point_name_matches(&candidate, &negative).unwrap());
+
+        let full_name = parse_distribution_point_name(
+            r#"fullName:{ uniformResourceIdentifier:"https://crl.example.org/root.crl" }"#,
+        )
+        .unwrap();
+        assert!(!distribution_point_name_matches(&candidate, &full_name).unwrap());
     }
 
     #[test]

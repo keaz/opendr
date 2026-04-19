@@ -374,9 +374,10 @@ Schema validation:
   assertions including asserted GeneralSubtree minimum/maximum bounds;
   certificate pair component matching delegates to those certificate components;
   CRL component matching covers issuer, date, CRL-number ranges, authority key
-  identifier, reason flags, and full-name distribution points. The remaining RFC
-  4523 path-to-name, `otherName` value, X.400/EDI general-name, and
-  name-relative-to-CRL-issuer components remain tracked follow-up work.
+  identifier, reason flags, full-name distribution points, and
+  name-relative-to-CRL-issuer distribution points. The remaining RFC 4523
+  path-to-name, `otherName` value, and X.400/EDI general-name components remain
+  tracked follow-up work.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active
