@@ -544,16 +544,17 @@ key usage, subject alternative name type, certificate policy, and
 path-to-name checks against certificate NameConstraints, plus name-constraint
 assertions including asserted GeneralSubtree minimum/maximum bounds and
 `otherName` BOOLEAN, INTEGER, BIT STRING, NULL, object identifier, string, and
-OCTET STRING values, `ediPartyName` values, and X.400 ORAddress built-in
-standard attributes (`C`, `ADMD`, `PRMD`, `X121`, `T-ID`, `O`, `OU`, `UA-ID`,
-`S`, `G`, `I`, `GQ`) rendered in RFC 2156 string form in GeneralSubtree bases;
+OCTET STRING values, `ediPartyName` values, X.400 ORAddress built-in standard
+attributes (`C`, `ADMD`, `PRMD`, `X121`, `T-ID`, `O`, `OU`, `UA-ID`, `S`, `G`,
+`I`, `GQ`), and domain-defined `DD.<type>` attributes rendered in RFC 2156
+string form in GeneralSubtree bases;
 certificate pair issued-to and issued-by assertions that delegate to those
 certificate components; and CRL issuer, date-and-time, CRL-number range,
 authority key identifier, reason-flag, full-name distribution point, and
 name-relative-to-CRL-issuer distribution point assertions. The remaining RFC
 4523 components, including constructed or schema-specific open-type `otherName`
-values plus X.400 domain-defined and extension attributes, are rejected
-explicitly until implemented.
+values plus X.400 extension attributes, are rejected explicitly until
+implemented.
 
 ### Core Attributes
 

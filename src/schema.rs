@@ -5586,18 +5586,42 @@ fn x400_address_matches(value: &[u8], assertion: &str) -> Result<bool, String> {
 }
 
 fn x400_address_to_rfc2156_string(value: &[u8]) -> Result<String, String> {
-    let (remaining, built_in_standard_attributes) = read_der_tlv(value)?;
+    let (mut remaining, built_in_standard_attributes) = read_der_tlv(value)?;
     if built_in_standard_attributes.tag != 0x30 {
         return Err("ORAddress must start with BuiltInStandardAttributes SEQUENCE".to_string());
     }
-    if !remaining.is_empty() {
-        return Err(
-            "ORAddress domain-defined and extension attributes are not supported yet".to_string(),
-        );
-    }
 
     let built_in = parse_x400_built_in_standard_attributes(built_in_standard_attributes.content)?;
-    built_in.to_rfc2156_string()
+    let mut output = String::new();
+    built_in.append_rfc2156_components(&mut output)?;
+
+    let mut saw_domain_defined_attributes = false;
+    while !remaining.is_empty() {
+        let (next, component) = read_der_tlv(remaining)?;
+        match component.tag {
+            0x30 if !saw_domain_defined_attributes => {
+                let domain_defined = parse_x400_domain_defined_attributes(component.content)?;
+                for attribute in &domain_defined {
+                    append_rfc2156_domain_defined_attribute(
+                        &mut output,
+                        &attribute.attribute_type,
+                        &attribute.value,
+                    )?;
+                }
+                saw_domain_defined_attributes = true;
+            }
+            0x30 => return Err("duplicate ORAddress domain-defined attributes".to_string()),
+            0x31 => return Err("ORAddress extension attributes are not supported yet".to_string()),
+            other => return Err(format!("unexpected ORAddress component tag 0x{other:02x}")),
+        }
+        remaining = next;
+    }
+
+    if output.is_empty() {
+        return Err("ORAddress contains no supported RFC 2156 components".to_string());
+    }
+    output.push('/');
+    Ok(output)
 }
 
 #[derive(Debug, Default)]
@@ -5621,41 +5645,42 @@ struct X400PersonalName {
     generation_qualifier: Option<String>,
 }
 
+#[derive(Debug)]
+struct X400DomainDefinedAttribute {
+    attribute_type: String,
+    value: String,
+}
+
 impl X400BuiltInStandardAttributes {
-    fn to_rfc2156_string(&self) -> Result<String, String> {
-        let mut output = String::new();
+    fn append_rfc2156_components(&self, output: &mut String) -> Result<(), String> {
         if let Some(country) = self.country.as_deref() {
-            append_rfc2156_or_address_component(&mut output, "C", country)?;
+            append_rfc2156_or_address_component(output, "C", country)?;
         }
         if let Some(administration_domain) = self.administration_domain.as_deref() {
-            append_rfc2156_or_address_component(&mut output, "ADMD", administration_domain)?;
+            append_rfc2156_or_address_component(output, "ADMD", administration_domain)?;
         }
         if let Some(private_domain) = self.private_domain.as_deref() {
-            append_rfc2156_or_address_component(&mut output, "PRMD", private_domain)?;
+            append_rfc2156_or_address_component(output, "PRMD", private_domain)?;
         }
         if let Some(network_address) = self.network_address.as_deref() {
-            append_rfc2156_or_address_component(&mut output, "X121", network_address)?;
+            append_rfc2156_or_address_component(output, "X121", network_address)?;
         }
         if let Some(terminal_identifier) = self.terminal_identifier.as_deref() {
-            append_rfc2156_or_address_component(&mut output, "T-ID", terminal_identifier)?;
+            append_rfc2156_or_address_component(output, "T-ID", terminal_identifier)?;
         }
         if let Some(organization) = self.organization.as_deref() {
-            append_rfc2156_or_address_component(&mut output, "O", organization)?;
+            append_rfc2156_or_address_component(output, "O", organization)?;
         }
         for organizational_unit in &self.organizational_units {
-            append_rfc2156_or_address_component(&mut output, "OU", organizational_unit)?;
+            append_rfc2156_or_address_component(output, "OU", organizational_unit)?;
         }
         if let Some(numeric_user_identifier) = self.numeric_user_identifier.as_deref() {
-            append_rfc2156_or_address_component(&mut output, "UA-ID", numeric_user_identifier)?;
+            append_rfc2156_or_address_component(output, "UA-ID", numeric_user_identifier)?;
         }
         if let Some(personal_name) = self.personal_name.as_ref() {
-            personal_name.append_rfc2156_components(&mut output)?;
+            personal_name.append_rfc2156_components(output)?;
         }
-        if output.is_empty() {
-            return Err("ORAddress contains no supported RFC 2156 components".to_string());
-        }
-        output.push('/');
-        Ok(output)
+        Ok(())
     }
 }
 
@@ -5750,6 +5775,43 @@ fn parse_x400_built_in_standard_attributes(
     Ok(attributes)
 }
 
+fn parse_x400_domain_defined_attributes(
+    mut value: &[u8],
+) -> Result<Vec<X400DomainDefinedAttribute>, String> {
+    let mut attributes = Vec::new();
+    while !value.is_empty() {
+        let (next, attribute) = read_der_tlv(value)?;
+        if attribute.tag != 0x30 {
+            return Err("DomainDefinedAttribute must be encoded as a DER SEQUENCE".to_string());
+        }
+        attributes.push(parse_x400_domain_defined_attribute(attribute.content)?);
+        value = next;
+    }
+    if attributes.is_empty() {
+        return Err("BuiltInDomainDefinedAttributes must contain at least one value".to_string());
+    }
+    Ok(attributes)
+}
+
+fn parse_x400_domain_defined_attribute(value: &[u8]) -> Result<X400DomainDefinedAttribute, String> {
+    let (remaining, attribute_type) = read_der_tlv(value)?;
+    let (remaining, attribute_value) = read_der_tlv(remaining)?;
+    if !remaining.is_empty() {
+        return Err("DomainDefinedAttribute contains trailing DER data".to_string());
+    }
+    Ok(X400DomainDefinedAttribute {
+        attribute_type: parse_printable_string(attribute_type, "DomainDefinedAttribute type")?,
+        value: parse_printable_string(attribute_value, "DomainDefinedAttribute value")?,
+    })
+}
+
+fn parse_printable_string(value: DerTlv<'_>, label: &str) -> Result<String, String> {
+    if value.tag != 0x13 {
+        return Err(format!("{label} must be a PrintableString"));
+    }
+    der_tlv_string_value(&value).map_err(|err| format!("{label} is invalid: {err}"))
+}
+
 fn parse_implicit_x400_string(value: &[u8], label: &str) -> Result<String, String> {
     std::str::from_utf8(value)
         .map(str::to_string)
@@ -5829,6 +5891,19 @@ fn append_rfc2156_or_address_component(
 ) -> Result<(), String> {
     output.push('/');
     output.push_str(key);
+    output.push('=');
+    output.push_str(&escape_rfc2156_or_address_value(value)?);
+    Ok(())
+}
+
+fn append_rfc2156_domain_defined_attribute(
+    output: &mut String,
+    attribute_type: &str,
+    value: &str,
+) -> Result<(), String> {
+    output.push('/');
+    output.push_str("DD.");
+    output.push_str(&escape_rfc2156_or_address_value(attribute_type)?);
     output.push('=');
     output.push_str(&escape_rfc2156_or_address_value(value)?);
     Ok(())
@@ -9156,10 +9231,29 @@ mod tests {
         organizational_units.extend(wrap_der_value(0x13, b"Gateway"));
         built_in.extend(wrap_der_value(0xa6, &organizational_units));
 
-        let or_address = wrap_der_value(0x30, &built_in);
+        let mut domain_defined = Vec::new();
+        domain_defined.extend(wrap_der_value(
+            0x30,
+            &[
+                wrap_der_value(0x13, b"RFC-822"),
+                wrap_der_value(0x13, b"ops@example.com"),
+            ]
+            .concat(),
+        ));
+        domain_defined.extend(wrap_der_value(
+            0x30,
+            &[
+                wrap_der_value(0x13, b"A/B"),
+                wrap_der_value(0x13, b"value=one$"),
+            ]
+            .concat(),
+        ));
+
+        let mut or_address = wrap_der_value(0x30, &built_in);
+        or_address.extend(wrap_der_value(0x30, &domain_defined));
         assert_eq!(
             x400_address_to_rfc2156_string(&or_address).unwrap(),
-            "/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Ops$/Dir$=One$$/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/"
+            "/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Ops$/Dir$=One$$/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/"
         );
     }
 

@@ -182,7 +182,27 @@ fn x400_or_address_der() -> Vec<u8> {
     organizational_units.extend(test_der_wrap(0x13, b"Gateway"));
     built_in.extend(test_der_wrap(0xa6, &organizational_units));
 
-    test_der_wrap(0x30, &built_in)
+    let mut domain_defined = Vec::new();
+    domain_defined.extend(test_der_wrap(
+        0x30,
+        &[
+            test_der_wrap(0x13, b"RFC-822"),
+            test_der_wrap(0x13, b"ops@example.com"),
+        ]
+        .concat(),
+    ));
+    domain_defined.extend(test_der_wrap(
+        0x30,
+        &[
+            test_der_wrap(0x13, b"A/B"),
+            test_der_wrap(0x13, b"value=one$"),
+        ]
+        .concat(),
+    ));
+
+    let mut or_address = test_der_wrap(0x30, &built_in);
+    or_address.extend(test_der_wrap(0x30, &domain_defined));
+    or_address
 }
 
 fn certificate_policy_extension_content(policy_oid: &[u64]) -> Vec<u8> {
@@ -1860,7 +1880,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
         certificate_component_rule
             .values_equal(
                 &cert_pem,
-                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=ExampleOrg/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/\" } } } }",
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=ExampleOrg/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/\" } } } }",
             )
             .unwrap()
     );
@@ -1868,7 +1888,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
         !certificate_component_rule
             .values_equal(
                 &cert_pem,
-                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Other/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/\" } } } }",
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Other/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/\" } } } }",
             )
             .unwrap()
     );
