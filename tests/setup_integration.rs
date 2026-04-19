@@ -89,20 +89,23 @@ async fn test_setup_generates_bundled_schema_files() {
         .await
         .unwrap();
 
-    let core_schema = schema_dir.join("core").join("rfc3672.ldif");
+    let core_subentry_schema = schema_dir.join("core").join("rfc3672.ldif");
+    let core_collective_schema = schema_dir.join("core").join("rfc3671.ldif");
     let posix_schema = schema_dir.join("posix").join("rfc2307.ldif");
     let cosine_schema = schema_dir.join("cosine").join("rfc4524.ldif");
     let x509_schema = schema_dir.join("x509").join("rfc4523.ldif");
     assert_eq!(
         written,
         vec![
-            core_schema.clone(),
+            core_subentry_schema.clone(),
+            core_collective_schema.clone(),
             posix_schema.clone(),
             cosine_schema.clone(),
             x509_schema.clone()
         ]
     );
-    assert!(core_schema.is_file());
+    assert!(core_subentry_schema.is_file());
+    assert!(core_collective_schema.is_file());
     assert!(posix_schema.is_file());
     assert!(cosine_schema.is_file());
     assert!(x509_schema.is_file());
@@ -110,6 +113,11 @@ async fn test_setup_generates_bundled_schema_files() {
     let mut schema = LdapSchema::with_core_schema();
     schema.load_schema_dir(&schema_dir).unwrap();
     assert!(schema.get_object_class("subentry").is_some());
+    assert!(
+        schema
+            .get_object_class("collectiveAttributeSubentry")
+            .is_some()
+    );
     assert!(schema.get_object_class("posixAccount").is_some());
     assert!(schema.get_object_class("nisNetgroup").is_some());
     assert!(schema.get_object_class("document").is_some());

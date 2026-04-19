@@ -346,6 +346,11 @@ async fn search_returns_entries_and_success() {
                     })
         })
         .return_once(move |_, _, _| Ok(vec![entry_clone.clone()]));
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "dc=example,dc=org")
+        .times(1)
+        .return_once(|_| Ok(None));
 
     let request = SearchRequest {
         base_object: LdapDN(Cow::Owned("dc=example,dc=org".to_string())),
@@ -454,6 +459,11 @@ async fn base_object_search_uses_get_entry_fast_path() {
         .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
         .times(1)
         .return_once(|_| Ok(Some(entry)));
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "dc=example,dc=org")
+        .times(1)
+        .return_once(|_| Ok(None));
     backend.expect_search_entries_with_hint().times(0);
 
     let request = SearchRequest {

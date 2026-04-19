@@ -1629,10 +1629,13 @@ async fn handle_search_request_with_fsm_runtime(
                 request,
                 request_context,
                 runtime_context.metrics.as_deref(),
+                backend.as_ref(),
+                schema,
                 stream_report.entries,
                 manage_dsa_it,
                 search_req.scope,
                 subentries_visibility,
+                &attribute_selection,
                 strip_internal_object_class,
                 search_req.types_only,
                 search_started_at,
@@ -1677,6 +1680,8 @@ async fn handle_search_request_with_fsm_runtime(
                 request,
                 request_context,
                 runtime_context.metrics.as_deref(),
+                backend.as_ref(),
+                schema,
                 stream_report.entries,
                 manage_dsa_it,
                 search_req.scope,
@@ -1696,6 +1701,8 @@ async fn handle_search_request_with_fsm_runtime(
             request,
             request_context,
             runtime_context.metrics.as_deref(),
+            backend.as_ref(),
+            schema,
             stream_report.entries,
             manage_dsa_it,
             search_req.scope,
@@ -1856,6 +1863,26 @@ async fn handle_search_request_with_fsm_runtime(
     preloaded_entries.retain(|entry| {
         entry_matches_subentries_visibility(entry, search_req.scope, subentries_visibility)
     });
+    preloaded_entries = match crate::collective_attrs::project_collective_attributes_for_entries(
+        backend.as_ref(),
+        schema,
+        preloaded_entries,
+    )
+    .await
+    {
+        Ok(entries) => entries,
+        Err(err) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                map_backend_error_code(&err),
+                backend_diagnostic(&err),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     if let Some(requested_sort) = requested_sort.as_ref() {
         sort_native_search_entries(&mut preloaded_entries, requested_sort);
     }
@@ -2886,16 +2913,20 @@ async fn emit_projected_index_covered_plain_search_stream(
     request: &FsmRequestContext,
     request_context: &RequestContext,
     metrics: Option<&MetricsCollector>,
+    backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     mut entries: ProjectedSearchEntryStreamReceiver,
     manage_dsa_it: bool,
     scope: ldap_parser::ldap::SearchScope,
     subentries_visibility: SubentriesSearchVisibility,
+    requested_attributes: &[String],
     strip_internal_object_class: bool,
     types_only: bool,
     started_at: Instant,
     time_limit: u32,
     size_limit: u32,
 ) -> Result<(), String> {
+    let projection = DirectoryAttributeProjection::new(requested_attributes);
     let effective_size_limit = (size_limit != 0).then_some(size_limit as usize);
     let mut pending_entry_bytes = Vec::with_capacity(FSM_SEARCH_ENTRY_WRITE_BATCH_BYTES);
     let mut emitted_entries = 0usize;
@@ -2992,8 +3023,54 @@ async fn emit_projected_index_covered_plain_search_stream(
             return Ok(());
         }
 
-        let response_attributes =
-            projected_response_attributes(&entry, strip_internal_object_class);
+        let mut response_attributes = match backend.get_entry(&entry.dn).await {
+            Ok(Some(full_entry)) => {
+                let projected_entry =
+                    match crate::collective_attrs::project_collective_attributes_for_entry(
+                        backend, schema, full_entry,
+                    )
+                    .await
+                    {
+                        Ok(projected_entry) => projected_entry,
+                        Err(err) => {
+                            flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                            record_direct_search_complete(
+                                metrics,
+                                emitted_entries,
+                                started_at,
+                                false,
+                            );
+                            send_request_result_response(
+                                fsm_set,
+                                request.message_id as u32,
+                                request.response_kind,
+                                map_backend_error_code(&err),
+                                backend_diagnostic(&err),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    };
+                projection.project_entry(&projected_entry)
+            }
+            Ok(None) => projected_response_attributes(&entry, strip_internal_object_class),
+            Err(err) => {
+                flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                record_direct_search_complete(metrics, emitted_entries, started_at, false);
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if strip_internal_object_class {
+            response_attributes.retain(|(name, _)| !name.eq_ignore_ascii_case("objectClass"));
+        }
         let encoded_entry = encode_search_entry_parts_with_controls(
             request.message_id as u32,
             &entry.dn,
@@ -3136,6 +3213,8 @@ async fn emit_index_covered_plain_search_stream(
     request: &FsmRequestContext,
     request_context: &RequestContext,
     metrics: Option<&MetricsCollector>,
+    backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     mut entries: SearchEntryStreamReceiver,
     manage_dsa_it: bool,
     scope: ldap_parser::ldap::SearchScope,
@@ -3229,6 +3308,27 @@ async fn emit_index_covered_plain_search_stream(
             continue;
         }
 
+        let entry = match crate::collective_attrs::project_collective_attributes_for_entry(
+            backend, schema, entry,
+        )
+        .await
+        {
+            Ok(entry) => entry,
+            Err(err) => {
+                flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                record_direct_search_complete(metrics, emitted_entries, started_at, false);
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
         if effective_size_limit.is_some_and(|limit| emitted_entries >= limit) {
             flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
             record_direct_search_complete(metrics, emitted_entries, started_at, false);
@@ -3282,6 +3382,8 @@ async fn emit_filtering_plain_search_stream(
     request: &FsmRequestContext,
     request_context: &RequestContext,
     metrics: Option<&MetricsCollector>,
+    backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     mut entries: SearchEntryStreamReceiver,
     manage_dsa_it: bool,
     scope: ldap_parser::ldap::SearchScope,
@@ -3376,6 +3478,27 @@ async fn emit_filtering_plain_search_stream(
             search_references.push(referrals);
             continue;
         }
+
+        let entry = match crate::collective_attrs::project_collective_attributes_for_entry(
+            backend, schema, entry,
+        )
+        .await
+        {
+            Ok(entry) => entry,
+            Err(err) => {
+                flush_fsm_search_entry_batch(fsm_set, &mut pending_entry_bytes).await?;
+                record_direct_search_complete(metrics, emitted_entries, started_at, false);
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         let search_entry = directory_entry_to_search_entry(&entry);
         if !prepared_filter
@@ -3914,7 +4037,7 @@ fn search_fsm_error_response(error: &SearchFsmError) -> (ResultCode, String) {
 
 fn directory_entry_to_search_entry(entry: &crate::backend::DirectoryEntry) -> SearchEntry {
     let mut combined_attrs = entry.attributes.clone();
-    combined_attrs.extend(entry.operational_attributes.to_attributes());
+    combined_attrs.extend(entry.response_operational_attributes());
 
     SearchEntry {
         dn: entry.dn.clone(),
@@ -7904,6 +8027,91 @@ mod tests {
                 attribute: "cn".to_string(),
                 value: "alice".to_string(),
             })]
+        );
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_projects_collective_attributes_before_filtering() {
+        let backend = Arc::new(HintTrackingBackend::new());
+        for entry in [
+            DirectoryEntry::new(
+                "ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "organizationalUnit".to_string()],
+                    ),
+                    ("ou".to_string(), vec!["People".to_string()]),
+                    (
+                        "administrativeRole".to_string(),
+                        vec!["collectiveAttributeSpecificArea".to_string()],
+                    ),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=alice,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    ("objectClass".to_string(), vec!["person".to_string()]),
+                    ("cn".to_string(), vec!["alice".to_string()]),
+                    ("sn".to_string(), vec!["Example".to_string()]),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=collective,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec![
+                            "top".to_string(),
+                            "subentry".to_string(),
+                            "collectiveAttributeSubentry".to_string(),
+                        ],
+                    ),
+                    ("cn".to_string(), vec!["collective".to_string()]),
+                    (
+                        "subtreeSpecification".to_string(),
+                        vec!["{ minimum 1 }".to_string()],
+                    ),
+                    ("c-l".to_string(), vec!["Colombo".to_string()]),
+                ]),
+            ),
+        ] {
+            backend.insert_entry(entry).await;
+        }
+
+        let backend_for_server: Arc<dyn DirectoryBackend> = backend.clone();
+        let (server_task, mut client_stream) = spawn_test_connection(backend_for_server).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                128,
+                "ou=People,dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::EqualityMatch(RasnAttributeValueAssertion::new(
+                    b"c-l".to_vec().into(),
+                    b"Colombo".to_vec().into(),
+                )),
+                &["cn", "c-l"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=alice,ou=People,dc=example,dc=org".to_string()]
+        );
+        let attribute_names = first_search_entry_attribute_names(&messages);
+        assert!(
+            attribute_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("c-l"))
         );
 
         client_stream.shutdown().await.unwrap();

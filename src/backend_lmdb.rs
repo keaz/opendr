@@ -4810,12 +4810,14 @@ impl LmdbBackend {
         else {
             return Ok(true);
         };
+        let virtual_operational_attributes = HashMap::new();
         let projected = ProjectedDirectoryEntry {
             dn: entry.dn.clone(),
             attributes: projection.project_attributes(
                 &entry.dn,
                 &entry.attributes,
                 &entry.operational_attributes,
+                &virtual_operational_attributes,
             ),
             referral_urls: referral_urls_from_attributes(&entry.attributes),
         };

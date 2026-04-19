@@ -183,6 +183,8 @@ impl OperationalAttributes {
             || attr_name.eq_ignore_ascii_case("lastfailedlogin")
             || attr_name.eq_ignore_ascii_case("failedlogincount")
             || attr_name.eq_ignore_ascii_case("contextcsn")
+            || attr_name.eq_ignore_ascii_case("collectiveattributesubentries")
+            || attr_name.eq_ignore_ascii_case("collectiveexclusions")
     }
 }
 
@@ -200,6 +202,9 @@ pub struct DirectoryEntry {
     /// Operational attributes (not returned by default in searches)
     #[serde(default)]
     pub operational_attributes: OperationalAttributes,
+    /// Virtual operational attributes computed at read time.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub virtual_operational_attributes: HashMap<String, Vec<String>>,
 }
 
 impl DirectoryEntry {
@@ -213,6 +218,7 @@ impl DirectoryEntry {
             dn: dn.into(),
             attributes: normalized_attributes,
             operational_attributes: OperationalAttributes::new(),
+            virtual_operational_attributes: HashMap::new(),
         }
     }
 
@@ -231,7 +237,14 @@ impl DirectoryEntry {
             dn: dn.into(),
             attributes: normalized_attributes,
             operational_attributes,
+            virtual_operational_attributes: HashMap::new(),
         }
+    }
+
+    pub fn response_operational_attributes(&self) -> HashMap<String, Vec<String>> {
+        let mut attributes = self.operational_attributes.to_attributes();
+        attributes.extend(self.virtual_operational_attributes.clone());
+        attributes
     }
 }
 
@@ -250,6 +263,7 @@ impl ProjectedDirectoryEntry {
                 &entry.dn,
                 &entry.attributes,
                 &entry.operational_attributes,
+                &entry.virtual_operational_attributes,
             ),
             referral_urls: referral_urls_from_attributes(&entry.attributes),
         }
@@ -292,7 +306,12 @@ impl DirectoryAttributeProjection {
     }
 
     pub fn project_entry(&self, entry: &DirectoryEntry) -> Vec<(String, Vec<String>)> {
-        self.project_attributes(&entry.dn, &entry.attributes, &entry.operational_attributes)
+        self.project_attributes(
+            &entry.dn,
+            &entry.attributes,
+            &entry.operational_attributes,
+            &entry.virtual_operational_attributes,
+        )
     }
 
     pub fn project_attributes(
@@ -300,6 +319,7 @@ impl DirectoryAttributeProjection {
         dn: &str,
         attributes: &HashMap<String, Vec<String>>,
         operational_attributes: &OperationalAttributes,
+        virtual_operational_attributes: &HashMap<String, Vec<String>>,
     ) -> Vec<(String, Vec<String>)> {
         let mut selected = Vec::with_capacity(attributes.len());
 
@@ -327,6 +347,12 @@ impl DirectoryAttributeProjection {
 
         if self.include_all_operational || !self.specific_operational.is_empty() {
             let mut operational = operational_attributes.to_attributes();
+            for (name, values) in attributes {
+                if OperationalAttributes::is_operational(name) {
+                    operational.insert(name.clone(), values.clone());
+                }
+            }
+            operational.extend(virtual_operational_attributes.clone());
             operational.insert("entryDN".to_string(), vec![dn.to_string()]);
 
             for (name, values) in operational {
@@ -1039,6 +1065,7 @@ impl MockBackend {
                         dn: dn_string,
                         attributes: HashMap::new(),
                         operational_attributes: OperationalAttributes::new(),
+                        virtual_operational_attributes: HashMap::new(),
                     },
                 },
             );

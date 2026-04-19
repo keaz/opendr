@@ -414,7 +414,6 @@ fn rfc_2307_full_posix_nis_schema_bundle_is_available() {
 }
 
 #[test]
-#[ignore = "RFC 3671 collective attributes are not implemented yet"]
 fn rfc_3671_collective_attribute_schema_and_runtime_projection_are_available() {
     let schema = LdapSchema::with_core_schema();
 

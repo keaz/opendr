@@ -16,6 +16,7 @@ use x520_stringprep::{
 
 use crate::dn::{canonicalize_dn, parse_dn, parse_rdn, rdn_attribute_values};
 
+const RFC3671_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc3671.ldif");
 const RFC3672_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc3672.ldif");
 const RFC2307_SCHEMA_LDIF: &str = include_str!("../resources/schema/posix/rfc2307.ldif");
 const RFC4524_SCHEMA_LDIF: &str = include_str!("../resources/schema/cosine/rfc4524.ldif");
@@ -424,11 +425,18 @@ impl AttributeMatchingProfile {
 
 pub fn bundled_schema_files(bundle: &str) -> Result<Vec<BuiltinSchemaFile>, SchemaError> {
     match bundle.to_ascii_lowercase().as_str() {
-        "core" => Ok(vec![BuiltinSchemaFile {
-            bundle: "core",
-            relative_path: "core/rfc3672.ldif",
-            contents: RFC3672_SCHEMA_LDIF,
-        }]),
+        "core" => Ok(vec![
+            BuiltinSchemaFile {
+                bundle: "core",
+                relative_path: "core/rfc3672.ldif",
+                contents: RFC3672_SCHEMA_LDIF,
+            },
+            BuiltinSchemaFile {
+                bundle: "core",
+                relative_path: "core/rfc3671.ldif",
+                contents: RFC3671_SCHEMA_LDIF,
+            },
+        ]),
         "posix" => Ok(vec![BuiltinSchemaFile {
             bundle: "posix",
             relative_path: "posix/rfc2307.ldif",
@@ -1396,6 +1404,8 @@ impl LdapSchema {
     fn load_core_schema_files(&mut self) {
         self.load_ldif_str(RFC3672_SCHEMA_LDIF)
             .expect("bundled RFC 3672 schema must load");
+        self.load_ldif_str(RFC3671_SCHEMA_LDIF)
+            .expect("bundled RFC 3671 schema must load");
     }
 
     /// Load RFC 2307 POSIX and NIS schema definitions.
@@ -1748,6 +1758,25 @@ impl LdapSchema {
     pub fn get_attribute_metadata(&self, name: &str) -> Option<&AttributeTypeMetadata> {
         self.get_attribute_type(name)
             .and_then(|attribute| self.attribute_metadata_by_oid.get(&attribute.oid))
+    }
+
+    pub fn attribute_types_match(&self, left: &str, right: &str) -> bool {
+        if attribute_description_type_name(left)
+            .eq_ignore_ascii_case(attribute_description_type_name(right))
+        {
+            return true;
+        }
+
+        let Some(left_attribute) = self.get_attribute_type(left) else {
+            return false;
+        };
+        self.get_attribute_type(right)
+            .is_some_and(|right_attribute| left_attribute.oid == right_attribute.oid)
+    }
+
+    pub fn is_collective_attribute(&self, name: &str) -> bool {
+        self.get_attribute_metadata(name)
+            .is_some_and(|metadata| metadata.collective)
     }
 
     pub fn get_matching_rule(&self, name_or_oid: &str) -> Option<&MatchingRule> {
@@ -2862,6 +2891,8 @@ impl LdapSchema {
             .filter_map(|name| self.get_attribute_type(name).map(|attr| attr.oid.clone()))
             .collect();
 
+        let is_collective_attribute_subentry =
+            entry_declares_object_class(attributes, "collectiveAttributeSubentry");
         for attr_name in attributes.keys() {
             let attr_lower = attribute_description_type_name(attr_name).to_lowercase();
             if !all_allowed.contains(&attr_lower) {
@@ -2869,6 +2900,16 @@ impl LdapSchema {
                 let Some(attr_type) = self.get_attribute_type(attr_name) else {
                     return Err(SchemaError::AttributeNotFound(attr_name.clone()));
                 };
+                if self
+                    .attribute_metadata_by_oid
+                    .get(&attr_type.oid)
+                    .is_some_and(|metadata| metadata.collective)
+                {
+                    if is_collective_attribute_subentry {
+                        continue;
+                    }
+                    return Err(SchemaError::AttributeNotAllowed(attr_name.clone()));
+                }
                 if allowed_oids.contains(&attr_type.oid) {
                     continue;
                 }
@@ -2956,12 +2997,14 @@ impl LdapSchema {
     }
 
     fn attribute_is_globally_allowed_operational(&self, attr_type: &AttributeType) -> bool {
-        attr_type.oid == "2.5.18.5"
-            && self
-                .attribute_metadata_by_oid
-                .get(&attr_type.oid)
-                .and_then(|metadata| metadata.usage.as_deref())
-                .is_some_and(|usage| usage.eq_ignore_ascii_case("directoryOperation"))
+        matches!(
+            attr_type.oid.as_str(),
+            "2.5.18.5" | "2.5.18.7" | "2.5.18.12"
+        ) && self
+            .attribute_metadata_by_oid
+            .get(&attr_type.oid)
+            .and_then(|metadata| metadata.usage.as_deref())
+            .is_some_and(|usage| usage.eq_ignore_ascii_case("directoryOperation"))
     }
 
     fn validate_subentry_administrative_parent(
@@ -2969,6 +3012,14 @@ impl LdapSchema {
         attributes: &HashMap<String, Vec<String>>,
         parent_attributes: Option<&HashMap<String, Vec<String>>>,
     ) -> Result<(), SchemaError> {
+        if entry_declares_object_class(attributes, "collectiveAttributeSubentry")
+            && !entry_declares_object_class(attributes, "subentry")
+        {
+            return Err(SchemaError::StructureRuleViolation(
+                "collectiveAttributeSubentry must be used with the subentry structural object class"
+                    .to_string(),
+            ));
+        }
         if !entry_declares_object_class(attributes, "subentry") {
             return Ok(());
         }
@@ -2985,6 +3036,21 @@ impl LdapSchema {
         }) {
             return Err(SchemaError::StructureRuleViolation(
                 "subentry parent must define administrativeRole".to_string(),
+            ));
+        }
+        if entry_declares_object_class(attributes, "collectiveAttributeSubentry")
+            && attribute_values(parent_attributes, "administrativeRole").is_none_or(|roles| {
+                roles.iter().all(|role| {
+                    !role.eq_ignore_ascii_case("collectiveAttributeSpecificArea")
+                        && !role.eq_ignore_ascii_case("collectiveAttributeInnerArea")
+                        && role != "2.5.23.5"
+                        && role != "2.5.23.6"
+                })
+            })
+        {
+            return Err(SchemaError::StructureRuleViolation(
+                "collectiveAttributeSubentry requires a parent administrative entry with collectiveAttributeSpecificArea or collectiveAttributeInnerArea"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -3993,7 +4059,6 @@ pub(crate) enum Refinement {
     Not(Box<Refinement>),
 }
 
-#[cfg(test)]
 impl SubtreeSpecification {
     pub(crate) fn contains_entry(
         &self,
@@ -4033,7 +4098,6 @@ impl SubtreeSpecification {
     }
 }
 
-#[cfg(test)]
 impl SpecificExclusion {
     fn excludes(&self, base_dn: &str, entry_dn: &str) -> bool {
         let excluded_dn = if self.local_name.is_empty() {
@@ -4057,7 +4121,6 @@ impl SpecificExclusion {
     }
 }
 
-#[cfg(test)]
 impl Refinement {
     fn matches(&self, object_classes: &[String]) -> bool {
         match self {
@@ -4133,7 +4196,6 @@ fn validate_subtree_specification(value: &str) -> Result<(), String> {
     parse_subtree_specification(value).map(|_| ())
 }
 
-#[cfg(test)]
 fn subtree_base_distance(base_dn: &str, entry_dn: &str) -> Option<u32> {
     let base = parse_dn(base_dn).ok()?;
     let entry = parse_dn(entry_dn).ok()?;
@@ -7071,12 +7133,25 @@ mod tests {
     }
 
     #[test]
-    fn core_schema_loads_file_backed_rfc3672_definitions() {
+    fn core_schema_loads_file_backed_rfc3671_and_rfc3672_definitions() {
         let mut schema = LdapSchema::with_core_schema();
 
         assert!(schema.get_attribute_type("administrativeRole").is_some());
         assert!(schema.get_attribute_type("subtreeSpecification").is_some());
         assert!(schema.get_object_class("subentry").is_some());
+        assert!(
+            schema
+                .get_attribute_type("collectiveAttributeSubentries")
+                .is_some()
+        );
+        assert!(schema.get_attribute_type("collectiveExclusions").is_some());
+        assert!(schema.get_attribute_type("c-l").is_some());
+        assert!(
+            schema
+                .get_object_class("collectiveAttributeSubentry")
+                .is_some()
+        );
+        assert!(schema.is_collective_attribute("c-l"));
         assert!(
             schema
                 .ldap_syntax_descriptions_unique_sorted()
@@ -7086,6 +7161,11 @@ mod tests {
 
         schema.load_builtin_schema("core").unwrap();
         assert!(schema.get_object_class("subentry").is_some());
+        assert!(
+            schema
+                .get_object_class("collectiveAttributeSubentry")
+                .is_some()
+        );
     }
 
     #[test]
@@ -7219,6 +7299,106 @@ mod tests {
                 "cn=Collective People,ou=People,dc=example,dc=org",
                 &subentry,
                 Some(&parent_without_role)
+            ),
+            Err(SchemaError::StructureRuleViolation(_))
+        ));
+    }
+
+    #[test]
+    fn rfc3671_collective_attributes_are_only_stored_on_collective_subentries() {
+        let schema = LdapSchema::with_core_schema();
+        let parent = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
+            ("ou".to_string(), vec!["People".to_string()]),
+            (
+                "administrativeRole".to_string(),
+                vec!["collectiveAttributeSpecificArea".to_string()],
+            ),
+        ]);
+        let collective_subentry = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec![
+                    "top".to_string(),
+                    "subentry".to_string(),
+                    "collectiveAttributeSubentry".to_string(),
+                ],
+            ),
+            ("cn".to_string(), vec!["Collective People".to_string()]),
+            ("subtreeSpecification".to_string(), vec!["{}".to_string()]),
+            ("c-l".to_string(), vec!["Colombo".to_string()]),
+        ]);
+        let ordinary_entry = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            ("cn".to_string(), vec!["Alice".to_string()]),
+            ("sn".to_string(), vec!["Example".to_string()]),
+            ("c-l".to_string(), vec!["Colombo".to_string()]),
+        ]);
+        let excluded_entry = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            ("cn".to_string(), vec!["Alice".to_string()]),
+            ("sn".to_string(), vec!["Example".to_string()]),
+            ("collectiveExclusions".to_string(), vec!["c-l".to_string()]),
+        ]);
+
+        assert!(
+            schema
+                .validate_entry_at_dn(
+                    "cn=Collective People,ou=People,dc=example,dc=org",
+                    &collective_subentry,
+                    Some(&parent)
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            schema.validate_entry(&ordinary_entry),
+            Err(SchemaError::AttributeNotAllowed(attribute)) if attribute == "c-l"
+        ));
+        assert!(schema.validate_entry(&excluded_entry).is_ok());
+    }
+
+    #[test]
+    fn rfc3671_collective_subentry_requires_collective_administrative_area() {
+        let schema = LdapSchema::with_core_schema();
+        let parent_without_collective_role = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
+            ("ou".to_string(), vec!["People".to_string()]),
+            (
+                "administrativeRole".to_string(),
+                vec!["accessControlSpecificArea".to_string()],
+            ),
+        ]);
+        let collective_subentry = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec![
+                    "top".to_string(),
+                    "subentry".to_string(),
+                    "collectiveAttributeSubentry".to_string(),
+                ],
+            ),
+            ("cn".to_string(), vec!["Collective People".to_string()]),
+            ("subtreeSpecification".to_string(), vec!["{}".to_string()]),
+            ("c-l".to_string(), vec!["Colombo".to_string()]),
+        ]);
+
+        assert!(matches!(
+            schema.validate_entry_at_dn(
+                "cn=Collective People,ou=People,dc=example,dc=org",
+                &collective_subentry,
+                Some(&parent_without_collective_role)
             ),
             Err(SchemaError::StructureRuleViolation(_))
         ));

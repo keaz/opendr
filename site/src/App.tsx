@@ -394,7 +394,7 @@ allow_online_updates = false`,
     options: [
       ["enabled", "Loads the built-in and external LDAP schema registry at startup."],
       ["schema_dir", "Directory recursively loaded for RFC-style LDIF schema files with `.ldif`, `.schema`, or `.conf` extensions."],
-      ["load_builtin", "Built-in schema bundle names loaded before external files. Use core by default for RFC 3672 subentries, add posix for RFC 2307 POSIX/NIS entries, add cosine for RFC 4524 COSINE entries, or add x509 for RFC 4523 certificate schema entries."],
+      ["load_builtin", "Built-in schema bundle names loaded before external files. Use core by default for RFC 3672 subentries and RFC 3671 collective attributes, add posix for RFC 2307 POSIX/NIS entries, add cosine for RFC 4524 COSINE entries, or add x509 for RFC 4523 certificate schema entries."],
       ["strict_validation", "Treats malformed schema files as startup errors."],
       ["allow_online_updates", "Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into the configured schema directory."],
     ],
@@ -1575,7 +1575,7 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
                 <li><code>server.toml</code> with canonical runtime fields.</li>
                 <li><code>setup.state</code> to block accidental reconfiguration.</li>
                 <li><code>admin.ldif</code>, <code>base.ldif</code>, and optional <code>sample.ldif</code>.</li>
-                <li>Bundled schema LDIF files such as <code>core/rfc3672.ldif</code>, <code>posix/rfc2307.ldif</code>, <code>cosine/rfc4524.ldif</code>, and <code>x509/rfc4523.ldif</code> when <code>generate-schema</code> is used.</li>
+                <li>Bundled schema LDIF files such as <code>core/rfc3672.ldif</code>, <code>core/rfc3671.ldif</code>, <code>posix/rfc2307.ldif</code>, <code>cosine/rfc4524.ldif</code>, and <code>x509/rfc4523.ldif</code> when <code>generate-schema</code> is used.</li>
                 <li>Data and replication state directories.</li>
               </ul>
             </section>
@@ -1638,7 +1638,7 @@ opendr-setup --config-dir ./config generate-schema --bundle all --overwrite`}</c
                   <KeyValueTable
                     headings={["Bundle", "Standard coverage"]}
                     rows={[
-                      ["core", "RFC 4519 core user schema plus file-backed RFC 3672 LDAP subentries."],
+                      ["core", "RFC 4519 core user schema plus file-backed RFC 3672 LDAP subentries and RFC 3671 collective attributes."],
                       ["posix", "RFC 2307 POSIX/NIS account, group, shadow, host, network, service, protocol, RPC, netgroup, map, IEEE 802 device, and bootable device schema."],
                       ["cosine", "RFC 4524 COSINE account, document, domain, domain-related object, friendly country, RFC 822 local part, room, and simple security object schema."],
                       ["x509", "RFC 4523 X.509 certificate, CRL, certificate pair, supported algorithm, PKI user, PKI CA, and CRL distribution point schema. DER-backed values are validated; GSER matching remains tracked work."],

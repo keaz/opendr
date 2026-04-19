@@ -108,11 +108,11 @@ opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
 This writes bundled schema files such as `config/schema/core/rfc3672.ldif`,
-`config/schema/posix/rfc2307.ldif`, `config/schema/cosine/rfc4524.ldif`, and
-`config/schema/x509/rfc4523.ldif`. The generated files are the same LDIF that
-backs the built-in bundles. If both `load_builtin` and generated files are
-enabled for the same bundle, compatible duplicate standard definitions are
-merged idempotently.
+`config/schema/core/rfc3671.ldif`, `config/schema/posix/rfc2307.ldif`,
+`config/schema/cosine/rfc4524.ldif`, and `config/schema/x509/rfc4523.ldif`.
+The generated files are the same LDIF that backs the built-in bundles. If both
+`load_builtin` and generated files are enabled for the same bundle, compatible
+duplicate standard definitions are merged idempotently.
 
 ### LDAP Subentries
 
@@ -127,6 +127,23 @@ Subentry entries must be subordinate to an administrative entry that carries
 one-level and subtree searches hide subentries while base-object searches can
 return them. With a TRUE control value, search returns subentries and hides
 normal entries; with FALSE, search returns normal entries and hides subentries.
+
+### Collective Attributes
+
+The core schema also registers RFC 3671 collective attributes from
+`resources/schema/core/rfc3671.ldif`. A collective attribute subentry must be
+stored below an administrative entry whose `administrativeRole` includes
+`collectiveAttributeSpecificArea` or `collectiveAttributeInnerArea`, and the
+subentry must include both `subentry` and `collectiveAttributeSubentry` object
+classes.
+
+Collective attribute values such as `c-l` are stored on the collective subentry.
+At search time, OpenDR projects applicable collective values virtually onto
+normal entries according to the subentry's `subtreeSpecification`. The projected
+values can be returned in search results and used by search filters, but they
+are not persisted on the target entries. Entries can opt out with
+`collectiveExclusions`, including `excludeAllCollectiveAttributes` or a specific
+collective attribute type such as `c-l`.
 
 ### External Schema Files
 

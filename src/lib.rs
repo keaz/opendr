@@ -12,6 +12,7 @@ pub mod backup;
 mod backend_txn_fsm;
 pub mod ber_decoder_fsm;
 pub mod change_observer;
+pub mod collective_attrs;
 pub mod compare_fsm;
 pub mod config;
 pub mod connection_fsm;

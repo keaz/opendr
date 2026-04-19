@@ -421,7 +421,7 @@ pub fn build_production_search_fsm_with_request(
 
 fn directory_entry_to_search_entry(entry: &DirectoryEntry) -> SearchEntry {
     let mut combined_attrs = entry.attributes.clone();
-    combined_attrs.extend(entry.operational_attributes.to_attributes());
+    combined_attrs.extend(entry.response_operational_attributes());
 
     SearchEntry {
         dn: entry.dn.clone(),

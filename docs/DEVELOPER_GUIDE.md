@@ -169,8 +169,9 @@ opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
 The command writes bundled schema files such as
-`config/schema/core/rfc3672.ldif`, `config/schema/posix/rfc2307.ldif`,
-`config/schema/cosine/rfc4524.ldif`, and `config/schema/x509/rfc4523.ldif`.
+`config/schema/core/rfc3672.ldif`, `config/schema/core/rfc3671.ldif`,
+`config/schema/posix/rfc2307.ldif`, `config/schema/cosine/rfc4524.ldif`, and
+`config/schema/x509/rfc4523.ldif`.
 The runtime also supports the same schema through
 `load_builtin = ["core", "posix", "cosine", "x509"]`.
 
@@ -354,7 +355,8 @@ Schema validation:
   recursively from `[schema].schema_dir`.
 - The core schema includes common LDAP classes such as `top`, `person`,
   `organizationalPerson`, `inetOrgPerson`, `organization`, and
-  `organizationalUnit`, plus RFC 3672 subentry schema loaded from bundled LDIF.
+  `organizationalUnit`, plus RFC 3672 subentry schema and RFC 3671 collective
+  attribute schema loaded from bundled LDIF.
 - The optional `posix` built-in schema bundle adds full RFC 2307 POSIX/NIS
   coverage, including account, group, shadow, host, network, service, protocol,
   RPC, netgroup, NIS map, IEEE 802 device, and bootable device entries.

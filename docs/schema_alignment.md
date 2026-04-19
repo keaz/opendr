@@ -51,6 +51,8 @@ Tracked follow-up work:
   including strict `groupOfNames`.
 - GitHub issue #194: completed RFC 2798 `inetOrgPerson` schema coverage.
 - GitHub issue #195: completed RFC 2307 POSIX/NIS schema coverage.
+- GitHub issue #196: completed RFC 3671 collective attribute schema,
+  validation, and search-time projection.
 - GitHub issue #197: completed RFC 3672 LDAP subentries schema and search
   visibility behavior.
 - GitHub issue #199: completed RFC 4524 COSINE LDAP/X.500 schema coverage.
@@ -61,8 +63,6 @@ Tracked follow-up work:
 - GitHub issue #200: move all built-in standard schema definitions from Rust
   literals into bundled schema files while keeping only the schema engine and
   runtime behavior in Rust.
-- GitHub issue #196: complete the remaining strict schema RFC conformance work
-  for RFC 3671 collective attributes.
 
 ## Recommended DIT Shape
 
@@ -176,6 +176,7 @@ for a complete conformance example that uses `core` plus `posix`.
 | RFC 4519 `groupOfUniqueNames` | Supported | `uniqueMember` is required and validated with Name and Optional UID syntax. |
 | RFC 2798 `inetOrgPerson` | Supported | Full RFC 2798 MAY attribute set is available, including audio/photo, binary/certificate attributes, and `preferredLanguage` validation. |
 | RFC 2307 POSIX/NIS | Optional built-in bundle | Load with `load_builtin = ["core", "posix"]` for the full RFC 2307 object class and attribute set, including shadow accounts, hosts, networks, services, protocols, RPCs, netgroups, NIS maps, IEEE 802 devices, and bootable devices. |
+| RFC 3671 collective attributes | Supported | The core bundle registers collective attribute subentries, `collectiveAttributeSubentries`, `collectiveExclusions`, and RFC collective attribute types. Values stored on collective subentries are projected virtually into matching search results and filters, with per-entry exclusions. |
 | RFC 3672 LDAP subentries | Supported | The core bundle registers `subentry`, `administrativeRole`, and `subtreeSpecification`, validates subtree specifications, advertises the Subentries request control, and applies RFC 3672 search visibility rules. |
 | RFC 4523 X.509 certificate schema | Optional built-in bundle, partial runtime matching | Load with `load_builtin = ["core", "x509"]` for the RFC 4523 attribute, object class, syntax, and matching-rule definitions. Certificate, CRL, certificate-pair, and supported-algorithm values are validated as DER, PEM, or base64 DER. The RFC 4523 GSER assertion matching rules are registered but not executed yet. |
 | RFC 4524 COSINE LDAP/X.500 | Optional built-in bundle | Load with `load_builtin = ["core", "cosine"]` for the full COSINE attribute and object class set, including account, document, domain, domain-related object, friendly country, RFC 822 local part, room, and simple security object entries. |

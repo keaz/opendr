@@ -4574,6 +4574,7 @@ async fn collect_search_result_set(
     if request.scope == ldap_parser::ldap::SearchScope::BaseObject {
         return collect_base_object_search_result_set(
             backend,
+            schema,
             &prepared_filter,
             effective_base_dn,
             base_object_entry,
@@ -4661,6 +4662,18 @@ async fn collect_search_result_set(
             continue;
         }
 
+        let entry = crate::collective_attrs::project_collective_attributes_for_entry(
+            backend, schema, entry,
+        )
+        .await
+        .map_err(|err| SearchExecutionError {
+            result_code: map_backend_error(&err),
+            diagnostic: diagnostic_for_error(&err).to_string(),
+            target_dn: effective_base_dn.to_string(),
+            alias_dereference_failure: false,
+            referral_processing_failure: false,
+        })?;
+
         if !index_covers_filter
             && !prepared_filter
                 .matches_entry(&entry)
@@ -4699,6 +4712,7 @@ async fn collect_search_result_set(
 #[allow(clippy::too_many_arguments)]
 async fn collect_base_object_search_result_set(
     backend: &dyn DirectoryBackend,
+    schema: &LdapSchema,
     prepared_filter: &PreparedLdapFilter,
     effective_base_dn: &str,
     base_object_entry: Option<DirectoryEntry>,
@@ -4804,6 +4818,17 @@ async fn collect_base_object_search_result_set(
             time_limit_hit: false,
         });
     }
+
+    let entry =
+        crate::collective_attrs::project_collective_attributes_for_entry(backend, schema, entry)
+            .await
+            .map_err(|err| SearchExecutionError {
+                result_code: map_backend_error(&err),
+                diagnostic: diagnostic_for_error(&err).to_string(),
+                target_dn: effective_base_dn.to_string(),
+                alias_dereference_failure: false,
+                referral_processing_failure: false,
+            })?;
 
     if !prepared_filter
         .matches_entry(&entry)
@@ -8668,6 +8693,9 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
 
     // Add regular attributes
     for (name, values) in &entry.attributes {
+        if OperationalAttributes::is_operational(name) {
+            continue;
+        }
         if include_all
             || requested
                 .iter()
@@ -8685,7 +8713,12 @@ fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(Strin
             .iter()
             .any(|attr| OperationalAttributes::is_operational(attr))
     {
-        let mut operational = entry.operational_attributes.to_attributes();
+        let mut operational = entry.response_operational_attributes();
+        for (name, values) in &entry.attributes {
+            if OperationalAttributes::is_operational(name) {
+                operational.insert(name.clone(), values.clone());
+            }
+        }
         operational.insert("entryDN".to_string(), vec![entry.dn.clone()]);
 
         for (name, values) in operational {
@@ -9492,6 +9525,121 @@ mod tests {
         let response = read_response(&mut client_stream).await;
         let (_, messages) = parse_ldap_messages(&response).unwrap();
         assert!(search_result_dns(&messages).is_empty());
+    }
+
+    #[tokio::test]
+    async fn collective_attributes_are_projected_for_search_results_and_filters() {
+        let backend = MockBackend::new();
+        for entry in [
+            DirectoryEntry::new(
+                "ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "organizationalUnit".to_string()],
+                    ),
+                    ("ou".to_string(), vec!["People".to_string()]),
+                    (
+                        "administrativeRole".to_string(),
+                        vec!["collectiveAttributeSpecificArea".to_string()],
+                    ),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=Alice,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "person".to_string()],
+                    ),
+                    ("cn".to_string(), vec!["Alice".to_string()]),
+                    ("sn".to_string(), vec!["Example".to_string()]),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=People Collective,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec![
+                            "top".to_string(),
+                            "subentry".to_string(),
+                            "collectiveAttributeSubentry".to_string(),
+                        ],
+                    ),
+                    ("cn".to_string(), vec!["People Collective".to_string()]),
+                    (
+                        "subtreeSpecification".to_string(),
+                        vec!["{ minimum 1 }".to_string()],
+                    ),
+                    ("c-l".to_string(), vec!["Colombo".to_string()]),
+                ]),
+            ),
+        ] {
+            backend.add_entry(entry, Vec::new()).await.unwrap();
+        }
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+        let request = SearchRequest {
+            base_object: LdapDN(Cow::Owned("ou=People,dc=example,dc=org".to_string())),
+            scope: SearchScope::WholeSubtree,
+            deref_aliases: DerefAliases(0),
+            size_limit: 0,
+            time_limit: 0,
+            types_only: false,
+            filter: Filter::EqualityMatch(AttributeValueAssertion {
+                attribute_desc: LdapString(Cow::Owned("c-l".to_string())),
+                assertion_value: Cow::Borrowed(b"Colombo"),
+            }),
+            attributes: vec![
+                LdapString(Cow::Owned("cn".to_string())),
+                LdapString(Cow::Owned("c-l".to_string())),
+                LdapString(Cow::Owned("collectiveAttributeSubentries".to_string())),
+            ],
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            64,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &RequestControls::default(),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=Alice,ou=People,dc=example,dc=org".to_string()]
+        );
+
+        let entry = messages
+            .iter()
+            .find_map(|message| match &message.protocol_op {
+                ProtocolOp::SearchResultEntry(entry) => Some(entry),
+                _ => None,
+            })
+            .expect("search result entry");
+        let attributes = search_entry_attribute_map(entry);
+        assert_eq!(attributes.get("c-l"), Some(&vec!["Colombo".to_string()]));
+        assert_eq!(
+            attributes.get("collectiveAttributeSubentries"),
+            Some(&vec![
+                "cn=People Collective,ou=People,dc=example,dc=org".to_string()
+            ])
+        );
     }
 
     #[test]

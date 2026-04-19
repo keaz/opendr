@@ -1293,6 +1293,7 @@ impl ProviderConnectionImpl {
                     dn: entry.dn,
                     attributes: entry.attributes,
                     operational_attributes: crate::backend::OperationalAttributes::new(),
+                    virtual_operational_attributes: std::collections::HashMap::new(),
                 };
                 if let Some(encoded) = encode_directory_entry_as_change(backend_entry) {
                     encoded_entries.push(encoded);
@@ -1409,6 +1410,7 @@ impl ProviderConnection for ProviderConnectionImpl {
                             dn: entry.dn,
                             attributes: entry.attributes,
                             operational_attributes: crate::backend::OperationalAttributes::new(),
+                            virtual_operational_attributes: std::collections::HashMap::new(),
                         };
                         encode_directory_entry_as_change(backend_entry)
                     })
