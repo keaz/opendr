@@ -378,14 +378,13 @@ Schema validation:
   built-in standard attributes (`C`, `ADMD`, `PRMD`, `X121`, `T-ID`, `O`, `OU`,
   `UA-ID`, `S`, `G`, `I`, `GQ`), domain-defined `DD.<type>` attributes, and
   RFC 2156-renderable extension attributes (`CN`, PDS keys, `NET-NUM`,
-  `NET-SUB`, `T-TY`) are supported in GeneralSubtree bases;
+  `NET-SUB`, `NET-PSAP`, `T-TY`) are supported in GeneralSubtree bases;
   path-to-name checks evaluate certificate NameConstraints; certificate pair
   component matching delegates to those certificate components; CRL component
   matching covers issuer, date, CRL-number ranges, authority key identifier,
   reason flags, full-name distribution points, and name-relative-to-CRL-issuer
   distribution points. The remaining RFC 4523 constructed or schema-specific
-  open-type `otherName` values plus X.400 `NET-PSAP` presentation-address
-  rendering remain tracked follow-up work.
+  open-type `otherName` values remain tracked follow-up work.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active

@@ -548,14 +548,13 @@ OCTET STRING values, `ediPartyName` values, X.400 ORAddress built-in standard
 attributes (`C`, `ADMD`, `PRMD`, `X121`, `T-ID`, `O`, `OU`, `UA-ID`, `S`, `G`,
 `I`, `GQ`), domain-defined `DD.<type>` attributes, and RFC 2156-renderable
 extension attributes (`CN`, physical-delivery keys, `NET-NUM`, `NET-SUB`,
-`T-TY`) rendered in RFC 2156 string form in GeneralSubtree bases;
+`NET-PSAP`, `T-TY`) rendered in RFC 2156 string form in GeneralSubtree bases;
 certificate pair issued-to and issued-by assertions that delegate to those
 certificate components; and CRL issuer, date-and-time, CRL-number range,
 authority key identifier, reason-flag, full-name distribution point, and
 name-relative-to-CRL-issuer distribution point assertions. The remaining RFC
 4523 components, including constructed or schema-specific open-type `otherName`
-values plus X.400 `NET-PSAP` presentation-address rendering, are rejected
-explicitly until implemented.
+values, are rejected explicitly until implemented.
 
 ### Core Attributes
 

@@ -495,9 +495,10 @@ validity, private-key validity, subject-public-key algorithm, key usage, subject
 alternative name type, certificate policy, name constraints including asserted
 GeneralSubtree minimum/maximum bounds, `otherName` primitive values,
 `ediPartyName` values, X.400 ORAddress built-in standard, domain-defined, and
-RFC 2156-renderable extension attributes, CRL issuer, CRL date, CRL-number
-range, CRL authority key identifier, reason-flag, full-name distribution point,
-or name-relative-to-CRL-issuer distribution point components.
+RFC 2156-renderable extension attributes including `NET-PSAP` presentation
+addresses, CRL issuer, CRL date, CRL-number range, CRL authority key identifier,
+reason-flag, full-name distribution point, or name-relative-to-CRL-issuer
+distribution point components.
 
 Generate bundled schema files when a deployment needs file-based schema
 artifacts instead of relying only on `load_builtin`:

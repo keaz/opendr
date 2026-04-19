@@ -227,6 +227,30 @@ fn x400_or_address_der() -> Vec<u8> {
     or_address
 }
 
+fn x400_psap_or_address_der() -> Vec<u8> {
+    let mut network_addresses = Vec::new();
+    network_addresses.extend(test_der_wrap(0x04, &[0xaa, 0x31, 0x06]));
+
+    let mut presentation_address = Vec::new();
+    presentation_address.extend(test_der_wrap(0xa0, &test_der_wrap(0x04, b"P")));
+    presentation_address.extend(test_der_wrap(0xa1, &test_der_wrap(0x04, b"S")));
+    presentation_address.extend(test_der_wrap(0xa2, &test_der_wrap(0x04, b"T")));
+    presentation_address.extend(test_der_wrap(
+        0xa3,
+        &test_der_wrap(0x31, &network_addresses),
+    ));
+
+    let mut extension_attributes = Vec::new();
+    extension_attributes.extend(x400_extension_attribute_der(
+        22,
+        test_der_wrap(0xa0, &presentation_address),
+    ));
+
+    let mut or_address = test_der_wrap(0x30, &[]);
+    or_address.extend(test_der_wrap(0x31, &extension_attributes));
+    or_address
+}
+
 fn certificate_policy_extension_content(policy_oid: &[u64]) -> Vec<u8> {
     let policy_information = test_der_wrap(0x30, &test_der_oid(policy_oid));
     test_der_wrap(0x30, &policy_information)
@@ -309,6 +333,11 @@ fn name_constraints_extension_content() -> Vec<u8> {
         None,
         None,
     );
+    let permitted_x400_psap_address = general_subtree_der(
+        x400_address_general_name_der(x400_psap_or_address_der()),
+        None,
+        None,
+    );
     let excluded = general_subtree_der(test_der_wrap(0x81, b"blocked@example.org"), Some(1), None);
     let excluded_directory = general_subtree_der(
         directory_name_general_name_der(&[
@@ -328,6 +357,7 @@ fn name_constraints_extension_content() -> Vec<u8> {
     permitted_subtrees.extend(permitted_other_name_bit_string);
     permitted_subtrees.extend(permitted_edi_party_name);
     permitted_subtrees.extend(permitted_x400_address);
+    permitted_subtrees.extend(permitted_x400_psap_address);
     let mut excluded_subtrees = excluded;
     excluded_subtrees.extend(excluded_directory);
     content.extend(test_der_wrap(0xa0, &permitted_subtrees));
@@ -1911,6 +1941,22 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .values_equal(
                 &cert_pem,
                 "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Other/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/CN=Gateway CN/NET-NUM=441234/NET-SUB=99/T-TY=ia5/\" } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/NET-PSAP='50'H$/'53'H$/'54'H$/NS+aa3106/\" } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/NET-PSAP='50'H$/'53'H$/'54'H$/NS+bbcc/\" } } } }",
             )
             .unwrap()
     );

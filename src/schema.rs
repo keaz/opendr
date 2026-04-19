@@ -6135,11 +6135,148 @@ fn append_x400_extended_network_address(
             }
             Ok(())
         }
-        0xa0 => Err("ExtendedNetworkAddress psap-address is not supported yet".to_string()),
+        0xa0 => {
+            let presentation_address = parse_x400_presentation_address(value.content)?;
+            append_rfc2156_or_address_component(output, "NET-PSAP", &presentation_address)
+        }
         other => Err(format!(
             "ExtendedNetworkAddress contains unexpected DER tag 0x{other:02x}"
         )),
     }
+}
+
+fn parse_x400_presentation_address(mut value: &[u8]) -> Result<String, String> {
+    let mut p_selector = None;
+    let mut s_selector = None;
+    let mut t_selector = None;
+    let mut network_addresses = None;
+
+    while !value.is_empty() {
+        let (next, field) = read_der_tlv(value)?;
+        match field.tag {
+            0xa0 if p_selector.is_none() => {
+                p_selector = Some(parse_explicit_octet_string(
+                    &field,
+                    "PresentationAddress pSelector",
+                )?);
+            }
+            0xa1 if s_selector.is_none() => {
+                s_selector = Some(parse_explicit_octet_string(
+                    &field,
+                    "PresentationAddress sSelector",
+                )?);
+            }
+            0xa2 if t_selector.is_none() => {
+                t_selector = Some(parse_explicit_octet_string(
+                    &field,
+                    "PresentationAddress tSelector",
+                )?);
+            }
+            0xa3 if network_addresses.is_none() => {
+                network_addresses = Some(parse_explicit_x400_network_addresses(&field)?);
+            }
+            0xa0 => return Err("PresentationAddress contains duplicate pSelector".to_string()),
+            0xa1 => return Err("PresentationAddress contains duplicate sSelector".to_string()),
+            0xa2 => return Err("PresentationAddress contains duplicate tSelector".to_string()),
+            0xa3 => return Err("PresentationAddress contains duplicate nAddresses".to_string()),
+            other => {
+                return Err(format!(
+                    "PresentationAddress contains unexpected DER tag 0x{other:02x}"
+                ));
+            }
+        }
+        value = next;
+    }
+
+    let network_addresses =
+        network_addresses.ok_or_else(|| "PresentationAddress requires nAddresses".to_string())?;
+    render_rfc1278_presentation_address(p_selector, s_selector, t_selector, &network_addresses)
+}
+
+fn parse_explicit_octet_string<'a>(value: &DerTlv<'a>, label: &str) -> Result<&'a [u8], String> {
+    let (remaining, octet_string) = read_der_tlv(value.content)?;
+    if !remaining.is_empty() {
+        return Err(format!("{label} contains trailing DER data"));
+    }
+    if octet_string.tag != 0x04 {
+        return Err(format!("{label} must contain a DER OCTET STRING"));
+    }
+    Ok(octet_string.content)
+}
+
+fn parse_explicit_x400_network_addresses<'a>(value: &DerTlv<'a>) -> Result<Vec<&'a [u8]>, String> {
+    let (remaining, set) = read_der_tlv(value.content)?;
+    if !remaining.is_empty() {
+        return Err("PresentationAddress nAddresses contains trailing DER data".to_string());
+    }
+    if set.tag != 0x31 {
+        return Err("PresentationAddress nAddresses must contain a DER SET".to_string());
+    }
+
+    let mut addresses = Vec::new();
+    let mut remaining_addresses = set.content;
+    while !remaining_addresses.is_empty() {
+        let (next, address) = read_der_tlv(remaining_addresses)?;
+        if address.tag != 0x04 {
+            return Err(
+                "PresentationAddress nAddresses values must be DER OCTET STRINGs".to_string(),
+            );
+        }
+        addresses.push(address.content);
+        remaining_addresses = next;
+    }
+    if addresses.is_empty() {
+        return Err("PresentationAddress nAddresses must contain at least one value".to_string());
+    }
+    Ok(addresses)
+}
+
+fn render_rfc1278_presentation_address(
+    p_selector: Option<&[u8]>,
+    s_selector: Option<&[u8]>,
+    t_selector: Option<&[u8]>,
+    network_addresses: &[&[u8]],
+) -> Result<String, String> {
+    let mut output = String::new();
+    if let Some(p_selector) = p_selector {
+        output.push_str(&render_rfc1278_selector(p_selector));
+        output.push('/');
+        output.push_str(&render_rfc1278_selector(s_selector.unwrap_or_default()));
+        output.push('/');
+        output.push_str(&render_rfc1278_selector(t_selector.unwrap_or_default()));
+        output.push('/');
+    } else if let Some(s_selector) = s_selector {
+        output.push_str(&render_rfc1278_selector(s_selector));
+        output.push('/');
+        output.push_str(&render_rfc1278_selector(t_selector.unwrap_or_default()));
+        output.push('/');
+    } else if let Some(t_selector) = t_selector {
+        output.push_str(&render_rfc1278_selector(t_selector));
+        output.push('/');
+    }
+
+    for (index, address) in network_addresses.iter().enumerate() {
+        if index > 0 {
+            output.push('_');
+        }
+        output.push_str(&render_rfc1278_network_address(address)?);
+    }
+    Ok(output)
+}
+
+fn render_rfc1278_selector(value: &[u8]) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        format!("'{}'H", normalize_hex_bytes(value))
+    }
+}
+
+fn render_rfc1278_network_address(value: &[u8]) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("PresentationAddress network address must not be empty".to_string());
+    }
+    Ok(format!("NS+{}", normalize_hex_bytes(value)))
 }
 
 fn parse_x400_e163_address(mut value: &[u8]) -> Result<(String, Option<String>), String> {
@@ -9753,6 +9890,41 @@ mod tests {
                 "/PD-STREET=Street/PD-BOX=Box/PD-RESTANTE=Restante/PD-UNIQUE=Unique",
                 "/PD-LOCAL=Local/NET-NUM=441234/NET-SUB=99/T-TY=ia5/"
             )
+        );
+    }
+
+    #[test]
+    fn rfc4523_x400_psap_address_renders_rfc1278_presentation_address() {
+        fn extension_attribute(attribute_type: u8, value: Vec<u8>) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend(wrap_der_value(0x80, &[attribute_type]));
+            content.extend(wrap_der_value(0xa1, &value));
+            wrap_der_value(0x30, &content)
+        }
+
+        let network_addresses = [
+            wrap_der_value(0x04, &[0xaa, 0x31, 0x06]),
+            wrap_der_value(0x04, &[0xbb, 0xcc]),
+        ]
+        .concat();
+        let mut presentation_address = Vec::new();
+        presentation_address.extend(wrap_der_value(0xa0, &wrap_der_value(0x04, b"P")));
+        presentation_address.extend(wrap_der_value(0xa1, &wrap_der_value(0x04, b"S")));
+        presentation_address.extend(wrap_der_value(0xa2, &wrap_der_value(0x04, &[0x01, 0x02])));
+        presentation_address.extend(wrap_der_value(
+            0xa3,
+            &wrap_der_value(0x31, &network_addresses),
+        ));
+
+        let mut or_address = wrap_der_value(0x30, &[]);
+        or_address.extend(wrap_der_value(
+            0x31,
+            &extension_attribute(22, wrap_der_value(0xa0, &presentation_address)),
+        ));
+
+        assert_eq!(
+            x400_address_to_rfc2156_string(&or_address).unwrap(),
+            "/NET-PSAP='50'H$/'53'H$/'0102'H$/NS+aa3106_NS+bbcc/"
         );
     }
 
