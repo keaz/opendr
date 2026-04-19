@@ -266,11 +266,11 @@ mail: schemae2e1@example.org
 exampleEmployeeNumber: 1001
 exampleAccessCode: blue
 exampleStartTime: 20260413010101Z
-exampleScore: 010
+exampleScore: 10
 exampleExactCode: CaseToken"
 
 if verify_entry_attributes_ci "cn=Schema E2E One,ou=people,${BASE_DN}" \
-  "exampleEmployeeNumber=1001" "exampleAccessCode=blue" "exampleStartTime=20260413010101Z" "exampleScore=010" "exampleExactCode=CaseToken"; then
+  "exampleEmployeeNumber=1001" "exampleAccessCode=blue" "exampleStartTime=20260413010101Z" "exampleScore=10" "exampleExactCode=CaseToken"; then
   log_success "✓ stored custom schema attributes are searchable"
   PASS_COUNT=$((PASS_COUNT + 1))
 else

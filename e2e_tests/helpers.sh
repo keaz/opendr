@@ -489,7 +489,7 @@ verify_entry_exists() {
   local port="$2"
   local dn="$3"
   
-  search_entry "${host}" "${port}" "${dn}" "(objectClass=*)" dn | grep -q "^dn: ${dn}$"
+  search_entry "${host}" "${port}" "${dn}" "(objectClass=*)" dn | grep -qi "^dn: ${dn}$"
 }
 
 verify_entry_attributes() {
