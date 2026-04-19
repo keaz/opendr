@@ -156,6 +156,28 @@ fn edi_party_name_general_name_der(name_assigner: Option<&str>, party_name: &str
     test_der_wrap(0xa5, &content)
 }
 
+fn x400_address_general_name_der(or_address: Vec<u8>) -> Vec<u8> {
+    test_der_wrap(0xa3, &or_address)
+}
+
+fn x400_or_address_der() -> Vec<u8> {
+    let mut built_in = Vec::new();
+    built_in.extend(test_der_wrap(0x61, &test_der_wrap(0x13, b"US")));
+    built_in.extend(test_der_wrap(0x62, &test_der_wrap(0x13, b"ExampleADMD")));
+    built_in.extend(test_der_wrap(0xa2, &test_der_wrap(0x13, b"ExamplePRMD")));
+    built_in.extend(test_der_wrap(0xa3, &test_der_wrap(0x13, b"ExampleOrg")));
+
+    let mut organizational_units = Vec::new();
+    organizational_units.extend(test_der_wrap(0x13, b"Directory"));
+    organizational_units.extend(test_der_wrap(0x13, b"Gateway"));
+    built_in.extend(test_der_wrap(
+        0xa6,
+        &test_der_wrap(0x30, &organizational_units),
+    ));
+
+    test_der_wrap(0x30, &built_in)
+}
+
 fn certificate_policy_extension_content(policy_oid: &[u64]) -> Vec<u8> {
     let policy_information = test_der_wrap(0x30, &test_der_oid(policy_oid));
     test_der_wrap(0x30, &policy_information)
@@ -233,6 +255,11 @@ fn name_constraints_extension_content() -> Vec<u8> {
         None,
         None,
     );
+    let permitted_x400_address = general_subtree_der(
+        x400_address_general_name_der(x400_or_address_der()),
+        None,
+        None,
+    );
     let excluded = general_subtree_der(test_der_wrap(0x81, b"blocked@example.org"), Some(1), None);
     let excluded_directory = general_subtree_der(
         directory_name_general_name_der(&[
@@ -251,6 +278,7 @@ fn name_constraints_extension_content() -> Vec<u8> {
     permitted_subtrees.extend(permitted_other_name_oid);
     permitted_subtrees.extend(permitted_other_name_bit_string);
     permitted_subtrees.extend(permitted_edi_party_name);
+    permitted_subtrees.extend(permitted_x400_address);
     let mut excluded_subtrees = excluded;
     excluded_subtrees.extend(excluded_directory);
     content.extend(test_der_wrap(0xa0, &permitted_subtrees));
@@ -1818,6 +1846,22 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
                     gser_quote("Example EDI"),
                     gser_quote("Other Gateway")
                 )
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/O=ExampleOrg/OU=Directory/OU=Gateway/\" } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/O=Other/OU=Directory/OU=Gateway/\" } } } }",
             )
             .unwrap()
     );

@@ -4654,6 +4654,7 @@ enum X509GeneralNameAssertion {
     },
     Rfc822Name(String),
     DnsName(String),
+    X400Address(String),
     EdiPartyName(X509EdiPartyNameAssertion),
     DirectoryName(String),
     UniformResourceIdentifier(String),
@@ -5380,6 +5381,10 @@ fn general_name_matches(
             X509GeneralNameAssertion::DnsName(asserted),
         ) => candidate.eq_ignore_ascii_case(asserted),
         (
+            x509_parser::extensions::GeneralName::X400Address(candidate),
+            X509GeneralNameAssertion::X400Address(asserted),
+        ) => x400_address_matches(candidate.data, asserted).unwrap_or(false),
+        (
             x509_parser::extensions::GeneralName::EDIPartyName(candidate),
             X509GeneralNameAssertion::EdiPartyName(asserted),
         ) => edi_party_name_der_matches_assertion(candidate.data, asserted).unwrap_or(false),
@@ -5573,6 +5578,175 @@ fn der_bit_string_bits(content: &[u8]) -> Result<String, String> {
         }
     }
     Ok(bits)
+}
+
+fn x400_address_matches(value: &[u8], assertion: &str) -> Result<bool, String> {
+    x400_address_to_rfc2156_string(value).map(|candidate| candidate == assertion)
+}
+
+fn x400_address_to_rfc2156_string(value: &[u8]) -> Result<String, String> {
+    let (remaining, built_in_standard_attributes) = read_der_tlv(value)?;
+    if built_in_standard_attributes.tag != 0x30 {
+        return Err("ORAddress must start with BuiltInStandardAttributes SEQUENCE".to_string());
+    }
+    if !remaining.is_empty() {
+        return Err(
+            "ORAddress domain-defined and extension attributes are not supported yet".to_string(),
+        );
+    }
+
+    let built_in = parse_x400_built_in_standard_attributes(built_in_standard_attributes.content)?;
+    built_in.to_rfc2156_string()
+}
+
+#[derive(Debug, Default)]
+struct X400BuiltInStandardAttributes {
+    country: Option<String>,
+    administration_domain: Option<String>,
+    private_domain: Option<String>,
+    organization: Option<String>,
+    organizational_units: Vec<String>,
+}
+
+impl X400BuiltInStandardAttributes {
+    fn to_rfc2156_string(&self) -> Result<String, String> {
+        let mut output = String::new();
+        if let Some(country) = self.country.as_deref() {
+            append_rfc2156_or_address_component(&mut output, "C", country)?;
+        }
+        if let Some(administration_domain) = self.administration_domain.as_deref() {
+            append_rfc2156_or_address_component(&mut output, "ADMD", administration_domain)?;
+        }
+        if let Some(private_domain) = self.private_domain.as_deref() {
+            append_rfc2156_or_address_component(&mut output, "PRMD", private_domain)?;
+        }
+        if let Some(organization) = self.organization.as_deref() {
+            append_rfc2156_or_address_component(&mut output, "O", organization)?;
+        }
+        for organizational_unit in &self.organizational_units {
+            append_rfc2156_or_address_component(&mut output, "OU", organizational_unit)?;
+        }
+        if output.is_empty() {
+            return Err("ORAddress contains no supported RFC 2156 components".to_string());
+        }
+        output.push('/');
+        Ok(output)
+    }
+}
+
+fn parse_x400_built_in_standard_attributes(
+    mut value: &[u8],
+) -> Result<X400BuiltInStandardAttributes, String> {
+    let mut attributes = X400BuiltInStandardAttributes::default();
+    while !value.is_empty() {
+        let (next, field) = read_der_tlv(value)?;
+        match field.tag {
+            0x61 if attributes.country.is_none() => {
+                attributes.country =
+                    Some(parse_explicit_x400_string(field.content, "CountryName")?);
+            }
+            0x62 if attributes.administration_domain.is_none() => {
+                attributes.administration_domain = Some(parse_explicit_x400_string(
+                    field.content,
+                    "AdministrationDomainName",
+                )?);
+            }
+            0xa2 if attributes.private_domain.is_none() => {
+                attributes.private_domain = Some(parse_explicit_x400_string(
+                    field.content,
+                    "PrivateDomainName",
+                )?);
+            }
+            0xa3 if attributes.organization.is_none() => {
+                attributes.organization = Some(parse_explicit_x400_string(
+                    field.content,
+                    "OrganizationName",
+                )?);
+            }
+            0xa6 if attributes.organizational_units.is_empty() => {
+                attributes.organizational_units =
+                    parse_explicit_x400_organizational_units(field.content)?;
+            }
+            0x61 | 0x62 | 0xa2 | 0xa3 | 0xa6 => {
+                return Err("duplicate ORAddress built-in standard attribute".to_string());
+            }
+            0x80 | 0xa0 | 0x81 | 0xa1 | 0x84 | 0xa4 | 0xa5 => {
+                return Err(format!(
+                    "unsupported ORAddress built-in standard attribute tag 0x{:02x}",
+                    field.tag
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unexpected ORAddress built-in standard attribute tag 0x{other:02x}"
+                ));
+            }
+        }
+        value = next;
+    }
+    Ok(attributes)
+}
+
+fn parse_explicit_x400_string(value: &[u8], label: &str) -> Result<String, String> {
+    let (remainder, string_value) = read_der_tlv(value)?;
+    if !remainder.is_empty() {
+        return Err(format!("{label} contains trailing DER data"));
+    }
+    der_tlv_string_value(&string_value).map_err(|err| format!("{label} is invalid: {err}"))
+}
+
+fn parse_explicit_x400_organizational_units(value: &[u8]) -> Result<Vec<String>, String> {
+    let (remainder, sequence) = read_der_tlv(value)?;
+    if !remainder.is_empty() {
+        return Err("OrganizationalUnitNames contains trailing DER data".to_string());
+    }
+    if sequence.tag != 0x30 {
+        return Err("OrganizationalUnitNames must be a DER SEQUENCE".to_string());
+    }
+
+    let mut organizational_units = Vec::new();
+    let mut remaining = sequence.content;
+    while !remaining.is_empty() {
+        let (next, organizational_unit) = read_der_tlv(remaining)?;
+        organizational_units.push(
+            der_tlv_string_value(&organizational_unit)
+                .map_err(|err| format!("OrganizationalUnitName is invalid: {err}"))?,
+        );
+        remaining = next;
+    }
+    if organizational_units.is_empty() {
+        return Err("OrganizationalUnitNames must contain at least one value".to_string());
+    }
+    Ok(organizational_units)
+}
+
+fn append_rfc2156_or_address_component(
+    output: &mut String,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    output.push('/');
+    output.push_str(key);
+    output.push('=');
+    output.push_str(&escape_rfc2156_or_address_value(value)?);
+    Ok(())
+}
+
+fn escape_rfc2156_or_address_value(value: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if !ch.is_ascii() || ch.is_ascii_control() {
+            return Err("ORAddress values must be IA5 strings".to_string());
+        }
+        match ch {
+            '/' | '=' | '$' => {
+                output.push('$');
+                output.push(ch);
+            }
+            _ => output.push(ch),
+        }
+    }
+    Ok(output)
 }
 
 fn edi_party_name_der_matches_assertion(
@@ -6551,6 +6725,9 @@ fn parse_general_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
         "dNSName" => Ok(X509GeneralNameAssertion::DnsName(
             unquote_gser_dquote_string(rest)?,
         )),
+        "x400Address" => Ok(X509GeneralNameAssertion::X400Address(
+            unquote_gser_dquote_string(rest)?,
+        )),
         "ediPartyName" => Ok(X509GeneralNameAssertion::EdiPartyName(
             parse_edi_party_name(rest)?,
         )),
@@ -6566,7 +6743,6 @@ fn parse_general_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
         "registeredID" => Ok(X509GeneralNameAssertion::RegisteredId(
             parse_object_identifier_component(rest)?,
         )),
-        "x400Address" => Err(format!("unsupported GeneralName form {kind}")),
         other => Err(format!("unknown GeneralName form {other}")),
     }
 }
@@ -8853,6 +9029,29 @@ mod tests {
             &wrap_der_value(0x04, &[0xde, 0xad]),
             "'BEEF'H"
         ));
+    }
+
+    #[test]
+    fn rfc4523_x400_address_common_built_in_fields_render_rfc2156_string() {
+        let mut built_in = Vec::new();
+        built_in.extend(wrap_der_value(0x61, &wrap_der_value(0x13, b"US")));
+        built_in.extend(wrap_der_value(0x62, &wrap_der_value(0x13, b"ExampleADMD")));
+        built_in.extend(wrap_der_value(0xa2, &wrap_der_value(0x13, b"ExamplePRMD")));
+        built_in.extend(wrap_der_value(0xa3, &wrap_der_value(0x13, b"Ops/Dir=One$")));
+
+        let mut organizational_units = Vec::new();
+        organizational_units.extend(wrap_der_value(0x13, b"Directory"));
+        organizational_units.extend(wrap_der_value(0x13, b"Gateway"));
+        built_in.extend(wrap_der_value(
+            0xa6,
+            &wrap_der_value(0x30, &organizational_units),
+        ));
+
+        let or_address = wrap_der_value(0x30, &built_in);
+        assert_eq!(
+            x400_address_to_rfc2156_string(&or_address).unwrap(),
+            "/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/O=Ops$/Dir$=One$$/OU=Directory/OU=Gateway/"
+        );
     }
 
     #[test]
