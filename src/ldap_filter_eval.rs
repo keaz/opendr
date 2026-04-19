@@ -1555,6 +1555,17 @@ mod tests {
         )
     }
 
+    fn certificate_exact_assertion(cert_pem: &str) -> String {
+        let (remainder, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).unwrap();
+        assert!(remainder.iter().all(u8::is_ascii_whitespace));
+        let (_, certificate) = x509_parser::parse_x509_certificate(&pem.contents).unwrap();
+        format!(
+            "{{ serialNumber {}, issuer rdnSequence:\"{}\" }}",
+            certificate.tbs_certificate.serial,
+            certificate.issuer().to_string().replace('"', "\"\"")
+        )
+    }
+
     #[test]
     fn compile_filter_parses_and_matches_compound_filters() {
         let filter = compile_filter("(&(objectClass=person)(cn=Alice*))").unwrap();
@@ -1681,6 +1692,49 @@ attributeTypes: ( 1.3.6.1.4.1.55555.60.1 NAME 'exampleNumber' EQUALITY integerMa
 
         assert!(substring_plan.matches_entry(&entry).unwrap());
         assert!(extensible_plan.matches_entry(&entry).unwrap());
+    }
+
+    #[test]
+    fn schema_filter_and_compare_use_rfc4523_certificate_exact_match() {
+        let mut schema = LdapSchema::with_core_schema();
+        schema.load_builtin_schema("x509").unwrap();
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["cert.example.org".to_string()]).unwrap();
+        let cert_pem = cert.pem();
+        let assertion = certificate_exact_assertion(&cert_pem);
+
+        let mut entry = test_entry("cn=carol,dc=example,dc=com", "person", "Carol Example");
+        entry
+            .attributes
+            .insert("sn".to_string(), vec!["Example".to_string()]);
+        entry
+            .attributes
+            .insert("usercertificate".to_string(), vec![cert_pem]);
+
+        assert!(
+            compile_filter(&format!("(userCertificate={assertion})"))
+                .unwrap()
+                .matches_with_schema(&entry, &schema)
+                .unwrap()
+        );
+        assert!(
+            compile_filter(&format!(
+                "(userCertificate:certificateExactMatch:={assertion})"
+            ))
+            .unwrap()
+            .matches_with_schema(&entry, &schema)
+            .unwrap()
+        );
+        assert!(
+            compare_attribute_with_schema(
+                &schema,
+                &entry.dn,
+                &entry.attributes,
+                "userCertificate",
+                &assertion,
+            )
+            .unwrap()
+        );
     }
 
     #[test]

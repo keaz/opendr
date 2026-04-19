@@ -404,6 +404,13 @@ impl ResolvedMatchingRule {
         supported_matching_rule_kind(self).is_some()
     }
 
+    pub fn is_index_supported(&self) -> bool {
+        !matches!(
+            supported_matching_rule_kind(self),
+            None | Some(SupportedMatchingRuleKind::X509CertificatePairExact)
+        )
+    }
+
     fn label(&self) -> &str {
         if self.primary_name.is_empty() {
             &self.oid
@@ -4671,6 +4678,10 @@ enum SupportedMatchingRuleKind {
     CaseExactSubstring,
     CaseIgnoreIa5Substring,
     CaseExactIa5Substring,
+    X509CertificateExact,
+    X509CertificateListExact,
+    X509CertificatePairExact,
+    X509AlgorithmIdentifier,
 }
 
 fn supported_matching_rule_kind(rule: &ResolvedMatchingRule) -> Option<SupportedMatchingRuleKind> {
@@ -4759,6 +4770,18 @@ fn supported_matching_rule_kind(rule: &ResolvedMatchingRule) -> Option<Supported
         }
         ("2.5.13.32", _) | (_, "wordmatch") => Some(SupportedMatchingRuleKind::Word),
         ("2.5.13.33", _) | (_, "keywordmatch") => Some(SupportedMatchingRuleKind::Keyword),
+        ("2.5.13.34", _) | (_, "certificateexactmatch") => {
+            Some(SupportedMatchingRuleKind::X509CertificateExact)
+        }
+        ("2.5.13.36", _) | (_, "certificatepairexactmatch") => {
+            Some(SupportedMatchingRuleKind::X509CertificatePairExact)
+        }
+        ("2.5.13.38", _) | (_, "certificatelistexactmatch") => {
+            Some(SupportedMatchingRuleKind::X509CertificateListExact)
+        }
+        ("2.5.13.40", _) | (_, "algorithmidentifiermatch") | (_, "algorithmidentifier") => {
+            Some(SupportedMatchingRuleKind::X509AlgorithmIdentifier)
+        }
         _ => None,
     }
 }
@@ -4860,6 +4883,22 @@ fn normalize_matching_rule_value(
             normalize_telephone_number_for_matching(value)
                 .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
+        SupportedMatchingRuleKind::X509CertificateExact => {
+            normalize_x509_certificate_exact_match_value(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+        }
+        SupportedMatchingRuleKind::X509CertificateListExact => {
+            normalize_x509_certificate_list_exact_match_value(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+        }
+        SupportedMatchingRuleKind::X509CertificatePairExact => {
+            normalize_x509_certificate_pair_exact_match_value(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+        }
+        SupportedMatchingRuleKind::X509AlgorithmIdentifier => {
+            normalize_x509_algorithm_identifier_match_value(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+        }
     }
 }
 
@@ -4890,6 +4929,12 @@ fn matching_rule_ordering_key(
                 .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
         SupportedMatchingRuleKind::OctetStringOrdering => Ok(value.to_string()),
+        SupportedMatchingRuleKind::X509CertificateExact
+        | SupportedMatchingRuleKind::X509CertificateListExact
+        | SupportedMatchingRuleKind::X509CertificatePairExact
+        | SupportedMatchingRuleKind::X509AlgorithmIdentifier => Err(
+            MatchingRuleError::UnsupportedRule(format!("{} is not an ordering rule", rule.label())),
+        ),
         _ => Err(MatchingRuleError::UnsupportedRule(format!(
             "{} is not an ordering rule",
             rule.label()
@@ -4942,6 +4987,10 @@ fn value_matches_normalized_assertion(
         SupportedMatchingRuleKind::Keyword => Ok(keyword_tokens(candidate, rule)?
             .iter()
             .any(|token| token == normalized_assertion)),
+        SupportedMatchingRuleKind::X509CertificatePairExact => {
+            x509_certificate_pair_exact_value_matches(candidate, normalized_assertion)
+                .map_err(|reason| invalid_matching_syntax(rule, candidate, &reason))
+        }
         _ => Ok(normalize_matching_rule_value(rule, candidate)? == normalized_assertion),
     }
 }
@@ -5520,6 +5569,567 @@ fn decode_supported_algorithm_value(value: &str) -> Result<Vec<u8>, String> {
         "supported algorithm",
         &["SUPPORTED ALGORITHM"],
         supported_algorithm_der_is_valid,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509CertificateExactKey {
+    serial_number: String,
+    issuer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509CertificateListExactKey {
+    issuer: String,
+    this_update: String,
+    distribution_point: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509CertificatePairExactKey {
+    issued_to_this_ca: Option<X509CertificateExactKey>,
+    issued_by_this_ca: Option<X509CertificateExactKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509AlgorithmIdentifierKey {
+    algorithm: String,
+    parameters_der_hex: Option<String>,
+}
+
+fn normalize_x509_certificate_exact_match_value(value: &str) -> Result<String, String> {
+    if let Ok(key) = parse_certificate_exact_assertion(value) {
+        return Ok(format_certificate_exact_key(&key));
+    }
+    let der = decode_certificate_value(value)?;
+    let key = certificate_exact_key_from_der(&der)?;
+    Ok(format_certificate_exact_key(&key))
+}
+
+fn normalize_x509_certificate_list_exact_match_value(value: &str) -> Result<String, String> {
+    if let Ok(key) = parse_certificate_list_exact_assertion(value) {
+        return Ok(format_certificate_list_exact_key(&key));
+    }
+    let der = decode_certificate_list_value(value)?;
+    let key = certificate_list_exact_key_from_der(&der)?;
+    Ok(format_certificate_list_exact_key(&key))
+}
+
+fn normalize_x509_certificate_pair_exact_match_value(value: &str) -> Result<String, String> {
+    if let Ok(key) = parse_certificate_pair_exact_assertion(value) {
+        return Ok(format_certificate_pair_exact_key(&key));
+    }
+    let der = decode_certificate_pair_value(value)?;
+    let key = certificate_pair_exact_key_from_der(&der)?;
+    Ok(format_certificate_pair_exact_key(&key))
+}
+
+fn normalize_x509_algorithm_identifier_match_value(value: &str) -> Result<String, String> {
+    if let Ok(key) = parse_algorithm_identifier_assertion(value) {
+        return Ok(format_algorithm_identifier_key(&key));
+    }
+    let der = decode_supported_algorithm_value(value)?;
+    let algorithm_identifier = extract_supported_algorithm_identifier_der(&der)?;
+    let key = algorithm_identifier_key_from_der(algorithm_identifier)?;
+    Ok(format_algorithm_identifier_key(&key))
+}
+
+fn x509_certificate_pair_exact_value_matches(
+    candidate: &str,
+    normalized_assertion: &str,
+) -> Result<bool, String> {
+    let assertion = parse_normalized_certificate_pair_exact_key(normalized_assertion)?;
+    let der = decode_certificate_pair_value(candidate)?;
+    let candidate = certificate_pair_exact_key_from_der(&der)?;
+
+    if let Some(asserted_issued_to) = assertion.issued_to_this_ca.as_ref()
+        && candidate.issued_to_this_ca.as_ref() != Some(asserted_issued_to)
+    {
+        return Ok(false);
+    }
+    if let Some(asserted_issued_by) = assertion.issued_by_this_ca.as_ref()
+        && candidate.issued_by_this_ca.as_ref() != Some(asserted_issued_by)
+    {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn certificate_exact_key_from_der(value: &[u8]) -> Result<X509CertificateExactKey, String> {
+    let (remainder, certificate) = x509_parser::parse_x509_certificate(value)
+        .map_err(|err| format!("certificate DER could not be parsed: {err}"))?;
+    if !remainder.is_empty() {
+        return Err("certificate DER contains trailing data".to_string());
+    }
+    Ok(X509CertificateExactKey {
+        serial_number: normalize_unsigned_decimal_integer(
+            &certificate.tbs_certificate.serial.to_string(),
+        )?,
+        issuer: normalize_x509_name(certificate.issuer())?,
+    })
+}
+
+fn certificate_list_exact_key_from_der(
+    value: &[u8],
+) -> Result<X509CertificateListExactKey, String> {
+    let (remainder, certificate_list) = x509_parser::parse_x509_crl(value)
+        .map_err(|err| format!("certificate list DER could not be parsed: {err}"))?;
+    if !remainder.is_empty() {
+        return Err("certificate list DER contains trailing data".to_string());
+    }
+    let this_update = certificate_list.last_update().to_datetime();
+    Ok(X509CertificateListExactKey {
+        issuer: normalize_x509_name(certificate_list.issuer())?,
+        this_update: format!(
+            "{}.{:09}",
+            this_update.unix_timestamp(),
+            this_update.nanosecond()
+        ),
+        distribution_point: None,
+    })
+}
+
+fn certificate_pair_exact_key_from_der(
+    value: &[u8],
+) -> Result<X509CertificatePairExactKey, String> {
+    let (remainder, pair) = read_der_tlv(value)?;
+    if !remainder.is_empty() {
+        return Err("certificate pair DER contains trailing data".to_string());
+    }
+    if pair.tag != 0x30 {
+        return Err("certificate pair must be a DER SEQUENCE".to_string());
+    }
+
+    let mut remaining = pair.content;
+    let mut issued_to_this_ca = None;
+    let mut issued_by_this_ca = None;
+    while !remaining.is_empty() {
+        let (next, component) = read_der_tlv(remaining)?;
+        match component.tag {
+            0xa0 if issued_to_this_ca.is_none() => {
+                issued_to_this_ca = Some(certificate_exact_key_from_der(
+                    &certificate_pair_component_der(component.content)?,
+                )?);
+            }
+            0xa1 if issued_by_this_ca.is_none() => {
+                issued_by_this_ca = Some(certificate_exact_key_from_der(
+                    &certificate_pair_component_der(component.content)?,
+                )?);
+            }
+            0xa0 | 0xa1 => {
+                return Err(
+                    "certificate pair contains a duplicate certificate component".to_string(),
+                );
+            }
+            _ => return Err("certificate pair contains an unexpected component".to_string()),
+        }
+        remaining = next;
+    }
+
+    if issued_to_this_ca.is_none() && issued_by_this_ca.is_none() {
+        return Err("certificate pair must contain at least one certificate".to_string());
+    }
+
+    Ok(X509CertificatePairExactKey {
+        issued_to_this_ca,
+        issued_by_this_ca,
+    })
+}
+
+fn certificate_pair_component_der(content: &[u8]) -> Result<Vec<u8>, String> {
+    if certificate_der_is_valid(content) {
+        return Ok(content.to_vec());
+    }
+    let wrapped = wrap_der_value(0x30, content);
+    if certificate_der_is_valid(&wrapped) {
+        Ok(wrapped)
+    } else {
+        Err("certificate pair component is not a valid X.509 certificate".to_string())
+    }
+}
+
+fn algorithm_identifier_key_from_der(value: &[u8]) -> Result<X509AlgorithmIdentifierKey, String> {
+    let (remainder, algorithm_identifier) = read_der_tlv(value)?;
+    if !remainder.is_empty() {
+        return Err("AlgorithmIdentifier DER contains trailing data".to_string());
+    }
+    if algorithm_identifier.tag != 0x30 {
+        return Err("AlgorithmIdentifier must be a DER SEQUENCE".to_string());
+    }
+
+    let (remaining, oid) = read_der_tlv(algorithm_identifier.content)?;
+    if oid.tag != 0x06 || !der_oid_content_is_valid(oid.content) {
+        return Err("AlgorithmIdentifier must start with an object identifier".to_string());
+    }
+    let algorithm = decode_der_oid(oid.content)?;
+    let parameters_der_hex = if remaining.is_empty() {
+        None
+    } else {
+        let (after_parameters, parameters) = read_der_tlv(remaining)?;
+        if !after_parameters.is_empty() {
+            return Err(
+                "AlgorithmIdentifier must contain only algorithm and optional parameters"
+                    .to_string(),
+            );
+        }
+        Some(hex::encode(parameters.full))
+    };
+
+    Ok(X509AlgorithmIdentifierKey {
+        algorithm,
+        parameters_der_hex,
+    })
+}
+
+fn parse_certificate_exact_assertion(value: &str) -> Result<X509CertificateExactKey, String> {
+    let components = parse_gser_sequence_fields(value, "CertificateExactAssertion")?;
+    let mut serial_number = None;
+    let mut issuer = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "serialNumber" if serial_number.is_none() => {
+                serial_number = Some(normalize_unsigned_decimal_integer(rest)?);
+            }
+            "issuer" if issuer.is_none() => {
+                issuer = Some(parse_rfc4523_name(rest)?);
+            }
+            "serialNumber" | "issuer" => {
+                return Err(format!(
+                    "duplicate CertificateExactAssertion component {keyword}"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unknown CertificateExactAssertion component {other}"
+                ));
+            }
+        }
+    }
+
+    Ok(X509CertificateExactKey {
+        serial_number: serial_number
+            .ok_or_else(|| "CertificateExactAssertion requires serialNumber".to_string())?,
+        issuer: issuer.ok_or_else(|| "CertificateExactAssertion requires issuer".to_string())?,
+    })
+}
+
+fn parse_certificate_list_exact_assertion(
+    value: &str,
+) -> Result<X509CertificateListExactKey, String> {
+    let components = parse_gser_sequence_fields(value, "CertificateListExactAssertion")?;
+    let mut issuer = None;
+    let mut this_update = None;
+    let mut distribution_point = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "issuer" if issuer.is_none() => issuer = Some(parse_rfc4523_name(rest)?),
+            "thisUpdate" if this_update.is_none() => {
+                this_update = Some(parse_rfc4523_time(rest)?);
+            }
+            "distributionPoint" if distribution_point.is_none() => {
+                distribution_point = Some(rest.trim().to_string());
+            }
+            "issuer" | "thisUpdate" | "distributionPoint" => {
+                return Err(format!(
+                    "duplicate CertificateListExactAssertion component {keyword}"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unknown CertificateListExactAssertion component {other}"
+                ));
+            }
+        }
+    }
+
+    Ok(X509CertificateListExactKey {
+        issuer: issuer
+            .ok_or_else(|| "CertificateListExactAssertion requires issuer".to_string())?,
+        this_update: this_update
+            .ok_or_else(|| "CertificateListExactAssertion requires thisUpdate".to_string())?,
+        distribution_point,
+    })
+}
+
+fn parse_certificate_pair_exact_assertion(
+    value: &str,
+) -> Result<X509CertificatePairExactKey, String> {
+    let components = parse_gser_sequence_fields(value, "CertificatePairExactAssertion")?;
+    let mut issued_to_this_ca = None;
+    let mut issued_by_this_ca = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "issuedToThisCAAssertion" if issued_to_this_ca.is_none() => {
+                issued_to_this_ca = Some(parse_certificate_exact_assertion(rest)?);
+            }
+            "issuedByThisCAAssertion" if issued_by_this_ca.is_none() => {
+                issued_by_this_ca = Some(parse_certificate_exact_assertion(rest)?);
+            }
+            "issuedToThisCAAssertion" | "issuedByThisCAAssertion" => {
+                return Err(format!(
+                    "duplicate CertificatePairExactAssertion component {keyword}"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unknown CertificatePairExactAssertion component {other}"
+                ));
+            }
+        }
+    }
+
+    if issued_to_this_ca.is_none() && issued_by_this_ca.is_none() {
+        return Err(
+            "CertificatePairExactAssertion requires issuedToThisCAAssertion or issuedByThisCAAssertion"
+                .to_string(),
+        );
+    }
+
+    Ok(X509CertificatePairExactKey {
+        issued_to_this_ca,
+        issued_by_this_ca,
+    })
+}
+
+fn parse_algorithm_identifier_assertion(value: &str) -> Result<X509AlgorithmIdentifierKey, String> {
+    let components = parse_gser_sequence_fields(value, "AlgorithmIdentifier")?;
+    let mut algorithm = None;
+    let mut parameters_der_hex = None;
+
+    for (keyword, rest) in components {
+        match keyword {
+            "algorithm" if algorithm.is_none() => {
+                let oid = rest.trim();
+                if !is_valid_numeric_oid(oid) {
+                    return Err("AlgorithmIdentifier algorithm must be a numeric OID".to_string());
+                }
+                algorithm = Some(oid.to_string());
+            }
+            "parameters" if parameters_der_hex.is_none() => {
+                parameters_der_hex = Some(parse_algorithm_identifier_parameters(rest)?);
+            }
+            "algorithm" | "parameters" => {
+                return Err(format!("duplicate AlgorithmIdentifier component {keyword}"));
+            }
+            other => return Err(format!("unknown AlgorithmIdentifier component {other}")),
+        }
+    }
+
+    Ok(X509AlgorithmIdentifierKey {
+        algorithm: algorithm.ok_or_else(|| "AlgorithmIdentifier requires algorithm".to_string())?,
+        parameters_der_hex,
+    })
+}
+
+fn parse_gser_sequence_fields<'a>(
+    value: &'a str,
+    label: &str,
+) -> Result<Vec<(&'a str, &'a str)>, String> {
+    let inner = braced_inner(value, label)?;
+    split_gser_components(inner)?
+        .into_iter()
+        .map(split_gser_keyword)
+        .collect()
+}
+
+fn parse_rfc4523_name(value: &str) -> Result<String, String> {
+    let Some(rdn_sequence) = value.trim().strip_prefix("rdnSequence:") else {
+        return Err("Name must use rdnSequence:<RDNSequence>".to_string());
+    };
+    let dn = unquote_gser_dquote_string(rdn_sequence.trim())?;
+    canonicalize_dn(&dn).map_err(|err| format!("invalid RDNSequence name {dn}: {err}"))
+}
+
+fn parse_rfc4523_time(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let time = if let Some(generalized_time) = value.strip_prefix("generalizedTime:") {
+        parse_generalized_time(generalized_time.trim())?
+    } else if let Some(utc_time) = value.strip_prefix("utcTime:") {
+        parse_utc_time(utc_time.trim())?
+    } else {
+        return Err(
+            "Time must use utcTime:<UTCTime> or generalizedTime:<GeneralizedTime>".to_string(),
+        );
+    };
+    Ok(format!(
+        "{}.{:09}",
+        time.timestamp(),
+        time.timestamp_subsec_nanos()
+    ))
+}
+
+fn parse_algorithm_identifier_parameters(value: &str) -> Result<String, String> {
+    match value.trim() {
+        "NULL" | "null" => Ok("0500".to_string()),
+        other => Err(format!(
+            "unsupported AlgorithmIdentifier parameters GSER value {other:?}; only NULL is currently supported"
+        )),
+    }
+}
+
+fn normalize_unsigned_decimal_integer(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let value = value.strip_prefix('+').unwrap_or(value);
+    if value.is_empty() {
+        return Err("integer value must not be empty".to_string());
+    }
+    if value.starts_with('-') {
+        return Err("integer value must not be negative".to_string());
+    }
+    if !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("integer value must contain only decimal digits".to_string());
+    }
+    let trimmed = value.trim_start_matches('0');
+    Ok(if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    })
+}
+
+fn normalize_x509_name(name: &x509_parser::x509::X509Name<'_>) -> Result<String, String> {
+    let rendered = name.to_string();
+    canonicalize_dn(&rendered).map_err(|err| format!("invalid X.509 name {rendered}: {err}"))
+}
+
+fn unquote_gser_dquote_string(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if !(value.starts_with('"') && value.ends_with('"') && value.len() >= 2) {
+        return Err("GSER string must be enclosed in double quotes".to_string());
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut decoded = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
+                decoded.push('"');
+            } else {
+                return Err("embedded GSER double quotes must be doubled".to_string());
+            }
+        } else {
+            decoded.push(ch);
+        }
+    }
+    Ok(decoded)
+}
+
+fn decode_der_oid(content: &[u8]) -> Result<String, String> {
+    let mut subidentifiers = Vec::new();
+    let mut current = 0_u128;
+    let mut in_component = false;
+    for byte in content {
+        current = current
+            .checked_mul(128)
+            .and_then(|value| value.checked_add(u128::from(byte & 0x7f)))
+            .ok_or_else(|| "object identifier component is too large".to_string())?;
+        in_component = true;
+        if byte & 0x80 == 0 {
+            subidentifiers.push(current);
+            current = 0;
+            in_component = false;
+        }
+    }
+    if in_component || subidentifiers.is_empty() {
+        return Err("object identifier DER is truncated".to_string());
+    }
+
+    let first_subidentifier = subidentifiers[0];
+    let (first, second) = if first_subidentifier < 40 {
+        (0, first_subidentifier)
+    } else if first_subidentifier < 80 {
+        (1, first_subidentifier - 40)
+    } else {
+        (2, first_subidentifier - 80)
+    };
+    let mut arcs = vec![first.to_string(), second.to_string()];
+    arcs.extend(
+        subidentifiers
+            .into_iter()
+            .skip(1)
+            .map(|arc| arc.to_string()),
+    );
+    Ok(arcs.join("."))
+}
+
+fn format_certificate_exact_key(key: &X509CertificateExactKey) -> String {
+    format!("serialNumber={};issuer={}", key.serial_number, key.issuer)
+}
+
+fn format_certificate_list_exact_key(key: &X509CertificateListExactKey) -> String {
+    format!(
+        "issuer={};thisUpdate={};distributionPoint={}",
+        key.issuer,
+        key.this_update,
+        key.distribution_point.as_deref().unwrap_or("")
+    )
+}
+
+fn format_certificate_pair_exact_key(key: &X509CertificatePairExactKey) -> String {
+    format!(
+        "issuedToThisCAAssertion={};issuedByThisCAAssertion={}",
+        key.issued_to_this_ca
+            .as_ref()
+            .map(format_certificate_exact_key)
+            .unwrap_or_default(),
+        key.issued_by_this_ca
+            .as_ref()
+            .map(format_certificate_exact_key)
+            .unwrap_or_default()
+    )
+}
+
+fn parse_normalized_certificate_pair_exact_key(
+    value: &str,
+) -> Result<X509CertificatePairExactKey, String> {
+    let Some(rest) = value.strip_prefix("issuedToThisCAAssertion=") else {
+        return Err("invalid normalized CertificatePairExactAssertion".to_string());
+    };
+    let Some((issued_to, issued_by)) = rest.split_once(";issuedByThisCAAssertion=") else {
+        return Err("invalid normalized CertificatePairExactAssertion".to_string());
+    };
+    let issued_to_this_ca = if issued_to.is_empty() {
+        None
+    } else {
+        Some(parse_normalized_certificate_exact_key(issued_to)?)
+    };
+    let issued_by_this_ca = if issued_by.is_empty() {
+        None
+    } else {
+        Some(parse_normalized_certificate_exact_key(issued_by)?)
+    };
+    if issued_to_this_ca.is_none() && issued_by_this_ca.is_none() {
+        return Err("normalized CertificatePairExactAssertion is empty".to_string());
+    }
+    Ok(X509CertificatePairExactKey {
+        issued_to_this_ca,
+        issued_by_this_ca,
+    })
+}
+
+fn parse_normalized_certificate_exact_key(value: &str) -> Result<X509CertificateExactKey, String> {
+    let Some((serial, issuer)) = value.split_once(";issuer=") else {
+        return Err("invalid normalized CertificateExactAssertion".to_string());
+    };
+    let Some(serial_number) = serial.strip_prefix("serialNumber=") else {
+        return Err("invalid normalized CertificateExactAssertion".to_string());
+    };
+    Ok(X509CertificateExactKey {
+        serial_number: serial_number.to_string(),
+        issuer: issuer.to_string(),
+    })
+}
+
+fn format_algorithm_identifier_key(key: &X509AlgorithmIdentifierKey) -> String {
+    format!(
+        "algorithm={};parameters={}",
+        key.algorithm,
+        key.parameters_der_hex.as_deref().unwrap_or("")
     )
 }
 

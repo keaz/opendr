@@ -526,9 +526,17 @@ definitions from `resources/schema/x509/rfc4523.ldif`.
   - Optional: deltaRevocationList
 
 OpenDR validates DER, PEM, and base64 DER values for certificate,
-certificate-list, certificate-pair, and supported-algorithm attributes. RFC
-4523 matching rule definitions are registered, but their GSER assertion
-matching semantics are not executed yet.
+certificate-list, certificate-pair, and supported-algorithm attributes. Exact
+RFC 4523 GSER assertion equality rules are executed for `certificateExactMatch`,
+`certificateListExactMatch`, `certificatePairExactMatch`, and
+`algorithmIdentifierMatch`, so certificate-backed equality filters and Compare
+operations can match by serial-number and issuer, CRL issuer and `thisUpdate`,
+certificate-pair issued-to and issued-by certificates, and supported-algorithm
+OID with absent or NULL parameters. Certificate-pair exact matching is not
+eligible for LMDB equality indexes because RFC 4523 permits partial pair
+assertions. The broader component matching rules `certificateMatch`,
+`certificateListMatch`, and `certificatePairMatch` remain deferred and are not
+advertised as executable.
 
 ### Core Attributes
 

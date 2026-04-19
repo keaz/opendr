@@ -365,8 +365,10 @@ Schema validation:
   security object entries.
 - The optional `x509` built-in schema bundle adds RFC 4523 X.509 certificate
   schema coverage, including PKI user, PKI CA, CRL distribution point, and
-  supported-algorithm entries. DER-backed values are validated; GSER assertion
-  matching for the RFC 4523 matching rules remains tracked follow-up work.
+  supported-algorithm entries. DER-backed values are validated; exact GSER
+  assertion matching works for certificate serial/issuer, CRL issuer/thisUpdate,
+  certificate-pair issued-to and issued-by, and supported-algorithm OID equality
+  rules. Broader RFC 4523 component matching remains tracked follow-up work.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active

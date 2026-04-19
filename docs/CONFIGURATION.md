@@ -485,7 +485,10 @@ entries such as `account`, `document`, `documentSeries`, `domain`,
 Use `load_builtin = ["core", "x509"]` when clients need RFC 4523 X.509
 certificate entries such as `pkiUser`, `pkiCA`, `cRLDistributionPoint`,
 `deltaCRL`, `strongAuthenticationUser`, `userSecurityInformation`,
-`certificationAuthority`, or `certificationAuthority-V2`.
+`certificationAuthority`, or `certificationAuthority-V2`. Exact RFC 4523
+certificate serial/issuer, CRL issuer/thisUpdate, certificate-pair issued-to and
+issued-by, and supported-algorithm OID equality assertions are available for
+search filters and Compare operations.
 
 Generate bundled schema files when a deployment needs file-based schema
 artifacts instead of relying only on `load_builtin`:

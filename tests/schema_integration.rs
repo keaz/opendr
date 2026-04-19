@@ -1,8 +1,6 @@
 // Integration tests for schema validation
 use base64::{Engine as _, engine::general_purpose};
-use opendr::schema::{
-    AttributeType, LdapSchema, MatchingRuleError, ObjectClass, ObjectClassKind, SchemaError,
-};
+use opendr::schema::{AttributeType, LdapSchema, ObjectClass, ObjectClassKind, SchemaError};
 use std::collections::HashMap;
 
 fn parse_simple_entry_ldif(contents: &str) -> Vec<HashMap<String, Vec<String>>> {
@@ -69,6 +67,42 @@ fn test_der_wrap(tag: u8, content: &[u8]) -> Vec<u8> {
 
 fn supported_algorithm_base64() -> String {
     general_purpose::STANDARD.encode(test_der_wrap(0x30, RSA_ENCRYPTION_ALGORITHM_IDENTIFIER))
+}
+
+fn gser_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn der_from_pem(value: &str, label: &str) -> Vec<u8> {
+    let (remainder, pem) = x509_parser::pem::parse_x509_pem(value.as_bytes()).unwrap();
+    assert!(
+        remainder.iter().all(u8::is_ascii_whitespace),
+        "{label} PEM should not contain trailing data"
+    );
+    assert_eq!(pem.label, label);
+    pem.contents
+}
+
+fn certificate_exact_assertion(cert_der: &[u8]) -> String {
+    let (_, certificate) = x509_parser::parse_x509_certificate(cert_der).unwrap();
+    format!(
+        "{{ serialNumber {}, issuer rdnSequence:{} }}",
+        certificate.tbs_certificate.serial,
+        gser_quote(&certificate.issuer().to_string())
+    )
+}
+
+fn certificate_list_exact_assertion(crl_der: &[u8]) -> String {
+    let (_, certificate_list) = x509_parser::parse_x509_crl(crl_der).unwrap();
+    format!(
+        "{{ issuer rdnSequence:{}, thisUpdate generalizedTime:20240101000000Z }}",
+        gser_quote(&certificate_list.issuer().to_string())
+    )
+}
+
+fn certificate_pair_base64(cert_der: &[u8]) -> String {
+    let issued_to_this_ca = test_der_wrap(0xa0, cert_der);
+    general_purpose::STANDARD.encode(test_der_wrap(0x30, &issued_to_this_ca))
 }
 
 fn test_crl_pem() -> String {
@@ -1086,26 +1120,44 @@ fn test_rfc4523_x509_bundle_defines_full_schema() {
     }
 
     assert!(
-        !schema
+        schema
             .resolve_matching_rule("certificateExactMatch")
             .unwrap()
             .is_supported()
     );
     assert!(
-        !schema
+        schema
             .resolve_matching_rule("certificateListExactMatch")
             .unwrap()
             .is_supported()
     );
     assert!(
-        !schema
+        schema
             .resolve_matching_rule("certificatePairExactMatch")
             .unwrap()
             .is_supported()
     );
     assert!(
-        !schema
+        schema
             .resolve_matching_rule("algorithmIdentifierMatch")
+            .unwrap()
+            .is_supported()
+    );
+    assert!(
+        !schema
+            .resolve_matching_rule("certificateMatch")
+            .unwrap()
+            .is_supported()
+    );
+    assert!(
+        !schema
+            .resolve_matching_rule("certificateListMatch")
+            .unwrap()
+            .is_supported()
+    );
+    assert!(
+        !schema
+            .resolve_matching_rule("certificatePairMatch")
             .unwrap()
             .is_supported()
     );
@@ -1244,41 +1296,91 @@ fn test_rfc4523_x509_entries_reject_invalid_values() {
 }
 
 #[test]
-fn test_rfc4523_x509_matching_rules_are_registered_but_not_executed() {
+fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
     let mut schema = LdapSchema::with_core_schema();
     schema.load_builtin_schema("x509").unwrap();
 
-    for matching_rule in [
-        "certificateExactMatch",
-        "certificateMatch",
-        "certificatePairExactMatch",
-        "certificatePairMatch",
-        "certificateListExactMatch",
-        "certificateListMatch",
-        "algorithmIdentifierMatch",
-    ] {
-        let rule = schema.resolve_matching_rule(matching_rule).unwrap();
-        assert!(
-            !rule.is_supported(),
-            "RFC 4523 GSER matching rule {matching_rule} should not be advertised as executable"
-        );
-    }
+    let rcgen::CertifiedKey { cert, .. } =
+        rcgen::generate_simple_self_signed(vec!["cert.example.org".to_string()]).unwrap();
+    let cert_pem = cert.pem();
+    let cert_der = der_from_pem(&cert_pem, "CERTIFICATE");
+    let certificate_assertion = certificate_exact_assertion(&cert_der);
 
     let certificate_rule = schema
         .equality_rule_for_attribute("userCertificate")
         .unwrap();
-    assert!(matches!(
-        certificate_rule.values_equal("{}", "{}"),
-        Err(MatchingRuleError::UnsupportedRule(_))
-    ));
+    assert!(
+        certificate_rule
+            .values_equal(&cert_pem, &certificate_assertion)
+            .unwrap()
+    );
+    assert!(
+        !certificate_rule
+            .values_equal(
+                &cert_pem,
+                &certificate_assertion.replacen("serialNumber ", "serialNumber 999", 1)
+            )
+            .unwrap()
+    );
+
+    let crl_pem = test_crl_pem();
+    let crl_der = der_from_pem(&crl_pem, "X509 CRL");
+    let certificate_list_rule = schema
+        .equality_rule_for_attribute("certificateRevocationList")
+        .unwrap();
+    assert!(
+        certificate_list_rule
+            .values_equal(&crl_pem, &certificate_list_exact_assertion(&crl_der))
+            .unwrap()
+    );
+
+    let certificate_pair_rule = schema
+        .equality_rule_for_attribute("crossCertificatePair")
+        .unwrap();
+    let certificate_pair_assertion = format!(
+        "{{ issuedToThisCAAssertion {} }}",
+        certificate_exact_assertion(&cert_der)
+    );
+    assert!(
+        certificate_pair_rule
+            .values_equal(
+                &certificate_pair_base64(&cert_der),
+                &certificate_pair_assertion
+            )
+            .unwrap()
+    );
 
     let algorithm_rule = schema
         .equality_rule_for_attribute("supportedAlgorithms")
         .unwrap();
-    assert!(matches!(
-        algorithm_rule.values_equal("{}", "{}"),
-        Err(MatchingRuleError::UnsupportedRule(_))
-    ));
+    assert!(
+        algorithm_rule
+            .values_equal(
+                &supported_algorithm_base64(),
+                "{ algorithm 1.2.840.113549.1.1.1, parameters NULL }"
+            )
+            .unwrap()
+    );
+    assert!(
+        !algorithm_rule
+            .values_equal(
+                &supported_algorithm_base64(),
+                "{ algorithm 1.2.840.113549.1.1.5, parameters NULL }"
+            )
+            .unwrap()
+    );
+
+    for matching_rule in [
+        "certificateMatch",
+        "certificatePairMatch",
+        "certificateListMatch",
+    ] {
+        let rule = schema.resolve_matching_rule(matching_rule).unwrap();
+        assert!(
+            !rule.is_supported(),
+            "RFC 4523 component matching rule {matching_rule} should stay unadvertised until full component semantics are implemented"
+        );
+    }
 }
 
 #[test]

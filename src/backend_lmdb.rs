@@ -1002,7 +1002,7 @@ impl IndexPlan {
             ))
         })?;
 
-        if !rule.is_supported() {
+        if !rule.is_index_supported() {
             return Err(BackendError::Storage(format!(
                 "unsupported matching rule {} for {} {} index",
                 rule.primary_name,
@@ -7258,6 +7258,36 @@ attributeTypes: ( 1.3.6.1.4.1.55555.40.3 NAME 'exampleFlexibleCode' EQUALITY cas
                 "uid=two,dc=example,dc=org".to_string(),
                 "uid=ten,dc=example,dc=org".to_string()
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schema_index_plan_rejects_partial_certificate_pair_matching_rule() {
+        let dir = tempdir().unwrap();
+        let mut schema = LdapSchema::with_core_schema();
+        schema.load_builtin_schema("x509").unwrap();
+
+        let result = LmdbBackend::new_with_schema_config(
+            dir.path(),
+            100,
+            1,
+            IndexConfig {
+                indexed_attributes: Vec::new(),
+                attribute_indexes: vec![AttributeIndexConfig {
+                    attribute: "crossCertificatePair".to_string(),
+                    index_types: vec![IndexType::Equality],
+                }],
+            },
+            &schema,
+        );
+        let err = match result {
+            Ok(_) => panic!("crossCertificatePair equality index should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("unsupported matching rule certificatePairExactMatch")
         );
     }
 
