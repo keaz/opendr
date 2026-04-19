@@ -61,6 +61,7 @@ use crate::parser::{
 };
 use crate::perf_profile::PerfPhase;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
+use crate::read_entry_controls::{decode_pre_read_request_control, pre_read_response_control};
 use crate::referral::LdapReferralResolver;
 use crate::referral_fsm::ReferralResolver;
 use crate::schema::LdapSchema;
@@ -4222,6 +4223,40 @@ async fn handle_delete_request_with_fsm_runtime(
         return Ok(());
     }
 
+    let pre_read_request = match decode_pre_read_request_control(&request.request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                &err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let pre_read_entry = if pre_read_request.is_some() {
+        match backend.get_entry(&dn).await {
+            Ok(entry) => entry,
+            Err(err) => {
+                error!("Pre-read lookup failed for delete {}: {}", dn, err);
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     let write_config = WriteFsmConfig {
         strict_schema_validation: false,
         enable_aci_checks: false,
@@ -4261,12 +4296,15 @@ async fn handle_delete_request_with_fsm_runtime(
     }
 
     log_delete_audit_event(request_context, &session, &dn, true).await;
-    send_request_result_response(
+    let response_controls = fsm_pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+    send_request_result_response_with_controls(
         fsm_set,
         request.message_id as u32,
         request.response_kind,
         ResultCode::Success,
+        &dn,
         "",
+        &response_controls,
     )
     .await
 }
@@ -4527,6 +4565,40 @@ async fn handle_modify_request_with_fsm_runtime(
         }
     }
 
+    let pre_read_request = match decode_pre_read_request_control(&request.request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                &err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let pre_read_entry = if pre_read_request.is_some() {
+        match backend.get_entry(&dn).await {
+            Ok(entry) => entry,
+            Err(err) => {
+                error!("Pre-read lookup failed for modify {}: {}", dn, err);
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    map_backend_error_code(&err),
+                    backend_diagnostic(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     let modify_result = {
         let _profile_phase =
             PerfPhase::start("modify", "backend_write", Some(request.message_id as u32));
@@ -4637,12 +4709,15 @@ async fn handle_modify_request_with_fsm_runtime(
         None,
     )
     .await;
-    send_request_result_response(
+    let response_controls = fsm_pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+    send_request_result_response_with_controls(
         fsm_set,
         request.message_id as u32,
         request.response_kind,
         ResultCode::Success,
+        &dn,
         "",
+        &response_controls,
     )
     .await
 }
@@ -4916,6 +4991,21 @@ async fn handle_moddn_request_with_fsm_runtime(
             return Ok(());
         }
     };
+    let pre_read_request = match decode_pre_read_request_control(&request.request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_request_result_response(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                &err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let pre_read_entry = pre_read_request.as_ref().map(|_| existing_entry.clone());
     let parent_attributes =
         if schema.requires_parent_attributes_for_entry(&existing_entry.attributes) {
             match crate::dn::parent_dn(&new_dn) {
@@ -5051,12 +5141,15 @@ async fn handle_moddn_request_with_fsm_runtime(
     }
 
     log_moddn_audit_event(request_context, &session, &dn, &new_dn, true, None).await;
-    send_request_result_response(
+    let response_controls = fsm_pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+    send_request_result_response_with_controls(
         fsm_set,
         request.message_id as u32,
         request.response_kind,
         ResultCode::Success,
+        &dn,
         "",
+        &response_controls,
     )
     .await
 }
@@ -6460,6 +6553,22 @@ async fn send_request_result_response(
         .await
         .map_err(|e| format!("Write error: {}", e))?;
     Ok(())
+}
+
+fn fsm_pre_read_response_controls(
+    request: &Option<crate::read_entry_controls::ReadEntryRequest>,
+    entry: &Option<DirectoryEntry>,
+) -> Result<Vec<LdapControl>, String> {
+    let Some(request) = request else {
+        return Ok(Vec::new());
+    };
+    let Some(entry) = entry else {
+        return Ok(Vec::new());
+    };
+
+    pre_read_response_control(entry, request.attributes())
+        .map(|control| vec![control])
+        .map_err(|err| format!("Encode error: {err:?}"))
 }
 
 async fn send_request_result_response_with_controls(

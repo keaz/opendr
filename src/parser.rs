@@ -1,7 +1,7 @@
-use rasn::der;
 use rasn::error::EncodeError;
 use rasn::types::{OctetString, SetOf};
 use rasn::{AsnType, Decode, Encode};
+use rasn::{ber, der};
 use rasn_ldap::{ResultCode, SearchResultEntry};
 
 use crate::backend::DirectoryEntry;
@@ -278,6 +278,28 @@ pub fn encode_search_entry_parts_with_controls(
     types_only: bool,
     controls: &[LdapControl],
 ) -> Result<Vec<u8>, EncodeError> {
+    let search_entry = search_result_entry(dn, attributes, types_only);
+
+    encode_message(
+        message_id,
+        rasn_ldap::ProtocolOp::SearchResEntry(search_entry),
+        controls,
+    )
+}
+
+pub fn encode_search_result_entry_value(
+    dn: &str,
+    attributes: &[(String, Vec<String>)],
+    types_only: bool,
+) -> Result<Vec<u8>, EncodeError> {
+    ber::encode(&search_result_entry(dn, attributes, types_only))
+}
+
+fn search_result_entry(
+    dn: &str,
+    attributes: &[(String, Vec<String>)],
+    types_only: bool,
+) -> SearchResultEntry {
     let partial_attributes: Vec<rasn_ldap::PartialAttribute> = attributes
         .iter()
         .map(|(name, values)| {
@@ -295,13 +317,7 @@ pub fn encode_search_entry_parts_with_controls(
 
     let attributes: rasn_ldap::PartialAttributeList = partial_attributes.into_iter().collect();
 
-    let search_entry = SearchResultEntry::new(dn.as_bytes().to_vec().into(), attributes);
-
-    encode_message(
-        message_id,
-        rasn_ldap::ProtocolOp::SearchResEntry(search_entry),
-        controls,
-    )
+    SearchResultEntry::new(dn.as_bytes().to_vec().into(), attributes)
 }
 
 pub fn encode_search_reference_with_controls(

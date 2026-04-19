@@ -13,6 +13,10 @@ use opendr::backend::MockBackend;
 use opendr::extended_ops::encode_cancel_request_value;
 use opendr::fsm_request::active_fsm_control_registry;
 use opendr::fsm_request::build_request_context;
+use opendr::ldap_controls::{LdapControl, RequestControls};
+use opendr::read_entry_controls::{
+    PRE_READ_CONTROL_OID, decode_pre_read_request_control, encode_attribute_selection,
+};
 use opendr::search_controls::{
     PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
     SERVER_SIDE_SORT_RESPONSE_OID, SUBENTRIES_CONTROL_OID, ServerSideSortRequestControl, SortKey,
@@ -41,7 +45,6 @@ const CANCEL_OID: &str = "1.3.6.1.1.8";
 const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
 const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
 const ASSERTION_CONTROL_OID: &str = "1.3.6.1.1.12";
-const PRE_READ_CONTROL_OID: &str = "1.3.6.1.1.13.1";
 const POST_READ_CONTROL_OID: &str = "1.3.6.1.1.13.2";
 
 #[tokio::test]
@@ -67,6 +70,7 @@ async fn root_dse_advertises_only_request_usable_controls_extensions_and_feature
         sorted(&[
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
+            PRE_READ_CONTROL_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
             SUBENTRIES_CONTROL_OID.to_string(),
             SYNC_REQUEST_OID.to_string(),
@@ -77,7 +81,6 @@ async fn root_dse_advertises_only_request_usable_controls_extensions_and_feature
         SYNC_STATE_OID,
         SYNC_DONE_OID,
         ASSERTION_CONTROL_OID,
-        PRE_READ_CONTROL_OID,
         POST_READ_CONTROL_OID,
     ] {
         assert!(
@@ -137,6 +140,7 @@ fn control_registry_separates_request_response_and_root_dse_oids() {
         sorted(&[
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
+            PRE_READ_CONTROL_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
             SUBENTRIES_CONTROL_OID.to_string(),
             SYNC_REQUEST_OID.to_string(),
@@ -148,6 +152,7 @@ fn control_registry_separates_request_response_and_root_dse_oids() {
         response_oids,
         sorted(&[
             PAGED_RESULTS_OID.to_string(),
+            PRE_READ_CONTROL_OID.to_string(),
             SERVER_SIDE_SORT_RESPONSE_OID.to_string(),
             SYNC_STATE_OID.to_string(),
             SYNC_DONE_OID.to_string(),
@@ -216,6 +221,19 @@ fn advertised_request_control_codecs_round_trip_positive_values() {
             reload_hint: true,
         }
     );
+
+    let pre_read_attributes = vec!["cn".to_string(), "+".to_string()];
+    let pre_read_value = encode_attribute_selection(&pre_read_attributes).unwrap();
+    let pre_read_controls = RequestControls::new(vec![LdapControl::new(
+        PRE_READ_CONTROL_OID,
+        true,
+        Some(pre_read_value),
+    )]);
+    let pre_read = decode_pre_read_request_control(&pre_read_controls)
+        .unwrap()
+        .unwrap();
+    assert!(pre_read.critical());
+    assert_eq!(pre_read.attributes(), pre_read_attributes.as_slice());
 }
 
 #[test]
@@ -262,13 +280,49 @@ fn supported_request_controls_are_accepted_by_shared_request_pipeline() {
 }
 
 #[test]
+fn pre_read_control_is_accepted_only_on_appropriate_update_operations() {
+    let value = encode_attribute_selection(&["cn".to_string()]).unwrap();
+    let delete = delete_message_with_controls(vec![control_with_value(
+        PRE_READ_CONTROL_OID,
+        true,
+        Some(value.clone()),
+    )]);
+    let context = build_request_context(&delete, 77, None, Some("cn=admin"), true).unwrap();
+    assert_eq!(context.request_controls.len(), 1);
+    assert_eq!(
+        context.request_controls.iter().next().unwrap().oid(),
+        PRE_READ_CONTROL_OID
+    );
+
+    let critical_search = ldap_message_with_controls(vec![control_with_value(
+        PRE_READ_CONTROL_OID,
+        true,
+        Some(value.clone()),
+    )]);
+    let rejection =
+        build_request_context(&critical_search, 77, None, Some("cn=admin"), true).unwrap_err();
+    assert_eq!(
+        rejection.result_code,
+        RasnResultCode::UnavailableCriticalExtension
+    );
+
+    let non_critical_search = ldap_message_with_controls(vec![control_with_value(
+        PRE_READ_CONTROL_OID,
+        false,
+        Some(value),
+    )]);
+    let context =
+        build_request_context(&non_critical_search, 77, None, Some("cn=admin"), true).unwrap();
+    assert!(context.request_controls.is_empty());
+}
+
+#[test]
 fn unsupported_or_response_only_controls_follow_rfc_4511_criticality_semantics() {
     for oid in [
         SERVER_SIDE_SORT_RESPONSE_OID,
         SYNC_STATE_OID,
         SYNC_DONE_OID,
         ASSERTION_CONTROL_OID,
-        PRE_READ_CONTROL_OID,
         POST_READ_CONTROL_OID,
         REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID,
     ] {
@@ -394,6 +448,14 @@ fn ldap_message_with_controls(controls: Vec<Control<'static>>) -> LdapMessage<'s
     LdapMessage {
         message_id: MessageID(10),
         protocol_op: ProtocolOp::SearchRequest(search_request()),
+        controls: Some(controls.into_iter().collect()),
+    }
+}
+
+fn delete_message_with_controls(controls: Vec<Control<'static>>) -> LdapMessage<'static> {
+    LdapMessage {
+        message_id: MessageID(10),
+        protocol_op: ProtocolOp::DelRequest(LdapDN(Cow::Borrowed("cn=Alice,dc=example,dc=org"))),
         controls: Some(controls.into_iter().collect()),
     }
 }

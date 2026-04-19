@@ -41,6 +41,7 @@ pub mod persistent_connection;
 pub mod provider_push_integration;
 pub mod push_manager;
 pub mod rate_limit;
+pub mod read_entry_controls;
 pub mod real_time_propagation;
 pub mod referral;
 pub mod referral_fsm;

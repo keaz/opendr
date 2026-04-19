@@ -77,6 +77,16 @@ impl RequestControls {
         &self.controls
     }
 
+    pub fn without_oid(&self, oid: &str) -> Self {
+        Self::new(
+            self.controls
+                .iter()
+                .filter(|control| !control.oid.eq_ignore_ascii_case(oid))
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub fn singleton(&self, oid: &str) -> Result<Option<&LdapControl>, ControlLookupError> {
         let mut matching = self
             .controls

@@ -53,6 +53,10 @@ use crate::parser::{
     encode_search_reference_with_controls,
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
+use crate::read_entry_controls::{
+    PRE_READ_CONTROL_OID, contains_critical_pre_read_control, decode_pre_read_request_control,
+    pre_read_response_control,
+};
 use crate::real_time_propagation::is_dn_in_scope;
 use crate::referral::LdapReferralResolver;
 use crate::referral_fsm::ReferralResolver;
@@ -1842,6 +1846,8 @@ fn active_runtime_control_registry() -> ControlRegistry {
         .register_response_control(SERVER_SIDE_SORT_RESPONSE_OID)
         .register_request_control(SUBENTRIES_CONTROL_OID)
         .register_request_control(MANAGE_DSA_IT_OID)
+        .register_request_control(PRE_READ_CONTROL_OID)
+        .register_response_control(PRE_READ_CONTROL_OID)
         .register_request_control(SYNC_REQUEST_OID)
         .register_response_control(SYNC_STATE_OID)
         .register_response_control(SYNC_DONE_OID);
@@ -1989,20 +1995,44 @@ async fn validate_message_controls(
     let registry = active_runtime_control_registry();
     match registry.validate_request_controls(message.controls.as_deref()) {
         Ok(validated_controls) => {
+            let mut accepted_controls = validated_controls.accepted().clone();
+            if !protocol_allows_pre_read_control(&message.protocol_op) {
+                if contains_critical_pre_read_control(&accepted_controls) {
+                    record_rejected_control_metric(request_context, PRE_READ_CONTROL_OID);
+                    log_control_processing(
+                        request_context,
+                        session,
+                        accepted_controls.as_slice(),
+                        validated_controls.ignored(),
+                        Some(PRE_READ_CONTROL_OID),
+                    )
+                    .await;
+                    send_rejection_response(
+                        socket,
+                        message_id,
+                        response_kind,
+                        ResultCode::UnavailableCriticalExtension,
+                        "pre-read control is only appropriate for modify, delete, and modifyDN operations",
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                accepted_controls = accepted_controls.without_oid(PRE_READ_CONTROL_OID);
+            }
             record_control_metrics(
                 request_context,
-                validated_controls.accepted().as_slice(),
+                accepted_controls.as_slice(),
                 validated_controls.ignored(),
             );
             log_control_processing(
                 request_context,
                 session,
-                validated_controls.accepted().as_slice(),
+                accepted_controls.as_slice(),
                 validated_controls.ignored(),
                 None,
             )
             .await;
-            Ok(Some(validated_controls.into_accepted()))
+            Ok(Some(accepted_controls))
         }
         Err(ControlValidationError::UnknownCritical { oid }) => {
             record_rejected_control_metric(request_context, &oid);
@@ -2018,6 +2048,13 @@ async fn validate_message_controls(
             Ok(None)
         }
     }
+}
+
+fn protocol_allows_pre_read_control(protocol_op: &ProtocolOp<'_>) -> bool {
+    matches!(
+        protocol_op,
+        ProtocolOp::ModifyRequest(_) | ProtocolOp::DelRequest(_) | ProtocolOp::ModDnRequest(_)
+    )
 }
 
 #[derive(Debug)]
@@ -2161,6 +2198,23 @@ fn sync_done_response_control(
     })
     .map_err(|err| ServerError::Io(std::io::Error::other(err.to_string())))?;
     Ok(LdapControl::new(SYNC_DONE_OID, false, Some(value)))
+}
+
+fn pre_read_response_controls(
+    request: &Option<crate::read_entry_controls::ReadEntryRequest>,
+    entry: &Option<DirectoryEntry>,
+) -> Result<Vec<LdapControl>, ServerError> {
+    let Some(request) = request else {
+        return Ok(Vec::new());
+    };
+    let Some(entry) = entry else {
+        return Ok(Vec::new());
+    };
+
+    Ok(vec![pre_read_response_control(
+        entry,
+        request.attributes(),
+    )?])
 }
 
 pub(crate) fn parse_sync_request_control(
@@ -7139,7 +7193,7 @@ pub(crate) async fn handle_modify_request_with_context(
     request: ModifyRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
-    _request_controls: &RequestControls,
+    request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.object.0.as_ref().trim().to_owned();
     let modifications = match convert_modifications(request.changes) {
@@ -7218,6 +7272,42 @@ pub(crate) async fn handle_modify_request_with_context(
         return Ok(());
     }
 
+    let pre_read_request = match decode_pre_read_request_control(request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let pre_read_entry = if pre_read_request.is_some() {
+        match backend.get_entry(&dn).await {
+            Ok(entry) => entry,
+            Err(err) => {
+                error!("Pre-read lookup failed for modify {}: {}", dn, err);
+                send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::Modify,
+                    map_backend_error(&err),
+                    &dn,
+                    diagnostic_for_error(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     match backend
         .modify_entry_validated_with_actor(
             &dn,
@@ -7237,13 +7327,15 @@ pub(crate) async fn handle_modify_request_with_context(
                 None,
             )
             .await;
-            send_result(
+            let response_controls = pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+            send_result_with_controls(
                 socket,
                 message_id,
                 ResponseOp::Modify,
                 ResultCode::Success,
                 &dn,
                 "",
+                &response_controls,
             )
             .await?;
         }
@@ -7558,7 +7650,7 @@ pub(crate) async fn handle_delete_request_with_context(
     dn: ldap_parser::ldap::LdapDN<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
-    _request_controls: &RequestControls,
+    request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = dn.0.as_ref().trim().to_owned();
 
@@ -7579,16 +7671,54 @@ pub(crate) async fn handle_delete_request_with_context(
         return Ok(());
     }
 
+    let pre_read_request = match decode_pre_read_request_control(request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Delete,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let pre_read_entry = if pre_read_request.is_some() {
+        match backend.get_entry(&dn).await {
+            Ok(entry) => entry,
+            Err(err) => {
+                error!("Pre-read lookup failed for delete {}: {}", dn, err);
+                send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::Delete,
+                    map_backend_error(&err),
+                    &dn,
+                    diagnostic_for_error(&err),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     match backend.delete_entry(&dn).await {
         Ok(()) => {
             log_delete_audit_event(request_context, session, &dn, true).await;
-            send_result(
+            let response_controls = pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+            send_result_with_controls(
                 socket,
                 message_id,
                 ResponseOp::Delete,
                 ResultCode::Success,
                 &dn,
                 "",
+                &response_controls,
             )
             .await?;
         }
@@ -7641,7 +7771,7 @@ pub(crate) async fn handle_moddn_request_with_context(
     request: ModDnRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
-    _request_controls: &RequestControls,
+    request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let new_rdn = request.newrdn.0.as_ref().trim().to_owned();
@@ -7721,6 +7851,22 @@ pub(crate) async fn handle_moddn_request_with_context(
             return Ok(());
         }
     };
+    let pre_read_request = match decode_pre_read_request_control(request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::ModifyDn,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let pre_read_entry = pre_read_request.as_ref().map(|_| existing_entry.clone());
 
     let parent_attributes =
         if schema.requires_parent_attributes_for_entry(&existing_entry.attributes) {
@@ -7812,13 +7958,15 @@ pub(crate) async fn handle_moddn_request_with_context(
     {
         Ok(()) => {
             log_moddn_audit_event(request_context, session, &dn, &new_dn, true, None).await;
-            send_result(
+            let response_controls = pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+            send_result_with_controls(
                 socket,
                 message_id,
                 ResponseOp::ModifyDn,
                 ResultCode::Success,
                 &dn,
                 "",
+                &response_controls,
             )
             .await?;
         }
@@ -8694,60 +8842,7 @@ async fn handle_extended_request_with_session_and_registry(
 }
 
 fn select_attributes(entry: &DirectoryEntry, requested: &[String]) -> Vec<(String, Vec<String>)> {
-    if requested
-        .iter()
-        .any(|attribute| attribute.eq_ignore_ascii_case("1.1"))
-    {
-        return Vec::new();
-    }
-
-    let include_all = requested.is_empty() || requested.iter().any(|attr| attr == "*");
-    let include_all_operational = requested.iter().any(|attr| attr == "+");
-
-    let mut selected = Vec::new();
-
-    // Add regular attributes
-    for (name, values) in &entry.attributes {
-        if OperationalAttributes::is_operational(name) {
-            continue;
-        }
-        if include_all
-            || requested
-                .iter()
-                .any(|attribute| attribute.eq_ignore_ascii_case(name))
-        {
-            selected.push((
-                crate::operational_attrs::response_user_attribute_name(name, requested),
-                values.clone(),
-            ));
-        }
-    }
-
-    if include_all_operational
-        || requested
-            .iter()
-            .any(|attr| OperationalAttributes::is_operational(attr))
-    {
-        let mut operational = entry.response_operational_attributes();
-        for (name, values) in &entry.attributes {
-            if OperationalAttributes::is_operational(name) {
-                operational.insert(name.clone(), values.clone());
-            }
-        }
-        operational.insert("entryDN".to_string(), vec![entry.dn.clone()]);
-
-        for (name, values) in operational {
-            if include_all_operational
-                || requested
-                    .iter()
-                    .any(|attribute| attribute.eq_ignore_ascii_case(&name))
-            {
-                selected.push((name, values));
-            }
-        }
-    }
-
-    selected
+    crate::read_entry_controls::select_entry_attributes(entry, requested)
 }
 
 #[cfg(test)]
@@ -9327,6 +9422,56 @@ mod tests {
             false,
             Some(encode_subentries_control(visible).unwrap()),
         )])
+    }
+
+    fn pre_read_request_controls(attributes: &[&str]) -> RequestControls {
+        let attributes = attributes
+            .iter()
+            .map(|attribute| (*attribute).to_string())
+            .collect::<Vec<_>>();
+        RequestControls::new(vec![LdapControl::new(
+            crate::read_entry_controls::PRE_READ_CONTROL_OID,
+            true,
+            Some(crate::read_entry_controls::encode_attribute_selection(&attributes).unwrap()),
+        )])
+    }
+
+    fn pre_read_response_entry(
+        message: &ldap_parser::ldap::LdapMessage<'_>,
+    ) -> rasn_ldap::SearchResultEntry {
+        let controls = message.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| {
+                control.control_type.0.as_ref() == crate::read_entry_controls::PRE_READ_CONTROL_OID
+            })
+            .expect("pre-read response control");
+        ber::decode(
+            control
+                .control_value
+                .as_deref()
+                .expect("pre-read response control value"),
+        )
+        .unwrap()
+    }
+
+    fn rasn_search_entry_attribute_map(
+        entry: &rasn_ldap::SearchResultEntry,
+    ) -> HashMap<String, Vec<String>> {
+        entry
+            .attributes
+            .iter()
+            .map(|attribute| {
+                (
+                    String::from_utf8(attribute.r#type.to_vec()).unwrap(),
+                    attribute
+                        .vals
+                        .iter()
+                        .map(|value| String::from_utf8(value.to_vec()).unwrap())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
     }
 
     fn paged_and_sort_request_controls(
@@ -10489,6 +10634,160 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn modify_with_pre_read_returns_prior_entry_control() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=Alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Alice".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let request = ModifyRequest {
+            object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            changes: vec![Change {
+                operation: Operation(2),
+                modification: PartialAttribute {
+                    attr_type: LdapString(Cow::Owned("cn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"Alice Updated".to_vec()))],
+                },
+            }],
+        };
+        let request_controls = pre_read_request_controls(&["cn", "sn"]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_modify_request_with_context(
+            &mut server_stream,
+            &backend,
+            &LdapSchema::default(),
+            31,
+            request,
+            &bound_schema_session(),
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::ModifyResponse(modify_response) => {
+                assert_eq!(
+                    modify_response.result.result_code,
+                    ParserResultCode::Success
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let pre_read_entry = pre_read_response_entry(&messages[0]);
+        assert_eq!(
+            String::from_utf8(pre_read_entry.object_name.to_vec()).unwrap(),
+            "cn=Alice,dc=example,dc=org"
+        );
+        let pre_read_attributes = rasn_search_entry_attribute_map(&pre_read_entry);
+        assert_eq!(
+            pre_read_attributes.get("cn").unwrap(),
+            &vec!["Alice".to_string()]
+        );
+        assert_eq!(
+            pre_read_attributes.get("sn").unwrap(),
+            &vec!["User".to_string()]
+        );
+        assert!(!pre_read_attributes.contains_key("objectclass"));
+
+        let stored = backend
+            .get_entry("cn=Alice,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.attributes.get("cn").unwrap(),
+            &vec!["Alice Updated".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_pre_read_modify_is_rejected_without_mutating_entry() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=Alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Alice".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let request = ModifyRequest {
+            object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            changes: vec![Change {
+                operation: Operation(2),
+                modification: PartialAttribute {
+                    attr_type: LdapString(Cow::Owned("cn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"Alice Updated".to_vec()))],
+                },
+            }],
+        };
+        let request_controls = RequestControls::new(vec![LdapControl::new(
+            crate::read_entry_controls::PRE_READ_CONTROL_OID,
+            true,
+            Some(b"not-ber".to_vec()),
+        )]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_modify_request_with_context(
+            &mut server_stream,
+            &backend,
+            &LdapSchema::default(),
+            32,
+            request,
+            &bound_schema_session(),
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::ModifyResponse(modify_response) => {
+                assert_eq!(
+                    modify_response.result.result_code,
+                    ParserResultCode::ProtocolError
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let stored = backend
+            .get_entry("cn=Alice,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.attributes.get("cn").unwrap(),
+            &vec!["Alice".to_string()]
+        );
+    }
+
     fn modify_increment_test_schema() -> LdapSchema {
         let mut schema = LdapSchema::with_core_schema();
         schema
@@ -11126,6 +11425,7 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
         let mut expected_controls = vec![
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
+            PRE_READ_CONTROL_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
             SUBENTRIES_CONTROL_OID.to_string(),
             SYNC_REQUEST_OID.to_string(),

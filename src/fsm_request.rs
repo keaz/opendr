@@ -5,6 +5,7 @@ use rasn_ldap::ResultCode;
 
 use crate::ldap_controls::{ControlRegistry, ControlValidationError, RequestControls};
 use crate::parser::ResponseOp;
+use crate::read_entry_controls::{PRE_READ_CONTROL_OID, contains_critical_pre_read_control};
 use crate::search_controls::{
     PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
     SUBENTRIES_CONTROL_OID,
@@ -95,6 +96,10 @@ impl FsmRequestKind {
                 | Self::Extended
         )
     }
+
+    fn allows_pre_read_control(self) -> bool {
+        matches!(self, Self::Modify | Self::Delete | Self::ModifyDn)
+    }
 }
 
 /// Response kind used for early rejections before operation-specific FSMs run.
@@ -123,6 +128,8 @@ pub fn active_fsm_control_registry() -> ControlRegistry {
         .register_response_control(SERVER_SIDE_SORT_RESPONSE_OID)
         .register_request_control(SUBENTRIES_CONTROL_OID)
         .register_request_control(MANAGE_DSA_IT_OID)
+        .register_request_control(PRE_READ_CONTROL_OID)
+        .register_response_control(PRE_READ_CONTROL_OID)
         .register_request_control(SYNC_REQUEST_OID)
         .register_response_control(SYNC_STATE_OID)
         .register_response_control(SYNC_DONE_OID);
@@ -140,7 +147,7 @@ pub fn build_request_context(
     let request_kind = FsmRequestKind::from(&message.protocol_op);
     let response_kind = request_kind.response_kind();
     let registry = active_fsm_control_registry();
-    let request_controls = registry
+    let mut request_controls = registry
         .validate_request_controls(message.controls.as_deref())
         .map(|validated| validated.into_accepted())
         .map_err(|error| match error {
@@ -150,6 +157,18 @@ pub fn build_request_context(
                 diagnostic_message: format!("unsupported critical control {}", oid),
             },
         })?;
+    if !request_kind.allows_pre_read_control() {
+        if contains_critical_pre_read_control(&request_controls) {
+            return Err(FsmRequestRejection {
+                response_kind,
+                result_code: ResultCode::UnavailableCriticalExtension,
+                diagnostic_message:
+                    "pre-read control is only appropriate for modify, delete, and modifyDN operations"
+                        .to_string(),
+            });
+        }
+        request_controls = request_controls.without_oid(PRE_READ_CONTROL_OID);
+    }
 
     Ok(FsmRequestContext {
         connection_id,
