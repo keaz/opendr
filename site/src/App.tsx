@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import perfComparisonMarkdown from "../../docs/PERFORMANCE_COMPARISON.md?raw";
 import productionReadinessMarkdown from "../../docs/PRODUCTION_READINESS_CHECKLIST.md?raw";
+import ldapRfcMatrixMarkdown from "../../docs/LDAP_RFC_COMPLIANCE_MATRIX.md?raw";
 import {
   replicationFlowDiagram,
   requestFlowDiagram,
@@ -68,15 +69,16 @@ const chapters: ChapterNavItem[] = [
   { id: "runtimes", number: "5", label: "Runtimes" },
   { id: "performance", number: "6", label: "Performance Results" },
   { id: "readiness", number: "7", label: "Production Readiness" },
-  { id: "setup", number: "8", label: "Setup Command" },
-  { id: "configuration", number: "9", label: "Configuration" },
-  { id: "tls", number: "10", label: "TLS" },
-  { id: "replication", number: "11", label: "Replication" },
-  { id: "indexing", number: "12", label: "Indexing" },
-  { id: "backup", number: "13", label: "Backup and Restore" },
-  { id: "operations", number: "14", label: "Operations" },
-  { id: "troubleshooting", number: "15", label: "Troubleshooting" },
-  { id: "pages", number: "16", label: "GitHub Pages" },
+  { id: "rfc-matrix", number: "8", label: "RFC Matrix" },
+  { id: "setup", number: "9", label: "Setup Command" },
+  { id: "configuration", number: "10", label: "Configuration" },
+  { id: "tls", number: "11", label: "TLS" },
+  { id: "replication", number: "12", label: "Replication" },
+  { id: "indexing", number: "13", label: "Indexing" },
+  { id: "backup", number: "14", label: "Backup and Restore" },
+  { id: "operations", number: "15", label: "Operations" },
+  { id: "troubleshooting", number: "16", label: "Troubleshooting" },
+  { id: "pages", number: "17", label: "GitHub Pages" },
 ];
 
 const latestReleaseVersion = "v1.0.1";
@@ -664,6 +666,7 @@ function App() {
         </a>
         <nav aria-label="Top navigation">
           <a href={docsHref("DEVELOPER_GUIDE.md")}>Developer Guide</a>
+          <a href={docsHref("LDAP_RFC_COMPLIANCE_MATRIX.md")}>RFC Matrix</a>
           <a href={docsHref("CONFIGURATION.md")}>Configuration</a>
           <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Management Console</a>
           <a href={docsHref("TROUBLESHOOTING.md")}>Troubleshooting</a>
@@ -727,6 +730,7 @@ function App() {
               <div className="chapter-links">
                 <a href={latestReleaseUrl}>Download latest release</a>
                 <a href={docsHref("DEVELOPER_GUIDE.md")}>Open full developer guide</a>
+                <a href={docsHref("LDAP_RFC_COMPLIANCE_MATRIX.md")}>Open LDAP RFC matrix</a>
                 <a href={docsHref("CONFIGURATION.md")}>Open configuration reference</a>
                 <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Open management console guide</a>
                 <a href={docsHref("TROUBLESHOOTING.md")}>Open troubleshooting guide</a>
@@ -1552,8 +1556,49 @@ pnpm build`}</code></pre>
               </div>
             </section>
 
-            <section className="chapter" id="setup" aria-labelledby="setup-title">
+            <section className="chapter" id="rfc-matrix" aria-labelledby="rfc-matrix-title">
               <p className="chapter-label">Chapter 8</p>
+              <h2 id="rfc-matrix-title">LDAP RFC Matrix</h2>
+              <p>
+                Use this matrix before changing protocol behavior, Root DSE
+                advertising, schema bundles, replication claims, or release
+                notes. Each row states whether the current server supports,
+                partially supports, aligns with, or deliberately excludes the
+                approved LDAP server RFC surface.
+              </p>
+
+              <div className="markdown-doc perf-results">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    table: ({ node: _node, children, ...props }) => (
+                      <div className="table-scroll">
+                        <table {...props}>{children}</table>
+                      </div>
+                    ),
+                    a: ({ node: _node, children, href, ...props }) => {
+                      const resolvedHref = markdownHref(href);
+                      const isExternal = Boolean(resolvedHref && /^(https?:|mailto:|tel:)/i.test(resolvedHref));
+                      return (
+                        <a
+                          {...props}
+                          href={resolvedHref}
+                          target={isExternal ? "_blank" : undefined}
+                          rel={isExternal ? "noreferrer" : undefined}
+                        >
+                          {children}
+                        </a>
+                      );
+                    },
+                  }}
+                >
+                  {ldapRfcMatrixMarkdown}
+                </ReactMarkdown>
+              </div>
+            </section>
+
+            <section className="chapter" id="setup" aria-labelledby="setup-title">
+              <p className="chapter-label">Chapter 9</p>
               <h2 id="setup-title">Setup Command</h2>
               <p>
                 <code>opendr-setup</code> is the supported first-run path. It
@@ -1581,7 +1626,7 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
             </section>
 
             <section className="chapter" id="configuration" aria-labelledby="configuration-title">
-              <p className="chapter-label">Chapter 9</p>
+              <p className="chapter-label">Chapter 10</p>
               <h2 id="configuration-title">Configuration</h2>
               <p>
                 Runtime configuration is TOML plus optional <code>OPENDR_*</code>{" "}
@@ -1651,7 +1696,7 @@ opendr-setup --config-dir ./config generate-schema --bundle all --overwrite`}</c
             </section>
 
             <section className="chapter" id="tls" aria-labelledby="tls-title">
-              <p className="chapter-label">Chapter 10</p>
+              <p className="chapter-label">Chapter 11</p>
               <h2 id="tls-title">TLS</h2>
               <p>
                 LDAPS and StartTLS share the rustls handler. TLS 1.2 and TLS 1.3
@@ -1675,7 +1720,7 @@ min_tls_version = "1.2"`}</code></pre>
             </section>
 
             <section className="chapter" id="replication" aria-labelledby="replication-title">
-              <p className="chapter-label">Chapter 11</p>
+              <p className="chapter-label">Chapter 12</p>
               <h2 id="replication-title">Replication</h2>
               <p>
                 OpenDR uses provider-owned LDAP Sync streams. A consumer performs
@@ -1708,7 +1753,7 @@ enable_change_listening = true`}</code></pre>
             </section>
 
             <section className="chapter" id="indexing" aria-labelledby="indexing-title">
-              <p className="chapter-label">Chapter 12</p>
+              <p className="chapter-label">Chapter 13</p>
               <h2 id="indexing-title">Indexing</h2>
               <p>
                 LMDB indexes are configured by attribute and index type. Startup
@@ -1737,7 +1782,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="backup" aria-labelledby="backup-title">
-              <p className="chapter-label">Chapter 13</p>
+              <p className="chapter-label">Chapter 14</p>
               <h2 id="backup-title">Backup and Restore</h2>
               <p>
                 Full backups are online LMDB environment copies with manifests.
@@ -1775,7 +1820,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="operations" aria-labelledby="operations-title">
-              <p className="chapter-label">Chapter 14</p>
+              <p className="chapter-label">Chapter 15</p>
               <h2 id="operations-title">Operations and Maintenance</h2>
               <p>
                 Use this chapter for day-2 work: stop and restart the service,
@@ -1844,7 +1889,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="troubleshooting" aria-labelledby="troubleshooting-title">
-              <p className="chapter-label">Chapter 15</p>
+              <p className="chapter-label">Chapter 16</p>
               <h2 id="troubleshooting-title">Troubleshooting</h2>
               <p>
                 Start from the failing boundary. Most failures are caused by
@@ -1859,7 +1904,7 @@ types = ["ordering"]`}</code></pre>
             </section>
 
             <section className="chapter" id="pages" aria-labelledby="pages-title">
-              <p className="chapter-label">Chapter 16</p>
+              <p className="chapter-label">Chapter 17</p>
               <h2 id="pages-title">GitHub Pages</h2>
               <p>
                 The documentation website is a React and Vite app in{" "}
@@ -1944,6 +1989,7 @@ pnpm preview`}</code></pre>
         <span>OpenDR LDAP Server</span>
         <nav aria-label="Footer navigation">
           <a href={docsHref("DEVELOPER_GUIDE.md")}>Developer Guide</a>
+          <a href={docsHref("LDAP_RFC_COMPLIANCE_MATRIX.md")}>RFC Matrix</a>
           <a href={docsHref("CONFIGURATION.md")}>Configuration</a>
           <a href={docsHref("MANAGEMENT_CONSOLE.md")}>Management Console</a>
           <a href={docsHref("BACKUP_RESTORE.md")}>Backup Restore</a>
