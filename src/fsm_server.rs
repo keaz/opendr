@@ -5098,7 +5098,7 @@ async fn handle_compare_request_with_fsm_runtime(
     };
 
     let mut compare_fsm = CompareFsmImpl::with_config(
-        Box::new(CompareBackendAdapter::new(backend)),
+        Box::new(CompareBackendAdapter::with_schema(backend, schema.clone())),
         Box::new(ProductionAttributeComparator::with_schema(schema.clone())),
         Box::new(AllowAllCompareAccessControl),
         compare_config,
@@ -8113,6 +8113,85 @@ mod tests {
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case("c-l"))
         );
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_projects_collective_attributes_for_compare() {
+        let backend = Arc::new(MockBackend::default());
+        for entry in [
+            DirectoryEntry::new(
+                "ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "organizationalUnit".to_string()],
+                    ),
+                    ("ou".to_string(), vec!["People".to_string()]),
+                    (
+                        "administrativeRole".to_string(),
+                        vec!["collectiveAttributeSpecificArea".to_string()],
+                    ),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=alice,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "person".to_string()],
+                    ),
+                    ("cn".to_string(), vec!["alice".to_string()]),
+                    ("sn".to_string(), vec!["Example".to_string()]),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=collective,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec![
+                            "top".to_string(),
+                            "subentry".to_string(),
+                            "collectiveAttributeSubentry".to_string(),
+                        ],
+                    ),
+                    ("cn".to_string(), vec!["collective".to_string()]),
+                    (
+                        "subtreeSpecification".to_string(),
+                        vec!["{ minimum 1 }".to_string()],
+                    ),
+                    ("c-l".to_string(), vec!["Colombo".to_string()]),
+                ]),
+            ),
+        ] {
+            backend.add_entry(entry, Vec::new()).await.unwrap();
+        }
+
+        let (server_task, mut client_stream) = spawn_test_connection(backend).await;
+
+        client_stream
+            .write_all(&encode_compare_request(
+                129,
+                "cn=alice,ou=People,dc=example,dc=org",
+                "c-l",
+                "Colombo",
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0].protocol_op {
+            ProtocolOp::CompareResponse(result) => {
+                assert_eq!(result.result_code, ParserResultCode::CompareTrue);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();

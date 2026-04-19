@@ -140,8 +140,8 @@ classes.
 Collective attribute values such as `c-l` are stored on the collective subentry.
 At search time, OpenDR projects applicable collective values virtually onto
 normal entries according to the subentry's `subtreeSpecification`. The projected
-values can be returned in search results and used by search filters, but they
-are not persisted on the target entries. Entries can opt out with
+values can be returned in search results, used by search filters, and evaluated
+by Compare operations, but they are not persisted on the target entries. Entries can opt out with
 `collectiveExclusions`, including `excludeAllCollectiveAttributes` or a specific
 collective attribute type such as `c-l`.
 

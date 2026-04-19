@@ -903,6 +903,11 @@ async fn compare_matching_attribute_returns_true() {
         .expect_get_entry()
         .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
         .return_once(move |_| Ok(Some(entry)));
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "dc=example,dc=org")
+        .times(1)
+        .return_once(|_| Ok(None));
 
     let request = CompareRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
@@ -950,6 +955,11 @@ async fn compare_uses_schema_case_ignore_matching() {
         .expect_get_entry()
         .withf(|dn| dn == "cn=Strasse,dc=example,dc=org")
         .return_once(move |_| Ok(Some(entry)));
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "dc=example,dc=org")
+        .times(1)
+        .return_once(|_| Ok(None));
 
     let request = CompareRequest {
         entry: LdapDN(Cow::Owned("cn=Strasse,dc=example,dc=org".to_string())),
@@ -987,6 +997,11 @@ async fn compare_non_matching_attribute_returns_false() {
         .expect_get_entry()
         .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
         .return_once(move |_| Ok(Some(entry)));
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "dc=example,dc=org")
+        .times(1)
+        .return_once(|_| Ok(None));
 
     let request = CompareRequest {
         entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),

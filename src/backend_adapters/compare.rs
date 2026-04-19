@@ -15,11 +15,22 @@ use crate::schema::LdapSchema;
 /// Adapter that implements `CompareBackend` using a `DirectoryBackend`.
 pub struct CompareBackendAdapter {
     backend: Arc<dyn DirectoryBackend>,
+    schema: Option<LdapSchema>,
 }
 
 impl CompareBackendAdapter {
     pub fn new(backend: Arc<dyn DirectoryBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            schema: None,
+        }
+    }
+
+    pub fn with_schema(backend: Arc<dyn DirectoryBackend>, schema: LdapSchema) -> Self {
+        Self {
+            backend,
+            schema: Some(schema),
+        }
     }
 }
 
@@ -196,6 +207,19 @@ impl CompareBackend for CompareBackendAdapter {
             .get_entry(dn)
             .await
             .map_err(|e| format!("Backend get_entry error: {}", e))?;
+
+        let entry = match (entry, self.schema.as_ref()) {
+            (Some(entry), Some(schema)) => Some(
+                crate::collective_attrs::project_collective_attributes_for_entry(
+                    self.backend.as_ref(),
+                    schema,
+                    entry,
+                )
+                .await
+                .map_err(|e| format!("Backend collective projection error: {}", e))?,
+            ),
+            (entry, _) => entry,
+        };
 
         Ok(entry.map(|entry| {
             let binary_attrs: HashMap<String, Vec<Vec<u8>>> = entry

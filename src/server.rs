@@ -7900,8 +7900,19 @@ pub(crate) async fn handle_compare_request_with_context(
 
     let compare_result = match backend.get_entry(&dn).await {
         Ok(Some(entry)) => {
-            compare_attribute_with_schema(schema, &dn, &entry.attributes, &attribute, &assertion)
-                .map_err(CompareRequestError::Filter)
+            crate::collective_attrs::project_collective_attributes_for_entry(backend, schema, entry)
+                .await
+                .map_err(CompareRequestError::Backend)
+                .and_then(|entry| {
+                    compare_attribute_with_schema(
+                        schema,
+                        &dn,
+                        &entry.attributes,
+                        &attribute,
+                        &assertion,
+                    )
+                    .map_err(CompareRequestError::Filter)
+                })
         }
         Ok(None) => Err(CompareRequestError::Backend(BackendError::NotFound)),
         Err(err) => Err(CompareRequestError::Backend(err)),
@@ -9640,6 +9651,92 @@ mod tests {
                 "cn=People Collective,ou=People,dc=example,dc=org".to_string()
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn collective_attributes_are_projected_for_compare() {
+        let backend = MockBackend::new();
+        for entry in [
+            DirectoryEntry::new(
+                "ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "organizationalUnit".to_string()],
+                    ),
+                    ("ou".to_string(), vec!["People".to_string()]),
+                    (
+                        "administrativeRole".to_string(),
+                        vec!["collectiveAttributeSpecificArea".to_string()],
+                    ),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=Alice,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "person".to_string()],
+                    ),
+                    ("cn".to_string(), vec!["Alice".to_string()]),
+                    ("sn".to_string(), vec!["Example".to_string()]),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=People Collective,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec![
+                            "top".to_string(),
+                            "subentry".to_string(),
+                            "collectiveAttributeSubentry".to_string(),
+                        ],
+                    ),
+                    ("cn".to_string(), vec!["People Collective".to_string()]),
+                    (
+                        "subtreeSpecification".to_string(),
+                        vec!["{ minimum 1 }".to_string()],
+                    ),
+                    ("c-l".to_string(), vec!["Colombo".to_string()]),
+                ]),
+            ),
+        ] {
+            backend.add_entry(entry, Vec::new()).await.unwrap();
+        }
+
+        let request = CompareRequest {
+            entry: LdapDN(Cow::Owned(
+                "cn=Alice,ou=People,dc=example,dc=org".to_string(),
+            )),
+            ava: AttributeValueAssertion {
+                attribute_desc: LdapString(Cow::Owned("c-l".to_string())),
+                assertion_value: Cow::Borrowed(b"Colombo"),
+            },
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_compare_request_with_context(
+            &mut server_stream,
+            &backend,
+            &LdapSchema::with_core_schema(),
+            65,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &RequestControls::default(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::CompareResponse(compare_response) => {
+                assert_eq!(compare_response.result_code, ParserResultCode::CompareTrue);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
     }
 
     #[test]

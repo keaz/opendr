@@ -2621,18 +2621,34 @@ impl LdapSchema {
             let Some(metadata) = self.attribute_metadata_by_oid.get(&attribute.oid) else {
                 continue;
             };
-            if let Some(superior) = metadata.superior.as_deref()
-                && self.get_attribute_type(superior).is_none()
-            {
-                return Err(SchemaError::MissingDependency(format!(
-                    "attribute {} references unknown superior {}",
-                    attribute
-                        .names
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or(&attribute.oid),
-                    superior
-                )));
+            if let Some(superior) = metadata.superior.as_deref() {
+                let Some(superior_attribute) = self.get_attribute_type(superior) else {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "attribute {} references unknown superior {}",
+                        attribute
+                            .names
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or(&attribute.oid),
+                        superior
+                    )));
+                };
+                if self
+                    .attribute_metadata_by_oid
+                    .get(&superior_attribute.oid)
+                    .is_some_and(|superior_metadata| superior_metadata.collective)
+                    && !metadata.collective
+                {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "non-collective attribute {} must not subtype collective attribute {}",
+                        attribute
+                            .names
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or(&attribute.oid),
+                        superior
+                    )));
+                }
             }
             for matching_rule in attribute
                 .equality
@@ -2669,9 +2685,24 @@ impl LdapSchema {
                 }
             }
             for attribute in object_class.must.iter().chain(object_class.may.iter()) {
-                if self.get_attribute_type(attribute).is_none() {
+                let Some(attribute_type) = self.get_attribute_type(attribute) else {
                     return Err(SchemaError::MissingDependency(format!(
                         "object class {} references unknown attribute {}",
+                        object_class
+                            .names
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or(&object_class.oid),
+                        attribute
+                    )));
+                };
+                if self
+                    .attribute_metadata_by_oid
+                    .get(&attribute_type.oid)
+                    .is_some_and(|metadata| metadata.collective)
+                {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "object class {} must not list collective attribute {} in MUST or MAY",
                         object_class
                             .names
                             .first()
@@ -6763,6 +6794,12 @@ fn parse_attribute_type_description(input: &str) -> Result<ParsedAttributeType, 
             )));
         }
     }
+    if metadata.collective && single_value {
+        return Err(SchemaError::ParseError(format!(
+            "collective attribute type {} must not be SINGLE-VALUE",
+            names.first().map(String::as_str).unwrap_or(&oid)
+        )));
+    }
 
     Ok(ParsedAttributeType {
         attribute_type: AttributeType {
@@ -7402,6 +7439,46 @@ mod tests {
             ),
             Err(SchemaError::StructureRuleViolation(_))
         ));
+    }
+
+    #[test]
+    fn rfc3671_rejects_invalid_collective_schema_definitions() {
+        let mut schema = LdapSchema::with_core_schema();
+
+        let single_value_collective = schema
+            .load_ldif_str(
+                "attributeTypes: ( 1.3.6.1.4.1.55555.3671.1 NAME 'badCollectiveSingle' SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE COLLECTIVE )",
+            )
+            .unwrap_err();
+        assert!(
+            single_value_collective
+                .to_string()
+                .contains("must not be SINGLE-VALUE")
+        );
+
+        let mut schema = LdapSchema::with_core_schema();
+        let non_collective_subtype = schema
+            .load_ldif_str(
+                "attributeTypes: ( 1.3.6.1.4.1.55555.3671.2 NAME 'badNonCollectiveSubtype' SUP c-l )",
+            )
+            .unwrap_err();
+        assert!(
+            non_collective_subtype
+                .to_string()
+                .contains("must not subtype collective attribute")
+        );
+
+        let mut schema = LdapSchema::with_core_schema();
+        let object_class_collective_may = schema
+            .load_ldif_str(
+                "objectClasses: ( 1.3.6.1.4.1.55555.3671.3 NAME 'badCollectiveObject' SUP top AUXILIARY MAY c-l )",
+            )
+            .unwrap_err();
+        assert!(
+            object_class_collective_may
+                .to_string()
+                .contains("must not list collective attribute")
+        );
     }
 
     #[test]
