@@ -468,7 +468,7 @@ allow_online_updates = false
 | --- | --- | --- |
 | `enabled` | `true` | Loads the built-in and external LDAP schema registry |
 | `schema_dir` | `config/schema` | Directory recursively loaded for `.ldif`, `.schema`, or `.conf` schema definition files |
-| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files. Supported values are `core`, optional RFC 2307 `posix`, optional RFC 4524 `cosine`, and optional RFC 4523 `x509`. The `core` bundle includes file-backed RFC 4519 user schema, RFC 2798 `inetOrgPerson`, RFC 3672 subentries, and RFC 3671 collective attributes. |
+| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files. Supported values are `core`, optional RFC 2307 `posix`, optional RFC 4524 `cosine`, and optional RFC 4523 `x509`. The `core` bundle includes file-backed RFC 4517 syntaxes and matching rules, RFC 4519 user schema, RFC 2798 `inetOrgPerson`, RFC 3672 subentries, and RFC 3671 collective attributes. |
 | `strict_validation` | `true` | Treats malformed schema files as startup errors |
 | `allow_online_updates` | `false` | Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into `schema_dir/99-online.ldif` |
 
@@ -504,10 +504,11 @@ artifacts instead of relying only on `load_builtin`:
 opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
-The command writes files such as `config/schema/core/rfc4519.ldif`,
-`config/schema/core/rfc2798.ldif`, `config/schema/core/rfc3672.ldif`,
-`config/schema/core/rfc3671.ldif`, `config/schema/posix/rfc2307.ldif`,
-`config/schema/cosine/rfc4524.ldif`, and `config/schema/x509/rfc4523.ldif`.
+The command writes files such as `config/schema/core/rfc4517.ldif`,
+`config/schema/core/rfc4519.ldif`, `config/schema/core/rfc2798.ldif`,
+`config/schema/core/rfc3672.ldif`, `config/schema/core/rfc3671.ldif`,
+`config/schema/posix/rfc2307.ldif`, `config/schema/cosine/rfc4524.ldif`,
+and `config/schema/x509/rfc4523.ldif`.
 Keep generated standard files unchanged unless you intentionally fork
 compatibility behavior.
 

@@ -17,6 +17,7 @@ use x520_stringprep::{
 
 use crate::dn::{canonicalize_dn, parse_dn, parse_rdn, rdn_attribute_values};
 
+const RFC4517_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc4517.ldif");
 const RFC3671_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc3671.ldif");
 const RFC3672_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc3672.ldif");
 const RFC4519_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc4519.ldif");
@@ -441,6 +442,11 @@ pub fn bundled_schema_files(bundle: &str) -> Result<Vec<BuiltinSchemaFile>, Sche
         "core" => Ok(vec![
             BuiltinSchemaFile {
                 bundle: "core",
+                relative_path: "core/rfc4517.ldif",
+                contents: RFC4517_SCHEMA_LDIF,
+            },
+            BuiltinSchemaFile {
+                bundle: "core",
                 relative_path: "core/rfc4519.ldif",
                 contents: RFC4519_SCHEMA_LDIF,
             },
@@ -573,229 +579,8 @@ impl LdapSchema {
     }
 
     fn load_standard_syntaxes_and_matching_rules(&mut self) {
-        let syntaxes = [
-            ("1.3.6.1.4.1.1466.115.121.1.3", "Attribute Type Description"),
-            ("1.3.6.1.4.1.1466.115.121.1.5", "Binary"),
-            ("1.3.6.1.4.1.1466.115.121.1.6", "Bit String"),
-            ("1.3.6.1.4.1.1466.115.121.1.7", "Boolean"),
-            ("1.3.6.1.4.1.1466.115.121.1.8", "Certificate"),
-            ("1.3.6.1.4.1.1466.115.121.1.11", "Country String"),
-            ("1.3.6.1.4.1.1466.115.121.1.12", "DN"),
-            ("1.3.6.1.4.1.1466.115.121.1.14", "Delivery Method"),
-            ("1.3.6.1.4.1.1466.115.121.1.15", "Directory String"),
-            (
-                "1.3.6.1.4.1.1466.115.121.1.16",
-                "DIT Content Rule Description",
-            ),
-            (
-                "1.3.6.1.4.1.1466.115.121.1.17",
-                "DIT Structure Rule Description",
-            ),
-            ("1.3.6.1.4.1.1466.115.121.1.21", "Enhanced Guide"),
-            (
-                "1.3.6.1.4.1.1466.115.121.1.22",
-                "Facsimile Telephone Number",
-            ),
-            ("1.3.6.1.4.1.1466.115.121.1.23", "Fax"),
-            ("1.3.6.1.4.1.1466.115.121.1.24", "Generalized Time"),
-            ("1.3.6.1.4.1.1466.115.121.1.25", "Guide"),
-            ("1.3.6.1.4.1.1466.115.121.1.26", "IA5 String"),
-            ("1.3.6.1.4.1.1466.115.121.1.27", "Integer"),
-            ("1.3.6.1.4.1.1466.115.121.1.28", "JPEG"),
-            ("1.3.6.1.4.1.1466.115.121.1.30", "Matching Rule Description"),
-            (
-                "1.3.6.1.4.1.1466.115.121.1.31",
-                "Matching Rule Use Description",
-            ),
-            ("1.3.6.1.4.1.1466.115.121.1.34", "Name And Optional UID"),
-            ("1.3.6.1.4.1.1466.115.121.1.35", "Name Form Description"),
-            ("1.3.6.1.4.1.1466.115.121.1.36", "Numeric String"),
-            ("1.3.6.1.4.1.1466.115.121.1.37", "Object Class Description"),
-            ("1.3.6.1.4.1.1466.115.121.1.38", "OID"),
-            ("1.3.6.1.4.1.1466.115.121.1.39", "Other Mailbox"),
-            ("1.3.6.1.4.1.1466.115.121.1.40", "Octet String"),
-            ("1.3.6.1.4.1.1466.115.121.1.41", "Postal Address"),
-            ("1.3.6.1.4.1.1466.115.121.1.44", "Printable String"),
-            ("1.3.6.1.4.1.1466.115.121.1.50", "Telephone Number"),
-            (
-                "1.3.6.1.4.1.1466.115.121.1.51",
-                "Teletex Terminal Identifier",
-            ),
-            ("1.3.6.1.4.1.1466.115.121.1.52", "Telex Number"),
-            ("1.3.6.1.4.1.1466.115.121.1.53", "UTC Time"),
-            ("1.3.6.1.4.1.1466.115.121.1.54", "LDAP Syntax Description"),
-            ("1.3.6.1.4.1.1466.115.121.1.58", "Substring Assertion"),
-        ];
-        for (oid, description) in syntaxes {
-            let _ = self.try_add_ldap_syntax(LdapSyntax {
-                oid: oid.to_string(),
-                description: Some(description.to_string()),
-                obsolete: false,
-                extensions: BTreeMap::new(),
-            });
-        }
-
-        let matching_rules = [
-            (
-                "2.5.13.0",
-                "objectIdentifierMatch",
-                "1.3.6.1.4.1.1466.115.121.1.38",
-            ),
-            (
-                "2.5.13.1",
-                "distinguishedNameMatch",
-                "1.3.6.1.4.1.1466.115.121.1.12",
-            ),
-            (
-                "2.5.13.2",
-                "caseIgnoreMatch",
-                "1.3.6.1.4.1.1466.115.121.1.15",
-            ),
-            (
-                "2.5.13.3",
-                "caseIgnoreOrderingMatch",
-                "1.3.6.1.4.1.1466.115.121.1.15",
-            ),
-            (
-                "2.5.13.4",
-                "caseIgnoreSubstringsMatch",
-                "1.3.6.1.4.1.1466.115.121.1.15",
-            ),
-            (
-                "2.5.13.5",
-                "caseExactMatch",
-                "1.3.6.1.4.1.1466.115.121.1.15",
-            ),
-            (
-                "2.5.13.6",
-                "caseExactOrderingMatch",
-                "1.3.6.1.4.1.1466.115.121.1.15",
-            ),
-            (
-                "2.5.13.7",
-                "caseExactSubstringsMatch",
-                "1.3.6.1.4.1.1466.115.121.1.15",
-            ),
-            (
-                "2.5.13.8",
-                "numericStringMatch",
-                "1.3.6.1.4.1.1466.115.121.1.36",
-            ),
-            (
-                "2.5.13.9",
-                "numericStringOrderingMatch",
-                "1.3.6.1.4.1.1466.115.121.1.36",
-            ),
-            (
-                "2.5.13.10",
-                "numericStringSubstringsMatch",
-                "1.3.6.1.4.1.1466.115.121.1.36",
-            ),
-            (
-                "2.5.13.11",
-                "caseIgnoreListMatch",
-                "1.3.6.1.4.1.1466.115.121.1.41",
-            ),
-            (
-                "2.5.13.12",
-                "caseIgnoreListSubstringsMatch",
-                "1.3.6.1.4.1.1466.115.121.1.41",
-            ),
-            ("2.5.13.13", "booleanMatch", "1.3.6.1.4.1.1466.115.121.1.7"),
-            ("2.5.13.14", "integerMatch", "1.3.6.1.4.1.1466.115.121.1.27"),
-            (
-                "2.5.13.15",
-                "integerOrderingMatch",
-                "1.3.6.1.4.1.1466.115.121.1.27",
-            ),
-            (
-                "2.5.13.16",
-                "bitStringMatch",
-                "1.3.6.1.4.1.1466.115.121.1.6",
-            ),
-            (
-                "2.5.13.17",
-                "octetStringMatch",
-                "1.3.6.1.4.1.1466.115.121.1.40",
-            ),
-            (
-                "2.5.13.18",
-                "octetStringOrderingMatch",
-                "1.3.6.1.4.1.1466.115.121.1.40",
-            ),
-            (
-                "2.5.13.20",
-                "telephoneNumberMatch",
-                "1.3.6.1.4.1.1466.115.121.1.50",
-            ),
-            (
-                "2.5.13.21",
-                "telephoneNumberSubstringsMatch",
-                "1.3.6.1.4.1.1466.115.121.1.50",
-            ),
-            (
-                "2.5.13.23",
-                "uniqueMemberMatch",
-                "1.3.6.1.4.1.1466.115.121.1.34",
-            ),
-            (
-                "2.5.13.27",
-                "generalizedTimeMatch",
-                "1.3.6.1.4.1.1466.115.121.1.24",
-            ),
-            (
-                "2.5.13.28",
-                "generalizedTimeOrderingMatch",
-                "1.3.6.1.4.1.1466.115.121.1.24",
-            ),
-            (
-                "2.5.13.29",
-                "integerFirstComponentMatch",
-                "1.3.6.1.4.1.1466.115.121.1.27",
-            ),
-            (
-                "2.5.13.30",
-                "objectIdentifierFirstComponentMatch",
-                "1.3.6.1.4.1.1466.115.121.1.38",
-            ),
-            (
-                "2.5.13.31",
-                "directoryStringFirstComponentMatch",
-                "1.3.6.1.4.1.1466.115.121.1.15",
-            ),
-            ("2.5.13.32", "wordMatch", "1.3.6.1.4.1.1466.115.121.1.15"),
-            ("2.5.13.33", "keywordMatch", "1.3.6.1.4.1.1466.115.121.1.15"),
-            (
-                "1.3.6.1.4.1.1466.109.114.2",
-                "caseIgnoreIA5Match",
-                "1.3.6.1.4.1.1466.115.121.1.26",
-            ),
-            (
-                "1.3.6.1.4.1.1466.109.114.1",
-                "caseExactIA5Match",
-                "1.3.6.1.4.1.1466.115.121.1.26",
-            ),
-            (
-                "1.3.6.1.4.1.1466.109.114.3",
-                "caseIgnoreIA5SubstringsMatch",
-                "1.3.6.1.4.1.1466.115.121.1.26",
-            ),
-            (
-                "1.3.6.1.4.1.4203.1.2.1",
-                "caseExactIA5SubstringsMatch",
-                "1.3.6.1.4.1.1466.115.121.1.26",
-            ),
-        ];
-        for (oid, name, syntax) in matching_rules {
-            let _ = self.try_add_matching_rule(MatchingRule {
-                oid: oid.to_string(),
-                names: vec![name.to_string()],
-                description: Some(name.to_string()),
-                obsolete: false,
-                syntax: syntax.to_string(),
-                extensions: BTreeMap::new(),
-            });
-        }
+        self.load_ldif_str(RFC4517_SCHEMA_LDIF)
+            .expect("bundled RFC 4517 schema must load");
     }
 
     /// Add an attribute type to the schema

@@ -4,6 +4,10 @@ OpenDR validates values for every LDAP syntax it advertises in the generated
 subschema. Attribute values using an advertised but unsupported syntax are
 rejected during schema validation instead of being silently accepted.
 
+The RFC 4517 syntax and matching-rule declarations are loaded from
+`resources/schema/core/rfc4517.ldif`; Rust code owns the validators,
+normalizers, ordering keys, and matching-rule execution.
+
 ## LDAP Syntaxes
 
 | Syntax | OID | Status | Validation |

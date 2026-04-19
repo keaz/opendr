@@ -182,7 +182,7 @@ for a complete conformance example that uses `core` plus `posix`.
 
 | Area | Current support | Notes |
 | --- | --- | --- |
-| RFC 4517 syntaxes and matching rules | Supported | The built-in subschema advertises the RFC 4517 registry and validates or executes the advertised syntax and matching-rule surface. |
+| RFC 4517 syntaxes and matching rules | Supported | File-backed in `resources/schema/core/rfc4517.ldif`; the built-in subschema advertises the RFC 4517 registry and validates or executes the advertised syntax and matching-rule surface. |
 | RFC 4518 string preparation | Supported | Directory String, Numeric String, Telephone Number, and related matching rules use X.520/RFC 4518 preparation before comparison and index key generation. |
 | RFC 4519 user schema | Supported | File-backed in `resources/schema/core/rfc4519.ldif`; RFC 4519 user attributes and object classes are registered and validated, including strict `groupOfNames`. |
 | RFC 4519 `groupOfNames` | Supported | Both `cn` and `member` are required. |

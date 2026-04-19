@@ -1805,6 +1805,7 @@ mod tests {
             .await
             .unwrap();
 
+        let syntax_schema_path = output_dir.join("core").join("rfc4517.ldif");
         let user_schema_path = output_dir.join("core").join("rfc4519.ldif");
         let inetorgperson_schema_path = output_dir.join("core").join("rfc2798.ldif");
         let subentry_schema_path = output_dir.join("core").join("rfc3672.ldif");
@@ -1812,12 +1813,14 @@ mod tests {
         assert_eq!(
             written,
             vec![
+                syntax_schema_path.clone(),
                 user_schema_path.clone(),
                 inetorgperson_schema_path.clone(),
                 subentry_schema_path.clone(),
                 collective_schema_path.clone()
             ]
         );
+        assert!(syntax_schema_path.is_file());
         assert!(user_schema_path.is_file());
         assert!(inetorgperson_schema_path.is_file());
         assert!(subentry_schema_path.is_file());
@@ -1825,6 +1828,7 @@ mod tests {
 
         let mut schema = crate::schema::LdapSchema::with_core_schema();
         schema.load_schema_dir(&output_dir).unwrap();
+        assert!(schema.resolve_matching_rule("caseIgnoreMatch").is_ok());
         assert!(schema.get_object_class("person").is_some());
         assert!(schema.get_object_class("inetOrgPerson").is_some());
         assert!(schema.get_attribute_type("subtreeSpecification").is_some());

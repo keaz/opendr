@@ -169,10 +169,10 @@ opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
 The command writes bundled schema files such as
-`config/schema/core/rfc4519.ldif`, `config/schema/core/rfc2798.ldif`,
-`config/schema/core/rfc3672.ldif`, `config/schema/core/rfc3671.ldif`,
-`config/schema/posix/rfc2307.ldif`, `config/schema/cosine/rfc4524.ldif`,
-and `config/schema/x509/rfc4523.ldif`.
+`config/schema/core/rfc4517.ldif`, `config/schema/core/rfc4519.ldif`,
+`config/schema/core/rfc2798.ldif`, `config/schema/core/rfc3672.ldif`,
+`config/schema/core/rfc3671.ldif`, `config/schema/posix/rfc2307.ldif`,
+`config/schema/cosine/rfc4524.ldif`, and `config/schema/x509/rfc4523.ldif`.
 The runtime also supports the same schema through
 `load_builtin = ["core", "posix", "cosine", "x509"]`.
 

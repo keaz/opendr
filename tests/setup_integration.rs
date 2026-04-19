@@ -89,6 +89,7 @@ async fn test_setup_generates_bundled_schema_files() {
         .await
         .unwrap();
 
+    let core_syntax_schema = schema_dir.join("core").join("rfc4517.ldif");
     let core_user_schema = schema_dir.join("core").join("rfc4519.ldif");
     let core_inetorgperson_schema = schema_dir.join("core").join("rfc2798.ldif");
     let core_subentry_schema = schema_dir.join("core").join("rfc3672.ldif");
@@ -99,6 +100,7 @@ async fn test_setup_generates_bundled_schema_files() {
     assert_eq!(
         written,
         vec![
+            core_syntax_schema.clone(),
             core_user_schema.clone(),
             core_inetorgperson_schema.clone(),
             core_subentry_schema.clone(),
@@ -108,6 +110,7 @@ async fn test_setup_generates_bundled_schema_files() {
             x509_schema.clone()
         ]
     );
+    assert!(core_syntax_schema.is_file());
     assert!(core_user_schema.is_file());
     assert!(core_inetorgperson_schema.is_file());
     assert!(core_subentry_schema.is_file());
@@ -118,6 +121,7 @@ async fn test_setup_generates_bundled_schema_files() {
 
     let mut schema = LdapSchema::with_core_schema();
     schema.load_schema_dir(&schema_dir).unwrap();
+    assert!(schema.resolve_matching_rule("caseIgnoreMatch").is_ok());
     assert!(schema.get_object_class("person").is_some());
     assert!(schema.get_object_class("inetOrgPerson").is_some());
     assert!(schema.get_object_class("subentry").is_some());

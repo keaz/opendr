@@ -666,6 +666,27 @@ fn test_inet_org_person_employee_number_is_single_value() {
 }
 
 #[test]
+fn test_rfc4517_syntax_matching_schema_loads_from_bundled_ldif_file() {
+    let mut schema = LdapSchema::new();
+    schema
+        .load_ldif_str(include_str!("../resources/schema/core/rfc4517.ldif"))
+        .unwrap();
+
+    assert!(
+        schema
+            .ldap_syntax_descriptions_unique_sorted()
+            .iter()
+            .any(|description| description.contains("Directory String"))
+    );
+    assert!(schema.resolve_matching_rule("caseIgnoreMatch").is_ok());
+    assert!(
+        schema
+            .resolve_matching_rule("caseExactIA5SubstringsMatch")
+            .is_ok()
+    );
+}
+
+#[test]
 fn test_rfc4519_user_schema_loads_from_bundled_ldif_file() {
     let mut schema = LdapSchema::with_core_schema();
     schema
