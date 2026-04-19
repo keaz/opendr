@@ -373,14 +373,16 @@ Schema validation:
   identifiers, validity, private-key validity, subject-public-key algorithm, key
   usage, subject alternative name type, certificate policy, and name-constraint
   assertions including asserted GeneralSubtree minimum/maximum bounds;
-  `otherName` string/OCTET STRING values and `ediPartyName` values are
-  supported in GeneralSubtree bases;
+  `otherName` BOOLEAN, INTEGER, BIT STRING, NULL, object identifier, string,
+  and OCTET STRING values plus `ediPartyName` values are supported in
+  GeneralSubtree bases;
   path-to-name checks evaluate certificate NameConstraints; certificate pair
   component matching delegates to those certificate components; CRL component
   matching covers issuer, date, CRL-number ranges, authority key identifier,
   reason flags, full-name distribution points, and name-relative-to-CRL-issuer
-  distribution points. The remaining RFC 4523 unsupported open-type `otherName`
-  values and X.400 general-name components remain tracked follow-up work.
+  distribution points. The remaining RFC 4523 constructed or schema-specific
+  open-type `otherName` values and X.400 general-name components remain tracked
+  follow-up work.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active

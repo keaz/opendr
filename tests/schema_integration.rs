@@ -208,6 +208,26 @@ fn name_constraints_extension_content() -> Vec<u8> {
         None,
         None,
     );
+    let permitted_other_name_boolean = general_subtree_der(
+        other_name_general_name_der(&[1, 2, 3, 5], test_der_wrap(0x01, &[0xff])),
+        None,
+        None,
+    );
+    let permitted_other_name_integer = general_subtree_der(
+        other_name_general_name_der(&[1, 2, 3, 6], test_der_wrap(0x02, &[42])),
+        None,
+        None,
+    );
+    let permitted_other_name_oid = general_subtree_der(
+        other_name_general_name_der(&[1, 2, 3, 7], test_der_oid(&[1, 2, 840, 113549, 1, 1, 1])),
+        None,
+        None,
+    );
+    let permitted_other_name_bit_string = general_subtree_der(
+        other_name_general_name_der(&[1, 2, 3, 8], test_der_wrap(0x03, &[4, 0xa0])),
+        None,
+        None,
+    );
     let permitted_edi_party_name = general_subtree_der(
         edi_party_name_general_name_der(Some("Example EDI"), "Directory Gateway"),
         None,
@@ -226,6 +246,10 @@ fn name_constraints_extension_content() -> Vec<u8> {
     let mut permitted_subtrees = permitted;
     permitted_subtrees.extend(permitted_directory);
     permitted_subtrees.extend(permitted_other_name);
+    permitted_subtrees.extend(permitted_other_name_boolean);
+    permitted_subtrees.extend(permitted_other_name_integer);
+    permitted_subtrees.extend(permitted_other_name_oid);
+    permitted_subtrees.extend(permitted_other_name_bit_string);
     permitted_subtrees.extend(permitted_edi_party_name);
     let mut excluded_subtrees = excluded;
     excluded_subtrees.extend(excluded_directory);
@@ -1708,6 +1732,46 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
                     "{{ pathToName rdnSequence:{} }}",
                     gser_quote("ou=Allowed,o=Example")
                 )
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.2.3.5, value TRUE } } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.2.3.5, value FALSE } } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.2.3.6, value 42 } } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.2.3.7, value 1.2.840.113549.1.1.1 } } } } }",
+            )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                "{ nameConstraints { permittedSubtrees { { base otherName:{ type-id 1.2.3.8, value '1010'B } } } } }",
             )
             .unwrap()
     );

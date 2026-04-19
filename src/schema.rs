@@ -4663,6 +4663,11 @@ enum X509GeneralNameAssertion {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum X509GserValueAssertion {
+    Boolean(bool),
+    Integer(String),
+    BitString(String),
+    Null,
+    ObjectIdentifier(String),
     String(String),
     OctetString(String),
 }
@@ -5422,6 +5427,22 @@ fn der_value_matches_gser_assertion(
     assertion: &X509GserValueAssertion,
 ) -> Result<bool, String> {
     match assertion {
+        X509GserValueAssertion::Boolean(asserted) if value.tag == 0x01 => {
+            der_boolean_value(value.content).map(|candidate| candidate == *asserted)
+        }
+        X509GserValueAssertion::Integer(asserted) if value.tag == 0x02 => {
+            der_integer_decimal(value.content).map(|candidate| candidate == *asserted)
+        }
+        X509GserValueAssertion::BitString(asserted) if value.tag == 0x03 => {
+            der_bit_string_bits(value.content).map(|candidate| candidate == *asserted)
+        }
+        X509GserValueAssertion::Null if value.tag == 0x05 => Ok(value.content.is_empty()),
+        X509GserValueAssertion::ObjectIdentifier(asserted) if value.tag == 0x06 => {
+            if !der_oid_content_is_valid(value.content) {
+                return Err("object identifier DER is invalid".to_string());
+            }
+            decode_der_oid(value.content).map(|candidate| candidate == *asserted)
+        }
         X509GserValueAssertion::String(asserted) => der_tlv_string_value(value)
             .map(|candidate| candidate == *asserted)
             .or(Ok(false)),
@@ -5473,6 +5494,85 @@ fn der_universal_string_value(content: &[u8]) -> Result<String, String> {
         output.push(ch);
     }
     Ok(output)
+}
+
+fn der_boolean_value(content: &[u8]) -> Result<bool, String> {
+    match content {
+        [0x00] => Ok(false),
+        [0xff] => Ok(true),
+        [_] => Err("DER BOOLEAN true must be encoded as 0xff".to_string()),
+        _ => Err("DER BOOLEAN content must contain exactly one octet".to_string()),
+    }
+}
+
+fn der_integer_decimal(content: &[u8]) -> Result<String, String> {
+    if content.is_empty() {
+        return Err("DER INTEGER content must not be empty".to_string());
+    }
+    if content.len() > 1 {
+        if content[0] == 0x00 && content[1] & 0x80 == 0 {
+            return Err("DER INTEGER positive value is not minimally encoded".to_string());
+        }
+        if content[0] == 0xff && content[1] & 0x80 == 0x80 {
+            return Err("DER INTEGER negative value is not minimally encoded".to_string());
+        }
+    }
+
+    if content[0] & 0x80 == 0 {
+        return der_unsigned_integer_decimal(content);
+    }
+
+    let mut magnitude = content.iter().map(|byte| !byte).collect::<Vec<_>>();
+    for byte in magnitude.iter_mut().rev() {
+        let (updated, carried) = byte.overflowing_add(1);
+        *byte = updated;
+        if !carried {
+            break;
+        }
+    }
+    let magnitude = der_unsigned_integer_decimal(&magnitude)?;
+    Ok(if magnitude == "0" {
+        "0".to_string()
+    } else {
+        format!("-{magnitude}")
+    })
+}
+
+fn der_bit_string_bits(content: &[u8]) -> Result<String, String> {
+    let Some((&unused_bits, bytes)) = content.split_first() else {
+        return Err("DER BIT STRING content must include unused-bit count".to_string());
+    };
+    if unused_bits > 7 {
+        return Err("DER BIT STRING unused-bit count must be between 0 and 7".to_string());
+    }
+    if bytes.is_empty() {
+        if unused_bits == 0 {
+            return Ok(String::new());
+        }
+        return Err("DER BIT STRING empty value must have zero unused bits".to_string());
+    }
+    if unused_bits > 0 {
+        let mask = (1_u8 << unused_bits) - 1;
+        if bytes.last().copied().unwrap_or_default() & mask != 0 {
+            return Err("DER BIT STRING unused bits must be zero".to_string());
+        }
+    }
+
+    let bit_len = bytes.len() * 8 - usize::from(unused_bits);
+    let mut bits = String::with_capacity(bit_len);
+    for (byte_index, byte) in bytes.iter().enumerate() {
+        for bit_index in (0..8).rev() {
+            if byte_index * 8 + (7 - bit_index) >= bit_len {
+                break;
+            }
+            bits.push(if (byte >> bit_index) & 1 == 1 {
+                '1'
+            } else {
+                '0'
+            });
+        }
+    }
+    Ok(bits)
 }
 
 fn edi_party_name_der_matches_assertion(
@@ -6525,20 +6625,60 @@ fn parse_other_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
 
 fn parse_gser_value_assertion(value: &str) -> Result<X509GserValueAssertion, String> {
     let value = value.trim();
+    if value == "TRUE" {
+        return Ok(X509GserValueAssertion::Boolean(true));
+    }
+    if value == "FALSE" {
+        return Ok(X509GserValueAssertion::Boolean(false));
+    }
+    if value == "NULL" {
+        return Ok(X509GserValueAssertion::Null);
+    }
     if value.starts_with('"') {
         return Ok(X509GserValueAssertion::String(unquote_gser_dquote_string(
             value,
         )?));
+    }
+    if bit_string_bits(value).is_some() {
+        return Ok(X509GserValueAssertion::BitString(
+            validate_and_normalize_gser_bit_string(value)?,
+        ));
     }
     if value.starts_with('\'') {
         return Ok(X509GserValueAssertion::OctetString(parse_octet_string_hex(
             value,
         )?));
     }
-    Err(
-        "OtherName Value currently supports GSER string values and OCTET STRING hstring values"
-            .to_string(),
-    )
+    if value.contains('.') {
+        return Ok(X509GserValueAssertion::ObjectIdentifier(
+            parse_object_identifier_component(value)?,
+        ));
+    }
+    if is_signed_decimal_integer(value) {
+        return Ok(X509GserValueAssertion::Integer(
+            normalize_signed_decimal_integer(value)?,
+        ));
+    }
+    Err("OtherName Value currently supports BOOLEAN, INTEGER, BIT STRING, NULL, OBJECT IDENTIFIER, GSER string, and OCTET STRING hstring values".to_string())
+}
+
+fn validate_and_normalize_gser_bit_string(value: &str) -> Result<String, String> {
+    let Some(bits) = bit_string_bits(value) else {
+        return Err("BIT STRING must use the form '0101'B".to_string());
+    };
+    if !bits.chars().all(|ch| matches!(ch, '0' | '1')) {
+        return Err("BIT STRING may contain only 0 and 1 bits".to_string());
+    }
+    Ok(bits.to_string())
+}
+
+fn is_signed_decimal_integer(value: &str) -> bool {
+    let value = value.trim();
+    let digits = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .unwrap_or(value);
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn parse_object_identifier_component(value: &str) -> Result<String, String> {
@@ -6775,6 +6915,21 @@ fn normalize_unsigned_decimal_integer(value: &str) -> Result<String, String> {
         "0".to_string()
     } else {
         trimmed.to_string()
+    })
+}
+
+fn normalize_signed_decimal_integer(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let (negative, digits) = if let Some(digits) = value.strip_prefix('-') {
+        (true, digits)
+    } else {
+        (false, value.strip_prefix('+').unwrap_or(value))
+    };
+    let normalized = normalize_unsigned_decimal_integer(digits)?;
+    Ok(if negative && normalized != "0" {
+        format!("-{normalized}")
+    } else {
+        normalized
     })
 }
 
@@ -8662,6 +8817,42 @@ mod tests {
             (1 << 1) | (1 << 2)
         );
         assert_eq!(parse_reason_flags("'60'H").unwrap(), (1 << 1) | (1 << 2));
+    }
+
+    #[test]
+    fn rfc4523_other_name_gser_primitive_values_match_der() {
+        fn matches_gser(der: &[u8], gser: &str) -> bool {
+            let (remainder, value) = read_der_tlv(der).unwrap();
+            assert!(remainder.is_empty());
+            let assertion = parse_gser_value_assertion(gser).unwrap();
+            der_value_matches_gser_assertion(&value, &assertion).unwrap()
+        }
+
+        assert!(matches_gser(&wrap_der_value(0x01, &[0xff]), "TRUE"));
+        assert!(!matches_gser(&wrap_der_value(0x01, &[0x00]), "TRUE"));
+        assert!(matches_gser(&wrap_der_value(0x02, &[42]), "42"));
+        assert!(matches_gser(&wrap_der_value(0x02, &[0xd6]), "-42"));
+        assert!(matches_gser(&wrap_der_value(0x03, &[4, 0xa0]), "'1010'B"));
+        assert!(matches_gser(&wrap_der_value(0x05, &[]), "NULL"));
+        assert!(matches_gser(
+            &wrap_der_value(
+                0x06,
+                &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
+            ),
+            "1.2.840.113549.1.1.1",
+        ));
+        assert!(matches_gser(
+            &wrap_der_value(0x0c, b"Directory namespace"),
+            r#""Directory namespace""#,
+        ));
+        assert!(matches_gser(
+            &wrap_der_value(0x04, &[0xde, 0xad]),
+            "'DEAD'H"
+        ));
+        assert!(!matches_gser(
+            &wrap_der_value(0x04, &[0xde, 0xad]),
+            "'BEEF'H"
+        ));
     }
 
     #[test]
