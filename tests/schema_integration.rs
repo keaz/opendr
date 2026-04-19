@@ -1,5 +1,8 @@
 // Integration tests for schema validation
-use opendr::schema::{AttributeType, LdapSchema, ObjectClass, ObjectClassKind, SchemaError};
+use base64::{Engine as _, engine::general_purpose};
+use opendr::schema::{
+    AttributeType, LdapSchema, MatchingRuleError, ObjectClass, ObjectClassKind, SchemaError,
+};
 use std::collections::HashMap;
 
 fn parse_simple_entry_ldif(contents: &str) -> Vec<HashMap<String, Vec<String>>> {
@@ -27,6 +30,69 @@ fn parse_simple_entry_ldif(contents: &str) -> Vec<HashMap<String, Vec<String>>> 
             }
         })
         .collect()
+}
+
+fn attrs(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+    pairs
+        .iter()
+        .map(|(name, values)| {
+            (
+                (*name).to_string(),
+                values.iter().map(|value| (*value).to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+const RSA_ENCRYPTION_ALGORITHM_IDENTIFIER: &[u8] = &[
+    0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+];
+
+fn test_der_wrap(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    output.push(tag);
+    if content.len() < 128 {
+        output.push(content.len() as u8);
+    } else {
+        let bytes = content.len().to_be_bytes();
+        let first_non_zero = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(bytes.len() - 1);
+        let length_bytes = &bytes[first_non_zero..];
+        output.push(0x80 | length_bytes.len() as u8);
+        output.extend_from_slice(length_bytes);
+    }
+    output.extend_from_slice(content);
+    output
+}
+
+fn supported_algorithm_base64() -> String {
+    general_purpose::STANDARD.encode(test_der_wrap(0x30, RSA_ENCRYPTION_ALGORITHM_IDENTIFIER))
+}
+
+fn test_crl_pem() -> String {
+    let signing_key = rcgen::KeyPair::generate().unwrap();
+    let mut issuer_params =
+        rcgen::CertificateParams::new(vec!["ca.example.org".to_string()]).unwrap();
+    issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    issuer_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let issuer = rcgen::CertifiedIssuer::self_signed(issuer_params, signing_key).unwrap();
+    let crl = rcgen::CertificateRevocationListParams {
+        this_update: rcgen::date_time_ymd(2024, 1, 1),
+        next_update: rcgen::date_time_ymd(2025, 1, 1),
+        crl_number: rcgen::SerialNumber::from(1),
+        issuing_distribution_point: None,
+        revoked_certs: Vec::new(),
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    }
+    .signed_by(&issuer)
+    .unwrap();
+    crl.pem().unwrap()
 }
 
 #[test]
@@ -136,6 +202,8 @@ fn test_inet_org_person_full_attributes() {
 #[test]
 fn test_inet_org_person_allows_expanded_rfc2798_attributes() {
     let schema = LdapSchema::with_core_schema();
+    let rcgen::CertifiedKey { cert, .. } =
+        rcgen::generate_simple_self_signed(vec!["carol.example.org".to_string()]).unwrap();
 
     let mut attributes = HashMap::new();
     attributes.insert(
@@ -158,12 +226,14 @@ fn test_inet_org_person_allows_expanded_rfc2798_attributes() {
     attributes.insert("departmentNumber".to_string(), vec!["RND".to_string()]);
     attributes.insert("employeeNumber".to_string(), vec!["1001".to_string()]);
     attributes.insert("employeeType".to_string(), vec!["Employee".to_string()]);
+    attributes.insert("audio".to_string(), vec!["audio bytes".to_string()]);
     attributes.insert("homePhone".to_string(), vec!["+1 555 0101".to_string()]);
     attributes.insert(
         "homePostalAddress".to_string(),
         vec!["10 Home Road$Colombo".to_string()],
     );
     attributes.insert("jpegPhoto".to_string(), vec!["jpeg bytes".to_string()]);
+    attributes.insert("photo".to_string(), vec!["fax bytes".to_string()]);
     attributes.insert(
         "labeledURI".to_string(),
         vec!["https://example.com Carol Example".to_string()],
@@ -175,7 +245,10 @@ fn test_inet_org_person_allows_expanded_rfc2798_attributes() {
     attributes.insert("mobile".to_string(), vec!["+1 555 0102".to_string()]);
     attributes.insert("o".to_string(), vec!["Example Corporation".to_string()]);
     attributes.insert("pager".to_string(), vec!["+1 555 0103".to_string()]);
-    attributes.insert("preferredLanguage".to_string(), vec!["en-US".to_string()]);
+    attributes.insert(
+        "preferredLanguage".to_string(),
+        vec!["fr, en-gb;q=0.8, en;q=0.7".to_string()],
+    );
     attributes.insert("roomNumber".to_string(), vec!["A-101".to_string()]);
     attributes.insert(
         "secretary".to_string(),
@@ -198,11 +271,59 @@ fn test_inet_org_person_allows_expanded_rfc2798_attributes() {
         "physicalDeliveryOfficeName".to_string(),
         vec!["Head Office".to_string()],
     );
+    attributes.insert(
+        "x500UniqueIdentifier".to_string(),
+        vec!["'1010'B".to_string()],
+    );
+    attributes.insert("userCertificate;binary".to_string(), vec![cert.pem()]);
+    attributes.insert(
+        "userSMIMECertificate;binary".to_string(),
+        vec!["pkcs7 bytes".to_string()],
+    );
+    attributes.insert(
+        "userPKCS12;binary".to_string(),
+        vec!["pfx bytes".to_string()],
+    );
 
     assert!(
         schema.validate_entry(&attributes).is_ok(),
-        "inetOrgPerson should allow common RFC2798 employee and contact attributes"
+        "inetOrgPerson should allow the full RFC2798 attribute set"
     );
+}
+
+#[test]
+fn test_inet_org_person_rejects_invalid_rfc2798_syntaxes() {
+    let schema = LdapSchema::with_core_schema();
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "objectClass".to_string(),
+        vec![
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "inetOrgPerson".to_string(),
+        ],
+    );
+    attributes.insert("cn".to_string(), vec!["Carol Example".to_string()]);
+    attributes.insert("sn".to_string(), vec!["Example".to_string()]);
+    attributes.insert(
+        "preferredLanguage".to_string(),
+        vec!["Accept-Language: en-US".to_string()],
+    );
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "preferredLanguage"
+    ));
+
+    attributes.insert("preferredLanguage".to_string(), vec!["en-US".to_string()]);
+    attributes.insert(
+        "userCertificate;binary".to_string(),
+        vec!["not a certificate".to_string()],
+    );
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == "userCertificate;binary"
+    ));
 }
 
 #[test]
@@ -409,7 +530,7 @@ fn test_organizational_unit_allows_expanded_rfc4519_contact_attributes() {
 }
 
 #[test]
-fn test_group_of_names_allows_empty_open_dj_style_group() {
+fn test_group_of_names_requires_member_per_rfc4519() {
     let schema = LdapSchema::with_core_schema();
 
     let mut attributes = HashMap::new();
@@ -421,10 +542,10 @@ fn test_group_of_names_allows_empty_open_dj_style_group() {
     attributes.insert("ou".to_string(), vec!["dc=example,dc=com".to_string()]);
     attributes.insert("description".to_string(), vec!["Empty group".to_string()]);
 
-    assert!(
-        schema.validate_entry(&attributes).is_ok(),
-        "OpenDJ-style empty groupOfNames entries should validate"
-    );
+    assert!(matches!(
+        schema.validate_entry(&attributes),
+        Err(SchemaError::MissingRequiredAttribute(attribute)) if attribute == "member"
+    ));
 }
 
 #[test]
@@ -508,6 +629,131 @@ fn test_group_of_unique_names_entry() {
         schema.validate_entry(&attributes).is_ok(),
         "groupOfUniqueNames should validate with DN-valued uniqueMember"
     );
+}
+
+#[test]
+fn test_rfc4519_user_schema_attributes_and_object_classes() {
+    let schema = LdapSchema::with_core_schema();
+
+    for attribute in [
+        "name",
+        "serialNumber",
+        "c",
+        "searchGuide",
+        "destinationIndicator",
+        "distinguishedName",
+        "dnQualifier",
+        "enhancedSearchGuide",
+        "facsimileTelephoneNumber",
+        "generationQualifier",
+        "houseIdentifier",
+        "internationalISDNNumber",
+        "roleOccupant",
+        "telexNumber",
+        "teletexTerminalIdentifier",
+        "x121Address",
+        "x500UniqueIdentifier",
+        "preferredDeliveryMethod",
+    ] {
+        assert!(
+            schema.get_attribute_type(attribute).is_some(),
+            "RFC 4519 attribute {attribute} should be registered"
+        );
+    }
+
+    for object_class in [
+        "applicationProcess",
+        "country",
+        "device",
+        "locality",
+        "organizationalRole",
+        "residentialPerson",
+        "uidObject",
+    ] {
+        assert!(
+            schema.get_object_class(object_class).is_some(),
+            "RFC 4519 object class {object_class} should be registered"
+        );
+    }
+}
+
+#[test]
+fn test_rfc4519_user_schema_entries_validate() {
+    let schema = LdapSchema::with_core_schema();
+
+    let country = HashMap::from([
+        (
+            "objectClass".to_string(),
+            vec!["top".to_string(), "country".to_string()],
+        ),
+        ("c".to_string(), vec!["US".to_string()]),
+        ("searchGuide".to_string(), vec!["person#sn$EQ".to_string()]),
+    ]);
+    assert!(schema.validate_entry(&country).is_ok());
+
+    let device = HashMap::from([
+        (
+            "objectClass".to_string(),
+            vec!["top".to_string(), "device".to_string()],
+        ),
+        ("cn".to_string(), vec!["router-1".to_string()]),
+        ("serialNumber".to_string(), vec!["WI-3005".to_string()]),
+        (
+            "owner".to_string(),
+            vec!["uid=alice,ou=People,dc=example,dc=com".to_string()],
+        ),
+    ]);
+    assert!(schema.validate_entry(&device).is_ok());
+
+    let role = HashMap::from([
+        (
+            "objectClass".to_string(),
+            vec!["top".to_string(), "organizationalRole".to_string()],
+        ),
+        (
+            "cn".to_string(),
+            vec!["Human Resources Director".to_string()],
+        ),
+        (
+            "roleOccupant".to_string(),
+            vec!["uid=alice,ou=People,dc=example,dc=com".to_string()],
+        ),
+        (
+            "preferredDeliveryMethod".to_string(),
+            vec!["mhs $ telephone".to_string()],
+        ),
+    ]);
+    assert!(schema.validate_entry(&role).is_ok());
+
+    let residential_person = HashMap::from([
+        (
+            "objectClass".to_string(),
+            vec!["top".to_string(), "residentialPerson".to_string()],
+        ),
+        ("cn".to_string(), vec!["Alice Example".to_string()]),
+        ("sn".to_string(), vec!["Example".to_string()]),
+        ("l".to_string(), vec!["Colombo".to_string()]),
+        (
+            "x121Address".to_string(),
+            vec!["36111222333444555".to_string()],
+        ),
+    ]);
+    assert!(schema.validate_entry(&residential_person).is_ok());
+
+    let uid_object_person = HashMap::from([
+        (
+            "objectClass".to_string(),
+            vec![
+                "top".to_string(),
+                "person".to_string(),
+                "uidObject".to_string(),
+            ],
+        ),
+        ("cn".to_string(), vec!["Bob Example".to_string()]),
+        ("sn".to_string(), vec!["Example".to_string()]),
+        ("uid".to_string(), vec!["bexample".to_string()]),
+    ]);
+    assert!(schema.validate_entry(&uid_object_person).is_ok());
 }
 
 #[test]
@@ -698,6 +944,779 @@ fn test_posix_group_member_uid_requires_ia5_syntax() {
 }
 
 #[test]
+fn test_rfc2307_posix_bundle_defines_full_schema() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    for attribute in [
+        "uidNumber",
+        "gidNumber",
+        "gecos",
+        "homeDirectory",
+        "loginShell",
+        "shadowLastChange",
+        "shadowMin",
+        "shadowMax",
+        "shadowWarning",
+        "shadowInactive",
+        "shadowExpire",
+        "shadowFlag",
+        "memberUid",
+        "memberNisNetgroup",
+        "nisNetgroupTriple",
+        "ipServicePort",
+        "ipServiceProtocol",
+        "ipProtocolNumber",
+        "oncRpcNumber",
+        "ipHostNumber",
+        "ipNetworkNumber",
+        "ipNetmaskNumber",
+        "macAddress",
+        "bootParameter",
+        "bootFile",
+        "nisMapName",
+        "nisMapEntry",
+    ] {
+        assert!(
+            schema.get_attribute_type(attribute).is_some(),
+            "RFC 2307 attribute {attribute} should be registered"
+        );
+    }
+
+    for object_class in [
+        "posixAccount",
+        "shadowAccount",
+        "posixGroup",
+        "ipService",
+        "ipProtocol",
+        "oncRpc",
+        "ipHost",
+        "ipNetwork",
+        "nisNetgroup",
+        "nisMap",
+        "nisObject",
+        "ieee802Device",
+        "bootableDevice",
+    ] {
+        assert!(
+            schema.get_object_class(object_class).is_some(),
+            "RFC 2307 object class {object_class} should be registered"
+        );
+    }
+}
+
+#[test]
+fn test_rfc2307_posix_schema_loads_from_bundled_ldif_file() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(include_str!("../resources/schema/posix/rfc2307.ldif"))
+        .unwrap();
+
+    assert!(schema.get_attribute_type("nisNetgroupTriple").is_some());
+    assert!(schema.get_attribute_type("bootParameter").is_some());
+    assert!(schema.get_object_class("posixAccount").is_some());
+    assert!(schema.get_object_class("bootableDevice").is_some());
+}
+
+#[test]
+fn test_rfc4523_x509_bundle_defines_full_schema() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("x509").unwrap();
+
+    for attribute in [
+        "userCertificate",
+        "cACertificate",
+        "authorityRevocationList",
+        "certificateRevocationList",
+        "crossCertificatePair",
+        "supportedAlgorithms",
+        "deltaRevocationList",
+    ] {
+        assert!(
+            schema.get_attribute_type(attribute).is_some(),
+            "RFC 4523 attribute {attribute} should be registered"
+        );
+    }
+
+    for object_class in [
+        "pkiUser",
+        "pkiCA",
+        "cRLDistributionPoint",
+        "deltaCRL",
+        "strongAuthenticationUser",
+        "userSecurityInformation",
+        "certificationAuthority",
+        "certificationAuthority-V2",
+    ] {
+        assert!(
+            schema.get_object_class(object_class).is_some(),
+            "RFC 4523 object class {object_class} should be registered"
+        );
+    }
+
+    for syntax_oid in [
+        "1.3.6.1.4.1.1466.115.121.1.9",
+        "1.3.6.1.4.1.1466.115.121.1.10",
+        "1.3.6.1.4.1.1466.115.121.1.49",
+        "1.3.6.1.1.15.1",
+        "1.3.6.1.1.15.7",
+    ] {
+        assert!(
+            schema
+                .ldap_syntax_descriptions_unique_sorted()
+                .iter()
+                .any(|description| description.contains(syntax_oid)),
+            "RFC 4523 syntax {syntax_oid} should be registered"
+        );
+    }
+
+    for matching_rule in [
+        "certificateExactMatch",
+        "certificateMatch",
+        "certificatePairExactMatch",
+        "certificatePairMatch",
+        "certificateListExactMatch",
+        "certificateListMatch",
+        "algorithmIdentifierMatch",
+    ] {
+        assert!(
+            schema.get_matching_rule(matching_rule).is_some(),
+            "RFC 4523 matching rule {matching_rule} should be registered"
+        );
+    }
+
+    assert!(
+        !schema
+            .resolve_matching_rule("certificateExactMatch")
+            .unwrap()
+            .is_supported()
+    );
+    assert!(
+        !schema
+            .resolve_matching_rule("certificateListExactMatch")
+            .unwrap()
+            .is_supported()
+    );
+    assert!(
+        !schema
+            .resolve_matching_rule("certificatePairExactMatch")
+            .unwrap()
+            .is_supported()
+    );
+    assert!(
+        !schema
+            .resolve_matching_rule("algorithmIdentifierMatch")
+            .unwrap()
+            .is_supported()
+    );
+}
+
+#[test]
+fn test_rfc4523_x509_schema_loads_from_bundled_ldif_file() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(include_str!("../resources/schema/x509/rfc4523.ldif"))
+        .unwrap();
+
+    assert!(schema.get_attribute_type("cACertificate").is_some());
+    assert!(
+        schema
+            .get_attribute_type("certificateRevocationList")
+            .is_some()
+    );
+    assert!(schema.get_attribute_type("supportedAlgorithms").is_some());
+    assert!(schema.get_object_class("pkiUser").is_some());
+    assert!(schema.get_object_class("cRLDistributionPoint").is_some());
+}
+
+#[test]
+fn test_rfc4523_x509_entries_validate() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("x509").unwrap();
+    let rcgen::CertifiedKey { cert, .. } =
+        rcgen::generate_simple_self_signed(vec!["cert.example.org".to_string()]).unwrap();
+    let cert_pem = cert.pem();
+    let crl_pem = test_crl_pem();
+    let supported_algorithm = supported_algorithm_base64();
+
+    let valid_entries = vec![
+        attrs(&[
+            ("objectClass", &["top", "person", "pkiUser"]),
+            ("cn", &["Carol Example"]),
+            ("sn", &["Example"]),
+            ("userCertificate;binary", &[cert_pem.as_str()]),
+        ]),
+        attrs(&[
+            (
+                "objectClass",
+                &["top", "person", "strongAuthenticationUser"],
+            ),
+            ("cn", &["Strong User"]),
+            ("sn", &["User"]),
+            ("userCertificate;binary", &[cert_pem.as_str()]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "cRLDistributionPoint"]),
+            ("cn", &["Example CRL"]),
+            ("certificateRevocationList;binary", &[crl_pem.as_str()]),
+            ("deltaRevocationList;binary", &[crl_pem.as_str()]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "person", "userSecurityInformation"]),
+            ("cn", &["Security User"]),
+            ("sn", &["User"]),
+            (
+                "supportedAlgorithms;binary",
+                &[supported_algorithm.as_str()],
+            ),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "organization", "pkiCA"]),
+            ("o", &["Example CA"]),
+            ("cACertificate;binary", &[cert_pem.as_str()]),
+            ("certificateRevocationList;binary", &[crl_pem.as_str()]),
+        ]),
+    ];
+
+    for attributes in valid_entries {
+        assert!(
+            schema.validate_entry(&attributes).is_ok(),
+            "RFC 4523 entry should validate: {attributes:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rfc4523_x509_entries_reject_invalid_values() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("x509").unwrap();
+
+    let invalid_entries = vec![
+        (
+            attrs(&[
+                ("objectClass", &["top", "person", "pkiUser"]),
+                ("cn", &["Carol Example"]),
+                ("sn", &["Example"]),
+                ("userCertificate;binary", &["not a certificate"]),
+            ]),
+            SchemaError::InvalidSyntax("userCertificate;binary".to_string(), String::new()),
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "cRLDistributionPoint"]),
+                ("cn", &["Example CRL"]),
+                ("certificateRevocationList;binary", &["not a crl"]),
+            ]),
+            SchemaError::InvalidSyntax(
+                "certificateRevocationList;binary".to_string(),
+                String::new(),
+            ),
+        ),
+        (
+            attrs(&[
+                (
+                    "objectClass",
+                    &["top", "person", "strongAuthenticationUser"],
+                ),
+                ("cn", &["Strong User"]),
+                ("sn", &["User"]),
+            ]),
+            SchemaError::MissingRequiredAttribute("userCertificate".to_string()),
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "person", "userSecurityInformation"]),
+                ("cn", &["Security User"]),
+                ("sn", &["User"]),
+                ("supportedAlgorithms;binary", &["not an algorithm"]),
+            ]),
+            SchemaError::InvalidSyntax("supportedAlgorithms;binary".to_string(), String::new()),
+        ),
+    ];
+
+    for (attributes, expected) in invalid_entries {
+        let actual = schema.validate_entry(&attributes).unwrap_err();
+        assert!(
+            std::mem::discriminant(&actual) == std::mem::discriminant(&expected),
+            "expected {expected:?} for RFC 4523 invalid entry {attributes:?}, got {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rfc4523_x509_matching_rules_are_registered_but_not_executed() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("x509").unwrap();
+
+    for matching_rule in [
+        "certificateExactMatch",
+        "certificateMatch",
+        "certificatePairExactMatch",
+        "certificatePairMatch",
+        "certificateListExactMatch",
+        "certificateListMatch",
+        "algorithmIdentifierMatch",
+    ] {
+        let rule = schema.resolve_matching_rule(matching_rule).unwrap();
+        assert!(
+            !rule.is_supported(),
+            "RFC 4523 GSER matching rule {matching_rule} should not be advertised as executable"
+        );
+    }
+
+    let certificate_rule = schema
+        .equality_rule_for_attribute("userCertificate")
+        .unwrap();
+    assert!(matches!(
+        certificate_rule.values_equal("{}", "{}"),
+        Err(MatchingRuleError::UnsupportedRule(_))
+    ));
+
+    let algorithm_rule = schema
+        .equality_rule_for_attribute("supportedAlgorithms")
+        .unwrap();
+    assert!(matches!(
+        algorithm_rule.values_equal("{}", "{}"),
+        Err(MatchingRuleError::UnsupportedRule(_))
+    ));
+}
+
+#[test]
+fn test_rfc4524_cosine_bundle_defines_full_schema() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("cosine").unwrap();
+
+    for attribute in [
+        "associatedDomain",
+        "associatedName",
+        "buildingName",
+        "co",
+        "friendlyCountryName",
+        "documentAuthor",
+        "documentIdentifier",
+        "documentLocation",
+        "documentPublisher",
+        "documentTitle",
+        "documentVersion",
+        "drink",
+        "favouriteDrink",
+        "homePhone",
+        "homeTelephone",
+        "homePostalAddress",
+        "host",
+        "info",
+        "mail",
+        "rfc822Mailbox",
+        "manager",
+        "mobile",
+        "mobileTelephoneNumber",
+        "organizationalStatus",
+        "pager",
+        "pagerTelephoneNumber",
+        "personalTitle",
+        "roomNumber",
+        "secretary",
+        "uniqueIdentifier",
+        "userClass",
+    ] {
+        assert!(
+            schema.get_attribute_type(attribute).is_some(),
+            "RFC 4524 attribute {attribute} should be registered"
+        );
+    }
+
+    for object_class in [
+        "account",
+        "document",
+        "documentSeries",
+        "domain",
+        "domainRelatedObject",
+        "friendlyCountry",
+        "rFC822LocalPart",
+        "room",
+        "simpleSecurityObject",
+    ] {
+        assert!(
+            schema.get_object_class(object_class).is_some(),
+            "RFC 4524 object class {object_class} should be registered"
+        );
+    }
+
+    let domain = schema.get_object_class("domain").unwrap();
+    assert!(
+        domain
+            .may
+            .iter()
+            .any(|attribute| attribute.eq_ignore_ascii_case("associatedName")),
+        "RFC 4524 should upgrade the partial core domain class with associatedName"
+    );
+}
+
+#[test]
+fn test_rfc4524_cosine_schema_loads_from_bundled_ldif_file() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(include_str!("../resources/schema/cosine/rfc4524.ldif"))
+        .unwrap();
+
+    assert!(schema.get_attribute_type("associatedDomain").is_some());
+    assert!(schema.get_attribute_type("friendlyCountryName").is_some());
+    assert!(schema.get_object_class("document").is_some());
+    assert!(schema.get_object_class("simpleSecurityObject").is_some());
+}
+
+#[test]
+fn test_rfc4524_cosine_entries_validate() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("cosine").unwrap();
+
+    let valid_entries = vec![
+        attrs(&[
+            ("objectClass", &["top", "account"]),
+            ("uid", &["host-admin"]),
+            ("host", &["ldap01.example.com"]),
+            ("description", &["Computer account"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "document"]),
+            ("documentIdentifier", &["RFC 4524"]),
+            ("documentTitle", &["COSINE LDAP/X.500 Schema"]),
+            (
+                "documentAuthor",
+                &["cn=Kurt Zeilenga,ou=People,dc=example,dc=com"],
+            ),
+            ("documentPublisher", &["Internet Engineering Task Force"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "documentSeries"]),
+            ("cn", &["Request for Comments", "RFC"]),
+            ("telephoneNumber", &["+1 775 555 1111"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "domain"]),
+            ("dc", &["example"]),
+            (
+                "associatedName",
+                &["o=Example Organization,dc=example,dc=com"],
+            ),
+        ]),
+        attrs(&[
+            (
+                "objectClass",
+                &["top", "organization", "dcObject", "domainRelatedObject"],
+            ),
+            ("o", &["Example Organization"]),
+            ("dc", &["example"]),
+            ("associatedDomain", &["example.com"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "country", "friendlyCountry"]),
+            ("c", &["DE"]),
+            ("friendlyCountryName", &["Germany"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "domain", "rFC822LocalPart"]),
+            ("dc", &["kdz"]),
+            ("associatedName", &["cn=Kurt,ou=People,dc=example,dc=com"]),
+            ("cn", &["kdz"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "room"]),
+            ("cn", &["conference room"]),
+            ("roomNumber", &["1A"]),
+            ("telephoneNumber", &["+1 775 555 1111"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "account", "simpleSecurityObject"]),
+            ("uid", &["service-account"]),
+            ("userPassword", &["{SSHA512}hashed"]),
+        ]),
+    ];
+
+    for attributes in valid_entries {
+        assert!(
+            schema.validate_entry(&attributes).is_ok(),
+            "RFC 4524 entry should validate: {attributes:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rfc4524_cosine_entries_reject_invalid_values() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("cosine").unwrap();
+
+    let long_identifier = "x".repeat(257);
+
+    let invalid_entries = vec![
+        (
+            attrs(&[
+                (
+                    "objectClass",
+                    &["top", "organization", "dcObject", "domainRelatedObject"],
+                ),
+                ("o", &["Example Organization"]),
+                ("dc", &["example"]),
+                ("associatedDomain", &["exämple.com"]),
+            ]),
+            SchemaError::InvalidSyntax("associatedDomain".to_string(), String::new()),
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "domain"]),
+                ("dc", &["example"]),
+                ("associatedName", &["not a dn"]),
+            ]),
+            SchemaError::InvalidSyntax("associatedName".to_string(), String::new()),
+        ),
+        (
+            {
+                let mut attributes = attrs(&[
+                    ("objectClass", &["top", "document"]),
+                    ("documentTitle", &["Too long"]),
+                ]);
+                attributes.insert("documentIdentifier".to_string(), vec![long_identifier]);
+                attributes
+            },
+            SchemaError::InvalidSyntax("documentIdentifier".to_string(), String::new()),
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "account", "simpleSecurityObject"]),
+                ("uid", &["service-account"]),
+            ]),
+            SchemaError::MissingRequiredAttribute("userPassword".to_string()),
+        ),
+    ];
+
+    for (attributes, expected) in invalid_entries {
+        match (schema.validate_entry(&attributes), expected) {
+            (
+                Err(SchemaError::InvalidSyntax(attribute, _)),
+                SchemaError::InvalidSyntax(expected_attribute, _),
+            ) if attribute == expected_attribute => {}
+            (
+                Err(SchemaError::MissingRequiredAttribute(attribute)),
+                SchemaError::MissingRequiredAttribute(expected_attribute),
+            ) if attribute == expected_attribute => {}
+            (actual, expected) => panic!(
+                "expected {expected:?} for RFC 4524 invalid entry {attributes:?}, got {actual:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn test_schema_dir_loads_nested_schema_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let posix_dir = temp_dir.path().join("posix");
+    std::fs::create_dir_all(&posix_dir).unwrap();
+    std::fs::write(
+        posix_dir.join("rfc2307.ldif"),
+        include_str!("../resources/schema/posix/rfc2307.ldif"),
+    )
+    .unwrap();
+
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_schema_dir(temp_dir.path()).unwrap();
+
+    assert!(schema.get_object_class("nisObject").is_some());
+    assert!(schema.get_attribute_type("nisMapEntry").is_some());
+}
+
+#[test]
+fn test_rfc2307_posix_nis_entries_validate() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let valid_entries = vec![
+        attrs(&[
+            ("objectClass", &["top", "person", "shadowAccount"]),
+            ("cn", &["Alice Example"]),
+            ("sn", &["Example"]),
+            ("uid", &["alice"]),
+            ("userPassword", &["{crypt}X5/DBrWPOQQaI"]),
+            ("shadowLastChange", &["19710"]),
+            ("shadowMin", &["0"]),
+            ("shadowMax", &["99999"]),
+            ("shadowWarning", &["7"]),
+            ("shadowInactive", &["30"]),
+            ("shadowExpire", &["20000"]),
+            ("shadowFlag", &["0"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "ipService"]),
+            ("cn", &["ssh"]),
+            ("ipServicePort", &["22"]),
+            ("ipServiceProtocol", &["tcp"]),
+            ("description", &["Secure Shell"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "ipProtocol"]),
+            ("cn", &["tcp"]),
+            ("ipProtocolNumber", &["6"]),
+            ("description", &["Transmission Control Protocol"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "oncRpc"]),
+            ("cn", &["mountd"]),
+            ("oncRpcNumber", &["100005"]),
+            ("description", &["NFS mount daemon"]),
+        ]),
+        attrs(&[
+            (
+                "objectClass",
+                &["top", "device", "ipHost", "ieee802Device", "bootableDevice"],
+            ),
+            ("cn", &["peg.aja.com", "www.aja.com"]),
+            ("ipHostNumber", &["10.0.0.1"]),
+            ("macAddress", &["00:00:92:90:ee:e2"]),
+            ("bootFile", &["mach"]),
+            ("bootParameter", &["root=fs:/nfsroot/peg"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "ipNetwork"]),
+            ("cn", &["engineering-net"]),
+            ("ipNetworkNumber", &["192.168"]),
+            ("ipNetmaskNumber", &["255.255.0.0"]),
+            ("description", &["Engineering network"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "nisNetgroup"]),
+            ("cn", &["nightfly"]),
+            (
+                "nisNetgroupTriple",
+                &["(peg,charlemagne,dunes.aja.com)", "(,lester,-)"],
+            ),
+            ("memberNisNetgroup", &["kamakiriad"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "nisMap"]),
+            ("nisMapName", &["tracks"]),
+            ("description", &["Album track map"]),
+        ]),
+        attrs(&[
+            ("objectClass", &["top", "nisObject"]),
+            ("cn", &["Maxine"]),
+            ("nisMapName", &["tracks"]),
+            ("nisMapEntry", &["Nightfly$4"]),
+        ]),
+    ];
+
+    for attributes in valid_entries {
+        assert!(
+            schema.validate_entry(&attributes).is_ok(),
+            "RFC 2307 entry should validate: {attributes:?}"
+        );
+    }
+}
+
+#[test]
+fn test_rfc2307_posix_nis_entries_reject_invalid_values() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("posix").unwrap();
+
+    let invalid_entries = vec![
+        (
+            attrs(&[
+                ("objectClass", &["top", "person", "shadowAccount"]),
+                ("cn", &["Alice Example"]),
+                ("sn", &["Example"]),
+                ("uid", &["alice"]),
+                ("shadowLastChange", &["yesterday"]),
+            ]),
+            "shadowLastChange",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "ipService"]),
+                ("cn", &["ssh"]),
+                ("ipServicePort", &["-1"]),
+                ("ipServiceProtocol", &["tcp"]),
+            ]),
+            "ipServicePort",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "ipProtocol"]),
+                ("cn", &["badproto"]),
+                ("ipProtocolNumber", &["999"]),
+                ("description", &["Invalid protocol"]),
+            ]),
+            "ipProtocolNumber",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "oncRpc"]),
+                ("cn", &["badrpc"]),
+                ("oncRpcNumber", &["-1"]),
+                ("description", &["Invalid RPC"]),
+            ]),
+            "oncRpcNumber",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "device", "ipHost"]),
+                ("cn", &["badhost"]),
+                ("ipHostNumber", &["10.0.0.999"]),
+            ]),
+            "ipHostNumber",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "ipNetwork"]),
+                ("cn", &["badnet"]),
+                ("ipNetworkNumber", &["192.168.0.0"]),
+            ]),
+            "ipNetworkNumber",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "device", "ieee802Device"]),
+                ("cn", &["badmac"]),
+                ("macAddress", &["00:00:92:90:ee"]),
+            ]),
+            "macAddress",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "device", "bootableDevice"]),
+                ("cn", &["badboot"]),
+                ("bootParameter", &["root=fs"]),
+            ]),
+            "bootParameter",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "nisNetgroup"]),
+                ("cn", &["badnetgroup"]),
+                ("nisNetgroupTriple", &["peg,charlemagne,dunes.aja.com"]),
+            ]),
+            "nisNetgroupTriple",
+        ),
+        (
+            attrs(&[
+                ("objectClass", &["top", "nisObject"]),
+                ("cn", &["BadMap"]),
+                ("nisMapName", &["tracks"]),
+                ("nisMapEntry", &["café"]),
+            ]),
+            "nisMapEntry",
+        ),
+    ];
+
+    for (attributes, expected_attribute) in invalid_entries {
+        assert!(
+            matches!(
+                schema.validate_entry(&attributes),
+                Err(SchemaError::InvalidSyntax(attribute, _)) if attribute == expected_attribute
+            ),
+            "expected invalid attribute {expected_attribute} for {attributes:?}"
+        );
+    }
+}
+
+#[test]
 fn test_standard_directory_ldif_fixture_validates() {
     let mut schema = LdapSchema::with_core_schema();
     schema.load_builtin_schema("posix").unwrap();
@@ -873,8 +1892,8 @@ fn test_single_value_attribute_with_one_value() {
 
     schema.add_attribute_type(AttributeType {
         oid: "1.2.3.4.8".to_string(),
-        names: vec!["serialNumber".to_string()],
-        description: Some("Serial number".to_string()),
+        names: vec!["customSerialNumber".to_string()],
+        description: Some("Custom serial number".to_string()),
         equality: Some("caseIgnoreMatch".to_string()),
         syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
         single_value: true,
@@ -882,20 +1901,23 @@ fn test_single_value_attribute_with_one_value() {
 
     schema.add_object_class(ObjectClass {
         oid: "1.2.3.4.9".to_string(),
-        names: vec!["device".to_string()],
+        names: vec!["customDevice".to_string()],
         sup: vec!["top".to_string()],
         kind: ObjectClassKind::Structural,
         must: vec!["cn".to_string()],
-        may: vec!["serialNumber".to_string()],
+        may: vec!["customSerialNumber".to_string()],
     });
 
     let mut attributes = HashMap::new();
     attributes.insert(
         "objectClass".to_string(),
-        vec!["top".to_string(), "device".to_string()],
+        vec!["top".to_string(), "customDevice".to_string()],
     );
     attributes.insert("cn".to_string(), vec!["Device1".to_string()]);
-    attributes.insert("serialNumber".to_string(), vec!["SN12345".to_string()]);
+    attributes.insert(
+        "customSerialNumber".to_string(),
+        vec!["SN12345".to_string()],
+    );
 
     let result = schema.validate_entry(&attributes);
     assert!(

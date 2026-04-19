@@ -3,6 +3,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use opendr::aci::AciEngine;
 use opendr::audit::{AuditConfig, AuditFormat, AuditLevel, AuditLogger};
@@ -333,8 +334,14 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
                     }
                     Ok(None) | Err(_) => {
                         println!("Initializing base directory structure...");
-                        initialize_lmdb_base_structure(&mut backend, &config, &root_password)
-                            .await?;
+                        initialize_lmdb_base_structure(
+                            &mut backend,
+                            &config,
+                            &root_password,
+                            &args.config,
+                            &schema_for_indexes,
+                        )
+                        .await?;
                     }
                 }
 
@@ -348,7 +355,17 @@ async fn run(args: Args, config: ServerConfig) -> Result<(), Box<dyn Error>> {
                 let mut backend = MockBackend::with_replica_id(config.server.replica_id);
 
                 // Add base structure entries
-                initialize_base_structure(&mut backend, &config, &root_password).await?;
+                if !initialize_base_structure_from_config_ldif(
+                    &mut backend,
+                    &config,
+                    &root_password,
+                    &args.config,
+                    &schema_for_indexes,
+                )
+                .await?
+                {
+                    initialize_base_structure(&mut backend, &config, &root_password).await?;
+                }
 
                 Arc::new(backend)
             }
@@ -728,6 +745,290 @@ fn root_common_name(root_dn: &str) -> String {
         .unwrap_or_else(|| "manager".to_string())
 }
 
+#[derive(Debug)]
+struct InitialLdifEntry {
+    dn: String,
+    attributes: HashMap<String, Vec<String>>,
+    password: Vec<u8>,
+}
+
+fn config_directory(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+async fn initialize_base_structure_from_config_ldif(
+    backend: &mut dyn DirectoryBackend,
+    config: &ServerConfig,
+    root_password: &str,
+    config_path: &Path,
+    schema: &opendr::schema::LdapSchema,
+) -> Result<bool, Box<dyn Error>> {
+    let config_dir = config_directory(config_path);
+    let base_path = config_dir.join("base.ldif");
+    let admin_path = config_dir.join("admin.ldif");
+
+    let mut entries = Vec::new();
+    if base_path.is_file() {
+        entries.extend(read_initial_ldif_entries(
+            &base_path,
+            config,
+            root_password,
+            schema,
+        )?);
+    }
+    if admin_path.is_file() {
+        entries.extend(read_initial_ldif_entries(
+            &admin_path,
+            config,
+            root_password,
+            schema,
+        )?);
+    }
+
+    if entries.is_empty() {
+        return Ok(false);
+    }
+
+    for entry in entries {
+        backend
+            .add_entry(
+                DirectoryEntry::new(entry.dn, entry.attributes),
+                entry.password,
+            )
+            .await?;
+    }
+
+    ensure_initialized_entry_exists(backend, &config.server.base_dn, "base DN").await?;
+    ensure_initialized_entry_exists(backend, &config.canonical_root_dn()?, "root user").await?;
+    println!(
+        "Base directory structure initialized from {}",
+        config_dir.display()
+    );
+    Ok(true)
+}
+
+async fn ensure_initialized_entry_exists(
+    backend: &dyn DirectoryBackend,
+    dn: &str,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    if backend.get_entry(dn).await?.is_some() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{} entry {} was not created by initial LDIF import",
+        label, dn
+    )
+    .into())
+}
+
+fn read_initial_ldif_entries(
+    path: &Path,
+    config: &ServerConfig,
+    root_password: &str,
+    schema: &opendr::schema::LdapSchema,
+) -> Result<Vec<InitialLdifEntry>, Box<dyn Error>> {
+    let contents = std::fs::read_to_string(path)?;
+    parse_initial_ldif_entries(&contents, path, config, root_password, schema)
+}
+
+fn parse_initial_ldif_entries(
+    contents: &str,
+    source: &Path,
+    config: &ServerConfig,
+    root_password: &str,
+    schema: &opendr::schema::LdapSchema,
+) -> Result<Vec<InitialLdifEntry>, Box<dyn Error>> {
+    let root_dn = config.canonical_root_dn()?;
+    let lines = unfold_initial_ldif_lines(contents, source)?;
+    let mut entries = Vec::new();
+    let mut current = Vec::new();
+
+    for (line_no, line) in lines {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                entries.push(parse_initial_ldif_entry(
+                    &current,
+                    source,
+                    config,
+                    &root_dn,
+                    root_password,
+                    schema,
+                )?);
+                current.clear();
+            }
+            continue;
+        }
+        current.push((line_no, line));
+    }
+
+    if !current.is_empty() {
+        entries.push(parse_initial_ldif_entry(
+            &current,
+            source,
+            config,
+            &root_dn,
+            root_password,
+            schema,
+        )?);
+    }
+
+    Ok(entries)
+}
+
+fn unfold_initial_ldif_lines(
+    contents: &str,
+    source: &Path,
+) -> Result<Vec<(usize, String)>, Box<dyn Error>> {
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line_no = index + 1;
+        if let Some(continuation) = raw_line.strip_prefix(' ') {
+            let Some((_, previous)) = lines.last_mut() else {
+                return Err(format!(
+                    "{}:{}: LDIF continuation line has no preceding line",
+                    source.display(),
+                    line_no
+                )
+                .into());
+            };
+            previous.push_str(continuation);
+        } else {
+            lines.push((line_no, raw_line.to_string()));
+        }
+    }
+    Ok(lines)
+}
+
+fn parse_initial_ldif_entry(
+    lines: &[(usize, String)],
+    source: &Path,
+    config: &ServerConfig,
+    root_dn: &str,
+    root_password: &str,
+    schema: &opendr::schema::LdapSchema,
+) -> Result<InitialLdifEntry, Box<dyn Error>> {
+    let mut dn = None;
+    let mut attributes: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (line_no, line) in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let (name, value) = parse_initial_ldif_attr_value(line, source, *line_no)?;
+        if name.eq_ignore_ascii_case("dn") {
+            dn = Some(value);
+            continue;
+        }
+
+        let key = name.to_ascii_lowercase();
+        if opendr::backend::OperationalAttributes::is_operational(&key) {
+            return Err(format!(
+                "{}:{}: operational attribute {} is server-managed",
+                source.display(),
+                line_no,
+                name
+            )
+            .into());
+        }
+        attributes.entry(key).or_default().push(value);
+    }
+
+    let raw_dn = dn.ok_or_else(|| format!("{}: LDIF entry is missing dn", source.display()))?;
+    let canonical_root = config.canonical_root_dn()?;
+    let dn = if raw_dn.eq_ignore_ascii_case(&config.server.root_user_dn)
+        || raw_dn.eq_ignore_ascii_case(root_dn)
+    {
+        canonical_root
+    } else {
+        raw_dn
+    };
+
+    let is_root_entry = dn.eq_ignore_ascii_case(root_dn);
+    if is_root_entry && !root_password.is_empty() {
+        attributes.insert("userpassword".to_string(), vec![root_password.to_string()]);
+    }
+
+    schema.validate_entry(&attributes).map_err(|err| {
+        format!(
+            "{}: schema validation failed for initial entry {}: {}",
+            source.display(),
+            dn,
+            err
+        )
+    })?;
+
+    let password = attributes
+        .get("userpassword")
+        .and_then(|values| values.first())
+        .map(|value| value.as_bytes().to_vec())
+        .unwrap_or_default();
+
+    Ok(InitialLdifEntry {
+        dn,
+        attributes,
+        password,
+    })
+}
+
+fn parse_initial_ldif_attr_value(
+    line: &str,
+    source: &Path,
+    line_no: usize,
+) -> Result<(String, String), Box<dyn Error>> {
+    let Some((name, rest)) = line.split_once(':') else {
+        return Err(format!(
+            "{}:{}: invalid LDIF attribute line: {}",
+            source.display(),
+            line_no,
+            line
+        )
+        .into());
+    };
+
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!(
+            "{}:{}: empty LDIF attribute name",
+            source.display(),
+            line_no
+        )
+        .into());
+    }
+
+    if let Some(encoded) = rest.strip_prefix(':') {
+        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded.trim_start())?;
+        let value = String::from_utf8(decoded).map_err(|err| {
+            format!(
+                "{}:{}: base64 LDIF value for {} is not valid UTF-8: {}",
+                source.display(),
+                line_no,
+                name,
+                err
+            )
+        })?;
+        return Ok((name.to_string(), value));
+    }
+
+    if rest.trim_start().starts_with('<') {
+        return Err(format!(
+            "{}:{}: LDIF URL values are not supported during startup import",
+            source.display(),
+            line_no
+        )
+        .into());
+    }
+
+    Ok((name.to_string(), rest.trim_start().to_string()))
+}
+
 /// Initialize base directory structure
 async fn initialize_base_structure(
     backend: &mut dyn DirectoryBackend,
@@ -831,7 +1132,21 @@ async fn initialize_lmdb_base_structure(
     backend: &mut LmdbBackend,
     config: &ServerConfig,
     root_password: &str,
+    config_path: &Path,
+    schema: &opendr::schema::LdapSchema,
 ) -> Result<(), Box<dyn Error>> {
+    if initialize_base_structure_from_config_ldif(
+        backend,
+        config,
+        root_password,
+        config_path,
+        schema,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     let root_dn = config.canonical_root_dn()?;
     let root_cn = root_common_name(&root_dn);
 
@@ -943,6 +1258,119 @@ mod tests {
 
         assert!(err.contains("log config file not found"));
         assert!(err.contains("missing-log4rs.yml"));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_base_structure_imports_config_ldif_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("server.toml");
+        std::fs::write(&config_path, "").unwrap();
+        std::fs::write(
+            temp_dir.path().join("base.ldif"),
+            r#"dn: dc=example,dc=org
+objectClass: top
+objectClass: organization
+o: Example Org
+description: Example Org
+
+dn: ou=People,dc=example,dc=org
+objectClass: top
+objectClass: organizationalUnit
+objectClass: opendrPeopleProfile
+ou: People
+description: People container
+department: People
+employeeType: DirectoryContainer
+mobile: +94 77 123 4567
+age: 1
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.path().join("admin.ldif"),
+            r#"dn: cn=manager
+objectClass: person
+objectClass: organizationalPerson
+objectClass: inetOrgPerson
+cn: manager
+sn: Administrator
+userPassword: stale
+description: Root Administrator Account
+"#,
+        )
+        .unwrap();
+
+        let mut config = ServerConfig::default();
+        config.server.base_dn = "dc=example,dc=org".to_string();
+        config.server.root_user_dn = "cn=manager".to_string();
+        config.server.organization_name = "Example Org".to_string();
+
+        let mut schema = opendr::schema::LdapSchema::with_core_schema();
+        schema
+            .load_ldif_str(
+                r#"dn: cn=schema
+attributeTypes: ( 1.3.6.1.4.1.55555.40.1 NAME 'department' DESC 'Department name for people entries' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+attributeTypes: ( 1.3.6.1.4.1.55555.40.2 NAME 'age' DESC 'Age for people entries' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+objectClasses: ( 1.3.6.1.4.1.55555.40.100 NAME 'opendrPeopleProfile' DESC 'Custom profile attributes for entries under ou=People' SUP top AUXILIARY MAY ( department $ employeeType $ mobile $ age ) )
+"#,
+            )
+            .unwrap();
+
+        let mut backend = MockBackend::new();
+        let imported = initialize_base_structure_from_config_ldif(
+            &mut backend,
+            &config,
+            "secret",
+            &config_path,
+            &schema,
+        )
+        .await
+        .unwrap();
+
+        assert!(imported);
+        let people = backend
+            .get_entry("ou=People,dc=example,dc=org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            people.attributes["objectclass"],
+            vec![
+                "top".to_string(),
+                "organizationalUnit".to_string(),
+                "opendrPeopleProfile".to_string()
+            ]
+        );
+        assert_eq!(people.attributes["department"], vec!["People".to_string()]);
+        assert_eq!(
+            people.attributes["employeetype"],
+            vec!["DirectoryContainer".to_string()]
+        );
+        assert_eq!(
+            people.attributes["mobile"],
+            vec!["+94 77 123 4567".to_string()]
+        );
+        assert_eq!(people.attributes["age"], vec!["1".to_string()]);
+
+        assert!(
+            backend
+                .get_entry("cn=manager,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .authenticate("cn=manager,dc=example,dc=org", b"secret")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .authenticate("cn=manager,dc=example,dc=org", b"stale")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

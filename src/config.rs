@@ -1819,7 +1819,7 @@ impl ServerConfig {
             ));
         }
         for builtin in &self.schema.load_builtin {
-            if !["core", "posix"]
+            if !["core", "posix", "cosine", "x509"]
                 .iter()
                 .any(|supported| builtin.eq_ignore_ascii_case(supported))
             {

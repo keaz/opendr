@@ -185,6 +185,10 @@ pub fn canonicalize_dn(input: &str) -> Result<String, DnError> {
     parse_dn(input).map(|dn| dn.to_canonical_string())
 }
 
+pub fn parent_dn(input: &str) -> Result<Option<String>, DnError> {
+    parse_dn(input).map(|dn| dn.parent().map(|parent| parent.to_canonical_string()))
+}
+
 pub fn canonical_root_dn(root_user_dn: &str, base_dn: &str) -> Result<String, DnError> {
     let root_user_dn = root_user_dn.trim();
     if root_user_dn.is_empty() {

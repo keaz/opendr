@@ -82,6 +82,13 @@ The setup wizard creates the config directory when needed, then writes
 `config/server.toml`, `config/log4rs.yml`, setup state, LDIF scaffolding, and
 the configured data directories.
 
+To materialize bundled standard schema files for review or file-based
+deployment, run:
+
+```bash
+opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
+```
+
 ### Run OpenDR
 
 ```bash

@@ -1065,7 +1065,7 @@ fn values_match_normalized_rule(
     rule: &ResolvedMatchingRule,
 ) -> Result<bool, FilterSchemaError> {
     for candidate in values {
-        if rule.normalize_value(candidate)? == normalized_assertion {
+        if rule.value_matches_normalized_assertion(candidate, normalized_assertion)? {
             return Ok(true);
         }
     }
@@ -1167,7 +1167,7 @@ fn matches_prepared_extensible(
 
     if dn_attributes {
         for value in dn_attribute_values(dn, None) {
-            if rule.normalize_value(&value)? == normalized_value {
+            if rule.value_matches_normalized_assertion(&value, normalized_value)? {
                 return Ok(true);
             }
         }

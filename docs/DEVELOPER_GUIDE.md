@@ -169,8 +169,10 @@ opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
 The command writes bundled schema files such as
-`config/schema/core/rfc3672.ldif` and `config/schema/posix/rfc2307.ldif`. The
-runtime also supports the same schema through `load_builtin = ["core", "posix"]`.
+`config/schema/core/rfc3672.ldif`, `config/schema/posix/rfc2307.ldif`,
+`config/schema/cosine/rfc4524.ldif`, and `config/schema/x509/rfc4523.ldif`.
+The runtime also supports the same schema through
+`load_builtin = ["core", "posix", "cosine", "x509"]`.
 
 Check setup status:
 
@@ -356,6 +358,13 @@ Schema validation:
 - The optional `posix` built-in schema bundle adds full RFC 2307 POSIX/NIS
   coverage, including account, group, shadow, host, network, service, protocol,
   RPC, netgroup, NIS map, IEEE 802 device, and bootable device entries.
+- The optional `cosine` built-in schema bundle adds RFC 4524 COSINE coverage,
+  including account, document, domain, room, friendly country, and simple
+  security object entries.
+- The optional `x509` built-in schema bundle adds RFC 4523 X.509 certificate
+  schema coverage, including PKI user, PKI CA, CRL distribution point, and
+  supported-algorithm entries. DER-backed values are validated; GSER assertion
+  matching for the RFC 4523 matching rules remains tracked follow-up work.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active

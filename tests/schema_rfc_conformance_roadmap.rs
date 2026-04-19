@@ -461,9 +461,9 @@ fn rfc_3672_subentry_schema_control_and_subtree_specification_are_available() {
 }
 
 #[test]
-#[ignore = "RFC 4523 X.509 certificate schema is not implemented yet"]
 fn rfc_4523_x509_certificate_schema_is_available() {
-    let schema = LdapSchema::with_core_schema();
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("x509").unwrap();
 
     for attribute in [
         "userCertificate",
@@ -487,6 +487,8 @@ fn rfc_4523_x509_certificate_schema_is_available() {
         "userSecurityInformation",
         "certificationAuthority",
         "certificationAuthority-V2",
+        "cRLDistributionPoint",
+        "deltaCRL",
     ] {
         assert!(
             schema.get_object_class(object_class).is_some(),
@@ -496,22 +498,35 @@ fn rfc_4523_x509_certificate_schema_is_available() {
 }
 
 #[test]
-#[ignore = "RFC 4524 COSINE schema is not implemented yet"]
 fn rfc_4524_cosine_schema_is_available() {
-    let schema = LdapSchema::with_core_schema();
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_builtin_schema("cosine").unwrap();
 
     for attribute in [
         "associatedDomain",
+        "associatedName",
+        "buildingName",
+        "co",
         "documentIdentifier",
         "documentTitle",
         "documentVersion",
         "documentAuthor",
         "documentLocation",
         "documentPublisher",
+        "drink",
         "friendlyCountryName",
         "host",
         "info",
+        "mail",
+        "manager",
+        "mobile",
+        "organizationalStatus",
+        "pager",
         "personalTitle",
+        "roomNumber",
+        "secretary",
+        "uniqueIdentifier",
+        "userClass",
     ] {
         assert!(
             schema.get_attribute_type(attribute).is_some(),
@@ -519,7 +534,17 @@ fn rfc_4524_cosine_schema_is_available() {
         );
     }
 
-    for object_class in ["account", "document", "documentSeries", "domain"] {
+    for object_class in [
+        "account",
+        "document",
+        "documentSeries",
+        "domain",
+        "domainRelatedObject",
+        "friendlyCountry",
+        "rFC822LocalPart",
+        "room",
+        "simpleSecurityObject",
+    ] {
         assert!(
             schema.get_object_class(object_class).is_some(),
             "RFC 4524 object class {object_class} should be defined"

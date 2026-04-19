@@ -37,6 +37,21 @@ enum Commands {
         output: PathBuf,
     },
 
+    /// Generate bundled LDAP schema files
+    GenerateSchema {
+        /// Built-in bundle to generate. Use all for every bundled schema file.
+        #[arg(short, long, value_delimiter = ',', default_value = "all")]
+        bundle: Vec<String>,
+
+        /// Output directory. Defaults to <config-dir>/schema.
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+
+        /// Replace existing generated files
+        #[arg(long)]
+        overwrite: bool,
+    },
+
     /// Check if server is configured
     Status,
 
@@ -119,6 +134,25 @@ async fn run(cli: Cli) -> Result<(), String> {
                 "  opendr-setup non-interactive --config {}",
                 output.display()
             );
+        }
+
+        Commands::GenerateSchema {
+            bundle,
+            output_dir,
+            overwrite,
+        } => {
+            let output_dir = output_dir.unwrap_or_else(|| cli.config_dir.join("schema"));
+            let written = handler
+                .generate_builtin_schema_files(&output_dir, &bundle, overwrite)
+                .await?;
+            println!(
+                "✓ Generated {} bundled schema file(s) under {}",
+                written.len(),
+                output_dir.display()
+            );
+            for path in written {
+                println!("  {}", path.display());
+            }
         }
 
         Commands::Status => {

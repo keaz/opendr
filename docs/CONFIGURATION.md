@@ -468,7 +468,7 @@ allow_online_updates = false
 | --- | --- | --- |
 | `enabled` | `true` | Loads the built-in and external LDAP schema registry |
 | `schema_dir` | `config/schema` | Directory recursively loaded for `.ldif`, `.schema`, or `.conf` schema definition files |
-| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files. Supported values are `core` and optional RFC 2307 `posix`. The `core` bundle includes RFC 3672 subentries. |
+| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files. Supported values are `core`, optional RFC 2307 `posix`, optional RFC 4524 `cosine`, and optional RFC 4523 `x509`. The `core` bundle includes RFC 3672 subentries. |
 | `strict_validation` | `true` | Treats malformed schema files as startup errors |
 | `allow_online_updates` | `false` | Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into `schema_dir/99-online.ldif` |
 
@@ -477,6 +477,16 @@ entries such as `posixAccount`, `shadowAccount`, `posixGroup`, `ipHost`,
 `ipNetwork`, `ipService`, `ipProtocol`, `oncRpc`, `nisNetgroup`, `nisMap`,
 `nisObject`, `ieee802Device`, or `bootableDevice`.
 
+Use `load_builtin = ["core", "cosine"]` when clients need RFC 4524 COSINE
+entries such as `account`, `document`, `documentSeries`, `domain`,
+`domainRelatedObject`, `friendlyCountry`, `rFC822LocalPart`, `room`, or
+`simpleSecurityObject`.
+
+Use `load_builtin = ["core", "x509"]` when clients need RFC 4523 X.509
+certificate entries such as `pkiUser`, `pkiCA`, `cRLDistributionPoint`,
+`deltaCRL`, `strongAuthenticationUser`, `userSecurityInformation`,
+`certificationAuthority`, or `certificationAuthority-V2`.
+
 Generate bundled schema files when a deployment needs file-based schema
 artifacts instead of relying only on `load_builtin`:
 
@@ -484,9 +494,11 @@ artifacts instead of relying only on `load_builtin`:
 opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
-The command writes files such as `config/schema/core/rfc3672.ldif` and
-`config/schema/posix/rfc2307.ldif`. Keep generated standard files unchanged
-unless you intentionally fork compatibility behavior.
+The command writes files such as `config/schema/core/rfc3672.ldif`,
+`config/schema/posix/rfc2307.ldif`, `config/schema/cosine/rfc4524.ldif`, and
+`config/schema/x509/rfc4523.ldif`.
+Keep generated standard files unchanged unless you intentionally fork
+compatibility behavior.
 
 Schema files use RFC-style subschema attributes:
 

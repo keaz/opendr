@@ -808,6 +808,45 @@ load_builtin = ["core", "posix"]
 }
 
 #[test]
+fn test_load_cosine_builtin_schema_bundle() {
+    let toml = r#"
+[schema]
+load_builtin = ["core", "cosine"]
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    config.validate().unwrap();
+
+    let schema = config.load_schema().unwrap();
+    assert!(schema.get_attribute_type("associatedDomain").is_some());
+    assert!(schema.get_attribute_type("friendlyCountryName").is_some());
+    assert!(schema.get_object_class("document").is_some());
+    assert!(schema.get_object_class("simpleSecurityObject").is_some());
+}
+
+#[test]
+fn test_load_x509_builtin_schema_bundle() {
+    let toml = r#"
+[schema]
+load_builtin = ["core", "x509"]
+    "#;
+
+    let config = ServerConfig::from_toml_str(toml).unwrap();
+    config.validate().unwrap();
+
+    let schema = config.load_schema().unwrap();
+    assert!(schema.get_attribute_type("cACertificate").is_some());
+    assert!(
+        schema
+            .get_attribute_type("certificateRevocationList")
+            .is_some()
+    );
+    assert!(schema.get_attribute_type("supportedAlgorithms").is_some());
+    assert!(schema.get_object_class("pkiUser").is_some());
+    assert!(schema.get_object_class("cRLDistributionPoint").is_some());
+}
+
+#[test]
 fn test_schema_index_validation_rejects_missing_substring_rule() {
     let toml = r#"
 [backend]

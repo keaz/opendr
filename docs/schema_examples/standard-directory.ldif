@@ -21,12 +21,43 @@ objectClass: organizationalUnit
 ou: groups
 description: Groups
 
+dn: ou=hosts,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: hosts
+description: Hosts
+
+dn: ou=networks,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: networks
+description: Networks
+
+dn: ou=services,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: services
+description: Services
+
+dn: ou=netgroups,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: netgroups
+description: Netgroups
+
+dn: ou=nis,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: nis
+description: NIS maps
+
 dn: uid=alice,ou=people,dc=example,dc=com
 objectClass: top
 objectClass: person
 objectClass: organizationalPerson
 objectClass: inetOrgPerson
 objectClass: posixAccount
+objectClass: shadowAccount
 cn: Alice Example
 sn: Example
 uid: alice
@@ -41,6 +72,13 @@ gidNumber: 1000
 homeDirectory: /home/alice
 loginShell: /bin/zsh
 gecos: Alice Example
+shadowLastChange: 19710
+shadowMin: 0
+shadowMax: 99999
+shadowWarning: 7
+shadowInactive: 30
+shadowExpire: 20000
+shadowFlag: 0
 
 dn: cn=developers,ou=groups,dc=example,dc=com
 objectClass: top
@@ -53,7 +91,8 @@ dn: cn=empty-static-group,ou=groups,dc=example,dc=com
 objectClass: top
 objectClass: groupOfNames
 cn: empty-static-group
-description: OpenDJ-compatible empty static group
+description: Static group with a placeholder member
+member: uid=alice,ou=people,dc=example,dc=com
 
 dn: cn=unique-admins,ou=groups,dc=example,dc=com
 objectClass: top
@@ -68,3 +107,67 @@ objectClass: posixGroup
 cn: posix-developers
 gidNumber: 1000
 memberUid: alice
+
+dn: cn=ssh,ou=services,dc=example,dc=com
+objectClass: top
+objectClass: ipService
+cn: ssh
+ipServicePort: 22
+ipServiceProtocol: tcp
+description: Secure Shell
+
+dn: cn=tcp,ou=services,dc=example,dc=com
+objectClass: top
+objectClass: ipProtocol
+cn: tcp
+ipProtocolNumber: 6
+description: Transmission Control Protocol
+
+dn: cn=mountd,ou=services,dc=example,dc=com
+objectClass: top
+objectClass: oncRpc
+cn: mountd
+oncRpcNumber: 100005
+description: NFS mount daemon
+
+dn: cn=peg.example.com,ou=hosts,dc=example,dc=com
+objectClass: top
+objectClass: device
+objectClass: ipHost
+objectClass: ieee802Device
+objectClass: bootableDevice
+cn: peg.example.com
+cn: www.example.com
+ipHostNumber: 10.0.0.1
+macAddress: 00:00:92:90:ee:e2
+bootFile: mach
+bootParameter: root=fs:/nfsroot/peg
+
+dn: cn=engineering-net,ou=networks,dc=example,dc=com
+objectClass: top
+objectClass: ipNetwork
+cn: engineering-net
+ipNetworkNumber: 192.168
+ipNetmaskNumber: 255.255.0.0
+description: Engineering network
+
+dn: cn=nightfly,ou=netgroups,dc=example,dc=com
+objectClass: top
+objectClass: nisNetgroup
+cn: nightfly
+nisNetgroupTriple: (peg,charlemagne,dunes.example.com)
+nisNetgroupTriple: (,alice,-)
+memberNisNetgroup: kamakiriad
+
+dn: nisMapName=tracks,ou=nis,dc=example,dc=com
+objectClass: top
+objectClass: nisMap
+nisMapName: tracks
+description: Album track map
+
+dn: cn=Maxine,nisMapName=tracks,ou=nis,dc=example,dc=com
+objectClass: top
+objectClass: nisObject
+cn: Maxine
+nisMapName: tracks
+nisMapEntry: Nightfly$4

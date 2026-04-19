@@ -18,6 +18,8 @@ use crate::dn::{canonicalize_dn, parse_dn, parse_rdn, rdn_attribute_values};
 
 const RFC3672_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc3672.ldif");
 const RFC2307_SCHEMA_LDIF: &str = include_str!("../resources/schema/posix/rfc2307.ldif");
+const RFC4524_SCHEMA_LDIF: &str = include_str!("../resources/schema/cosine/rfc4524.ldif");
+const RFC4523_SCHEMA_LDIF: &str = include_str!("../resources/schema/x509/rfc4523.ldif");
 
 /// LDAP Schema containing attribute types and object classes
 #[derive(Debug, Clone)]
@@ -432,6 +434,16 @@ pub fn bundled_schema_files(bundle: &str) -> Result<Vec<BuiltinSchemaFile>, Sche
             relative_path: "posix/rfc2307.ldif",
             contents: RFC2307_SCHEMA_LDIF,
         }]),
+        "cosine" => Ok(vec![BuiltinSchemaFile {
+            bundle: "cosine",
+            relative_path: "cosine/rfc4524.ldif",
+            contents: RFC4524_SCHEMA_LDIF,
+        }]),
+        "x509" => Ok(vec![BuiltinSchemaFile {
+            bundle: "x509",
+            relative_path: "x509/rfc4523.ldif",
+            contents: RFC4523_SCHEMA_LDIF,
+        }]),
         _ => Err(SchemaError::ParseError(format!(
             "unsupported builtin schema bundle: {}",
             bundle
@@ -476,6 +488,8 @@ impl LdapSchema {
                 Ok(())
             }
             "posix" => self.load_posix_schema(),
+            "cosine" => self.load_cosine_schema(),
+            "x509" => self.load_x509_schema(),
             _ => Err(SchemaError::ParseError(format!(
                 "unsupported builtin schema bundle: {}",
                 bundle
@@ -483,7 +497,7 @@ impl LdapSchema {
         }
     }
 
-    /// Load core LDAP schema (RFC 4519, 4524, and file-backed core extensions).
+    /// Load core LDAP schema (RFC 4519 and file-backed core extensions).
     fn load_core_schema(&mut self) {
         // Core attribute types
         let core_attributes = vec![
@@ -1393,6 +1407,24 @@ impl LdapSchema {
         self.load_ldif_str(RFC2307_SCHEMA_LDIF)
     }
 
+    /// Load RFC 4524 COSINE LDAP/X.500 schema definitions.
+    fn load_cosine_schema(&mut self) -> Result<(), SchemaError> {
+        if self.get_object_class("top").is_none() {
+            self.load_core_schema();
+        }
+
+        self.load_ldif_str(RFC4524_SCHEMA_LDIF)
+    }
+
+    /// Load RFC 4523 X.509 certificate schema definitions.
+    fn load_x509_schema(&mut self) -> Result<(), SchemaError> {
+        if self.get_object_class("top").is_none() {
+            self.load_core_schema();
+        }
+
+        self.load_ldif_str(RFC4523_SCHEMA_LDIF)
+    }
+
     fn load_standard_syntaxes_and_matching_rules(&mut self) {
         let syntaxes = [
             ("1.3.6.1.4.1.1466.115.121.1.3", "Attribute Type Description"),
@@ -1639,6 +1671,23 @@ impl LdapSchema {
             .insert(attr.oid.clone(), metadata);
     }
 
+    fn replace_attribute_type_with_metadata(
+        &mut self,
+        attr: AttributeType,
+        metadata: AttributeTypeMetadata,
+    ) {
+        let oid = attr.oid.clone();
+        let existing_names = self
+            .attribute_types
+            .iter()
+            .filter_map(|(name, existing)| (existing.oid == oid).then_some(name.clone()))
+            .collect::<Vec<_>>();
+        for name in existing_names {
+            self.attribute_types.remove(&name);
+        }
+        self.add_attribute_type_with_metadata(attr, metadata);
+    }
+
     /// Add an object class to the schema
     pub fn add_object_class(&mut self, oc: ObjectClass) {
         self.add_object_class_with_metadata(oc, SchemaElementMetadata::default());
@@ -1652,6 +1701,23 @@ impl LdapSchema {
             .insert(oc.oid.clone(), oc.clone());
         self.object_class_metadata_by_oid
             .insert(oc.oid.clone(), metadata);
+    }
+
+    fn replace_object_class_with_metadata(
+        &mut self,
+        object_class: ObjectClass,
+        metadata: SchemaElementMetadata,
+    ) {
+        let oid = object_class.oid.clone();
+        let existing_names = self
+            .object_classes
+            .iter()
+            .filter_map(|(name, existing)| (existing.oid == oid).then_some(name.clone()))
+            .collect::<Vec<_>>();
+        for name in existing_names {
+            self.object_classes.remove(&name);
+        }
+        self.add_object_class_with_metadata(object_class, metadata);
     }
 
     fn set_attribute_substring_rule(&mut self, attr_name: &str, matching_rule: &str) {
@@ -2201,16 +2267,8 @@ impl LdapSchema {
         attr: AttributeType,
         metadata: AttributeTypeMetadata,
     ) -> Result<(), SchemaError> {
-        if let Some(existing) = self.attribute_types_by_oid.get(&attr.oid) {
-            let existing_metadata = self
-                .attribute_metadata_by_oid
-                .get(&attr.oid)
-                .cloned()
-                .unwrap_or_default();
-            if existing == &attr && existing_metadata == metadata {
-                return Ok(());
-            }
-            return Err(SchemaError::DuplicateOid(attr.oid));
+        if self.attribute_types_by_oid.contains_key(&attr.oid) {
+            return self.merge_compatible_attribute_type(attr, metadata);
         }
         for name in &attr.names {
             let normalized = name.to_lowercase();
@@ -2222,21 +2280,65 @@ impl LdapSchema {
         Ok(())
     }
 
+    fn merge_compatible_attribute_type(
+        &mut self,
+        attr: AttributeType,
+        metadata: AttributeTypeMetadata,
+    ) -> Result<(), SchemaError> {
+        let Some(existing) = self.attribute_types_by_oid.get(&attr.oid).cloned() else {
+            self.add_attribute_type_with_metadata(attr, metadata);
+            return Ok(());
+        };
+        let existing_metadata = self
+            .attribute_metadata_by_oid
+            .get(&attr.oid)
+            .cloned()
+            .unwrap_or_default();
+        if existing == attr && existing_metadata == metadata {
+            return Ok(());
+        }
+        if !compatible_optional_name(&existing.equality, &attr.equality)
+            || !compatible_schema_value(&existing.syntax, &attr.syntax)
+            || existing.single_value != attr.single_value
+        {
+            return Err(SchemaError::DuplicateOid(attr.oid));
+        }
+
+        let names = merged_schema_names(&existing.names, &attr.names);
+        for name in &names {
+            let normalized = name.to_lowercase();
+            if let Some(existing_by_name) = self.attribute_types.get(&normalized)
+                && existing_by_name.oid != existing.oid
+            {
+                return Err(SchemaError::DuplicateName(name.clone()));
+            }
+        }
+
+        let metadata = merge_attribute_metadata(&existing_metadata, &metadata)
+            .ok_or_else(|| SchemaError::DuplicateOid(attr.oid.clone()))?;
+        let merged = AttributeType {
+            oid: existing.oid.clone(),
+            names,
+            description: existing.description.or(attr.description),
+            equality: existing.equality.or(attr.equality),
+            syntax: if existing.syntax.is_empty() {
+                attr.syntax
+            } else {
+                existing.syntax
+            },
+            single_value: existing.single_value,
+        };
+        self.replace_attribute_type_with_metadata(merged, metadata);
+        Ok(())
+    }
+
     fn try_add_object_class_with_metadata(
         &mut self,
         object_class: ObjectClass,
         metadata: SchemaElementMetadata,
     ) -> Result<(), SchemaError> {
-        if let Some(existing) = self.object_classes_by_oid.get(&object_class.oid) {
-            let existing_metadata = self
-                .object_class_metadata_by_oid
-                .get(&object_class.oid)
-                .cloned()
-                .unwrap_or_default();
-            if existing == &object_class && existing_metadata == metadata {
-                return Ok(());
-            }
-            return Err(SchemaError::DuplicateOid(object_class.oid));
+        if self.object_classes_by_oid.contains_key(&object_class.oid) {
+            return self.merge_compatible_object_class(object_class, metadata);
         }
         for name in &object_class.names {
             let normalized = name.to_lowercase();
@@ -2248,12 +2350,68 @@ impl LdapSchema {
         Ok(())
     }
 
+    fn merge_compatible_object_class(
+        &mut self,
+        object_class: ObjectClass,
+        metadata: SchemaElementMetadata,
+    ) -> Result<(), SchemaError> {
+        let Some(existing) = self.object_classes_by_oid.get(&object_class.oid).cloned() else {
+            self.add_object_class_with_metadata(object_class, metadata);
+            return Ok(());
+        };
+        let existing_metadata = self
+            .object_class_metadata_by_oid
+            .get(&object_class.oid)
+            .cloned()
+            .unwrap_or_default();
+        if existing == object_class && existing_metadata == metadata {
+            return Ok(());
+        }
+        if existing.kind != object_class.kind
+            || !schema_name_sets_equal(&existing.sup, &object_class.sup)
+            || !schema_name_sets_equal(&existing.must, &object_class.must)
+        {
+            return Err(SchemaError::DuplicateOid(object_class.oid));
+        }
+
+        let names = merged_schema_names(&existing.names, &object_class.names);
+        for name in &names {
+            let normalized = name.to_lowercase();
+            if let Some(existing_by_name) = self.object_classes.get(&normalized)
+                && existing_by_name.oid != existing.oid
+            {
+                return Err(SchemaError::DuplicateName(name.clone()));
+            }
+        }
+
+        let metadata = merge_schema_element_metadata(&existing_metadata, &metadata)
+            .ok_or_else(|| SchemaError::DuplicateOid(object_class.oid.clone()))?;
+        let merged = ObjectClass {
+            oid: existing.oid.clone(),
+            names,
+            sup: existing.sup,
+            kind: existing.kind,
+            must: existing.must,
+            may: merged_schema_names(&existing.may, &object_class.may),
+        };
+        self.replace_object_class_with_metadata(merged, metadata);
+        Ok(())
+    }
+
     fn try_add_ldap_syntax(&mut self, syntax: LdapSyntax) -> Result<(), SchemaError> {
         if let Some(existing) = self.ldap_syntaxes.get(&syntax.oid) {
             if existing == &syntax {
                 return Ok(());
             }
-            return Err(SchemaError::DuplicateOid(syntax.oid));
+            if existing.obsolete != syntax.obsolete || existing.extensions != syntax.extensions {
+                return Err(SchemaError::DuplicateOid(syntax.oid));
+            }
+            let mut merged = existing.clone();
+            if merged.description.is_none() {
+                merged.description = syntax.description;
+            }
+            self.ldap_syntaxes.insert(merged.oid.clone(), merged);
+            return Ok(());
         }
         self.ldap_syntaxes.insert(syntax.oid.clone(), syntax);
         Ok(())
@@ -2676,9 +2834,17 @@ impl LdapSchema {
         // Validate required attributes are present
         for must_attr in &must_attrs {
             let attr_lower = must_attr.to_lowercase();
-            let found = attributes
-                .keys()
-                .any(|k| attribute_description_type_name(k).to_lowercase() == attr_lower);
+            let must_oid = self
+                .get_attribute_type(must_attr)
+                .map(|attribute| attribute.oid.as_str());
+            let found = attributes.keys().any(|k| {
+                let entry_attr = attribute_description_type_name(k);
+                entry_attr.to_lowercase() == attr_lower
+                    || must_oid.is_some_and(|oid| {
+                        self.get_attribute_type(entry_attr)
+                            .is_some_and(|attribute| attribute.oid == oid)
+                    })
+            });
             if !found {
                 return Err(SchemaError::MissingRequiredAttribute(must_attr.clone()));
             }
@@ -2690,6 +2856,11 @@ impl LdapSchema {
             .chain(may_attrs.iter())
             .map(|s| s.to_lowercase())
             .collect();
+        let allowed_oids: HashSet<String> = must_attrs
+            .iter()
+            .chain(may_attrs.iter())
+            .filter_map(|name| self.get_attribute_type(name).map(|attr| attr.oid.clone()))
+            .collect();
 
         for attr_name in attributes.keys() {
             let attr_lower = attribute_description_type_name(attr_name).to_lowercase();
@@ -2698,6 +2869,9 @@ impl LdapSchema {
                 let Some(attr_type) = self.get_attribute_type(attr_name) else {
                     return Err(SchemaError::AttributeNotFound(attr_name.clone()));
                 };
+                if allowed_oids.contains(&attr_type.oid) {
+                    continue;
+                }
                 if self.attribute_is_globally_allowed_operational(attr_type) {
                     continue;
                 }
@@ -4171,6 +4345,8 @@ enum SupportedSyntaxKind {
     Boolean,
     BootParameter,
     Certificate,
+    CertificateList,
+    CertificatePair,
     CountryString,
     DeliveryMethod,
     DistinguishedName,
@@ -4198,6 +4374,7 @@ enum SupportedSyntaxKind {
     OctetString,
     PostalAddress,
     PrintableString,
+    SupportedAlgorithm,
     SubtreeSpecification,
     SubstringAssertion,
     TeletexTerminalIdentifier,
@@ -4215,6 +4392,8 @@ fn supported_syntax_kind(syntax_oid: &str) -> Option<SupportedSyntaxKind> {
         "1.3.6.1.4.1.1466.115.121.1.6" => Some(SupportedSyntaxKind::BitString),
         "1.3.6.1.4.1.1466.115.121.1.7" => Some(SupportedSyntaxKind::Boolean),
         "1.3.6.1.4.1.1466.115.121.1.8" => Some(SupportedSyntaxKind::Certificate),
+        "1.3.6.1.4.1.1466.115.121.1.9" => Some(SupportedSyntaxKind::CertificateList),
+        "1.3.6.1.4.1.1466.115.121.1.10" => Some(SupportedSyntaxKind::CertificatePair),
         "1.3.6.1.4.1.1466.115.121.1.11" => Some(SupportedSyntaxKind::CountryString),
         "1.3.6.1.4.1.1466.115.121.1.12" => Some(SupportedSyntaxKind::DistinguishedName),
         "1.3.6.1.4.1.1466.115.121.1.14" => Some(SupportedSyntaxKind::DeliveryMethod),
@@ -4241,6 +4420,7 @@ fn supported_syntax_kind(syntax_oid: &str) -> Option<SupportedSyntaxKind> {
         "1.3.6.1.4.1.1466.115.121.1.41" => Some(SupportedSyntaxKind::PostalAddress),
         "1.3.6.1.4.1.1466.115.121.1.44" => Some(SupportedSyntaxKind::PrintableString),
         "1.3.6.1.4.1.1466.115.121.1.45" => Some(SupportedSyntaxKind::SubtreeSpecification),
+        "1.3.6.1.4.1.1466.115.121.1.49" => Some(SupportedSyntaxKind::SupportedAlgorithm),
         "1.3.6.1.4.1.1466.115.121.1.50" => Some(SupportedSyntaxKind::TelephoneNumber),
         "1.3.6.1.4.1.1466.115.121.1.51" => Some(SupportedSyntaxKind::TeletexTerminalIdentifier),
         "1.3.6.1.4.1.1466.115.121.1.52" => Some(SupportedSyntaxKind::TelexNumber),
@@ -4271,6 +4451,8 @@ fn validate_ldap_syntax_value(syntax_oid: &str, value: &str) -> Result<(), Strin
             }
         }
         SupportedSyntaxKind::Certificate => validate_certificate(value),
+        SupportedSyntaxKind::CertificateList => validate_certificate_list(value),
+        SupportedSyntaxKind::CertificatePair => validate_certificate_pair(value),
         SupportedSyntaxKind::CountryString => validate_country_string(value),
         SupportedSyntaxKind::DeliveryMethod => validate_delivery_method(value),
         SupportedSyntaxKind::DistinguishedName => canonicalize_dn(value)
@@ -4326,6 +4508,7 @@ fn validate_ldap_syntax_value(syntax_oid: &str, value: &str) -> Result<(), Strin
         SupportedSyntaxKind::PrintableString => {
             validate_printable_string(value, "Printable String")
         }
+        SupportedSyntaxKind::SupportedAlgorithm => validate_supported_algorithm(value),
         SupportedSyntaxKind::SubtreeSpecification => validate_subtree_specification(value),
         SupportedSyntaxKind::SubstringAssertion => validate_substring_assertion(value),
         SupportedSyntaxKind::TeletexTerminalIdentifier => {
@@ -4948,23 +5131,250 @@ fn validate_guide(value: &str, enhanced: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_certificate(value: &str) -> Result<(), String> {
-    let raw = value.as_bytes();
-    if certificate_der_is_valid(raw) {
+fn certificate_der_is_valid(value: &[u8]) -> bool {
+    matches!(
+        x509_parser::parse_x509_certificate(value),
+        Ok((remainder, _certificate)) if remainder.is_empty()
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DerTlv<'a> {
+    tag: u8,
+    full: &'a [u8],
+    content: &'a [u8],
+}
+
+fn read_der_tlv(input: &[u8]) -> Result<(&[u8], DerTlv<'_>), String> {
+    if input.len() < 2 {
+        return Err("DER value is truncated".to_string());
+    }
+
+    let tag = input[0];
+    let length_byte = input[1];
+    let (length, content_offset) = if length_byte & 0x80 == 0 {
+        (usize::from(length_byte), 2)
+    } else {
+        let length_octets = usize::from(length_byte & 0x7f);
+        if length_octets == 0 {
+            return Err("DER indefinite lengths are not allowed".to_string());
+        }
+        if length_octets > std::mem::size_of::<usize>() || input.len() < 2 + length_octets {
+            return Err("DER length is truncated".to_string());
+        }
+        if input[2] == 0 {
+            return Err("DER length must use the shortest form".to_string());
+        }
+        let mut length = 0usize;
+        for octet in &input[2..2 + length_octets] {
+            length = (length << 8) | usize::from(*octet);
+        }
+        if length < 128 {
+            return Err("DER long-form length used for short value".to_string());
+        }
+        (length, 2 + length_octets)
+    };
+
+    let end = content_offset
+        .checked_add(length)
+        .ok_or_else(|| "DER length overflows input".to_string())?;
+    if input.len() < end {
+        return Err("DER content is truncated".to_string());
+    }
+
+    Ok((
+        &input[end..],
+        DerTlv {
+            tag,
+            full: &input[..end],
+            content: &input[content_offset..end],
+        },
+    ))
+}
+
+fn encode_der_length(length: usize, output: &mut Vec<u8>) {
+    if length < 128 {
+        output.push(length as u8);
+        return;
+    }
+
+    let bytes = length.to_be_bytes();
+    let first_non_zero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    let length_bytes = &bytes[first_non_zero..];
+    output.push(0x80 | length_bytes.len() as u8);
+    output.extend_from_slice(length_bytes);
+}
+
+fn wrap_der_value(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(content.len() + 8);
+    output.push(tag);
+    encode_der_length(content.len(), &mut output);
+    output.extend_from_slice(content);
+    output
+}
+
+fn der_oid_content_is_valid(content: &[u8]) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    let mut saw_continuation = false;
+    for octet in content {
+        saw_continuation = octet & 0x80 != 0;
+    }
+    !saw_continuation
+}
+
+fn algorithm_identifier_der_is_valid(value: &[u8]) -> bool {
+    parse_algorithm_identifier_der(value).is_ok()
+}
+
+fn parse_algorithm_identifier_der(value: &[u8]) -> Result<(), String> {
+    let (remainder, algorithm_identifier) = read_der_tlv(value)?;
+    if !remainder.is_empty() {
+        return Err("AlgorithmIdentifier DER contains trailing data".to_string());
+    }
+    if algorithm_identifier.tag != 0x30 {
+        return Err("AlgorithmIdentifier must be a DER SEQUENCE".to_string());
+    }
+
+    let (remaining, oid) = read_der_tlv(algorithm_identifier.content)?;
+    if oid.tag != 0x06 || !der_oid_content_is_valid(oid.content) {
+        return Err("AlgorithmIdentifier must start with an object identifier".to_string());
+    }
+    if remaining.is_empty() {
         return Ok(());
+    }
+    let (remaining, _parameters) = read_der_tlv(remaining)?;
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err("AlgorithmIdentifier must contain only algorithm and optional parameters".to_string())
+    }
+}
+
+fn certificate_list_der_is_valid(value: &[u8]) -> bool {
+    matches!(
+        x509_parser::parse_x509_crl(value),
+        Ok((remainder, _certificate_list)) if remainder.is_empty()
+    )
+}
+
+fn certificate_pair_der_is_valid(value: &[u8]) -> bool {
+    parse_certificate_pair_der(value).is_ok()
+}
+
+fn parse_certificate_pair_der(value: &[u8]) -> Result<(), String> {
+    let (remainder, pair) = read_der_tlv(value)?;
+    if !remainder.is_empty() {
+        return Err("certificate pair DER contains trailing data".to_string());
+    }
+    if pair.tag != 0x30 {
+        return Err("certificate pair must be a DER SEQUENCE".to_string());
+    }
+
+    let mut remaining = pair.content;
+    let mut seen_issued_to_this_ca = false;
+    let mut seen_issued_by_this_ca = false;
+    while !remaining.is_empty() {
+        let (next, component) = read_der_tlv(remaining)?;
+        match component.tag {
+            0xa0 if !seen_issued_to_this_ca => {
+                validate_certificate_pair_component(component.content)?;
+                seen_issued_to_this_ca = true;
+            }
+            0xa1 if !seen_issued_by_this_ca => {
+                validate_certificate_pair_component(component.content)?;
+                seen_issued_by_this_ca = true;
+            }
+            0xa0 | 0xa1 => {
+                return Err(
+                    "certificate pair contains a duplicate certificate component".to_string(),
+                );
+            }
+            _ => return Err("certificate pair contains an unexpected component".to_string()),
+        }
+        remaining = next;
+    }
+
+    if seen_issued_to_this_ca || seen_issued_by_this_ca {
+        Ok(())
+    } else {
+        Err("certificate pair must contain at least one certificate".to_string())
+    }
+}
+
+fn validate_certificate_pair_component(content: &[u8]) -> Result<(), String> {
+    if certificate_der_is_valid(content) {
+        return Ok(());
+    }
+    let wrapped = wrap_der_value(0x30, content);
+    if certificate_der_is_valid(&wrapped) {
+        Ok(())
+    } else {
+        Err("certificate pair component is not a valid X.509 certificate".to_string())
+    }
+}
+
+fn supported_algorithm_der_is_valid(value: &[u8]) -> bool {
+    extract_supported_algorithm_identifier_der(value).is_ok()
+}
+
+fn extract_supported_algorithm_identifier_der(value: &[u8]) -> Result<&[u8], String> {
+    let (remainder, supported_algorithm) = read_der_tlv(value)?;
+    if !remainder.is_empty() {
+        return Err("SupportedAlgorithm DER contains trailing data".to_string());
+    }
+    if supported_algorithm.tag != 0x30 {
+        return Err("SupportedAlgorithm must be a DER SEQUENCE".to_string());
+    }
+
+    let (mut remaining, algorithm_identifier) = read_der_tlv(supported_algorithm.content)?;
+    if !algorithm_identifier_der_is_valid(algorithm_identifier.full) {
+        return Err("SupportedAlgorithm must start with an AlgorithmIdentifier".to_string());
+    }
+    while !remaining.is_empty() {
+        let (next, _component) = read_der_tlv(remaining)?;
+        remaining = next;
+    }
+    Ok(algorithm_identifier.full)
+}
+
+fn decode_der_like_value<F>(
+    value: &str,
+    value_name: &str,
+    pem_labels: &[&str],
+    is_valid_der: F,
+) -> Result<Vec<u8>, String>
+where
+    F: Fn(&[u8]) -> bool,
+{
+    let raw = value.as_bytes();
+    if is_valid_der(raw) {
+        return Ok(raw.to_vec());
     }
 
     let trimmed = value.trim();
-    if trimmed.starts_with("-----BEGIN CERTIFICATE-----") {
+    if trimmed.starts_with("-----BEGIN ") {
         let (remainder, pem) = x509_parser::pem::parse_x509_pem(trimmed.as_bytes())
-            .map_err(|err| format!("certificate PEM could not be parsed: {err}"))?;
+            .map_err(|err| format!("{value_name} PEM could not be parsed: {err}"))?;
         if !remainder.iter().all(u8::is_ascii_whitespace) {
-            return Err("certificate PEM contains trailing non-whitespace data".to_string());
+            return Err(format!(
+                "{value_name} PEM contains trailing non-whitespace data"
+            ));
         }
-        if pem.label != "CERTIFICATE" {
-            return Err("certificate PEM block must use CERTIFICATE label".to_string());
+        if !pem_labels.iter().any(|label| *label == pem.label) {
+            return Err(format!(
+                "{value_name} PEM block must use one of these labels: {}",
+                pem_labels.join(", ")
+            ));
         }
-        return validate_certificate_der_bytes(&pem.contents);
+        if is_valid_der(&pem.contents) {
+            return Ok(pem.contents);
+        }
+        return Err(format!("{value_name} DER could not be parsed"));
     }
 
     let compact_base64 = trimmed
@@ -4972,27 +5382,68 @@ fn validate_certificate(value: &str) -> Result<(), String> {
         .filter(|ch| !ch.is_ascii_whitespace())
         .collect::<String>();
     if compact_base64.is_empty() {
-        return Err("certificate value must not be empty".to_string());
+        return Err(format!("{value_name} value must not be empty"));
     }
     let decoded = general_purpose::STANDARD
         .decode(compact_base64)
-        .map_err(|_| "certificate value must be DER, PEM, or base64 DER".to_string())?;
-    validate_certificate_der_bytes(&decoded)
-}
-
-fn validate_certificate_der_bytes(value: &[u8]) -> Result<(), String> {
-    if certificate_der_is_valid(value) {
-        Ok(())
+        .map_err(|_| format!("{value_name} value must be DER, PEM, or base64 DER"))?;
+    if is_valid_der(&decoded) {
+        Ok(decoded)
     } else {
-        Err("certificate DER could not be parsed as X.509".to_string())
+        Err(format!("{value_name} DER could not be parsed"))
     }
 }
 
-fn certificate_der_is_valid(value: &[u8]) -> bool {
-    matches!(
-        x509_parser::parse_x509_certificate(value),
-        Ok((remainder, _certificate)) if remainder.is_empty()
+fn decode_certificate_value(value: &str) -> Result<Vec<u8>, String> {
+    decode_der_like_value(
+        value,
+        "certificate",
+        &["CERTIFICATE"],
+        certificate_der_is_valid,
     )
+}
+
+fn decode_certificate_list_value(value: &str) -> Result<Vec<u8>, String> {
+    decode_der_like_value(
+        value,
+        "certificate list",
+        &["X509 CRL", "CRL"],
+        certificate_list_der_is_valid,
+    )
+}
+
+fn decode_certificate_pair_value(value: &str) -> Result<Vec<u8>, String> {
+    decode_der_like_value(
+        value,
+        "certificate pair",
+        &["CERTIFICATE PAIR"],
+        certificate_pair_der_is_valid,
+    )
+}
+
+fn decode_supported_algorithm_value(value: &str) -> Result<Vec<u8>, String> {
+    decode_der_like_value(
+        value,
+        "supported algorithm",
+        &["SUPPORTED ALGORITHM"],
+        supported_algorithm_der_is_valid,
+    )
+}
+
+fn validate_certificate(value: &str) -> Result<(), String> {
+    decode_certificate_value(value).map(|_| ())
+}
+
+fn validate_certificate_list(value: &str) -> Result<(), String> {
+    decode_certificate_list_value(value).map(|_| ())
+}
+
+fn validate_certificate_pair(value: &str) -> Result<(), String> {
+    decode_certificate_pair_value(value).map(|_| ())
+}
+
+fn validate_supported_algorithm(value: &str) -> Result<(), String> {
+    decode_supported_algorithm_value(value).map(|_| ())
 }
 
 fn validate_rfc2307_attribute_semantics(oid: &str, value: &str) -> Result<(), String> {
@@ -5805,6 +6256,111 @@ fn parse_syntax_with_optional_length(value: &str) -> Result<(String, Option<usiz
     }
 }
 
+fn merged_schema_names(left: &[String], right: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    for name in left.iter().chain(right.iter()) {
+        if seen.insert(name.to_lowercase()) {
+            merged.push(name.clone());
+        }
+    }
+    merged
+}
+
+fn schema_name_sets_equal(left: &[String], right: &[String]) -> bool {
+    let left = left
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect::<HashSet<_>>();
+    let right = right
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect::<HashSet<_>>();
+    left == right
+}
+
+fn compatible_optional_name(left: &Option<String>, right: &Option<String>) -> bool {
+    match (left.as_deref(), right.as_deref()) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => true,
+    }
+}
+
+fn compatible_schema_value(left: &str, right: &str) -> bool {
+    left.is_empty() || right.is_empty() || left.eq_ignore_ascii_case(right)
+}
+
+fn merge_optional_schema_name(
+    left: &Option<String>,
+    right: &Option<String>,
+) -> Option<Option<String>> {
+    match (left.as_ref(), right.as_ref()) {
+        (Some(left), Some(right)) if left.eq_ignore_ascii_case(right) => Some(Some(left.clone())),
+        (Some(_), Some(_)) => None,
+        (Some(left), None) => Some(Some(left.clone())),
+        (None, Some(right)) => Some(Some(right.clone())),
+        (None, None) => Some(None),
+    }
+}
+
+fn merge_optional_schema_value<T: Clone + Eq>(
+    left: &Option<T>,
+    right: &Option<T>,
+) -> Option<Option<T>> {
+    match (left, right) {
+        (Some(left), Some(right)) if left == right => Some(Some(left.clone())),
+        (Some(_), Some(_)) => None,
+        (Some(left), None) => Some(Some(left.clone())),
+        (None, Some(right)) => Some(Some(right.clone())),
+        (None, None) => Some(None),
+    }
+}
+
+fn merge_schema_extensions(
+    left: &BTreeMap<String, Vec<String>>,
+    right: &BTreeMap<String, Vec<String>>,
+) -> Option<BTreeMap<String, Vec<String>>> {
+    let mut merged = left.clone();
+    for (name, values) in right {
+        if let Some(existing_values) = merged.get(name) {
+            if existing_values != values {
+                return None;
+            }
+        } else {
+            merged.insert(name.clone(), values.clone());
+        }
+    }
+    Some(merged)
+}
+
+fn merge_attribute_metadata(
+    left: &AttributeTypeMetadata,
+    right: &AttributeTypeMetadata,
+) -> Option<AttributeTypeMetadata> {
+    Some(AttributeTypeMetadata {
+        obsolete: left.obsolete || right.obsolete,
+        superior: merge_optional_schema_name(&left.superior, &right.superior)?,
+        ordering: merge_optional_schema_name(&left.ordering, &right.ordering)?,
+        substring: merge_optional_schema_name(&left.substring, &right.substring)?,
+        collective: left.collective || right.collective,
+        no_user_modification: left.no_user_modification || right.no_user_modification,
+        usage: merge_optional_schema_name(&left.usage, &right.usage)?,
+        syntax_length: merge_optional_schema_value(&left.syntax_length, &right.syntax_length)?,
+        extensions: merge_schema_extensions(&left.extensions, &right.extensions)?,
+    })
+}
+
+fn merge_schema_element_metadata(
+    left: &SchemaElementMetadata,
+    right: &SchemaElementMetadata,
+) -> Option<SchemaElementMetadata> {
+    Some(SchemaElementMetadata {
+        description: merge_optional_schema_value(&left.description, &right.description)?,
+        obsolete: left.obsolete || right.obsolete,
+        extensions: merge_schema_extensions(&left.extensions, &right.extensions)?,
+    })
+}
+
 fn unfold_ldif_lines(contents: &str) -> Result<Vec<String>, SchemaError> {
     let mut unfolded: Vec<String> = Vec::new();
     for raw_line in contents.lines() {
@@ -6530,6 +7086,41 @@ mod tests {
 
         schema.load_builtin_schema("core").unwrap();
         assert!(schema.get_object_class("subentry").is_some());
+    }
+
+    #[test]
+    fn cosine_schema_loads_file_backed_rfc4524_definitions() {
+        let mut schema = LdapSchema::with_core_schema();
+
+        schema.load_builtin_schema("cosine").unwrap();
+
+        assert!(schema.get_attribute_type("associatedDomain").is_some());
+        assert!(schema.get_attribute_type("friendlyCountryName").is_some());
+        assert!(schema.get_object_class("document").is_some());
+        assert!(schema.get_object_class("simpleSecurityObject").is_some());
+    }
+
+    #[test]
+    fn x509_schema_loads_file_backed_rfc4523_definitions() {
+        let mut schema = LdapSchema::with_core_schema();
+
+        schema.load_builtin_schema("x509").unwrap();
+
+        assert!(schema.get_attribute_type("cACertificate").is_some());
+        assert!(
+            schema
+                .get_attribute_type("certificateRevocationList")
+                .is_some()
+        );
+        assert!(schema.get_attribute_type("supportedAlgorithms").is_some());
+        assert!(schema.get_object_class("pkiUser").is_some());
+        assert!(schema.get_object_class("cRLDistributionPoint").is_some());
+        assert!(schema.get_matching_rule("certificateExactMatch").is_some());
+        assert!(
+            schema
+                .get_matching_rule("algorithmIdentifierMatch")
+                .is_some()
+        );
     }
 
     #[test]

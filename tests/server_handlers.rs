@@ -164,6 +164,61 @@ fn person_add_attributes(include_password: bool) -> Vec<FilterAttribute<'static>
     attributes
 }
 
+fn structured_person_add_attributes() -> Vec<FilterAttribute<'static>> {
+    vec![
+        FilterAttribute {
+            attr_type: LdapString(Cow::Owned("objectClass".to_string())),
+            attr_vals: vec![
+                AttributeValue(Cow::Owned(b"person".to_vec())),
+                AttributeValue(Cow::Owned(b"rfc4512HandlerPerson".to_vec())),
+            ],
+        },
+        FilterAttribute {
+            attr_type: LdapString(Cow::Owned("cn".to_string())),
+            attr_vals: vec![AttributeValue(Cow::Owned(b"Alice".to_vec()))],
+        },
+        FilterAttribute {
+            attr_type: LdapString(Cow::Owned("sn".to_string())),
+            attr_vals: vec![AttributeValue(Cow::Owned(b"Smith".to_vec()))],
+        },
+    ]
+}
+
+fn rfc4512_structure_schema() -> LdapSchema {
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(
+            "
+dn: cn=schema
+objectClasses: ( 1.3.6.1.4.1.55555.4512.50 NAME 'rfc4512HandlerDepartment' SUP organizationalUnit STRUCTURAL )
+objectClasses: ( 1.3.6.1.4.1.55555.4512.51 NAME 'rfc4512HandlerPerson' SUP person STRUCTURAL )
+nameForms: ( 1.3.6.1.4.1.55555.4512.52 NAME 'rfc4512HandlerDepartmentForm' OC rfc4512HandlerDepartment MUST ou )
+nameForms: ( 1.3.6.1.4.1.55555.4512.53 NAME 'rfc4512HandlerPersonForm' OC rfc4512HandlerPerson MUST cn )
+dITStructureRules: ( 451250 NAME 'rfc4512HandlerDepartmentRule' FORM rfc4512HandlerDepartmentForm )
+dITStructureRules: ( 451251 NAME 'rfc4512HandlerPersonRule' FORM rfc4512HandlerPersonForm SUP 451250 )
+",
+        )
+        .unwrap();
+    schema
+}
+
+fn structured_department_entry(dn: &str) -> DirectoryEntry {
+    DirectoryEntry::new(
+        dn,
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec![
+                    "top".to_string(),
+                    "organizationalUnit".to_string(),
+                    "rfc4512HandlerDepartment".to_string(),
+                ],
+            ),
+            ("ou".to_string(), vec!["Engineering".to_string()]),
+        ]),
+    )
+}
+
 #[tokio::test]
 async fn simple_bind_success_returns_success_code() {
     let mut backend = MockDirectory::new();
@@ -552,6 +607,96 @@ async fn add_success_persists_entry() {
     let schema = LdapSchema::default();
 
     server::handle_add_request(&mut server_stream, &backend, &schema, 15, request)
+        .await
+        .unwrap();
+
+    let data = read_response(&mut client_stream).await;
+    let (_, messages) = parse_ldap_messages(&data).unwrap();
+
+    match &messages[0].protocol_op {
+        ProtocolOp::AddResponse(response) => {
+            assert_eq!(response.result_code, ldap_parser::ldap::ResultCode::Success);
+        }
+        other => panic!("unexpected response: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn add_enforces_dit_structure_parent_rule() {
+    let mut backend = MockDirectory::new();
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "ou=engineering,dc=example,dc=org")
+        .return_once(|_| Ok(None));
+
+    let request = AddRequest {
+        entry: LdapDN(Cow::Owned(
+            "cn=Alice,ou=Engineering,dc=example,dc=org".to_string(),
+        )),
+        attributes: structured_person_add_attributes(),
+    };
+
+    let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+    let schema = rfc4512_structure_schema();
+
+    server::handle_add_request(&mut server_stream, &backend, &schema, 151, request)
+        .await
+        .unwrap();
+
+    let data = read_response(&mut client_stream).await;
+    let (_, messages) = parse_ldap_messages(&data).unwrap();
+
+    match &messages[0].protocol_op {
+        ProtocolOp::AddResponse(response) => {
+            assert_eq!(
+                response.result_code,
+                ldap_parser::ldap::ResultCode::ObjectClassViolation
+            );
+            assert!(
+                response
+                    .diagnostic_message
+                    .0
+                    .as_ref()
+                    .contains("DIT structure rule violation")
+            );
+        }
+        other => panic!("unexpected response: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn add_accepts_entry_under_valid_dit_structure_parent() {
+    let mut backend = MockDirectory::new();
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "ou=engineering,dc=example,dc=org")
+        .return_once(|_| {
+            Ok(Some(structured_department_entry(
+                "ou=engineering,dc=example,dc=org",
+            )))
+        });
+    backend
+        .expect_add_entry_with_actor()
+        .withf(|entry, _, _| {
+            entry.dn == "cn=Alice,ou=Engineering,dc=example,dc=org"
+                && entry
+                    .attributes
+                    .get("objectclass")
+                    .is_some_and(|values| values.contains(&"rfc4512HandlerPerson".to_string()))
+        })
+        .return_once(|_, _, _| Ok(()));
+
+    let request = AddRequest {
+        entry: LdapDN(Cow::Owned(
+            "cn=Alice,ou=Engineering,dc=example,dc=org".to_string(),
+        )),
+        attributes: structured_person_add_attributes(),
+    };
+
+    let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+    let schema = rfc4512_structure_schema();
+
+    server::handle_add_request(&mut server_stream, &backend, &schema, 152, request)
         .await
         .unwrap();
 

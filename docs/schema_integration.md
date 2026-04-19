@@ -64,8 +64,9 @@ allow_online_updates = false
 ```
 
 The server loads built-in schema bundles before supported files from
-`schema_dir` recursively in lexical path order. Supported built-ins are `core`
-and the optional RFC 2307 `posix` bundle. The `core` bundle includes the RFC
+`schema_dir` recursively in lexical path order. Supported built-ins are `core`,
+the optional RFC 2307 `posix` bundle, the optional RFC 4524 `cosine` bundle,
+and the optional RFC 4523 `x509` bundle. The `core` bundle includes the RFC
 3672 LDAP subentry definitions from bundled LDIF. Supported file extensions are
 `.ldif`, `.schema`, and `.conf`.
 
@@ -76,6 +77,23 @@ bootable device entries:
 ```toml
 [schema]
 load_builtin = ["core", "posix"]
+```
+
+Enable COSINE schema when clients need RFC 4524 account, document, domain,
+room, friendly country, or simple security object entries:
+
+```toml
+[schema]
+load_builtin = ["core", "cosine"]
+```
+
+Enable X.509 schema when clients need RFC 4523 certificate, CRL, certificate
+pair, supported algorithm, PKI user, PKI CA, CRL distribution point, or X.521
+security information entries:
+
+```toml
+[schema]
+load_builtin = ["core", "x509"]
 ```
 
 The example fixture
@@ -89,10 +107,12 @@ for inspection, packaging, or controlled customization:
 opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 ```
 
-This writes bundled schema files such as `config/schema/core/rfc3672.ldif` and
-`config/schema/posix/rfc2307.ldif`. The generated files are the same LDIF that
-backs the built-in bundles. If both `load_builtin = ["core", "posix"]` and the
-generated files are enabled, definitions are expected to be identical.
+This writes bundled schema files such as `config/schema/core/rfc3672.ldif`,
+`config/schema/posix/rfc2307.ldif`, `config/schema/cosine/rfc4524.ldif`, and
+`config/schema/x509/rfc4523.ldif`. The generated files are the same LDIF that
+backs the built-in bundles. If both `load_builtin` and generated files are
+enabled for the same bundle, compatible duplicate standard definitions are
+merged idempotently.
 
 ### LDAP Subentries
 
@@ -404,6 +424,95 @@ The optional `posix` built-in bundle includes these RFC 2307 classes:
   - Superior: top
   - Optional: bootFile, bootParameter
 
+### COSINE Object Classes
+
+The optional `cosine` built-in bundle includes these RFC 4524 classes:
+
+- **account** (Structural)
+  - Superior: top
+  - Required: uid
+  - Optional: description, seeAlso, l, o, ou, host
+
+- **document** (Structural)
+  - Superior: top
+  - Required: documentIdentifier
+  - Optional: cn, description, seeAlso, l, o, ou, documentTitle, documentVersion, documentAuthor, documentLocation, documentPublisher
+
+- **documentSeries** (Structural)
+  - Superior: top
+  - Required: cn
+  - Optional: description, l, o, ou, seeAlso, telephoneNumber
+
+- **domain** (Structural)
+  - Superior: top
+  - Required: dc
+  - Optional: userPassword, searchGuide, seeAlso, businessCategory, x121Address, registeredAddress, destinationIndicator, preferredDeliveryMethod, telexNumber, teletexTerminalIdentifier, telephoneNumber, internationalISDNNumber, facsimileTelephoneNumber, street, postOfficeBox, postalCode, postalAddress, physicalDeliveryOfficeName, st, l, description, o, associatedName
+
+- **domainRelatedObject** (Auxiliary)
+  - Superior: top
+  - Required: associatedDomain
+
+- **friendlyCountry** (Structural)
+  - Superior: country
+  - Required: co
+
+- **rFC822LocalPart** (Structural)
+  - Superior: domain
+  - Optional: cn, description, destinationIndicator, facsimileTelephoneNumber, internationalISDNNumber, physicalDeliveryOfficeName, postalAddress, postalCode, postOfficeBox, preferredDeliveryMethod, registeredAddress, seeAlso, sn, street, telephoneNumber, teletexTerminalIdentifier, telexNumber, x121Address
+
+- **room** (Structural)
+  - Superior: top
+  - Required: cn
+  - Optional: roomNumber, description, seeAlso, telephoneNumber
+
+- **simpleSecurityObject** (Auxiliary)
+  - Superior: top
+  - Required: userPassword
+
+### X.509 Object Classes
+
+The optional `x509` built-in bundle registers the RFC 4523 certificate schema
+definitions from `resources/schema/x509/rfc4523.ldif`.
+
+- **pkiUser** (Auxiliary)
+  - Superior: top
+  - Optional: userCertificate
+
+- **pkiCA** (Auxiliary)
+  - Superior: top
+  - Optional: cACertificate, certificateRevocationList, authorityRevocationList, crossCertificatePair
+
+- **cRLDistributionPoint** (Structural)
+  - Superior: top
+  - Required: cn
+  - Optional: certificateRevocationList, authorityRevocationList, deltaRevocationList
+
+- **deltaCRL** (Auxiliary)
+  - Superior: top
+  - Optional: deltaRevocationList
+
+- **strongAuthenticationUser** (Auxiliary)
+  - Superior: top
+  - Required: userCertificate
+
+- **userSecurityInformation** (Auxiliary)
+  - Superior: top
+  - Optional: supportedAlgorithms
+
+- **certificationAuthority** (Auxiliary)
+  - Superior: top
+  - Required: authorityRevocationList, certificateRevocationList, cACertificate
+  - Optional: crossCertificatePair
+
+- **certificationAuthority-V2** (Auxiliary)
+  - Superior: certificationAuthority
+  - Optional: deltaRevocationList
+
+OpenDR validates DER, PEM, and base64 DER values for certificate,
+certificate-list, certificate-pair, and supported-algorithm attributes. RFC
+4523 matching rule definitions are registered, but their GSER assertion
+matching semantics are not executed yet.
+
 ### Core Attributes
 
 - **objectClass**: Object class names
@@ -663,6 +772,7 @@ Potential improvements:
 
 - [RFC 4512: LDAP Directory Information Models](https://tools.ietf.org/html/rfc4512)
 - [RFC 4519: LDAP Schema for User Applications](https://tools.ietf.org/html/rfc4519)
+- [RFC 4523: LDAP Schema Definitions for X.509 Certificates](https://tools.ietf.org/html/rfc4523)
 - [RFC 4524: LDAP: COSINE LDAP/X.500 Schema](https://tools.ietf.org/html/rfc4524)
 
 ## See Also

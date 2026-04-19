@@ -326,7 +326,12 @@ fn requested_schema_bundles(bundles: &[String]) -> Vec<String> {
             .iter()
             .any(|bundle| bundle.eq_ignore_ascii_case("all"))
     {
-        vec!["core".to_string(), "posix".to_string()]
+        vec![
+            "core".to_string(),
+            "posix".to_string(),
+            "cosine".to_string(),
+            "x509".to_string(),
+        ]
     } else {
         bundles.to_vec()
     }
@@ -1738,6 +1743,55 @@ mod tests {
         schema.load_schema_dir(&output_dir).unwrap();
         assert!(schema.get_object_class("posixAccount").is_some());
         assert!(schema.get_object_class("nisObject").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_generate_builtin_schema_files_writes_loadable_cosine_schema() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let handler = SetupHandler::new(temp_dir.path().join("config"));
+        let output_dir = temp_dir.path().join("config").join("schema");
+
+        let written = handler
+            .generate_builtin_schema_files(&output_dir, &["cosine".to_string()], false)
+            .await
+            .unwrap();
+
+        let schema_path = output_dir.join("cosine").join("rfc4524.ldif");
+        assert_eq!(written, vec![schema_path.clone()]);
+        assert!(schema_path.is_file());
+
+        let mut schema = crate::schema::LdapSchema::with_core_schema();
+        schema.load_schema_dir(&output_dir).unwrap();
+        assert!(schema.get_attribute_type("associatedDomain").is_some());
+        assert!(schema.get_object_class("document").is_some());
+        assert!(schema.get_object_class("simpleSecurityObject").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_generate_builtin_schema_files_writes_loadable_x509_schema() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let handler = SetupHandler::new(temp_dir.path().join("config"));
+        let output_dir = temp_dir.path().join("config").join("schema");
+
+        let written = handler
+            .generate_builtin_schema_files(&output_dir, &["x509".to_string()], false)
+            .await
+            .unwrap();
+
+        let schema_path = output_dir.join("x509").join("rfc4523.ldif");
+        assert_eq!(written, vec![schema_path.clone()]);
+        assert!(schema_path.is_file());
+
+        let mut schema = crate::schema::LdapSchema::with_core_schema();
+        schema.load_schema_dir(&output_dir).unwrap();
+        assert!(schema.get_attribute_type("cACertificate").is_some());
+        assert!(
+            schema
+                .get_attribute_type("certificateRevocationList")
+                .is_some()
+        );
+        assert!(schema.get_object_class("pkiUser").is_some());
+        assert!(schema.get_object_class("cRLDistributionPoint").is_some());
     }
 
     #[tokio::test]

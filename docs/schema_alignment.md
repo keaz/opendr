@@ -17,6 +17,14 @@ OpenDR aligns with the common LDAP model in these areas:
 - RFC 2307 POSIX/NIS account, group, shadow, host, network, service, protocol,
   RPC, netgroup, map, IEEE 802 device, and bootable device schema is available
   through the optional `posix` built-in schema bundle.
+- RFC 4524 COSINE account, document, domain, room, friendly country, RFC 822
+  local part, domain-related object, and simple security object schema is
+  available through the optional `cosine` built-in schema bundle.
+- RFC 4523 X.509 certificate, CRL, certificate pair, supported algorithm, PKI
+  user, PKI CA, CRL distribution point, and X.521 security object schema is
+  available through the optional `x509` built-in schema bundle. OpenDR validates
+  DER-backed X.509 values, while RFC 4523 GSER matching rule execution remains
+  deferred.
 - `entryDN` is synthesized as an operational attribute for OpenDJ-compatible
   clients that request it explicitly.
 - Search responses preserve explicitly requested user attribute spelling, so a
@@ -45,11 +53,16 @@ Tracked follow-up work:
 - GitHub issue #195: completed RFC 2307 POSIX/NIS schema coverage.
 - GitHub issue #197: completed RFC 3672 LDAP subentries schema and search
   visibility behavior.
+- GitHub issue #199: completed RFC 4524 COSINE LDAP/X.500 schema coverage.
+- GitHub issue #198: partially completed RFC 4523 X.509 certificate schema
+  coverage with file-backed definitions and DER-backed value validation;
+  remaining work is GSER assertion parsing and X.509 component matching-rule
+  execution.
 - GitHub issue #200: move all built-in standard schema definitions from Rust
   literals into bundled schema files while keeping only the schema engine and
   runtime behavior in Rust.
-- GitHub issues #196, #198, and #199: complete the remaining strict schema RFC
-  conformance work for RFC 3671, RFC 4523, and RFC 4524.
+- GitHub issue #196: complete the remaining strict schema RFC conformance work
+  for RFC 3671 collective attributes.
 
 ## Recommended DIT Shape
 
@@ -164,3 +177,5 @@ for a complete conformance example that uses `core` plus `posix`.
 | RFC 2798 `inetOrgPerson` | Supported | Full RFC 2798 MAY attribute set is available, including audio/photo, binary/certificate attributes, and `preferredLanguage` validation. |
 | RFC 2307 POSIX/NIS | Optional built-in bundle | Load with `load_builtin = ["core", "posix"]` for the full RFC 2307 object class and attribute set, including shadow accounts, hosts, networks, services, protocols, RPCs, netgroups, NIS maps, IEEE 802 devices, and bootable devices. |
 | RFC 3672 LDAP subentries | Supported | The core bundle registers `subentry`, `administrativeRole`, and `subtreeSpecification`, validates subtree specifications, advertises the Subentries request control, and applies RFC 3672 search visibility rules. |
+| RFC 4523 X.509 certificate schema | Optional built-in bundle, partial runtime matching | Load with `load_builtin = ["core", "x509"]` for the RFC 4523 attribute, object class, syntax, and matching-rule definitions. Certificate, CRL, certificate-pair, and supported-algorithm values are validated as DER, PEM, or base64 DER. The RFC 4523 GSER assertion matching rules are registered but not executed yet. |
+| RFC 4524 COSINE LDAP/X.500 | Optional built-in bundle | Load with `load_builtin = ["core", "cosine"]` for the full COSINE attribute and object class set, including account, document, domain, domain-related object, friendly country, RFC 822 local part, room, and simple security object entries. |
