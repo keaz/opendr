@@ -232,6 +232,58 @@ impl AuthFsmImpl {
         Ok(None)
     }
 
+    /// Handle an externally authenticated identity, such as SASL EXTERNAL over mTLS.
+    async fn handle_external_bind(
+        &mut self,
+        dn: String,
+    ) -> Result<Option<AuthUserInfo>, AuthError> {
+        match &self.state {
+            AuthState::Anonymous
+            | AuthState::AuthenticationFailed
+            | AuthState::SimpleBound { .. } => {}
+            AuthState::Authenticating { .. } => {
+                return Err(AuthError::InvalidStateTransition {
+                    from: self.state.clone(),
+                    to: AuthState::SimpleBound { dn },
+                });
+            }
+        }
+
+        if let Some(backend) = &self.backend {
+            backend
+                .validate_dn(&dn)
+                .map_err(|e| AuthError::DirectoryError { message: e })?;
+            if !backend
+                .dn_exists(&dn)
+                .await
+                .map_err(|e| AuthError::DirectoryError { message: e })?
+            {
+                self.state = AuthState::AuthenticationFailed;
+                return Err(AuthError::AuthenticationFailed {
+                    reason: "SASL EXTERNAL identity not found".to_string(),
+                });
+            }
+
+            let user_info = backend
+                .get_user_info(&dn)
+                .await
+                .map_err(|e| AuthError::DirectoryError { message: e })?;
+            self.state = AuthState::SimpleBound { dn };
+            self.user_info = Some(user_info.clone());
+            self.stats.successful_auths += 1;
+            self.stats.current_auth_attempts = 0;
+            self.auth_start_time = None;
+            return Ok(Some(user_info));
+        }
+
+        self.state = AuthState::SimpleBound { dn };
+        self.user_info = None;
+        self.stats.successful_auths += 1;
+        self.stats.current_auth_attempts = 0;
+        self.auth_start_time = None;
+        Ok(None)
+    }
+
     /// Handle anonymous bind
     async fn handle_anonymous_bind(&mut self) -> Result<Option<AuthUserInfo>, AuthError> {
         if !self.config.allow_anonymous {
@@ -345,6 +397,7 @@ impl StateMachine for AuthFsmImpl {
     ) -> Result<Option<Self::Output>, Self::Error> {
         match event {
             AuthEvent::BindRequest { dn, password } => self.handle_bind_request(dn, password).await,
+            AuthEvent::ExternalBind { dn } => self.handle_external_bind(dn).await,
             AuthEvent::AuthenticationSuccess => self.handle_auth_success().await,
             AuthEvent::AuthenticationFailure => self.handle_auth_failure().await,
             AuthEvent::Unbind => self.handle_unbind().await,

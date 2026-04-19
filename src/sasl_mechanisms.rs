@@ -2,8 +2,9 @@
 //!
 //! This module provides concrete implementations of various SASL mechanisms
 //! for LDAP authentication. The built-in production handler currently enables
-//! SASL PLAIN only; challenge-response mechanisms should be added only once their
-//! client proofs are verified against credential material.
+//! SASL PLAIN plus SASL EXTERNAL authzid parsing for the server bind paths;
+//! challenge-response mechanisms should be added only once their client proofs
+//! are verified against credential material.
 
 use crate::sasl_fsm::{CredentialVerifier, SaslChallengeResult, SaslMechanismHandler};
 use async_trait::async_trait;
@@ -24,6 +25,42 @@ pub(crate) struct PlainCredentialsRef<'a> {
     pub(crate) password: &'a [u8],
 }
 
+pub(crate) fn plain_authzid_matches_authenticated_identity(
+    authzid: &str,
+    authcid: &str,
+    authenticated_dn: &str,
+) -> bool {
+    if authzid.is_empty() {
+        return true;
+    }
+
+    if let Some(dn) = strip_authzid_prefix(authzid, "dn:") {
+        return crate::dn::dn_eq(dn, authenticated_dn);
+    }
+
+    if let Some(username) = strip_authzid_prefix(authzid, "u:") {
+        return username == authcid;
+    }
+
+    crate::dn::dn_eq(authzid, authenticated_dn) || authzid.eq_ignore_ascii_case(authenticated_dn)
+}
+
+pub(crate) fn parse_sasl_external_authzid(credentials: Option<&[u8]>) -> Result<&str, String> {
+    match credentials {
+        Some(bytes) => std::str::from_utf8(bytes)
+            .map_err(|_| "invalid SASL EXTERNAL authzid encoding".to_string()),
+        None => Ok(""),
+    }
+}
+
+fn strip_authzid_prefix<'a>(authzid: &'a str, prefix: &str) -> Option<&'a str> {
+    if authzid.len() < prefix.len() {
+        return None;
+    }
+    let (candidate, value) = authzid.split_at(prefix.len());
+    candidate.eq_ignore_ascii_case(prefix).then_some(value)
+}
+
 impl MultiMechanismHandler {
     /// Create a new multi-mechanism handler
     ///
@@ -41,6 +78,7 @@ impl MultiMechanismHandler {
 
     /// Add a supported mechanism implemented by this handler.
     pub fn add_mechanism(&mut self, mechanism: String) -> Result<(), String> {
+        let mechanism = mechanism.trim().to_ascii_uppercase();
         if mechanism != "PLAIN" {
             return Err(format!(
                 "SASL mechanism {mechanism} is not production-supported by MultiMechanismHandler"
@@ -142,6 +180,16 @@ impl MultiMechanismHandler {
             .await?
             .ok_or_else(|| "User not found".to_string())?;
 
+        if !plain_authzid_matches_authenticated_identity(
+            credentials.authzid,
+            credentials.authcid,
+            &dn,
+        ) {
+            return Ok(SaslChallengeResult::Failure(
+                "proxy authorization is not supported".to_string(),
+            ));
+        }
+
         Ok(SaslChallengeResult::Success { dn })
     }
 }
@@ -151,7 +199,7 @@ impl SaslMechanismHandler for MultiMechanismHandler {
     async fn supports_mechanism(&self, mechanism: &str) -> bool {
         self.supported_mechanisms
             .iter()
-            .any(|supported| supported == mechanism)
+            .any(|supported| supported.eq_ignore_ascii_case(mechanism.trim()))
     }
 
     async fn start_authentication(
@@ -159,7 +207,7 @@ impl SaslMechanismHandler for MultiMechanismHandler {
         mechanism: &str,
         initial_data: Option<&[u8]>,
     ) -> Result<SaslChallengeResult, String> {
-        match mechanism {
+        match mechanism.trim().to_ascii_uppercase().as_str() {
             "PLAIN" => self.handle_plain(initial_data).await,
             "DIGEST-MD5" | "CRAM-MD5" => Err(format!("{mechanism} is not production-supported")),
             _ => Err(format!("Unsupported mechanism: {}", mechanism)),
@@ -183,7 +231,7 @@ impl SaslMechanismHandler for MultiMechanismHandler {
 
     fn get_mechanism_properties(&self, mechanism: &str) -> HashMap<String, String> {
         let mut props = HashMap::new();
-        if mechanism == "PLAIN" {
+        if mechanism.trim().eq_ignore_ascii_case("PLAIN") {
             props.insert("steps".to_string(), "1".to_string());
             props.insert("security".to_string(), "requires-tls".to_string());
         }
@@ -225,9 +273,58 @@ mod tests {
         let handler = MultiMechanismHandler::new(verifier);
 
         assert!(handler.supports_mechanism("PLAIN").await);
+        assert!(handler.supports_mechanism("plain").await);
         assert!(!handler.supports_mechanism("DIGEST-MD5").await);
         assert!(!handler.supports_mechanism("CRAM-MD5").await);
         assert!(!handler.supports_mechanism("GSSAPI").await);
+    }
+
+    #[test]
+    fn test_plain_authzid_matches_authenticated_identity() {
+        let dn = "cn=testuser,dc=example,dc=org";
+
+        assert!(plain_authzid_matches_authenticated_identity(
+            "", "testuser", dn
+        ));
+        assert!(plain_authzid_matches_authenticated_identity(
+            "dn:CN=testuser,DC=example,DC=org",
+            "testuser",
+            dn
+        ));
+        assert!(plain_authzid_matches_authenticated_identity(
+            "DN:CN=testuser,DC=example,DC=org",
+            "testuser",
+            dn
+        ));
+        assert!(plain_authzid_matches_authenticated_identity(
+            "u:testuser",
+            "testuser",
+            dn
+        ));
+        assert!(plain_authzid_matches_authenticated_identity(
+            "cn=testuser,dc=example,dc=org",
+            "testuser",
+            dn
+        ));
+
+        assert!(!plain_authzid_matches_authenticated_identity(
+            "dn:cn=other,dc=example,dc=org",
+            "testuser",
+            dn
+        ));
+        assert!(!plain_authzid_matches_authenticated_identity(
+            "u:other", "testuser", dn
+        ));
+    }
+
+    #[test]
+    fn test_parse_sasl_external_authzid() {
+        assert_eq!(parse_sasl_external_authzid(None).unwrap(), "");
+        assert_eq!(
+            parse_sasl_external_authzid(Some(b"dn:cn=testuser,dc=example,dc=org")).unwrap(),
+            "dn:cn=testuser,dc=example,dc=org"
+        );
+        assert!(parse_sasl_external_authzid(Some(&[0xff])).is_err());
     }
 
     #[tokio::test]
@@ -245,6 +342,53 @@ mod tests {
             }
             _ => panic!("Expected success"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_plain_mechanism_accepts_self_authorization_identity_forms() {
+        let verifier = Arc::new(MockCredentialVerifier);
+        let handler = MultiMechanismHandler::new(verifier);
+
+        let result = handler
+            .handle_plain(Some(
+                b"dn:CN=testuser,DC=example,DC=org\0testuser\0password",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            SaslChallengeResult::Success {
+                dn: "cn=testuser,dc=example,dc=org".to_string()
+            }
+        );
+
+        let result = handler
+            .handle_plain(Some(b"u:testuser\0testuser\0password"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            SaslChallengeResult::Success {
+                dn: "cn=testuser,dc=example,dc=org".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plain_mechanism_rejects_proxy_authorization_identity() {
+        let verifier = Arc::new(MockCredentialVerifier);
+        let handler = MultiMechanismHandler::new(verifier);
+
+        let result = handler
+            .handle_plain(Some(b"dn:cn=other,dc=example,dc=org\0testuser\0password"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            SaslChallengeResult::Failure(reason)
+                if reason == "proxy authorization is not supported"
+        ));
     }
 
     #[tokio::test]
@@ -295,6 +439,10 @@ mod tests {
         let handler = MultiMechanismHandler::new(verifier);
 
         let props = handler.get_mechanism_properties("PLAIN");
+        assert_eq!(props.get("steps"), Some(&"1".to_string()));
+        assert_eq!(props.get("security"), Some(&"requires-tls".to_string()));
+
+        let props = handler.get_mechanism_properties("plain");
         assert_eq!(props.get("steps"), Some(&"1".to_string()));
         assert_eq!(props.get("security"), Some(&"requires-tls".to_string()));
 

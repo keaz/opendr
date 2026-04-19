@@ -110,6 +110,7 @@ async fn build_security_config_with_policy(
         access_control,
         root_dn,
         security_policy,
+        sasl_external_identity_map: std::collections::HashMap::new(),
     })
 }
 

@@ -79,7 +79,12 @@ cn=manager,dc=example,dc=com
 ### SASL PLAIN fails in `fsm`
 
 SASL PLAIN in the FSM runtime requires confidential transport. Use LDAPS or run
-StartTLS before binding. DIGEST-MD5, CRAM-MD5, and other SASL mechanisms are not
+StartTLS before binding.
+
+SASL EXTERNAL also requires confidential transport, a verified client
+certificate, and a certificate identity that maps to an existing LDAP DN through
+`security.sasl_external_identity_map` or a DN-valued certificate subject common
+name. DIGEST-MD5, CRAM-MD5, SCRAM, and other multi-step SASL mechanisms are not
 production-enabled.
 
 ### Bind fails after StartTLS

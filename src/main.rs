@@ -135,6 +135,7 @@ async fn build_legacy_security_config(
         access_control,
         root_dn: Some(config.canonical_root_dn()?),
         security_policy,
+        sasl_external_identity_map: config.security.sasl_external_identity_map.clone(),
     })))
 }
 

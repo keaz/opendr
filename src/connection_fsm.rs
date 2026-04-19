@@ -74,6 +74,17 @@ impl ConnectionTransport {
         matches!(self, Self::Tls(_))
     }
 
+    pub fn client_certificate_subject_common_name(&self) -> Option<String> {
+        match self {
+            Self::Tls(stream) => {
+                let connection = stream.get_ref().1;
+                let certificate = connection.peer_certificates()?.first()?;
+                crate::security_layer::client_certificate_subject_common_name(certificate.as_ref())
+            }
+            Self::Plain(_) | Self::Closed => None,
+        }
+    }
+
     pub fn tcp_ref(&self) -> Option<&TcpStream> {
         match self {
             Self::Plain(stream) => Some(stream),

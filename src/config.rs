@@ -32,6 +32,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -642,6 +643,14 @@ pub struct SecuritySettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_sasl_plain: Option<bool>,
 
+    /// Override whether SASL EXTERNAL is accepted over verified mutual TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_sasl_external: Option<bool>,
+
+    /// Map verified client certificate subject CN values to LDAP authorization DNs.
+    #[serde(default)]
+    pub sasl_external_identity_map: HashMap<String, String>,
+
     /// Override whether the Password Modify extended operation is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_password_modify: Option<bool>,
@@ -1152,6 +1161,8 @@ impl Default for SecuritySettings {
             allow_anonymous_bind: None,
             allow_cleartext_simple_bind: None,
             allow_sasl_plain: None,
+            allow_sasl_external: None,
+            sasl_external_identity_map: HashMap::new(),
             allow_password_modify: None,
             root_dse_requires_authentication: None,
         }
@@ -1174,6 +1185,9 @@ impl SecuritySettings {
         }
         if let Some(value) = self.allow_sasl_plain {
             policy.allow_sasl_plain = value;
+        }
+        if let Some(value) = self.allow_sasl_external {
+            policy.allow_sasl_external = value;
         }
         if let Some(value) = self.allow_password_modify {
             policy.allow_password_modify = value;
@@ -1949,6 +1963,19 @@ impl ServerConfig {
                 "security.profile=production requires tls.enabled=true".to_string(),
             ));
         }
+        for (certificate_cn, mapped_dn) in &self.security.sasl_external_identity_map {
+            if certificate_cn.trim().is_empty() {
+                return Err(ConfigError::ValidationError(
+                    "security.sasl_external_identity_map cannot contain an empty certificate CN"
+                        .to_string(),
+                ));
+            }
+            crate::dn::canonicalize_dn(mapped_dn).map_err(|err| {
+                ConfigError::ValidationError(format!(
+                    "security.sasl_external_identity_map maps {certificate_cn:?} to invalid DN {mapped_dn:?}: {err}"
+                ))
+            })?;
+        }
         self.validate_production_root_secret_source(&resolved_root_password)?;
 
         // Validate replication settings
@@ -2163,6 +2190,7 @@ profile = "Production"
         assert!(!policy.allow_anonymous_bind);
         assert!(!policy.allow_cleartext_simple_bind);
         assert!(policy.allow_sasl_plain);
+        assert!(policy.allow_sasl_external);
         assert!(policy.allow_password_modify);
         assert!(!policy.root_dse_requires_authentication);
 
@@ -2173,8 +2201,10 @@ profile = "production"
 allow_anonymous_bind = true
 allow_cleartext_simple_bind = true
 allow_sasl_plain = false
+allow_sasl_external = false
 allow_password_modify = false
 root_dse_requires_authentication = true
+sasl_external_identity_map = { "opendr-client" = "CN=admin,DC=example,DC=org" }
 "#,
         )
         .unwrap();
@@ -2183,8 +2213,17 @@ root_dse_requires_authentication = true
         assert!(policy.allow_anonymous_bind);
         assert!(policy.allow_cleartext_simple_bind);
         assert!(!policy.allow_sasl_plain);
+        assert!(!policy.allow_sasl_external);
         assert!(!policy.allow_password_modify);
         assert!(policy.root_dse_requires_authentication);
+        assert_eq!(
+            config
+                .security
+                .sasl_external_identity_map
+                .get("opendr-client")
+                .map(String::as_str),
+            Some("CN=admin,DC=example,DC=org")
+        );
     }
 
     #[test]

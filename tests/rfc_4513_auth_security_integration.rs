@@ -17,7 +17,9 @@ use opendr::sasl_fsm::{CredentialVerifier, SaslChallengeResult, SaslMechanismHan
 use opendr::sasl_mechanisms::MultiMechanismHandler;
 use opendr::search_protocol::{
     build_root_dse_attributes, supported_legacy_sasl_mechanisms_for_context,
+    supported_legacy_sasl_mechanisms_for_effective_security,
 };
+use opendr::security_layer::{EffectiveSecurityContext, SaslMechanismPolicy};
 use opendr::server;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -107,6 +109,7 @@ async fn sasl_plain_handler_supports_only_the_documented_confidentiality_bound_m
     let handler = MultiMechanismHandler::new(Arc::new(StaticCredentialVerifier));
 
     assert!(handler.supports_mechanism("PLAIN").await);
+    assert!(handler.supports_mechanism("plain").await);
     assert!(!handler.supports_mechanism("DIGEST-MD5").await);
     assert!(!handler.supports_mechanism("CRAM-MD5").await);
     assert!(!handler.supports_mechanism("GSSAPI").await);
@@ -127,6 +130,45 @@ async fn sasl_plain_handler_supports_only_the_documented_confidentiality_bound_m
         SaslChallengeResult::Success {
             dn: ADMIN_DN.to_string()
         }
+    );
+
+    let result = handler
+        .start_authentication(
+            "plain",
+            Some(format!("dn:{ADMIN_DN}\0admin\0{SASL_SECRET}").as_bytes()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        SaslChallengeResult::Success {
+            dn: ADMIN_DN.to_string()
+        }
+    );
+
+    let result = handler
+        .start_authentication(
+            "PLAIN",
+            Some(format!("u:admin\0admin\0{SASL_SECRET}").as_bytes()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        SaslChallengeResult::Success {
+            dn: ADMIN_DN.to_string()
+        }
+    );
+
+    let result = handler
+        .start_authentication(
+            "PLAIN",
+            Some(format!("dn:cn=other,dc=example,dc=org\0admin\0{SASL_SECRET}").as_bytes()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, SaslChallengeResult::Failure(reason) if reason == "proxy authorization is not supported")
     );
 
     let result = handler
@@ -196,6 +238,14 @@ async fn root_dse_advertises_starttls_and_sasl_plain_only_for_appropriate_securi
     assert_eq!(
         secure_attributes.get("supportedSASLMechanisms").unwrap(),
         &vec!["PLAIN".to_string()]
+    );
+
+    assert_eq!(
+        supported_legacy_sasl_mechanisms_for_effective_security(
+            &EffectiveSecurityContext::new(true, Some("cn=admin,dc=example,dc=org".to_string())),
+            SaslMechanismPolicy::default(),
+        ),
+        vec!["PLAIN".to_string(), "EXTERNAL".to_string()]
     );
 }
 

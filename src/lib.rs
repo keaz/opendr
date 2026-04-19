@@ -59,6 +59,7 @@ pub mod search_adapters;
 pub mod search_controls;
 pub mod search_fsm;
 pub mod search_protocol;
+pub mod security_layer;
 pub mod server;
 pub mod setup;
 pub mod shutdown;

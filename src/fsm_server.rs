@@ -728,6 +728,13 @@ async fn handle_connection_with_transport(
                             metrics.record_operation_start(operation_type, "");
                         }
 
+                        request_context.refresh_client_certificate_authz_dn(
+                            fsm_set
+                                .connection()
+                                .stream()
+                                .and_then(|stream| stream.client_certificate_subject_common_name()),
+                        );
+
                         let result = process_ldap_message(
                             &mut fsm_set,
                             message,
@@ -3891,7 +3898,10 @@ async fn try_handle_virtual_search_request_with_fsm_runtime(
             request.is_secure,
             runtime_context.tls_handler.is_some(),
             &supported_control_oids,
-            &crate::search_protocol::supported_fsm_sasl_mechanisms_for_context(request.is_secure),
+            &crate::search_protocol::supported_fsm_sasl_mechanisms_for_effective_security(
+                &request_context.effective_security_context(request.is_secure),
+                crate::server::security_policy(request_context).sasl_mechanism_policy(),
+            ),
         )
         .await
         {
@@ -6405,6 +6415,19 @@ async fn handle_sasl_bind_with_fsm(
     let mechanism = credentials.mechanism.0.as_ref().trim().to_owned();
     reset_auth_state(fsm_set).await?;
 
+    if mechanism.eq_ignore_ascii_case("EXTERNAL") {
+        return handle_sasl_external_bind_with_fsm(
+            fsm_set,
+            message_id,
+            request_name,
+            credentials,
+            connection_is_secure,
+            request_context,
+            metrics,
+        )
+        .await;
+    }
+
     if !mechanism.eq_ignore_ascii_case("PLAIN") {
         if let Some(metrics) = metrics {
             metrics.record_fsm_state(FsmType::Auth, "sasl_unsupported_mechanism");
@@ -6421,7 +6444,7 @@ async fn handle_sasl_bind_with_fsm(
             fsm_set,
             message_id,
             ResultCode::AuthMethodNotSupported,
-            "only SASL PLAIN is supported",
+            "only SASL PLAIN and EXTERNAL are supported",
         )
         .await?;
         return Ok(());
@@ -6523,7 +6546,11 @@ async fn handle_sasl_bind_with_fsm(
         return Ok(());
     }
 
-    if !parsed.authzid.is_empty() && !parsed.authzid.eq_ignore_ascii_case(&bind_dn) {
+    if !crate::sasl_mechanisms::plain_authzid_matches_authenticated_identity(
+        parsed.authzid,
+        parsed.authcid,
+        &bind_dn,
+    ) {
         if let Some(metrics) = metrics {
             metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
         }
@@ -6626,6 +6653,226 @@ async fn handle_sasl_bind_with_fsm(
                 message_id,
                 ResultCode::Unavailable,
                 "SASL not configured",
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_sasl_external_bind_with_fsm(
+    fsm_set: &mut ConnectionFsmSet,
+    message_id: u32,
+    request_name: String,
+    credentials: ldap_parser::ldap::SaslCredentials<'_>,
+    connection_is_secure: bool,
+    request_context: &RequestContext,
+    metrics: Option<&MetricsCollector>,
+) -> Result<(), String> {
+    use crate::fsm::{AuthEvent, StateMachine};
+
+    if !crate::server::security_policy(request_context).allow_sasl_external {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_unsupported_mechanism");
+        }
+        log_sasl_bind(
+            request_context,
+            request_name.as_str(),
+            "EXTERNAL",
+            false,
+            Some("SASL EXTERNAL is disabled by security policy"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::AuthMethodNotSupported,
+            "SASL EXTERNAL is disabled by security policy",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if !connection_is_secure {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_confidentiality_required");
+        }
+        log_sasl_bind(
+            request_context,
+            request_name.as_str(),
+            "EXTERNAL",
+            false,
+            Some("SASL EXTERNAL requires TLS"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::ConfidentialityRequired,
+            "SASL EXTERNAL requires TLS",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let Some(external_dn) = request_context.client_certificate_authz_dn() else {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+        }
+        log_sasl_bind(
+            request_context,
+            request_name.as_str(),
+            "EXTERNAL",
+            false,
+            Some("SASL EXTERNAL requires a verified client certificate"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::InvalidCredentials,
+            "SASL EXTERNAL requires a verified client certificate",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let authzid = match crate::sasl_mechanisms::parse_sasl_external_authzid(
+        credentials.credentials.as_deref(),
+    ) {
+        Ok(authzid) => authzid,
+        Err(err) => {
+            if let Some(metrics) = metrics {
+                metrics.record_fsm_state(FsmType::Auth, "sasl_malformed_credentials");
+            }
+            log_sasl_bind(
+                request_context,
+                external_dn.as_str(),
+                "EXTERNAL",
+                false,
+                Some(&err),
+            )
+            .await;
+            send_bind_result(fsm_set, message_id, ResultCode::InvalidCredentials, &err).await?;
+            return Ok(());
+        }
+    };
+
+    if !crate::sasl_mechanisms::plain_authzid_matches_authenticated_identity(
+        authzid,
+        &external_dn,
+        &external_dn,
+    ) {
+        if let Some(metrics) = metrics {
+            metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+        }
+        log_sasl_bind(
+            request_context,
+            external_dn.as_str(),
+            "EXTERNAL",
+            false,
+            Some("proxy authorization is not supported"),
+        )
+        .await;
+        send_bind_result(
+            fsm_set,
+            message_id,
+            ResultCode::InappropriateAuthentication,
+            "proxy authorization is not supported",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let backend = fsm_set.backend().clone();
+    match backend.get_entry(&external_dn).await {
+        Ok(Some(_)) => {
+            match fsm_set.auth_mut() {
+                AuthenticationFsm::Simple(auth_fsm) => {
+                    auth_fsm
+                        .handle_event(AuthEvent::ExternalBind {
+                            dn: external_dn.clone(),
+                        })
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
+                AuthenticationFsm::Sasl(_) => {
+                    return send_bind_result(
+                        fsm_set,
+                        message_id,
+                        ResultCode::AuthMethodNotSupported,
+                        "SASL not configured",
+                    )
+                    .await;
+                }
+            }
+            if let Some(metrics) = metrics {
+                metrics.record_fsm_state(FsmType::Auth, "sasl_bound");
+            }
+            record_authentication_success_metadata_with_context(
+                request_context,
+                backend.as_ref(),
+                &external_dn,
+            )
+            .await;
+            log_sasl_bind(
+                request_context,
+                external_dn.as_str(),
+                "EXTERNAL",
+                true,
+                None,
+            )
+            .await;
+            send_bind_success(fsm_set, message_id).await?;
+        }
+        Ok(None) => {
+            if let Some(metrics) = metrics {
+                metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+            }
+            record_authentication_failure_metadata_with_context(
+                request_context,
+                backend.as_ref(),
+                &external_dn,
+            )
+            .await;
+            log_sasl_bind(
+                request_context,
+                external_dn.as_str(),
+                "EXTERNAL",
+                false,
+                Some("SASL EXTERNAL identity not found"),
+            )
+            .await;
+            send_bind_result(
+                fsm_set,
+                message_id,
+                ResultCode::InvalidCredentials,
+                "SASL EXTERNAL identity not found",
+            )
+            .await?;
+        }
+        Err(err) => {
+            error!(
+                "SASL EXTERNAL backend lookup error for {}: {}",
+                external_dn, err
+            );
+            if let Some(metrics) = metrics {
+                metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+            }
+            log_sasl_bind(
+                request_context,
+                external_dn.as_str(),
+                "EXTERNAL",
+                false,
+                Some("backend failure"),
+            )
+            .await;
+            send_bind_result(
+                fsm_set,
+                message_id,
+                ResultCode::Unavailable,
+                "backend failure",
             )
             .await?;
         }
@@ -8350,6 +8597,7 @@ mod tests {
                 access_control: Some(aci_engine),
                 root_dn: Some("cn=directory manager,dc=example,dc=org".to_string()),
                 security_policy: crate::server::LegacySecurityPolicy::default(),
+                sasl_external_identity_map: HashMap::new(),
             })),
             ..FsmServerRuntimeContext::default()
         };
@@ -10100,6 +10348,43 @@ mod tests {
             &mut fsm_set,
             31,
             sasl_plain_bind_request("cn=admin,dc=example,dc=org", b"secret"),
+            true,
+            &RequestContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            fsm_set.authenticated_dn(),
+            Some("cn=admin,dc=example,dc=org")
+        );
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_bind_with_fsm_accepts_sasl_plain_self_authorization_identity_forms() {
+        let backend = Arc::new(MockBackend::default());
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut fsm_set = ConnectionFsmSet::new(server_stream, backend, None);
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            39,
+            sasl_plain_bind_request_with_authzid(
+                "cn=admin,dc=example,dc=org",
+                "dn:CN=admin,DC=example,DC=org",
+                "cn=admin,dc=example,dc=org",
+                b"secret",
+            ),
             true,
             &RequestContext::default(),
             None,

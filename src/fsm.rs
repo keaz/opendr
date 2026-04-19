@@ -199,6 +199,7 @@ pub enum AuthState {
 #[derive(Debug)]
 pub enum AuthEvent {
     BindRequest { dn: String, password: Vec<u8> },
+    ExternalBind { dn: String },
     AuthenticationSuccess,
     AuthenticationFailure,
     Unbind,

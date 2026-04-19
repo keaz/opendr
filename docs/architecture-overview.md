@@ -225,15 +225,17 @@ Backend writes maintain operational attributes such as:
 Operational attributes are hidden from normal search results unless the client
 requests `+` or explicit operational attribute names. `entryDN` is synthesized
 from the entry name for OpenDJ-compatible clients.
-Simple bind and SASL PLAIN update account authentication metadata on the target
-entry. Failed binds increment `failedLoginCount`; a successful bind sets
-`lastSuccessfulLogin` and resets `failedLoginCount` to `0`. Clients cannot add
-or modify server-managed operational attributes directly.
+Simple bind, SASL PLAIN, and SASL EXTERNAL update account authentication
+metadata on the target entry. Failed binds increment `failedLoginCount`; a
+successful bind sets `lastSuccessfulLogin` and resets `failedLoginCount` to
+`0`. Clients cannot add or modify server-managed operational attributes
+directly.
 
 ## Known Implementation Boundaries
 
-- FSM runtime simple bind, anonymous bind, and SASL PLAIN over confidential
-  transport are wired. Other SASL mechanisms are not production-enabled.
+- FSM runtime simple bind, anonymous bind, SASL PLAIN over confidential
+  transport, and SASL EXTERNAL over verified mutual TLS are wired. Other SASL
+  mechanisms are not production-enabled.
 - The ACI engine loads `access_control.rules_file` at startup and enforces
   operation-level and attribute-level rules in the server paths.
 - `performance.indexing_enabled` and `performance.cache_size` are wired into

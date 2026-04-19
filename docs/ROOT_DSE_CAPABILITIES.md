@@ -52,6 +52,11 @@ on other operations are ignored.
 PLAIN on insecure transports. Plain LDAP connections should use StartTLS before
 negotiating SASL PLAIN.
 
+`EXTERNAL` is advertised only when the current connection is confidential and
+the verified client certificate resolves to an LDAP authorization DN. Resolution
+uses `security.sasl_external_identity_map` first; if no mapping exists, the
+certificate subject common name may be used directly when it is a valid LDAP DN.
+
 ## `supportedLDAPVersion`
 
 OpenDR advertises LDAP version `3`.

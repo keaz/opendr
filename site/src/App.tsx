@@ -1117,9 +1117,12 @@ pnpm build`}</code></pre>
               <div className="callout warning">
                 <strong>Authentication support:</strong> FSM and legacy
                 runtimes support simple bind, anonymous bind, and SASL PLAIN
-                over LDAPS or StartTLS. Other SASL mechanisms are not
-                production-enabled. User bind metadata is recorded through
-                server-managed operational attributes including{" "}
+                over LDAPS or StartTLS. SASL PLAIN accepts empty authzid plus
+                self <code>dn:</code> and <code>u:</code> authzid forms; proxy
+                authorization remains unsupported. SASL EXTERNAL is accepted
+                over verified mutual TLS when the client certificate maps to an
+                LDAP DN. User bind metadata is recorded through server-managed
+                operational attributes including{" "}
                 <code>lastSuccessfulLogin</code>, <code>lastFailedLogin</code>,
                 and <code>failedLoginCount</code>.
               </div>

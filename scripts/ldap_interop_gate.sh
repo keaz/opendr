@@ -6,6 +6,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_DN="${OPENDR_BASE_DN:-dc=example,dc=org}"
 BIND_DN="${OPENDR_BIND_DN:-cn=admin,${BASE_DN}}"
 BIND_PW="${OPENDR_BIND_PW:-InteropSecret-${RANDOM}-$$}"
+SASL_AUTHCID="${OPENDR_SASL_AUTHCID:-${BIND_DN%%,*}}"
+SASL_AUTHCID="${SASL_AUTHCID#*=}"
 RUNTIME="${OPENDR_RUNTIME:-fsm}"
 START_SERVER="${OPENDR_INTEROP_START_SERVER:-1}"
 LDAP_URL="${OPENDR_LDAP_URL:-}"
@@ -81,6 +83,10 @@ run_ldapsearch() {
 
 run_ldapcompare() {
   LDAPTLS_REQCERT=never ldapcompare "$@"
+}
+
+run_ldapwhoami() {
+  LDAPTLS_REQCERT=never ldapwhoami "$@"
 }
 
 expect_ldapcompare_true() {
@@ -186,8 +192,38 @@ run_openldap_cli_checks() {
   local renamed_dn="cn=${PREFIX}-renamed,${target_ou}"
 
   echo "== OpenLDAP CLI: Root DSE"
-  run_ldapsearch -LLL -o ldif-wrap=no "${LDAP_BIND_ARGS[@]}" -b "" -s base "(objectClass=*)" \
-    namingContexts supportedControl supportedFeatures supportedExtension supportedSASLMechanisms >/dev/null
+  if [[ "${STARTTLS}" == "1" && "${LDAP_URL}" == ldap://* ]]; then
+    local insecure_root_dse
+    insecure_root_dse="$(run_ldapsearch -LLL -o ldif-wrap=no -x -H "${LDAP_URL}" -b "" -s base "(objectClass=*)" supportedSASLMechanisms)"
+    if grep -q '^supportedSASLMechanisms:' <<<"${insecure_root_dse}"; then
+      echo "Root DSE advertised SASL mechanisms before transport confidentiality" >&2
+      return 1
+    fi
+  fi
+
+  local root_dse
+  root_dse="$(run_ldapsearch -LLL -o ldif-wrap=no "${LDAP_BIND_ARGS[@]}" -b "" -s base "(objectClass=*)" \
+    namingContexts supportedControl supportedFeatures supportedExtension supportedSASLMechanisms)"
+  if [[ "${STARTTLS}" == "1" || "${LDAP_URL}" == ldaps://* ]]; then
+    if ! grep -q '^supportedSASLMechanisms: PLAIN$' <<<"${root_dse}"; then
+      echo "Root DSE did not advertise SASL PLAIN after transport confidentiality" >&2
+      return 1
+    fi
+  fi
+
+  echo "== OpenLDAP CLI: SASL PLAIN over confidential transport"
+  if [[ "${STARTTLS}" == "1" || "${LDAP_URL}" == ldaps://* ]]; then
+    local whoami_args=(-Y PLAIN -D "${BIND_DN}" -U "${SASL_AUTHCID}" -w "${BIND_PW}" -H "${LDAP_URL}")
+    if [[ "${STARTTLS}" == "1" ]]; then
+      whoami_args=(-ZZ "${whoami_args[@]}")
+    fi
+    local whoami
+    whoami="$(run_ldapwhoami "${whoami_args[@]}")"
+    if [[ "${whoami}" != "dn:${BIND_DN}" ]]; then
+      echo "SASL PLAIN WhoAmI returned '${whoami}', expected 'dn:${BIND_DN}'" >&2
+      return 1
+    fi
+  fi
 
   echo "== OpenLDAP CLI: Add"
   run_ldapadd "${LDAP_BIND_ARGS[@]}" >/dev/null <<EOF
@@ -299,6 +335,7 @@ main() {
   require_command ldapmodrdn
   require_command ldapmodify
   require_command ldapsearch
+  require_command ldapwhoami
   require_command python3
 
   python3 - <<'PY'

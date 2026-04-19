@@ -62,6 +62,9 @@ use crate::real_time_propagation::is_dn_in_scope;
 use crate::referral::LdapReferralResolver;
 use crate::referral_fsm::ReferralResolver;
 use crate::replication::RenameChange;
+use crate::sasl_mechanisms::{
+    parse_sasl_external_authzid, plain_authzid_matches_authenticated_identity,
+};
 use crate::schema::{LdapSchema, SchemaError, canonical_schema_attr_name, schema_definition_key};
 use crate::search_controls::{
     PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
@@ -69,6 +72,10 @@ use crate::search_controls::{
     decode_paged_results_control, decode_server_side_sort_request_control,
     decode_subentries_control, encode_paged_results_control,
     encode_server_side_sort_response_control,
+};
+use crate::security_layer::{
+    EffectiveSecurityContext, SaslMechanismPolicy, client_certificate_subject_common_name,
+    map_client_certificate_common_name_to_authz_dn,
 };
 use crate::sync_controls::{
     SYNC_DONE_OID, SYNC_INFO_OID, SYNC_REQUEST_OID, SYNC_STATE_OID, SyncDoneControl, SyncInfoValue,
@@ -467,6 +474,7 @@ pub struct LegacySecurityPolicy {
     pub allow_anonymous_bind: bool,
     pub allow_cleartext_simple_bind: bool,
     pub allow_sasl_plain: bool,
+    pub allow_sasl_external: bool,
     pub allow_password_modify: bool,
     pub root_dse_requires_authentication: bool,
 }
@@ -477,6 +485,7 @@ impl LegacySecurityPolicy {
             allow_anonymous_bind: true,
             allow_cleartext_simple_bind: true,
             allow_sasl_plain: true,
+            allow_sasl_external: true,
             allow_password_modify: true,
             root_dse_requires_authentication: false,
         }
@@ -487,8 +496,16 @@ impl LegacySecurityPolicy {
             allow_anonymous_bind: false,
             allow_cleartext_simple_bind: false,
             allow_sasl_plain: true,
+            allow_sasl_external: true,
             allow_password_modify: true,
             root_dse_requires_authentication: false,
+        }
+    }
+
+    pub(crate) fn sasl_mechanism_policy(self) -> SaslMechanismPolicy {
+        SaslMechanismPolicy {
+            allow_plain: self.allow_sasl_plain,
+            allow_external: self.allow_sasl_external,
         }
     }
 }
@@ -506,15 +523,30 @@ pub struct LegacySecurityConfig {
     pub access_control: Option<Arc<AciEngine>>,
     pub root_dn: Option<String>,
     pub security_policy: LegacySecurityPolicy,
+    pub sasl_external_identity_map: HashMap<String, String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct RequestContext {
     client_ip: Option<IpAddr>,
     session_id: Option<ConnectionId>,
     security: Option<Arc<LegacySecurityConfig>>,
     metrics: Option<Arc<MetricsCollector>>,
     auth_metadata: Option<AuthMetadataRecorder>,
+    client_certificate_authz_dn: Arc<RwLock<Option<String>>>,
+}
+
+impl Default for RequestContext {
+    fn default() -> Self {
+        Self {
+            client_ip: None,
+            session_id: None,
+            security: None,
+            metrics: None,
+            auth_metadata: None,
+            client_certificate_authz_dn: Arc::new(RwLock::new(None)),
+        }
+    }
 }
 
 impl RequestContext {
@@ -530,6 +562,7 @@ impl RequestContext {
             security,
             metrics,
             auth_metadata: None,
+            client_certificate_authz_dn: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -539,6 +572,44 @@ impl RequestContext {
     ) -> Self {
         self.auth_metadata = auth_metadata;
         self
+    }
+
+    pub(crate) fn refresh_client_certificate_authz_dn(&self, subject_common_name: Option<String>) {
+        let authz_dn = subject_common_name
+            .as_deref()
+            .and_then(|cn| self.sasl_external_authz_dn_for_certificate_cn(cn));
+        *self
+            .client_certificate_authz_dn
+            .write()
+            .expect("client certificate authz DN lock poisoned") = authz_dn;
+    }
+
+    pub(crate) fn client_certificate_authz_dn(&self) -> Option<String> {
+        self.client_certificate_authz_dn
+            .read()
+            .expect("client certificate authz DN lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn effective_security_context(
+        &self,
+        confidential_transport: bool,
+    ) -> EffectiveSecurityContext {
+        EffectiveSecurityContext::new(confidential_transport, self.client_certificate_authz_dn())
+    }
+
+    fn sasl_external_authz_dn_for_certificate_cn(
+        &self,
+        subject_common_name: &str,
+    ) -> Option<String> {
+        if let Some(security) = self.security.as_ref() {
+            return map_client_certificate_common_name_to_authz_dn(
+                subject_common_name,
+                &security.sasl_external_identity_map,
+            );
+        }
+
+        crate::dn::canonicalize_dn(subject_common_name).ok()
     }
 }
 
@@ -579,6 +650,17 @@ impl ConnectionStream {
 
     fn is_secure(&self) -> bool {
         matches!(self, Self::Tls(_))
+    }
+
+    fn client_certificate_subject_common_name(&self) -> Option<String> {
+        match self {
+            Self::Tls(stream) => {
+                let connection = stream.get_ref().1;
+                let certificate = connection.peer_certificates()?.first()?;
+                client_certificate_subject_common_name(certificate.as_ref())
+            }
+            Self::Plain(_) | Self::Closed => None,
+        }
     }
 
     async fn upgrade_in_place(
@@ -907,6 +989,7 @@ async fn run_plain_listener(
                         security: security.clone(),
                         metrics: metrics.clone(),
                         auth_metadata: connection_runtime_config.auth_metadata.clone(),
+                        client_certificate_authz_dn: Arc::new(RwLock::new(None)),
                     };
                     handle_client_with_metrics_and_tls(
                         ConnectionStream::plain(socket),
@@ -1114,6 +1197,7 @@ pub async fn run_tls_with_metrics_and_config_and_security_and_shared_schema(
                         security: security.clone(),
                         metrics: metrics.clone(),
                         auth_metadata: connection_runtime_config.auth_metadata.clone(),
+                        client_certificate_authz_dn: Arc::new(RwLock::new(None)),
                     };
                     handle_client_with_metrics_and_tls(
                         ConnectionStream::tls(tls_stream),
@@ -1358,6 +1442,10 @@ async fn handle_client_with_metrics_and_tls(
                                 continue;
                             }
                         }
+
+                        request_context.refresh_client_certificate_authz_dn(
+                            socket.client_certificate_subject_common_name(),
+                        );
 
                         let result = process_message_with_session(
                             &mut socket,
@@ -3171,6 +3259,177 @@ async fn handle_bind_request_with_session_and_context(
         }
         AuthenticationChoice::Sasl(credentials) => {
             let mechanism = credentials.mechanism.0.as_ref().trim().to_owned();
+            if mechanism.eq_ignore_ascii_case("EXTERNAL") {
+                if !security_policy(request_context).allow_sasl_external {
+                    session.clear();
+                    log_sasl_bind(
+                        request_context,
+                        request.name.0.as_ref().trim(),
+                        "EXTERNAL",
+                        false,
+                        Some("SASL EXTERNAL is disabled by security policy"),
+                    )
+                    .await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::AuthMethodNotSupported,
+                        "SASL EXTERNAL is disabled by security policy",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                if !connection_is_secure {
+                    session.clear();
+                    log_sasl_bind(
+                        request_context,
+                        request.name.0.as_ref().trim(),
+                        "EXTERNAL",
+                        false,
+                        Some("SASL EXTERNAL requires TLS"),
+                    )
+                    .await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::ConfidentialityRequired,
+                        "SASL EXTERNAL requires TLS",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                let Some(external_dn) = request_context.client_certificate_authz_dn() else {
+                    session.clear();
+                    log_sasl_bind(
+                        request_context,
+                        request.name.0.as_ref().trim(),
+                        "EXTERNAL",
+                        false,
+                        Some("SASL EXTERNAL requires a verified client certificate"),
+                    )
+                    .await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::InvalidCredentials,
+                        "SASL EXTERNAL requires a verified client certificate",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+
+                let authzid = match parse_sasl_external_authzid(credentials.credentials.as_deref())
+                {
+                    Ok(authzid) => authzid,
+                    Err(err) => {
+                        session.clear();
+                        log_sasl_bind(
+                            request_context,
+                            external_dn.as_str(),
+                            "EXTERNAL",
+                            false,
+                            Some(&err),
+                        )
+                        .await;
+                        send_bind_response(
+                            socket,
+                            message_id,
+                            ResultCode::InvalidCredentials,
+                            &err,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+
+                if !plain_authzid_matches_authenticated_identity(
+                    authzid,
+                    &external_dn,
+                    &external_dn,
+                ) {
+                    session.clear();
+                    log_sasl_bind(
+                        request_context,
+                        external_dn.as_str(),
+                        "EXTERNAL",
+                        false,
+                        Some("proxy authorization is not supported"),
+                    )
+                    .await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::InappropriateAuthentication,
+                        "proxy authorization is not supported",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                match backend.get_entry(&external_dn).await {
+                    Ok(Some(_)) => {
+                        session.bind(external_dn.clone());
+                        record_authentication_success_metadata_with_context(
+                            request_context,
+                            backend,
+                            &external_dn,
+                        )
+                        .await;
+                        log_sasl_bind(request_context, &external_dn, "EXTERNAL", true, None).await;
+                        send_bind_success(socket, message_id).await?;
+                    }
+                    Ok(None) => {
+                        session.clear();
+                        record_authentication_failure_metadata_with_context(
+                            request_context,
+                            backend,
+                            &external_dn,
+                        )
+                        .await;
+                        log_sasl_bind(
+                            request_context,
+                            &external_dn,
+                            "EXTERNAL",
+                            false,
+                            Some("SASL EXTERNAL identity not found"),
+                        )
+                        .await;
+                        send_bind_response(
+                            socket,
+                            message_id,
+                            ResultCode::InvalidCredentials,
+                            "SASL EXTERNAL identity not found",
+                        )
+                        .await?;
+                    }
+                    Err(err) => {
+                        session.clear();
+                        error!(
+                            "Backend SASL EXTERNAL lookup error for {}: {}",
+                            external_dn, err
+                        );
+                        log_sasl_bind(
+                            request_context,
+                            &external_dn,
+                            "EXTERNAL",
+                            false,
+                            Some("backend failure"),
+                        )
+                        .await;
+                        send_bind_response(
+                            socket,
+                            message_id,
+                            ResultCode::Unavailable,
+                            "backend failure",
+                        )
+                        .await?;
+                    }
+                }
+                return Ok(());
+            }
+
             if !mechanism.eq_ignore_ascii_case("PLAIN") {
                 session.clear();
                 log_sasl_bind(
@@ -3185,7 +3444,7 @@ async fn handle_bind_request_with_session_and_context(
                     socket,
                     message_id,
                     ResultCode::AuthMethodNotSupported,
-                    "only SASL PLAIN is supported",
+                    "only SASL PLAIN and EXTERNAL are supported",
                 )
                 .await?;
                 return Ok(());
@@ -3275,7 +3534,11 @@ async fn handle_bind_request_with_session_and_context(
                 return Ok(());
             }
 
-            if !parsed.authzid.is_empty() && !parsed.authzid.eq_ignore_ascii_case(&bind_dn) {
+            if !plain_authzid_matches_authenticated_identity(
+                parsed.authzid,
+                parsed.authcid,
+                &bind_dn,
+            ) {
                 session.clear();
                 log_sasl_bind(
                     request_context,
@@ -3620,8 +3883,9 @@ async fn try_handle_virtual_search_request(
         let supported_control_oids =
             active_runtime_control_registry().root_dse_supported_control_oids();
         let supported_sasl_mechanisms =
-            crate::search_protocol::supported_legacy_sasl_mechanisms_for_context(
-                connection_is_secure,
+            crate::search_protocol::supported_legacy_sasl_mechanisms_for_effective_security(
+                &request_context.effective_security_context(connection_is_secure),
+                security_policy(request_context).sasl_mechanism_policy(),
             );
         let attributes = match crate::search_protocol::build_root_dse_attributes(
             backend,
@@ -9296,9 +9560,11 @@ mod tests {
                 access_control: None,
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
                 security_policy: LegacySecurityPolicy::default(),
+                sasl_external_identity_map: HashMap::new(),
             })),
             metrics: None,
             auth_metadata: None,
+            client_certificate_authz_dn: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -10436,9 +10702,11 @@ mod tests {
                 access_control: None,
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
                 security_policy: LegacySecurityPolicy::default(),
+                sasl_external_identity_map: HashMap::new(),
             })),
             metrics: None,
             auth_metadata: None,
+            client_certificate_authz_dn: Arc::new(RwLock::new(None)),
         };
 
         let mut session = ConnectionSession::default();
@@ -10482,6 +10750,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sasl_plain_bind_accepts_self_authorization_identity_form() {
+        let backend = MockBackend::from_credentials([(
+            String::from("cn=admin,dc=example,dc=org"),
+            b"secret".to_vec(),
+        )]);
+        let mut session = ConnectionSession::default();
+        let request = BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned("cn=admin,dc=example,dc=org".to_string())),
+            authentication: AuthenticationChoice::Sasl(SaslCredentials {
+                mechanism: LdapString(Cow::Owned("plain".to_string())),
+                credentials: Some(Cow::Owned(
+                    b"dn:CN=admin,DC=example,DC=org\0cn=admin,dc=example,dc=org\0secret".to_vec(),
+                )),
+            }),
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::default();
+        handle_bind_request_with_session_and_context(
+            &mut server_stream,
+            &backend,
+            4,
+            request,
+            &mut session,
+            &RequestContext::default(),
+            true,
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(session.bound_dn(), Some("cn=admin,dc=example,dc=org"));
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn compare_denial_returns_insufficient_access_and_audits_denial() {
         let backend = MockBackend::new();
         let temp_file = NamedTempFile::new().unwrap();
@@ -10496,9 +10809,11 @@ mod tests {
                 access_control: Some(Arc::new(AciEngine::restrictive())),
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
                 security_policy: LegacySecurityPolicy::default(),
+                sasl_external_identity_map: HashMap::new(),
             })),
             metrics: None,
             auth_metadata: None,
+            client_certificate_authz_dn: Arc::new(RwLock::new(None)),
         };
         let mut session = ConnectionSession::default();
         session.bind("cn=user,dc=example,dc=org".to_string());

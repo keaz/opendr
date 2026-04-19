@@ -22,7 +22,10 @@ use rasn_ldap::{
     ProtocolOp as RasnProtocolOp, SaslCredentials as RasnSaslCredentials,
     SearchRequest as RasnSearchRequest, SearchRequestDerefAliases, SearchRequestScope,
 };
-use rcgen::generate_simple_self_signed;
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, generate_simple_self_signed,
+};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use tempfile::TempDir;
@@ -41,6 +44,8 @@ struct TestBinaryServer {
     ldap_port: u16,
     ldaps_port: u16,
     cert_pem: String,
+    client_cert_pem: Option<String>,
+    client_key_pem: Option<String>,
 }
 
 struct TlsFixtureConfig<'a> {
@@ -50,6 +55,9 @@ struct TlsFixtureConfig<'a> {
     tls_enabled: bool,
     cert_pem: &'a str,
     key_pem: &'a str,
+    ca_pem: Option<&'a str>,
+    require_client_cert: bool,
+    sasl_external_identity_map: Option<(&'a str, &'a str)>,
     security_profile: Option<&'a str>,
 }
 
@@ -88,6 +96,42 @@ fn generate_test_certificate() -> (String, String) {
     (cert_pem, key_pem)
 }
 
+fn certificate_params_with_cn(common_name: &str) -> CertificateParams {
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    params
+}
+
+fn generate_mtls_certificates() -> (String, String, String, String, String) {
+    let mut ca_params = certificate_params_with_cn("OpenDR Test CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+    let server_key = KeyPair::generate().unwrap();
+    let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+    let client_key = KeyPair::generate().unwrap();
+    let mut client_params = certificate_params_with_cn("opendr-client");
+    client_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
+    let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
+
+    (
+        ca_cert.pem(),
+        server_cert.pem(),
+        server_key.serialize_pem(),
+        client_cert.pem(),
+        client_key.serialize_pem(),
+    )
+}
+
 fn write_tls_fixture(tempdir: &TempDir, fixture: &TlsFixtureConfig<'_>) {
     let config_dir = tempdir.path().join("config");
     let cert_dir = tempdir.path().join("certs");
@@ -99,6 +143,9 @@ fn write_tls_fixture(tempdir: &TempDir, fixture: &TlsFixtureConfig<'_>) {
 
     fs::write(cert_dir.join("server.crt"), fixture.cert_pem).unwrap();
     fs::write(cert_dir.join("server.key"), fixture.key_pem).unwrap();
+    if let Some(ca_pem) = fixture.ca_pem {
+        fs::write(cert_dir.join("ca.crt"), ca_pem).unwrap();
+    }
 
     let production_profile = fixture
         .security_profile
@@ -111,7 +158,7 @@ fn write_tls_fixture(tempdir: &TempDir, fixture: &TlsFixtureConfig<'_>) {
         format!(r#"root_password = "{DEFAULT_TEST_ROOT_PASSWORD}""#)
     };
 
-    let security_toml = fixture
+    let mut security_toml = fixture
         .security_profile
         .map(|profile| {
             format!(
@@ -122,6 +169,15 @@ profile = "{profile}"
             )
         })
         .unwrap_or_default();
+    if let Some((certificate_cn, mapped_dn)) = fixture.sasl_external_identity_map {
+        if security_toml.is_empty() {
+            security_toml.push_str("\n[security]\n");
+        }
+        security_toml.push_str("allow_sasl_external = true\n");
+        security_toml.push_str(&format!(
+            "sasl_external_identity_map = {{ \"{certificate_cn}\" = \"{mapped_dn}\" }}\n"
+        ));
+    }
 
     let server_toml = format!(
         r#"
@@ -142,7 +198,8 @@ data_directory = "./data"
 enabled = {tls_enabled}
 cert_file = "certs/server.crt"
 key_file = "certs/server.key"
-require_client_cert = false
+{ca_file}
+require_client_cert = {require_client_cert}
 min_tls_version = "1.2"
 {security_toml}
 
@@ -159,6 +216,11 @@ enabled = false
         ldap_port = fixture.ldap_port,
         ldaps_port = fixture.ldaps_port,
         tls_enabled = fixture.tls_enabled,
+        ca_file = fixture
+            .ca_pem
+            .map(|_| r#"ca_file = "certs/ca.crt""#)
+            .unwrap_or(""),
+        require_client_cert = fixture.require_client_cert,
         root_password_toml = root_password_toml,
         security_toml = security_toml,
     );
@@ -181,6 +243,8 @@ fn spawn_opendr(
     ldap_port: u16,
     ldaps_port: u16,
     cert_pem: String,
+    client_cert_pem: Option<String>,
+    client_key_pem: Option<String>,
 ) -> TestBinaryServer {
     let child = Command::new(opendr_binary())
         .current_dir(tempdir.path())
@@ -195,6 +259,8 @@ fn spawn_opendr(
         ldap_port,
         ldaps_port,
         cert_pem,
+        client_cert_pem,
+        client_key_pem,
     }
 }
 
@@ -212,10 +278,13 @@ fn tls_runtime_fixture(runtime: &str, tls_enabled: bool) -> TestBinaryServer {
             tls_enabled,
             cert_pem: &cert_pem,
             key_pem: &key_pem,
+            ca_pem: None,
+            require_client_cert: false,
+            sasl_external_identity_map: None,
             security_profile: None,
         },
     );
-    spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem)
+    spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem, None, None)
 }
 
 fn tls_runtime_fixture_with_security_profile(runtime: &str, profile: &str) -> TestBinaryServer {
@@ -232,10 +301,44 @@ fn tls_runtime_fixture_with_security_profile(runtime: &str, profile: &str) -> Te
             tls_enabled: true,
             cert_pem: &cert_pem,
             key_pem: &key_pem,
+            ca_pem: None,
+            require_client_cert: false,
+            sasl_external_identity_map: None,
             security_profile: Some(profile),
         },
     );
-    spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem)
+    spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem, None, None)
+}
+
+fn mtls_runtime_fixture(runtime: &str) -> TestBinaryServer {
+    let tempdir = tempfile::tempdir().unwrap();
+    let ldap_port = reserve_port();
+    let ldaps_port = reserve_port();
+    let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
+        generate_mtls_certificates();
+    write_tls_fixture(
+        &tempdir,
+        &TlsFixtureConfig {
+            runtime,
+            ldap_port,
+            ldaps_port,
+            tls_enabled: true,
+            cert_pem: &server_cert_pem,
+            key_pem: &server_key_pem,
+            ca_pem: Some(&ca_pem),
+            require_client_cert: true,
+            sasl_external_identity_map: Some(("opendr-client", "cn=admin,dc=example,dc=org")),
+            security_profile: None,
+        },
+    );
+    spawn_opendr(
+        tempdir,
+        ldap_port,
+        ldaps_port,
+        ca_pem,
+        Some(client_cert_pem),
+        Some(client_key_pem),
+    )
 }
 
 async fn connect_with_retry(port: u16) -> TcpStream {
@@ -332,6 +435,30 @@ where
         RasnAuthChoice::Sasl(RasnSaslCredentials::new(
             b"PLAIN".to_vec().into(),
             Some(credentials.into()),
+        )),
+    );
+    let bind_message =
+        rasn_ldap::LdapMessage::new(message_id, rasn_ldap::ProtocolOp::BindRequest(bind_request));
+    let bind_message = der::encode(&bind_message).unwrap();
+
+    stream.write_all(&bind_message).await.unwrap();
+    read_response_bytes(stream).await
+}
+
+async fn send_sasl_external_bind_request<S>(
+    stream: &mut S,
+    message_id: u32,
+    authzid: Option<&str>,
+) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let bind_request = RasnBindRequest::new(
+        3,
+        Vec::<u8>::new().into(),
+        RasnAuthChoice::Sasl(RasnSaslCredentials::new(
+            b"EXTERNAL".to_vec().into(),
+            authzid.map(|authzid| authzid.as_bytes().to_vec().into()),
         )),
     );
     let bind_message =
@@ -524,6 +651,28 @@ fn assert_root_dse_capabilities(response: &[u8], secure_connection: bool, expect
     }
 }
 
+fn assert_root_dse_sasl_mechanisms(response: &[u8], expected: &[&str]) {
+    let (_, messages) = parse_ldap_messages(response).unwrap();
+    let attributes = messages
+        .iter()
+        .find_map(|message| match &message.protocol_op {
+            ProtocolOp::SearchResultEntry(entry) => Some(search_entry_attribute_map(entry)),
+            _ => None,
+        })
+        .expect("Root DSE search entry");
+    let mut actual = attributes
+        .get("supportedSASLMechanisms")
+        .cloned()
+        .unwrap_or_default();
+    actual.sort();
+    let mut expected = expected
+        .iter()
+        .map(|mechanism| mechanism.to_string())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
 async fn assert_root_dse_transport_capabilities(runtime: &str) {
     let server = tls_runtime_fixture(runtime, true);
 
@@ -586,6 +735,35 @@ fn trusted_tls_connector(cert_pem: &str) -> TlsConnector {
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
+}
+
+fn trusted_tls_connector_with_client_cert(
+    ca_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+) -> TlsConnector {
+    let mut roots = RootCertStore::empty();
+    let mut ca_reader = Cursor::new(ca_pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut ca_reader) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+
+    let mut cert_reader = Cursor::new(client_cert_pem.as_bytes());
+    let client_certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut key_reader = Cursor::new(client_key_pem.as_bytes());
+    let client_key = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+        .next()
+        .unwrap()
+        .unwrap()
+        .into();
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_certs, client_key)
+        .unwrap();
     TlsConnector::from(Arc::new(config))
 }
 
@@ -768,6 +946,69 @@ async fn fsm_ldaps_accepts_sasl_plain_and_whoami_returns_bound_dn() {
     assert_bind_success(&bind_response);
 
     let whoami_response = send_whoami_request(&mut tls_stream, 2).await;
+    assert_whoami_bound_admin(&whoami_response);
+}
+
+async fn assert_ldaps_sasl_external_with_client_certificate(runtime: &str) {
+    let server = mtls_runtime_fixture(runtime);
+    let stream = connect_with_retry(server.ldaps_port).await;
+    let connector = trusted_tls_connector_with_client_cert(
+        &server.cert_pem,
+        server.client_cert_pem.as_ref().unwrap(),
+        server.client_key_pem.as_ref().unwrap(),
+    );
+    let mut tls_stream = connector
+        .connect(localhost_server_name(), stream)
+        .await
+        .expect("LDAPS mTLS handshake should succeed");
+
+    let root_dse_response = send_root_dse_search_request(&mut tls_stream, 1).await;
+    assert_root_dse_sasl_mechanisms(&root_dse_response, &["PLAIN", "EXTERNAL"]);
+
+    let bind_response = send_sasl_external_bind_request(&mut tls_stream, 2, None).await;
+    assert_bind_success(&bind_response);
+
+    let whoami_response = send_whoami_request(&mut tls_stream, 3).await;
+    assert_whoami_bound_admin(&whoami_response);
+}
+
+#[tokio::test]
+async fn legacy_ldaps_accepts_sasl_external_with_client_certificate() {
+    assert_ldaps_sasl_external_with_client_certificate("legacy").await;
+}
+
+#[tokio::test]
+async fn fsm_ldaps_accepts_sasl_external_with_client_certificate() {
+    assert_ldaps_sasl_external_with_client_certificate("fsm").await;
+}
+
+#[tokio::test]
+async fn fsm_starttls_accepts_sasl_external_with_client_certificate_authzid() {
+    let server = mtls_runtime_fixture("fsm");
+
+    let mut stream = connect_with_retry(server.ldap_port).await;
+    let starttls_response = send_starttls_request(&mut stream, 1).await;
+    assert_starttls_success(&starttls_response);
+
+    let connector = trusted_tls_connector_with_client_cert(
+        &server.cert_pem,
+        server.client_cert_pem.as_ref().unwrap(),
+        server.client_key_pem.as_ref().unwrap(),
+    );
+    let mut tls_stream = connector
+        .connect(localhost_server_name(), stream)
+        .await
+        .expect("StartTLS mTLS upgrade should complete with client certificate");
+
+    let root_dse_response = send_root_dse_search_request(&mut tls_stream, 2).await;
+    assert_root_dse_sasl_mechanisms(&root_dse_response, &["PLAIN", "EXTERNAL"]);
+
+    let bind_response =
+        send_sasl_external_bind_request(&mut tls_stream, 3, Some("dn:CN=admin,DC=example,DC=org"))
+            .await;
+    assert_bind_success(&bind_response);
+
+    let whoami_response = send_whoami_request(&mut tls_stream, 4).await;
     assert_whoami_bound_admin(&whoami_response);
 }
 

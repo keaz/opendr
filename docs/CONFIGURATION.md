@@ -152,8 +152,10 @@ profile = "development"
 allow_anonymous_bind = true
 allow_cleartext_simple_bind = true
 allow_sasl_plain = true
+allow_sasl_external = true
 allow_password_modify = true
 root_dse_requires_authentication = false
+sasl_external_identity_map = { "opendr-client" = "cn=admin,dc=example,dc=org" }
 ```
 
 | Key | Default | Notes |
@@ -162,8 +164,10 @@ root_dse_requires_authentication = false
 | `allow_anonymous_bind` | profile default | Production default is `false` |
 | `allow_cleartext_simple_bind` | profile default | Production default is `false`; rejected binds return `confidentialityRequired` |
 | `allow_sasl_plain` | profile default | Still requires LDAPS or StartTLS |
+| `allow_sasl_external` | profile default | Still requires LDAPS or StartTLS plus a verified client certificate |
 | `allow_password_modify` | profile default | Password Modify still requires confidentiality when enabled |
 | `root_dse_requires_authentication` | profile default | Controls anonymous Root DSE visibility |
+| `sasl_external_identity_map` | empty | Maps client certificate subject common names to LDAP DNs for SASL EXTERNAL |
 
 See [PRODUCTION_SECURITY_PROFILE.md](PRODUCTION_SECURITY_PROFILE.md) for the
 RFC 4513 production checklist.

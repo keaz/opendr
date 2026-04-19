@@ -92,9 +92,10 @@ so keep that default if you switch runtime.
 
 Current runtime caveats:
 
-- FSM bind supports simple bind, anonymous bind, and SASL PLAIN over
-  confidential transport.
-- SASL DIGEST-MD5 and CRAM-MD5 are not production-enabled.
+- FSM bind supports simple bind, anonymous bind, SASL PLAIN over confidential
+  transport, and SASL EXTERNAL over verified mutual TLS.
+- SASL DIGEST-MD5, CRAM-MD5, SCRAM, and other multi-step mechanisms are not
+  production-enabled.
 - Runtime authentication gates are centralized in the RFC 4513
   [production security profile](PRODUCTION_SECURITY_PROFILE.md).
 - Both runtimes share backend, TLS, metrics, audit, and many protocol helper
@@ -318,7 +319,8 @@ Troubleshooting TLS:
 
 FSM runtime supports:
 
-- LDAPv3 simple bind, anonymous bind, and SASL PLAIN over LDAPS or StartTLS
+- LDAPv3 simple bind, anonymous bind, SASL PLAIN over LDAPS or StartTLS, and
+  SASL EXTERNAL over verified mutual TLS
 - search
 - add, modify, delete, ModifyDN
 - compare
@@ -700,8 +702,9 @@ Bind fails:
 - Confirm the bind DN includes the base DN if needed, for example
   `cn=manager,dc=example,dc=com`.
 - After StartTLS, bind again because the auth state is reset.
-- SASL PLAIN requires LDAPS or StartTLS. Other SASL mechanisms are not
-  production-enabled.
+- SASL PLAIN requires LDAPS or StartTLS. SASL EXTERNAL requires LDAPS or
+  StartTLS plus a verified client certificate that maps to an LDAP DN. Other
+  SASL mechanisms are not production-enabled.
 
 Search fails:
 

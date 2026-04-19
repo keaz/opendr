@@ -1,5 +1,9 @@
 use crate::backend::{BackendError, DirectoryBackend};
 use crate::schema::LdapSchema;
+use crate::security_layer::{
+    EffectiveSecurityContext, SaslMechanismPolicy,
+    supported_sasl_mechanisms as supported_sasl_mechanisms_for_effective_context,
+};
 
 const START_TLS_OID: &str = "1.3.6.1.4.1.1466.20037";
 const CANCEL_OID: &str = "1.3.6.1.1.8";
@@ -204,12 +208,25 @@ pub fn supported_fsm_sasl_mechanisms_for_context(connection_is_secure: bool) -> 
     supported_sasl_mechanisms_for_context(connection_is_secure)
 }
 
+pub fn supported_legacy_sasl_mechanisms_for_effective_security(
+    context: &EffectiveSecurityContext,
+    policy: SaslMechanismPolicy,
+) -> Vec<String> {
+    supported_sasl_mechanisms_for_effective_context(context, policy)
+}
+
+pub fn supported_fsm_sasl_mechanisms_for_effective_security(
+    context: &EffectiveSecurityContext,
+    policy: SaslMechanismPolicy,
+) -> Vec<String> {
+    supported_sasl_mechanisms_for_effective_context(context, policy)
+}
+
 fn supported_sasl_mechanisms_for_context(connection_is_secure: bool) -> Vec<String> {
-    if connection_is_secure {
-        vec!["PLAIN".to_string()]
-    } else {
-        Vec::new()
-    }
+    supported_sasl_mechanisms_for_effective_context(
+        &EffectiveSecurityContext::new(connection_is_secure, None),
+        SaslMechanismPolicy::default(),
+    )
 }
 
 #[cfg(test)]
