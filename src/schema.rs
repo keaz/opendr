@@ -5673,10 +5673,14 @@ struct X509AlgorithmIdentifierKey {
 struct X509CertificateAssertion {
     serial_number: Option<String>,
     issuer: Option<String>,
+    subject_key_identifier: Option<String>,
+    authority_key_identifier: Option<X509AuthorityKeyIdentifierAssertion>,
     subject: Option<String>,
     certificate_valid: Option<String>,
     subject_public_key_alg_id: Option<String>,
     key_usage_flags: Option<u16>,
+    subject_alt_name: Option<X509AltNameTypeAssertion>,
+    policy_oids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -5684,13 +5688,44 @@ struct X509CertificateListAssertion {
     issuer: Option<String>,
     min_crl_number: Option<String>,
     max_crl_number: Option<String>,
+    reason_flags: Option<u16>,
     date_and_time: Option<String>,
+    distribution_point: Option<X509DistributionPointNameAssertion>,
+    authority_key_identifier: Option<X509AuthorityKeyIdentifierAssertion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct X509CertificatePairAssertion {
     issued_to_this_ca: Option<X509CertificateAssertion>,
     issued_by_this_ca: Option<X509CertificateAssertion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct X509AuthorityKeyIdentifierAssertion {
+    key_identifier: Option<String>,
+    authority_cert_issuer: Option<Vec<X509GeneralNameAssertion>>,
+    authority_cert_serial_number: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct X509AltNameTypeAssertion {
+    builtin_name_form: Option<String>,
+    other_name_form: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct X509DistributionPointNameAssertion {
+    full_name: Option<Vec<X509GeneralNameAssertion>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+enum X509GeneralNameAssertion {
+    Rfc822Name(String),
+    DnsName(String),
+    DirectoryName(String),
+    UniformResourceIdentifier(String),
+    IpAddress(String),
+    RegisteredId(String),
 }
 
 fn normalize_x509_certificate_exact_match_value(value: &str) -> Result<String, String> {
@@ -5825,6 +5860,70 @@ fn x509_certificate_list_value_matches(
         }
     }
 
+    if let Some(asserted_reason_flags) = assertion.reason_flags {
+        let Some(issuing_distribution_point) =
+            certificate_list.extensions().iter().find_map(|extension| {
+                match extension.parsed_extension() {
+                    x509_parser::extensions::ParsedExtension::IssuingDistributionPoint(value) => {
+                        Some(value)
+                    }
+                    _ => None,
+                }
+            })
+        else {
+            return Ok(false);
+        };
+        let Some(reasons) = issuing_distribution_point.only_some_reasons.as_ref() else {
+            return Ok(false);
+        };
+        if reasons.flags & asserted_reason_flags != asserted_reason_flags {
+            return Ok(false);
+        }
+    }
+
+    if let Some(asserted_distribution_point) = assertion.distribution_point.as_ref() {
+        let Some(issuing_distribution_point) =
+            certificate_list.extensions().iter().find_map(|extension| {
+                match extension.parsed_extension() {
+                    x509_parser::extensions::ParsedExtension::IssuingDistributionPoint(value) => {
+                        Some(value)
+                    }
+                    _ => None,
+                }
+            })
+        else {
+            return Ok(false);
+        };
+        let Some(distribution_point) = issuing_distribution_point.distribution_point.as_ref()
+        else {
+            return Ok(false);
+        };
+        if !distribution_point_name_matches(distribution_point, asserted_distribution_point)? {
+            return Ok(false);
+        }
+    }
+
+    if let Some(asserted_authority_key_identifier) = assertion.authority_key_identifier.as_ref() {
+        let Some(authority_key_identifier) =
+            certificate_list.extensions().iter().find_map(|extension| {
+                match extension.parsed_extension() {
+                    x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(value) => {
+                        Some(value)
+                    }
+                    _ => None,
+                }
+            })
+        else {
+            return Ok(false);
+        };
+        if !authority_key_identifier_matches(
+            authority_key_identifier,
+            asserted_authority_key_identifier,
+        )? {
+            return Ok(false);
+        }
+    }
+
     Ok(true)
 }
 
@@ -5879,6 +5978,41 @@ fn x509_certificate_der_matches_assertion(
     {
         return Ok(false);
     }
+    if let Some(asserted_subject_key_identifier) = assertion.subject_key_identifier.as_ref() {
+        let subject_key_identifier = certificate.iter_extensions().find_map(|extension| {
+            match extension.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(value) => {
+                    Some(value)
+                }
+                _ => None,
+            }
+        });
+        let Some(subject_key_identifier) = subject_key_identifier else {
+            return Ok(false);
+        };
+        if normalize_hex_bytes(subject_key_identifier.0) != *asserted_subject_key_identifier {
+            return Ok(false);
+        }
+    }
+    if let Some(asserted_authority_key_identifier) = assertion.authority_key_identifier.as_ref() {
+        let authority_key_identifier = certificate.iter_extensions().find_map(|extension| {
+            match extension.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(value) => {
+                    Some(value)
+                }
+                _ => None,
+            }
+        });
+        let Some(authority_key_identifier) = authority_key_identifier else {
+            return Ok(false);
+        };
+        if !authority_key_identifier_matches(
+            authority_key_identifier,
+            asserted_authority_key_identifier,
+        )? {
+            return Ok(false);
+        }
+    }
     if let Some(asserted_subject) = assertion.subject.as_ref()
         && normalize_x509_name(certificate.subject())? != *asserted_subject
     {
@@ -5915,8 +6049,191 @@ fn x509_certificate_der_matches_assertion(
             return Ok(false);
         }
     }
+    if let Some(asserted_subject_alt_name) = assertion.subject_alt_name.as_ref() {
+        let subject_alt_name = certificate
+            .subject_alternative_name()
+            .map_err(|err| {
+                format!("certificate subjectAltName extension could not be read: {err}")
+            })?
+            .map(|extension| extension.value);
+        let Some(subject_alt_name) = subject_alt_name else {
+            return Ok(false);
+        };
+        if !subject_alt_name
+            .general_names
+            .iter()
+            .any(|name| subject_alt_name_type_matches(name, asserted_subject_alt_name))
+        {
+            return Ok(false);
+        }
+    }
+    if let Some(asserted_policy_oids) = assertion.policy_oids.as_ref() {
+        let certificate_policies = certificate.iter_extensions().find_map(|extension| {
+            match extension.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::CertificatePolicies(value) => Some(value),
+                _ => None,
+            }
+        });
+        let Some(certificate_policies) = certificate_policies else {
+            return Ok(false);
+        };
+        let candidate_oids = certificate_policies
+            .iter()
+            .map(|policy| policy.policy_id.to_id_string())
+            .collect::<HashSet<_>>();
+        if asserted_policy_oids
+            .iter()
+            .any(|policy_oid| !candidate_oids.contains(policy_oid))
+        {
+            return Ok(false);
+        }
+    }
 
     Ok(true)
+}
+
+fn authority_key_identifier_matches(
+    candidate: &x509_parser::extensions::AuthorityKeyIdentifier<'_>,
+    assertion: &X509AuthorityKeyIdentifierAssertion,
+) -> Result<bool, String> {
+    if let Some(asserted_key_identifier) = assertion.key_identifier.as_ref() {
+        let Some(key_identifier) = candidate.key_identifier.as_ref() else {
+            return Ok(false);
+        };
+        if normalize_hex_bytes(key_identifier.0) != *asserted_key_identifier {
+            return Ok(false);
+        }
+    }
+
+    if let Some(asserted_issuer_names) = assertion.authority_cert_issuer.as_ref() {
+        let Some(candidate_issuer_names) = candidate.authority_cert_issuer.as_ref() else {
+            return Ok(false);
+        };
+        for asserted_name in asserted_issuer_names {
+            if !candidate_issuer_names
+                .iter()
+                .any(|candidate_name| general_name_matches(candidate_name, asserted_name))
+            {
+                return Ok(false);
+            }
+        }
+    }
+
+    if let Some(asserted_serial) = assertion.authority_cert_serial_number.as_ref() {
+        let Some(candidate_serial) = candidate.authority_cert_serial.as_ref() else {
+            return Ok(false);
+        };
+        if normalize_unsigned_decimal_integer(&der_unsigned_integer_decimal(candidate_serial)?)?
+            != *asserted_serial
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn subject_alt_name_type_matches(
+    candidate: &x509_parser::extensions::GeneralName<'_>,
+    assertion: &X509AltNameTypeAssertion,
+) -> bool {
+    if let Some(builtin_name_form) = assertion.builtin_name_form.as_deref() {
+        return matches!(
+            (builtin_name_form, candidate),
+            (
+                "rfc822Name",
+                x509_parser::extensions::GeneralName::RFC822Name(_)
+            ) | ("dNSName", x509_parser::extensions::GeneralName::DNSName(_))
+                | (
+                    "x400Address",
+                    x509_parser::extensions::GeneralName::X400Address(_)
+                )
+                | (
+                    "directoryName",
+                    x509_parser::extensions::GeneralName::DirectoryName(_)
+                )
+                | (
+                    "ediPartyName",
+                    x509_parser::extensions::GeneralName::EDIPartyName(_)
+                )
+                | (
+                    "uniformResourceIdentifier",
+                    x509_parser::extensions::GeneralName::URI(_)
+                )
+                | (
+                    "iPAddress",
+                    x509_parser::extensions::GeneralName::IPAddress(_)
+                )
+                | (
+                    "registeredId",
+                    x509_parser::extensions::GeneralName::RegisteredID(_)
+                )
+        );
+    }
+
+    if let Some(other_name_form) = assertion.other_name_form.as_deref() {
+        return matches!(
+            candidate,
+            x509_parser::extensions::GeneralName::OtherName(oid, _)
+                if oid.to_id_string() == other_name_form
+        );
+    }
+
+    false
+}
+
+fn distribution_point_name_matches(
+    candidate: &x509_parser::extensions::DistributionPointName<'_>,
+    assertion: &X509DistributionPointNameAssertion,
+) -> Result<bool, String> {
+    if let Some(asserted_names) = assertion.full_name.as_ref() {
+        let x509_parser::extensions::DistributionPointName::FullName(candidate_names) = candidate
+        else {
+            return Ok(false);
+        };
+        for asserted_name in asserted_names {
+            if !candidate_names
+                .iter()
+                .any(|candidate_name| general_name_matches(candidate_name, asserted_name))
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn general_name_matches(
+    candidate: &x509_parser::extensions::GeneralName<'_>,
+    assertion: &X509GeneralNameAssertion,
+) -> bool {
+    match (candidate, assertion) {
+        (
+            x509_parser::extensions::GeneralName::RFC822Name(candidate),
+            X509GeneralNameAssertion::Rfc822Name(asserted),
+        ) => *candidate == asserted,
+        (
+            x509_parser::extensions::GeneralName::DNSName(candidate),
+            X509GeneralNameAssertion::DnsName(asserted),
+        ) => candidate.eq_ignore_ascii_case(asserted),
+        (
+            x509_parser::extensions::GeneralName::DirectoryName(candidate),
+            X509GeneralNameAssertion::DirectoryName(asserted),
+        ) => normalize_x509_name(candidate).as_deref() == Ok(asserted.as_str()),
+        (
+            x509_parser::extensions::GeneralName::URI(candidate),
+            X509GeneralNameAssertion::UniformResourceIdentifier(asserted),
+        ) => *candidate == asserted,
+        (
+            x509_parser::extensions::GeneralName::IPAddress(candidate),
+            X509GeneralNameAssertion::IpAddress(asserted),
+        ) => normalize_hex_bytes(candidate) == *asserted,
+        (
+            x509_parser::extensions::GeneralName::RegisteredID(candidate),
+            X509GeneralNameAssertion::RegisteredId(asserted),
+        ) => candidate.to_id_string() == *asserted,
+        _ => false,
+    }
 }
 
 fn certificate_exact_key_from_der(value: &[u8]) -> Result<X509CertificateExactKey, String> {
@@ -6171,10 +6488,14 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
     let mut assertion = X509CertificateAssertion {
         serial_number: None,
         issuer: None,
+        subject_key_identifier: None,
+        authority_key_identifier: None,
         subject: None,
         certificate_valid: None,
         subject_public_key_alg_id: None,
         key_usage_flags: None,
+        subject_alt_name: None,
+        policy_oids: None,
     };
 
     for (keyword, rest) in components {
@@ -6184,6 +6505,13 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
             }
             "issuer" if assertion.issuer.is_none() => {
                 assertion.issuer = Some(parse_rfc4523_name(rest)?);
+            }
+            "subjectKeyIdentifier" if assertion.subject_key_identifier.is_none() => {
+                assertion.subject_key_identifier = Some(parse_octet_string_hex(rest)?);
+            }
+            "authorityKeyIdentifier" if assertion.authority_key_identifier.is_none() => {
+                assertion.authority_key_identifier =
+                    Some(parse_authority_key_identifier_assertion(rest)?);
             }
             "subject" if assertion.subject.is_none() => {
                 assertion.subject = Some(parse_rfc4523_name(rest)?);
@@ -6198,23 +6526,27 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
             "keyUsage" if assertion.key_usage_flags.is_none() => {
                 assertion.key_usage_flags = Some(parse_key_usage_flags(rest)?);
             }
+            "subjectAltName" if assertion.subject_alt_name.is_none() => {
+                assertion.subject_alt_name = Some(parse_alt_name_type_assertion(rest)?);
+            }
+            "policy" if assertion.policy_oids.is_none() => {
+                assertion.policy_oids = Some(parse_cert_policy_set(rest)?);
+            }
             "serialNumber"
             | "issuer"
+            | "subjectKeyIdentifier"
+            | "authorityKeyIdentifier"
             | "subject"
             | "certificateValid"
             | "subjectPublicKeyAlgID"
-            | "keyUsage" => {
+            | "keyUsage"
+            | "subjectAltName"
+            | "policy" => {
                 return Err(format!(
                     "duplicate CertificateAssertion component {keyword}"
                 ));
             }
-            "subjectKeyIdentifier"
-            | "authorityKeyIdentifier"
-            | "privateKeyValid"
-            | "subjectAltName"
-            | "policy"
-            | "pathToName"
-            | "nameConstraints" => {
+            "privateKeyValid" | "pathToName" | "nameConstraints" => {
                 return Err(format!(
                     "unsupported CertificateAssertion component {keyword}"
                 ));
@@ -6234,7 +6566,10 @@ fn parse_certificate_list_assertion(value: &str) -> Result<X509CertificateListAs
         issuer: None,
         min_crl_number: None,
         max_crl_number: None,
+        reason_flags: None,
         date_and_time: None,
+        distribution_point: None,
+        authority_key_identifier: None,
     };
 
     for (keyword, rest) in components {
@@ -6248,17 +6583,28 @@ fn parse_certificate_list_assertion(value: &str) -> Result<X509CertificateListAs
             "maxCRLNumber" if assertion.max_crl_number.is_none() => {
                 assertion.max_crl_number = Some(normalize_unsigned_decimal_integer(rest)?);
             }
+            "reasonFlags" if assertion.reason_flags.is_none() => {
+                assertion.reason_flags = Some(parse_reason_flags(rest)?);
+            }
             "dateAndTime" if assertion.date_and_time.is_none() => {
                 assertion.date_and_time = Some(parse_rfc4523_time(rest)?);
             }
-            "issuer" | "minCRLNumber" | "maxCRLNumber" | "dateAndTime" => {
+            "distributionPoint" if assertion.distribution_point.is_none() => {
+                assertion.distribution_point = Some(parse_distribution_point_name(rest)?);
+            }
+            "authorityKeyIdentifier" if assertion.authority_key_identifier.is_none() => {
+                assertion.authority_key_identifier =
+                    Some(parse_authority_key_identifier_assertion(rest)?);
+            }
+            "issuer"
+            | "minCRLNumber"
+            | "maxCRLNumber"
+            | "reasonFlags"
+            | "dateAndTime"
+            | "distributionPoint"
+            | "authorityKeyIdentifier" => {
                 return Err(format!(
                     "duplicate CertificateListAssertion component {keyword}"
-                ));
-            }
-            "reasonFlags" | "distributionPoint" | "authorityKeyIdentifier" => {
-                return Err(format!(
-                    "unsupported CertificateListAssertion component {keyword}"
                 ));
             }
             other => {
@@ -6428,12 +6774,198 @@ fn parse_algorithm_identifier_parameters(value: &str) -> Result<String, String> 
     }
 }
 
+fn parse_authority_key_identifier_assertion(
+    value: &str,
+) -> Result<X509AuthorityKeyIdentifierAssertion, String> {
+    let components = parse_gser_sequence_fields(value, "AuthorityKeyIdentifier")?;
+    let mut assertion = X509AuthorityKeyIdentifierAssertion {
+        key_identifier: None,
+        authority_cert_issuer: None,
+        authority_cert_serial_number: None,
+    };
+
+    for (keyword, rest) in components {
+        match keyword {
+            "keyIdentifier" if assertion.key_identifier.is_none() => {
+                assertion.key_identifier = Some(parse_octet_string_hex(rest)?);
+            }
+            "authorityCertIssuer" if assertion.authority_cert_issuer.is_none() => {
+                assertion.authority_cert_issuer = Some(parse_general_names(rest)?);
+            }
+            "authorityCertSerialNumber" if assertion.authority_cert_serial_number.is_none() => {
+                assertion.authority_cert_serial_number =
+                    Some(normalize_unsigned_decimal_integer(rest)?);
+            }
+            "keyIdentifier" | "authorityCertIssuer" | "authorityCertSerialNumber" => {
+                return Err(format!(
+                    "duplicate AuthorityKeyIdentifier component {keyword}"
+                ));
+            }
+            other => {
+                return Err(format!("unknown AuthorityKeyIdentifier component {other}"));
+            }
+        }
+    }
+
+    if assertion.key_identifier.is_none()
+        && assertion.authority_cert_issuer.is_none()
+        && assertion.authority_cert_serial_number.is_none()
+    {
+        return Err(
+            "AuthorityKeyIdentifier requires keyIdentifier, authorityCertIssuer, or authorityCertSerialNumber"
+                .to_string(),
+        );
+    }
+
+    Ok(assertion)
+}
+
+fn parse_alt_name_type_assertion(value: &str) -> Result<X509AltNameTypeAssertion, String> {
+    let value = value.trim();
+    if let Some(name_form) = value.strip_prefix("builtinNameForm:") {
+        let name_form = name_form.trim();
+        if is_supported_builtin_name_form(name_form) {
+            return Ok(X509AltNameTypeAssertion {
+                builtin_name_form: Some(name_form.to_string()),
+                other_name_form: None,
+            });
+        }
+        return Err(format!("unknown builtinNameForm {name_form}"));
+    }
+    if let Some(oid) = value.strip_prefix("otherNameForm:") {
+        return Ok(X509AltNameTypeAssertion {
+            builtin_name_form: None,
+            other_name_form: Some(parse_object_identifier_component(oid)?),
+        });
+    }
+    Err("AltNameType must use builtinNameForm:<name> or otherNameForm:<OID>".to_string())
+}
+
+fn is_supported_builtin_name_form(value: &str) -> bool {
+    matches!(
+        value,
+        "rfc822Name"
+            | "dNSName"
+            | "x400Address"
+            | "directoryName"
+            | "ediPartyName"
+            | "uniformResourceIdentifier"
+            | "iPAddress"
+            | "registeredId"
+    )
+}
+
+fn parse_cert_policy_set(value: &str) -> Result<Vec<String>, String> {
+    let inner = braced_inner(value, "CertPolicySet")?;
+    let policies = split_gser_components(inner)?;
+    if policies.is_empty() {
+        return Err("CertPolicySet must contain at least one policy OID".to_string());
+    }
+    let mut normalized = Vec::with_capacity(policies.len());
+    for policy in policies {
+        let policy = parse_object_identifier_component(policy)?;
+        if normalized.contains(&policy) {
+            return Err(format!("duplicate CertPolicyId {policy}"));
+        }
+        normalized.push(policy);
+    }
+    Ok(normalized)
+}
+
+fn parse_distribution_point_name(
+    value: &str,
+) -> Result<X509DistributionPointNameAssertion, String> {
+    let value = value.trim();
+    let Some(general_names) = value.strip_prefix("fullName:") else {
+        return Err(
+            "only distributionPoint fullName:<GeneralNames> is currently supported".to_string(),
+        );
+    };
+    Ok(X509DistributionPointNameAssertion {
+        full_name: Some(parse_general_names(general_names.trim())?),
+    })
+}
+
+fn parse_general_names(value: &str) -> Result<Vec<X509GeneralNameAssertion>, String> {
+    let inner = braced_inner(value, "GeneralNames")?;
+    let names = split_gser_components(inner)?;
+    if names.is_empty() {
+        return Err("GeneralNames must contain at least one GeneralName".to_string());
+    }
+    names
+        .into_iter()
+        .map(parse_general_name)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn parse_general_name(value: &str) -> Result<X509GeneralNameAssertion, String> {
+    let Some((kind, rest)) = value.trim().split_once(':') else {
+        return Err("GeneralName must use <nameForm>:<value>".to_string());
+    };
+    let rest = rest.trim();
+    match kind.trim() {
+        "rfc822Name" => Ok(X509GeneralNameAssertion::Rfc822Name(
+            unquote_gser_dquote_string(rest)?,
+        )),
+        "dNSName" => Ok(X509GeneralNameAssertion::DnsName(
+            unquote_gser_dquote_string(rest)?,
+        )),
+        "directoryName" => Ok(X509GeneralNameAssertion::DirectoryName(parse_rfc4523_name(
+            rest,
+        )?)),
+        "uniformResourceIdentifier" => Ok(X509GeneralNameAssertion::UniformResourceIdentifier(
+            unquote_gser_dquote_string(rest)?,
+        )),
+        "iPAddress" => Ok(X509GeneralNameAssertion::IpAddress(parse_octet_string_hex(
+            rest,
+        )?)),
+        "registeredID" => Ok(X509GeneralNameAssertion::RegisteredId(
+            parse_object_identifier_component(rest)?,
+        )),
+        "otherName" | "x400Address" | "ediPartyName" => {
+            Err(format!("unsupported GeneralName form {kind}"))
+        }
+        other => Err(format!("unknown GeneralName form {other}")),
+    }
+}
+
 fn parse_object_identifier_component(value: &str) -> Result<String, String> {
     let oid = value.trim();
     if is_valid_numeric_oid(oid) {
         Ok(oid.to_string())
     } else {
         Err("object identifier component must be a numeric OID".to_string())
+    }
+}
+
+fn parse_reason_flags(value: &str) -> Result<u16, String> {
+    let value = value.trim();
+    if value.starts_with('{') {
+        let inner = braced_inner(value, "ReasonFlags")?;
+        if inner.is_empty() {
+            return Ok(0);
+        }
+        let mut flags = 0_u16;
+        for component in split_gser_components(inner)? {
+            flags |= reason_named_flag(component.trim())?;
+        }
+        return Ok(flags);
+    }
+    parse_gser_bit_string_flags(value, "ReasonFlags")
+}
+
+fn reason_named_flag(value: &str) -> Result<u16, String> {
+    match value {
+        "unused" => Ok(1 << 0),
+        "keyCompromise" => Ok(1 << 1),
+        "cACompromise" => Ok(1 << 2),
+        "affiliationChanged" => Ok(1 << 3),
+        "superseded" => Ok(1 << 4),
+        "cessationOfOperation" => Ok(1 << 5),
+        "certificateHold" => Ok(1 << 6),
+        "privilegeWithdrawn" => Ok(1 << 7),
+        "aACompromise" => Ok(1 << 8),
+        other => Err(format!("unknown ReasonFlags flag {other}")),
     }
 }
 
@@ -6451,15 +6983,41 @@ fn parse_key_usage_flags(value: &str) -> Result<u16, String> {
         return Ok(flags);
     }
 
-    validate_bit_string(value)?;
+    parse_gser_bit_string_flags(value, "KeyUsage")
+}
+
+fn parse_gser_bit_string_flags(value: &str, label: &str) -> Result<u16, String> {
+    if let Some(bits) = bit_string_bits(value) {
+        return bit_string_flags_from_bits(bits, label);
+    }
+    let octets = parse_hstring_bytes(value, label)?;
     let mut flags = 0_u16;
-    for (index, bit) in bit_string_bits(value)
-        .unwrap_or_default()
-        .chars()
-        .enumerate()
-    {
+    let mut index = 0_usize;
+    for octet in octets {
+        for bit_index in (0..8).rev() {
+            if index >= u16::BITS as usize {
+                return Err(format!("{label} bit string is too long"));
+            }
+            if (octet >> bit_index) & 1 == 1 {
+                flags |= 1_u16 << index;
+            }
+            index += 1;
+        }
+    }
+    Ok(flags)
+}
+
+fn bit_string_flags_from_bits(bits: &str, label: &str) -> Result<u16, String> {
+    if bits.is_empty() {
+        return Err(format!("{label} bit string must contain at least one bit"));
+    }
+    if !bits.chars().all(|ch| matches!(ch, '0' | '1')) {
+        return Err(format!("{label} bit string may contain only 0 and 1 bits"));
+    }
+    let mut flags = 0_u16;
+    for (index, bit) in bits.chars().enumerate() {
         if index >= u16::BITS as usize {
-            return Err("KeyUsage bit string is too long".to_string());
+            return Err(format!("{label} bit string is too long"));
         }
         if bit == '1' {
             flags |= 1_u16 << index;
@@ -6481,6 +7039,62 @@ fn key_usage_named_flag(value: &str) -> Result<u16, String> {
         "decipherOnly" => Ok(1 << 8),
         other => Err(format!("unknown KeyUsage flag {other}")),
     }
+}
+
+fn parse_octet_string_hex(value: &str) -> Result<String, String> {
+    parse_hstring_bytes(value, "OCTET-STRING").map(|bytes| normalize_hex_bytes(&bytes))
+}
+
+fn parse_hstring_bytes(value: &str, label: &str) -> Result<Vec<u8>, String> {
+    let value = value.trim();
+    let Some(hex_value) = value.strip_prefix('\'').and_then(|value| {
+        value
+            .strip_suffix("'H")
+            .or_else(|| value.strip_suffix("'h"))
+    }) else {
+        return Err(format!("{label} must use GSER hstring form '...'H"));
+    };
+    if hex_value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !hex_value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{label} hstring contains non-hexadecimal digits"));
+    }
+    let mut padded = hex_value.to_string();
+    if padded.len() % 2 != 0 {
+        padded.push('0');
+    }
+    hex::decode(padded).map_err(|err| format!("{label} hstring could not be decoded: {err}"))
+}
+
+fn normalize_hex_bytes(value: &[u8]) -> String {
+    hex::encode(value)
+}
+
+fn der_unsigned_integer_decimal(value: &[u8]) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("DER INTEGER content must not be empty".to_string());
+    }
+    let mut digits = vec![0_u8];
+    for byte in value.iter().skip_while(|byte| **byte == 0) {
+        let mut carry = u16::from(*byte);
+        for digit in digits.iter_mut().rev() {
+            let updated = u16::from(*digit) * 256 + carry;
+            *digit = (updated % 10) as u8;
+            carry = updated / 10;
+        }
+        while carry > 0 {
+            digits.insert(0, (carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    while digits.len() > 1 && digits.first() == Some(&0) {
+        digits.remove(0);
+    }
+    Ok(digits
+        .into_iter()
+        .map(|digit| char::from(b'0' + digit))
+        .collect())
 }
 
 fn format_x509_time_key(time: x509_parser::time::ASN1Time) -> String {
@@ -8405,6 +9019,23 @@ mod tests {
                 .get_matching_rule("algorithmIdentifierMatch")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn rfc4523_bit_list_parsers_accept_empty_and_hstring_forms() {
+        assert_eq!(parse_key_usage_flags("{ }").unwrap(), 0);
+        assert_eq!(
+            parse_key_usage_flags("{ digitalSignature, keyEncipherment }").unwrap(),
+            (1 << 0) | (1 << 2)
+        );
+        assert_eq!(parse_key_usage_flags("'A0'H").unwrap(), (1 << 0) | (1 << 2));
+
+        assert_eq!(parse_reason_flags("{ }").unwrap(), 0);
+        assert_eq!(
+            parse_reason_flags("{ keyCompromise, cACompromise }").unwrap(),
+            (1 << 1) | (1 << 2)
+        );
+        assert_eq!(parse_reason_flags("'60'H").unwrap(), (1 << 1) | (1 << 2));
     }
 
     #[test]

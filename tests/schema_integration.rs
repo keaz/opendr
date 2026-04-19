@@ -105,6 +105,111 @@ fn certificate_pair_base64(cert_der: &[u8]) -> String {
     general_purpose::STANDARD.encode(test_der_wrap(0x30, &issued_to_this_ca))
 }
 
+fn test_der_oid(arcs: &[u64]) -> Vec<u8> {
+    assert!(arcs.len() >= 2);
+    let mut content = vec![(arcs[0] * 40 + arcs[1]) as u8];
+    for arc in &arcs[2..] {
+        let mut value = *arc;
+        let mut encoded = vec![(value & 0x7f) as u8];
+        value >>= 7;
+        while value > 0 {
+            encoded.push(((value & 0x7f) as u8) | 0x80);
+            value >>= 7;
+        }
+        content.extend(encoded.into_iter().rev());
+    }
+    test_der_wrap(0x06, &content)
+}
+
+fn certificate_policy_extension_content(policy_oid: &[u64]) -> Vec<u8> {
+    let policy_information = test_der_wrap(0x30, &test_der_oid(policy_oid));
+    test_der_wrap(0x30, &policy_information)
+}
+
+fn test_component_certificate_pem() -> String {
+    let issuer_key = rcgen::KeyPair::generate().unwrap();
+    let mut issuer_params =
+        rcgen::CertificateParams::new(vec!["ca.example.org".to_string()]).unwrap();
+    issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    issuer_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let issuer = rcgen::CertifiedIssuer::self_signed(issuer_params, issuer_key).unwrap();
+
+    let cert_key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec![
+        "cert.example.org".to_string(),
+        "192.0.2.10".to_string(),
+    ])
+    .unwrap();
+    params.is_ca = rcgen::IsCa::ExplicitNoCa;
+    params.use_authority_key_identifier_extension = true;
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyEncipherment,
+    ];
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 32],
+            certificate_policy_extension_content(&[1, 2, 3, 4]),
+        ));
+
+    params.signed_by(&cert_key, &issuer).unwrap().pem()
+}
+
+fn certificate_subject_key_identifier(cert_der: &[u8]) -> Vec<u8> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(cert_der).unwrap();
+    certificate
+        .iter_extensions()
+        .find_map(|extension| match extension.parsed_extension() {
+            x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(key_identifier) => {
+                Some(key_identifier.0.to_vec())
+            }
+            _ => None,
+        })
+        .expect("test certificate should contain a subjectKeyIdentifier extension")
+}
+
+fn certificate_authority_key_identifier(cert_der: &[u8]) -> Vec<u8> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(cert_der).unwrap();
+    certificate
+        .iter_extensions()
+        .find_map(|extension| match extension.parsed_extension() {
+            x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(
+                authority_key_identifier,
+            ) => authority_key_identifier
+                .key_identifier
+                .as_ref()
+                .map(|key_identifier| key_identifier.0.to_vec()),
+            _ => None,
+        })
+        .expect("test certificate should contain an authorityKeyIdentifier extension")
+}
+
+fn crl_authority_key_identifier(crl_der: &[u8]) -> Vec<u8> {
+    let (_, certificate_list) = x509_parser::parse_x509_crl(crl_der).unwrap();
+    certificate_list
+        .extensions()
+        .iter()
+        .find_map(|extension| match extension.parsed_extension() {
+            x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(
+                authority_key_identifier,
+            ) => authority_key_identifier
+                .key_identifier
+                .as_ref()
+                .map(|key_identifier| key_identifier.0.to_vec()),
+            _ => None,
+        })
+        .expect("test CRL should contain an authorityKeyIdentifier extension")
+}
+
+fn gser_hstring(bytes: &[u8]) -> String {
+    format!("'{}'H", hex::encode_upper(bytes))
+}
+
 fn test_crl_pem() -> String {
     let signing_key = rcgen::KeyPair::generate().unwrap();
     let mut issuer_params =
@@ -120,7 +225,12 @@ fn test_crl_pem() -> String {
         this_update: rcgen::date_time_ymd(2024, 1, 1),
         next_update: rcgen::date_time_ymd(2025, 1, 1),
         crl_number: rcgen::SerialNumber::from(1),
-        issuing_distribution_point: None,
+        issuing_distribution_point: Some(rcgen::CrlIssuingDistributionPoint {
+            distribution_point: rcgen::CrlDistributionPoint {
+                uris: vec!["https://crl.example.org/root.crl".to_string()],
+            },
+            scope: None,
+        }),
         revoked_certs: Vec::new(),
         key_identifier_method: rcgen::KeyIdMethod::Sha256,
     }
@@ -1300,9 +1410,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
     let mut schema = LdapSchema::with_core_schema();
     schema.load_builtin_schema("x509").unwrap();
 
-    let rcgen::CertifiedKey { cert, .. } =
-        rcgen::generate_simple_self_signed(vec!["cert.example.org".to_string()]).unwrap();
-    let cert_pem = cert.pem();
+    let cert_pem = test_component_certificate_pem();
     let cert_der = der_from_pem(&cert_pem, "CERTIFICATE");
     let certificate_assertion = certificate_exact_assertion(&cert_der);
 
@@ -1341,15 +1449,22 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
         .algorithm
         .algorithm
         .to_id_string();
+    let subject_key_identifier = gser_hstring(&certificate_subject_key_identifier(&cert_der));
+    let authority_key_identifier = gser_hstring(&certificate_authority_key_identifier(&cert_der));
     let certificate_component_rule = schema.resolve_matching_rule("certificateMatch").unwrap();
     assert!(
         certificate_component_rule
             .values_equal(
                 &cert_pem,
                 &format!(
-                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, subjectPublicKeyAlgID {subject_public_key_alg_id} }}"
+                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }} }}"
                 ),
             )
+            .unwrap()
+    );
+    assert!(
+        certificate_component_rule
+            .values_equal(&cert_pem, "{ subjectAltName builtinNameForm:iPAddress }")
             .unwrap()
     );
     assert!(
@@ -1363,9 +1478,9 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .unwrap()
     );
     assert!(
-        certificate_component_rule
-            .values_equal(&cert_pem, "{ subjectAltName dNSName:cert.example.org }")
-            .is_err()
+        !certificate_component_rule
+            .values_equal(&cert_pem, "{ policy { 1.2.3.5 } }")
+            .unwrap()
     );
 
     let crl_pem = test_crl_pem();
@@ -1382,15 +1497,22 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
     let certificate_list_component_rule = schema
         .resolve_matching_rule("certificateListMatch")
         .unwrap();
+    let crl_authority_key_identifier = gser_hstring(&crl_authority_key_identifier(&crl_der));
     assert!(
         certificate_list_component_rule
             .values_equal(
                 &crl_pem,
                 &format!(
-                    "{{ issuer rdnSequence:{}, dateAndTime generalizedTime:20240101000000Z }}",
-                    gser_quote(&certificate_list.issuer().to_string())
+                    "{{ issuer rdnSequence:{}, dateAndTime generalizedTime:20240101000000Z, authorityKeyIdentifier {{ keyIdentifier {crl_authority_key_identifier} }}, distributionPoint fullName:{{ uniformResourceIdentifier:{} }} }}",
+                    gser_quote(&certificate_list.issuer().to_string()),
+                    gser_quote("https://crl.example.org/root.crl")
                 )
             )
+            .unwrap()
+    );
+    assert!(
+        !certificate_list_component_rule
+            .values_equal(&crl_pem, "{ reasonFlags { keyCompromise } }")
             .unwrap()
     );
 

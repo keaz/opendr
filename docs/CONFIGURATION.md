@@ -490,9 +490,10 @@ certificate serial/issuer, CRL issuer/thisUpdate, certificate-pair issued-to and
 issued-by, and supported-algorithm OID equality assertions are available for
 search filters and Compare operations. Component assertions are also available
 for `certificateMatch`, `certificatePairMatch`, and `certificateListMatch` when
-they use the implemented certificate serial, issuer, subject, validity,
-subject-public-key algorithm, key-usage, CRL issuer, date, or CRL-number range
-components.
+they use the implemented certificate serial, issuer, subject, key identifiers,
+validity, subject-public-key algorithm, key usage, subject alternative name type,
+certificate policy, CRL issuer, CRL date, CRL-number range, CRL authority key
+identifier, reason-flag, or full-name distribution point components.
 
 Generate bundled schema files when a deployment needs file-based schema
 artifacts instead of relying only on `load_builtin`:

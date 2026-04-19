@@ -536,13 +536,16 @@ OID with absent or NULL parameters. Certificate-pair exact matching is not
 eligible for LMDB equality indexes because RFC 4523 permits partial pair
 assertions. Component matching rules `certificateMatch`, `certificateListMatch`,
 and `certificatePairMatch` execute a standards-based subset: certificate
-serial-number, issuer, subject, certificate-valid time, subject-public-key
-algorithm, and key-usage assertions; certificate pair issued-to and issued-by
-assertions that delegate to those certificate components; and CRL issuer,
-date-and-time, and CRL-number range assertions. The remaining RFC 4523
-components, including key identifiers, private-key validity, subject alternate
-names, policies, path/name constraints, distribution points, reason flags, and
-authority key identifiers, are rejected explicitly until implemented.
+serial-number, issuer, subject, subject and authority key identifiers,
+certificate-valid time, subject-public-key algorithm, key usage, subject
+alternative name type, and certificate policy assertions; certificate pair
+issued-to and issued-by assertions that delegate to those certificate
+components; and CRL issuer, date-and-time, CRL-number range, authority key
+identifier, reason-flag, and full-name distribution point assertions. The
+remaining RFC 4523 components, including private-key validity, path/name
+constraints, name constraints, `otherName` values, X.400/EDI general names, and
+name-relative-to-CRL-issuer distribution points, are rejected explicitly until
+implemented.
 
 ### Core Attributes
 
