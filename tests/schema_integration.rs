@@ -164,16 +164,23 @@ fn x400_or_address_der() -> Vec<u8> {
     let mut built_in = Vec::new();
     built_in.extend(test_der_wrap(0x61, &test_der_wrap(0x13, b"US")));
     built_in.extend(test_der_wrap(0x62, &test_der_wrap(0x13, b"ExampleADMD")));
+    built_in.extend(test_der_wrap(0x80, b"311040123456"));
+    built_in.extend(test_der_wrap(0x81, b"TERM1"));
     built_in.extend(test_der_wrap(0xa2, &test_der_wrap(0x13, b"ExamplePRMD")));
-    built_in.extend(test_der_wrap(0xa3, &test_der_wrap(0x13, b"ExampleOrg")));
+    built_in.extend(test_der_wrap(0x83, b"ExampleOrg"));
+    built_in.extend(test_der_wrap(0x84, b"12345"));
+
+    let mut personal_name = Vec::new();
+    personal_name.extend(test_der_wrap(0xa0, &test_der_wrap(0x13, b"Support")));
+    personal_name.extend(test_der_wrap(0xa1, &test_der_wrap(0x13, b"Jane")));
+    personal_name.extend(test_der_wrap(0xa2, &test_der_wrap(0x13, b"Q")));
+    personal_name.extend(test_der_wrap(0xa3, &test_der_wrap(0x13, b"III")));
+    built_in.extend(test_der_wrap(0xa5, &personal_name));
 
     let mut organizational_units = Vec::new();
     organizational_units.extend(test_der_wrap(0x13, b"Directory"));
     organizational_units.extend(test_der_wrap(0x13, b"Gateway"));
-    built_in.extend(test_der_wrap(
-        0xa6,
-        &test_der_wrap(0x30, &organizational_units),
-    ));
+    built_in.extend(test_der_wrap(0xa6, &organizational_units));
 
     test_der_wrap(0x30, &built_in)
 }
@@ -1853,7 +1860,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
         certificate_component_rule
             .values_equal(
                 &cert_pem,
-                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/O=ExampleOrg/OU=Directory/OU=Gateway/\" } } } }",
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=ExampleOrg/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/\" } } } }",
             )
             .unwrap()
     );
@@ -1861,7 +1868,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
         !certificate_component_rule
             .values_equal(
                 &cert_pem,
-                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/O=Other/OU=Directory/OU=Gateway/\" } } } }",
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Other/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/\" } } } }",
             )
             .unwrap()
     );

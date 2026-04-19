@@ -5461,6 +5461,7 @@ fn der_value_matches_gser_assertion(
 fn der_tlv_string_value(value: &DerTlv<'_>) -> Result<String, String> {
     match value.tag {
         0x0c // UTF8String
+        | 0x12 // NumericString
         | 0x13 // PrintableString
         | 0x14 // TeletexString
         | 0x16 // IA5String
@@ -5603,9 +5604,21 @@ fn x400_address_to_rfc2156_string(value: &[u8]) -> Result<String, String> {
 struct X400BuiltInStandardAttributes {
     country: Option<String>,
     administration_domain: Option<String>,
+    network_address: Option<String>,
+    terminal_identifier: Option<String>,
     private_domain: Option<String>,
     organization: Option<String>,
+    numeric_user_identifier: Option<String>,
+    personal_name: Option<X400PersonalName>,
     organizational_units: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct X400PersonalName {
+    surname: Option<String>,
+    given_name: Option<String>,
+    initials: Option<String>,
+    generation_qualifier: Option<String>,
 }
 
 impl X400BuiltInStandardAttributes {
@@ -5620,17 +5633,48 @@ impl X400BuiltInStandardAttributes {
         if let Some(private_domain) = self.private_domain.as_deref() {
             append_rfc2156_or_address_component(&mut output, "PRMD", private_domain)?;
         }
+        if let Some(network_address) = self.network_address.as_deref() {
+            append_rfc2156_or_address_component(&mut output, "X121", network_address)?;
+        }
+        if let Some(terminal_identifier) = self.terminal_identifier.as_deref() {
+            append_rfc2156_or_address_component(&mut output, "T-ID", terminal_identifier)?;
+        }
         if let Some(organization) = self.organization.as_deref() {
             append_rfc2156_or_address_component(&mut output, "O", organization)?;
         }
         for organizational_unit in &self.organizational_units {
             append_rfc2156_or_address_component(&mut output, "OU", organizational_unit)?;
         }
+        if let Some(numeric_user_identifier) = self.numeric_user_identifier.as_deref() {
+            append_rfc2156_or_address_component(&mut output, "UA-ID", numeric_user_identifier)?;
+        }
+        if let Some(personal_name) = self.personal_name.as_ref() {
+            personal_name.append_rfc2156_components(&mut output)?;
+        }
         if output.is_empty() {
             return Err("ORAddress contains no supported RFC 2156 components".to_string());
         }
         output.push('/');
         Ok(output)
+    }
+}
+
+impl X400PersonalName {
+    fn append_rfc2156_components(&self, output: &mut String) -> Result<(), String> {
+        let Some(surname) = self.surname.as_deref() else {
+            return Err("PersonalName requires surname".to_string());
+        };
+        append_rfc2156_or_address_component(output, "S", surname)?;
+        if let Some(given_name) = self.given_name.as_deref() {
+            append_rfc2156_or_address_component(output, "G", given_name)?;
+        }
+        if let Some(initials) = self.initials.as_deref() {
+            append_rfc2156_or_address_component(output, "I", initials)?;
+        }
+        if let Some(generation_qualifier) = self.generation_qualifier.as_deref() {
+            append_rfc2156_or_address_component(output, "GQ", generation_qualifier)?;
+        }
+        Ok(())
     }
 }
 
@@ -5651,26 +5695,45 @@ fn parse_x400_built_in_standard_attributes(
                     "AdministrationDomainName",
                 )?);
             }
+            0x80 if attributes.network_address.is_none() => {
+                attributes.network_address =
+                    Some(parse_implicit_x400_string(field.content, "NetworkAddress")?);
+            }
+            0x81 if attributes.terminal_identifier.is_none() => {
+                attributes.terminal_identifier = Some(parse_implicit_x400_string(
+                    field.content,
+                    "TerminalIdentifier",
+                )?);
+            }
             0xa2 if attributes.private_domain.is_none() => {
                 attributes.private_domain = Some(parse_explicit_x400_string(
                     field.content,
                     "PrivateDomainName",
                 )?);
             }
-            0xa3 if attributes.organization.is_none() => {
-                attributes.organization = Some(parse_explicit_x400_string(
+            0x83 if attributes.organization.is_none() => {
+                attributes.organization = Some(parse_implicit_x400_string(
                     field.content,
                     "OrganizationName",
                 )?);
             }
+            0x84 if attributes.numeric_user_identifier.is_none() => {
+                attributes.numeric_user_identifier = Some(parse_implicit_x400_string(
+                    field.content,
+                    "NumericUserIdentifier",
+                )?);
+            }
+            0xa5 if attributes.personal_name.is_none() => {
+                attributes.personal_name = Some(parse_implicit_x400_personal_name(field.content)?);
+            }
             0xa6 if attributes.organizational_units.is_empty() => {
                 attributes.organizational_units =
-                    parse_explicit_x400_organizational_units(field.content)?;
+                    parse_implicit_x400_organizational_units(field.content)?;
             }
-            0x61 | 0x62 | 0xa2 | 0xa3 | 0xa6 => {
+            0x61 | 0x62 | 0x80 | 0x81 | 0xa2 | 0x83 | 0x84 | 0xa5 | 0xa6 => {
                 return Err("duplicate ORAddress built-in standard attribute".to_string());
             }
-            0x80 | 0xa0 | 0x81 | 0xa1 | 0x84 | 0xa4 | 0xa5 => {
+            0xa0 | 0xa1 | 0xa3 | 0xa4 => {
                 return Err(format!(
                     "unsupported ORAddress built-in standard attribute tag 0x{:02x}",
                     field.tag
@@ -5687,6 +5750,12 @@ fn parse_x400_built_in_standard_attributes(
     Ok(attributes)
 }
 
+fn parse_implicit_x400_string(value: &[u8], label: &str) -> Result<String, String> {
+    std::str::from_utf8(value)
+        .map(str::to_string)
+        .map_err(|_| format!("{label} is not UTF-8"))
+}
+
 fn parse_explicit_x400_string(value: &[u8], label: &str) -> Result<String, String> {
     let (remainder, string_value) = read_der_tlv(value)?;
     if !remainder.is_empty() {
@@ -5695,29 +5764,62 @@ fn parse_explicit_x400_string(value: &[u8], label: &str) -> Result<String, Strin
     der_tlv_string_value(&string_value).map_err(|err| format!("{label} is invalid: {err}"))
 }
 
-fn parse_explicit_x400_organizational_units(value: &[u8]) -> Result<Vec<String>, String> {
-    let (remainder, sequence) = read_der_tlv(value)?;
-    if !remainder.is_empty() {
-        return Err("OrganizationalUnitNames contains trailing DER data".to_string());
-    }
-    if sequence.tag != 0x30 {
-        return Err("OrganizationalUnitNames must be a DER SEQUENCE".to_string());
-    }
-
+fn parse_implicit_x400_organizational_units(mut value: &[u8]) -> Result<Vec<String>, String> {
     let mut organizational_units = Vec::new();
-    let mut remaining = sequence.content;
-    while !remaining.is_empty() {
-        let (next, organizational_unit) = read_der_tlv(remaining)?;
+    while !value.is_empty() {
+        let (next, organizational_unit) = read_der_tlv(value)?;
         organizational_units.push(
             der_tlv_string_value(&organizational_unit)
                 .map_err(|err| format!("OrganizationalUnitName is invalid: {err}"))?,
         );
-        remaining = next;
+        value = next;
     }
     if organizational_units.is_empty() {
         return Err("OrganizationalUnitNames must contain at least one value".to_string());
     }
     Ok(organizational_units)
+}
+
+fn parse_implicit_x400_personal_name(mut value: &[u8]) -> Result<X400PersonalName, String> {
+    let mut personal_name = X400PersonalName::default();
+    while !value.is_empty() {
+        let (next, field) = read_der_tlv(value)?;
+        match field.tag {
+            0xa0 if personal_name.surname.is_none() => {
+                personal_name.surname = Some(parse_explicit_x400_string(
+                    field.content,
+                    "PersonalName surname",
+                )?);
+            }
+            0xa1 if personal_name.given_name.is_none() => {
+                personal_name.given_name = Some(parse_explicit_x400_string(
+                    field.content,
+                    "PersonalName given-name",
+                )?);
+            }
+            0xa2 if personal_name.initials.is_none() => {
+                personal_name.initials = Some(parse_explicit_x400_string(
+                    field.content,
+                    "PersonalName initials",
+                )?);
+            }
+            0xa3 if personal_name.generation_qualifier.is_none() => {
+                personal_name.generation_qualifier = Some(parse_explicit_x400_string(
+                    field.content,
+                    "PersonalName generation-qualifier",
+                )?);
+            }
+            0xa0..=0xa3 => {
+                return Err("duplicate PersonalName attribute".to_string());
+            }
+            other => return Err(format!("unexpected PersonalName DER tag 0x{other:02x}")),
+        }
+        value = next;
+    }
+    if personal_name.surname.is_none() {
+        return Err("PersonalName requires surname".to_string());
+    }
+    Ok(personal_name)
 }
 
 fn append_rfc2156_or_address_component(
@@ -9036,21 +9138,28 @@ mod tests {
         let mut built_in = Vec::new();
         built_in.extend(wrap_der_value(0x61, &wrap_der_value(0x13, b"US")));
         built_in.extend(wrap_der_value(0x62, &wrap_der_value(0x13, b"ExampleADMD")));
+        built_in.extend(wrap_der_value(0x80, b"311040123456"));
+        built_in.extend(wrap_der_value(0x81, b"TERM1"));
         built_in.extend(wrap_der_value(0xa2, &wrap_der_value(0x13, b"ExamplePRMD")));
-        built_in.extend(wrap_der_value(0xa3, &wrap_der_value(0x13, b"Ops/Dir=One$")));
+        built_in.extend(wrap_der_value(0x83, b"Ops/Dir=One$"));
+        built_in.extend(wrap_der_value(0x84, b"12345"));
+
+        let mut personal_name = Vec::new();
+        personal_name.extend(wrap_der_value(0xa0, &wrap_der_value(0x13, b"Support")));
+        personal_name.extend(wrap_der_value(0xa1, &wrap_der_value(0x13, b"Jane")));
+        personal_name.extend(wrap_der_value(0xa2, &wrap_der_value(0x13, b"Q")));
+        personal_name.extend(wrap_der_value(0xa3, &wrap_der_value(0x13, b"III")));
+        built_in.extend(wrap_der_value(0xa5, &personal_name));
 
         let mut organizational_units = Vec::new();
         organizational_units.extend(wrap_der_value(0x13, b"Directory"));
         organizational_units.extend(wrap_der_value(0x13, b"Gateway"));
-        built_in.extend(wrap_der_value(
-            0xa6,
-            &wrap_der_value(0x30, &organizational_units),
-        ));
+        built_in.extend(wrap_der_value(0xa6, &organizational_units));
 
         let or_address = wrap_der_value(0x30, &built_in);
         assert_eq!(
             x400_address_to_rfc2156_string(&or_address).unwrap(),
-            "/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/O=Ops$/Dir$=One$$/OU=Directory/OU=Gateway/"
+            "/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Ops$/Dir$=One$$/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/"
         );
     }
 
