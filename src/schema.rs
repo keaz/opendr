@@ -5596,10 +5596,11 @@ fn x400_address_to_rfc2156_string(value: &[u8]) -> Result<String, String> {
     built_in.append_rfc2156_components(&mut output)?;
 
     let mut saw_domain_defined_attributes = false;
+    let mut saw_extension_attributes = false;
     while !remaining.is_empty() {
         let (next, component) = read_der_tlv(remaining)?;
         match component.tag {
-            0x30 if !saw_domain_defined_attributes => {
+            0x30 if !saw_domain_defined_attributes && !saw_extension_attributes => {
                 let domain_defined = parse_x400_domain_defined_attributes(component.content)?;
                 for attribute in &domain_defined {
                     append_rfc2156_domain_defined_attribute(
@@ -5611,7 +5612,11 @@ fn x400_address_to_rfc2156_string(value: &[u8]) -> Result<String, String> {
                 saw_domain_defined_attributes = true;
             }
             0x30 => return Err("duplicate ORAddress domain-defined attributes".to_string()),
-            0x31 => return Err("ORAddress extension attributes are not supported yet".to_string()),
+            0x31 if !saw_extension_attributes => {
+                append_x400_extension_attributes(&mut output, component.content)?;
+                saw_extension_attributes = true;
+            }
+            0x31 => return Err("duplicate ORAddress extension attributes".to_string()),
             other => return Err(format!("unexpected ORAddress component tag 0x{other:02x}")),
         }
         remaining = next;
@@ -5812,6 +5817,402 @@ fn parse_printable_string(value: DerTlv<'_>, label: &str) -> Result<String, Stri
     der_tlv_string_value(&value).map_err(|err| format!("{label} is invalid: {err}"))
 }
 
+fn append_x400_extension_attributes(output: &mut String, mut value: &[u8]) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("ExtensionAttributes must contain at least one value".to_string());
+    }
+    while !value.is_empty() {
+        let (next, attribute) = read_der_tlv(value)?;
+        if attribute.tag != 0x30 {
+            return Err("ExtensionAttribute must be encoded as a DER SEQUENCE".to_string());
+        }
+        let (attribute_type, attribute_value) = parse_x400_extension_attribute(attribute.content)?;
+        append_x400_extension_attribute(output, attribute_type, &attribute_value)?;
+        value = next;
+    }
+    Ok(())
+}
+
+fn parse_x400_extension_attribute(value: &[u8]) -> Result<(u16, DerTlv<'_>), String> {
+    let (remaining, attribute_type) = read_der_tlv(value)?;
+    if attribute_type.tag != 0x80 {
+        return Err("ExtensionAttribute type must be encoded as [0] IMPLICIT INTEGER".to_string());
+    }
+    let (remaining, attribute_value) = read_der_tlv(remaining)?;
+    if attribute_value.tag != 0xa1 {
+        return Err("ExtensionAttribute value must be encoded as explicit [1]".to_string());
+    }
+    if !remaining.is_empty() {
+        return Err("ExtensionAttribute contains trailing DER data".to_string());
+    }
+    let attribute_type =
+        der_non_negative_integer_u16(attribute_type.content, "ExtensionAttribute type")?;
+    let attribute_value = parse_explicit_x400_extension_value(attribute_value.content)?;
+    Ok((attribute_type, attribute_value))
+}
+
+fn parse_explicit_x400_extension_value(value: &[u8]) -> Result<DerTlv<'_>, String> {
+    let (remaining, attribute_value) = read_der_tlv(value)?;
+    if !remaining.is_empty() {
+        return Err("ExtensionAttribute explicit value contains trailing DER data".to_string());
+    }
+    Ok(attribute_value)
+}
+
+fn append_x400_extension_attribute(
+    output: &mut String,
+    attribute_type: u16,
+    value: &DerTlv<'_>,
+) -> Result<(), String> {
+    match attribute_type {
+        1 => append_x400_string_extension(output, "CN", value, "CommonName"),
+        2 => append_x400_string_extension(output, "CN", value, "TeletexCommonName"),
+        3 => append_x400_string_extension(output, "O", value, "TeletexOrganizationName"),
+        4 => {
+            if value.tag != 0x31 {
+                return Err("TeletexPersonalName must be encoded as a DER SET".to_string());
+            }
+            parse_implicit_x400_personal_name(value.content)?.append_rfc2156_components(output)
+        }
+        5 => {
+            if value.tag != 0x30 {
+                return Err(
+                    "TeletexOrganizationalUnitNames must be encoded as a DER SEQUENCE".to_string(),
+                );
+            }
+            for organizational_unit in parse_implicit_x400_organizational_units(value.content)? {
+                append_rfc2156_or_address_component(output, "OU", &organizational_unit)?;
+            }
+            Ok(())
+        }
+        6 => {
+            if value.tag != 0x30 {
+                return Err(
+                    "TeletexDomainDefinedAttributes must be encoded as a DER SEQUENCE".to_string(),
+                );
+            }
+            for attribute in parse_x400_teletex_domain_defined_attributes(value.content)? {
+                append_rfc2156_domain_defined_attribute(
+                    output,
+                    &attribute.attribute_type,
+                    &attribute.value,
+                )?;
+            }
+            Ok(())
+        }
+        7 => append_x400_pds_parameter_extension(output, "PD-SERVICE", value, "PDSName"),
+        8 => append_x400_string_extension(output, "PD-C", value, "PhysicalDeliveryCountryName"),
+        9 => append_x400_string_extension(output, "PD-CODE", value, "PostalCode"),
+        10 => append_x400_pds_parameter_extension(
+            output,
+            "PD-OFFICE",
+            value,
+            "PhysicalDeliveryOfficeName",
+        ),
+        11 => append_x400_pds_parameter_extension(
+            output,
+            "PD-OFFICE-NUM",
+            value,
+            "PhysicalDeliveryOfficeNumber",
+        ),
+        12 => append_x400_pds_parameter_extension(
+            output,
+            "PD-EXT-ADDRESS",
+            value,
+            "ExtensionORAddressComponents",
+        ),
+        13 => append_x400_pds_parameter_extension(
+            output,
+            "PD-PN",
+            value,
+            "PhysicalDeliveryPersonalName",
+        ),
+        14 => append_x400_pds_parameter_extension(
+            output,
+            "PD-O",
+            value,
+            "PhysicalDeliveryOrganizationName",
+        ),
+        15 => append_x400_pds_parameter_extension(
+            output,
+            "PD-EXT-DELIVERY",
+            value,
+            "ExtensionPhysicalDeliveryAddressComponents",
+        ),
+        16 => append_x400_unformatted_postal_address(output, value),
+        17 => append_x400_pds_parameter_extension(output, "PD-STREET", value, "StreetAddress"),
+        18 => append_x400_pds_parameter_extension(output, "PD-BOX", value, "PostOfficeBoxAddress"),
+        19 => append_x400_pds_parameter_extension(
+            output,
+            "PD-RESTANTE",
+            value,
+            "PosteRestanteAddress",
+        ),
+        20 => append_x400_pds_parameter_extension(output, "PD-UNIQUE", value, "UniquePostalName"),
+        21 => {
+            append_x400_pds_parameter_extension(output, "PD-LOCAL", value, "LocalPostalAttributes")
+        }
+        22 => append_x400_extended_network_address(output, value),
+        23 => append_x400_terminal_type(output, value),
+        other => Err(format!(
+            "unsupported ORAddress extension attribute type {other}"
+        )),
+    }
+}
+
+fn append_x400_string_extension(
+    output: &mut String,
+    key: &str,
+    value: &DerTlv<'_>,
+    label: &str,
+) -> Result<(), String> {
+    let value = der_tlv_string_value(value).map_err(|err| format!("{label} is invalid: {err}"))?;
+    append_rfc2156_or_address_component(output, key, &value)
+}
+
+fn append_x400_pds_parameter_extension(
+    output: &mut String,
+    key: &str,
+    value: &DerTlv<'_>,
+    label: &str,
+) -> Result<(), String> {
+    let value = parse_x400_pds_parameter(value, label)?;
+    append_rfc2156_or_address_component(output, key, &value)
+}
+
+fn parse_x400_teletex_domain_defined_attributes(
+    mut value: &[u8],
+) -> Result<Vec<X400DomainDefinedAttribute>, String> {
+    let mut attributes = Vec::new();
+    while !value.is_empty() {
+        let (next, attribute) = read_der_tlv(value)?;
+        if attribute.tag != 0x30 {
+            return Err(
+                "TeletexDomainDefinedAttribute must be encoded as a DER SEQUENCE".to_string(),
+            );
+        }
+        attributes.push(parse_x400_teletex_domain_defined_attribute(
+            attribute.content,
+        )?);
+        value = next;
+    }
+    if attributes.is_empty() {
+        return Err("TeletexDomainDefinedAttributes must contain at least one value".to_string());
+    }
+    Ok(attributes)
+}
+
+fn parse_x400_teletex_domain_defined_attribute(
+    value: &[u8],
+) -> Result<X400DomainDefinedAttribute, String> {
+    let (remaining, attribute_type) = read_der_tlv(value)?;
+    let (remaining, attribute_value) = read_der_tlv(remaining)?;
+    if !remaining.is_empty() {
+        return Err("TeletexDomainDefinedAttribute contains trailing DER data".to_string());
+    }
+    Ok(X400DomainDefinedAttribute {
+        attribute_type: der_tlv_string_value(&attribute_type)
+            .map_err(|err| format!("TeletexDomainDefinedAttribute type is invalid: {err}"))?,
+        value: der_tlv_string_value(&attribute_value)
+            .map_err(|err| format!("TeletexDomainDefinedAttribute value is invalid: {err}"))?,
+    })
+}
+
+fn parse_x400_pds_parameter(value: &DerTlv<'_>, label: &str) -> Result<String, String> {
+    if value.tag != 0x31 {
+        return Err(format!("{label} must be encoded as a DER SET"));
+    }
+    let mut printable = None;
+    let mut teletex = None;
+    let mut remaining = value.content;
+    while !remaining.is_empty() {
+        let (next, field) = read_der_tlv(remaining)?;
+        match field.tag {
+            0x13 if printable.is_none() => {
+                printable = Some(parse_printable_string(field, label)?);
+            }
+            0x14 if teletex.is_none() => {
+                teletex = Some(
+                    der_tlv_string_value(&field)
+                        .map_err(|err| format!("{label} TeletexString is invalid: {err}"))?,
+                );
+            }
+            0x13 => return Err(format!("{label} contains duplicate PrintableString values")),
+            0x14 => return Err(format!("{label} contains duplicate TeletexString values")),
+            other => return Err(format!("{label} contains unexpected DER tag 0x{other:02x}")),
+        }
+        remaining = next;
+    }
+    match (printable, teletex) {
+        (Some(printable), Some(teletex)) if printable == teletex => Ok(printable),
+        (Some(printable), Some(teletex)) => Ok(format!("{printable}*{teletex}")),
+        (Some(printable), None) => Ok(printable),
+        (None, Some(teletex)) => Ok(teletex),
+        (None, None) => Err(format!("{label} must contain a printable or teletex value")),
+    }
+}
+
+fn append_x400_unformatted_postal_address(
+    output: &mut String,
+    value: &DerTlv<'_>,
+) -> Result<(), String> {
+    let value = parse_x400_unformatted_postal_address(value)?;
+    append_rfc2156_or_address_component(output, "PD-ADDRESS", &value)
+}
+
+fn parse_x400_unformatted_postal_address(value: &DerTlv<'_>) -> Result<String, String> {
+    if value.tag != 0x31 {
+        return Err("UnformattedPostalAddress must be encoded as a DER SET".to_string());
+    }
+    let mut printable_address = None;
+    let mut teletex = None;
+    let mut remaining = value.content;
+    while !remaining.is_empty() {
+        let (next, field) = read_der_tlv(remaining)?;
+        match field.tag {
+            0x30 if printable_address.is_none() => {
+                printable_address = Some(parse_x400_printable_address_lines(field.content)?);
+            }
+            0x14 if teletex.is_none() => {
+                teletex = Some(der_tlv_string_value(&field).map_err(|err| {
+                    format!("UnformattedPostalAddress TeletexString is invalid: {err}")
+                })?);
+            }
+            0x30 => {
+                return Err(
+                    "UnformattedPostalAddress contains duplicate printable-address".to_string(),
+                );
+            }
+            0x14 => {
+                return Err(
+                    "UnformattedPostalAddress contains duplicate teletex-string".to_string()
+                );
+            }
+            other => {
+                return Err(format!(
+                    "UnformattedPostalAddress contains unexpected DER tag 0x{other:02x}"
+                ));
+            }
+        }
+        remaining = next;
+    }
+    match (printable_address, teletex) {
+        (Some(printable), Some(teletex)) => Ok(format!("{printable}*{teletex}")),
+        (Some(printable), None) => Ok(printable),
+        (None, Some(teletex)) => Ok(format!("*{teletex}")),
+        (None, None) => Err(
+            "UnformattedPostalAddress must contain printable-address or teletex-string".to_string(),
+        ),
+    }
+}
+
+fn parse_x400_printable_address_lines(mut value: &[u8]) -> Result<String, String> {
+    let mut lines = Vec::new();
+    while !value.is_empty() {
+        let (next, line) = read_der_tlv(value)?;
+        lines.push(parse_printable_string(
+            line,
+            "UnformattedPostalAddress printable line",
+        )?);
+        value = next;
+    }
+    if lines.is_empty() {
+        return Err("UnformattedPostalAddress printable-address must contain a line".to_string());
+    }
+    Ok(lines.join("|"))
+}
+
+fn append_x400_extended_network_address(
+    output: &mut String,
+    value: &DerTlv<'_>,
+) -> Result<(), String> {
+    match value.tag {
+        0x30 => {
+            let (number, sub_address) = parse_x400_e163_address(value.content)?;
+            append_rfc2156_or_address_component(output, "NET-NUM", &number)?;
+            if let Some(sub_address) = sub_address {
+                append_rfc2156_or_address_component(output, "NET-SUB", &sub_address)?;
+            }
+            Ok(())
+        }
+        0xa0 => Err("ExtendedNetworkAddress psap-address is not supported yet".to_string()),
+        other => Err(format!(
+            "ExtendedNetworkAddress contains unexpected DER tag 0x{other:02x}"
+        )),
+    }
+}
+
+fn parse_x400_e163_address(mut value: &[u8]) -> Result<(String, Option<String>), String> {
+    let mut number = None;
+    let mut sub_address = None;
+    while !value.is_empty() {
+        let (next, field) = read_der_tlv(value)?;
+        match field.tag {
+            0x80 if number.is_none() => {
+                number = Some(parse_implicit_x400_string(
+                    field.content,
+                    "E163Address number",
+                )?);
+            }
+            0x81 if sub_address.is_none() => {
+                sub_address = Some(parse_implicit_x400_string(
+                    field.content,
+                    "E163Address sub-address",
+                )?);
+            }
+            0x80 => return Err("E163Address contains duplicate number".to_string()),
+            0x81 => return Err("E163Address contains duplicate sub-address".to_string()),
+            other => {
+                return Err(format!(
+                    "E163Address contains unexpected DER tag 0x{other:02x}"
+                ));
+            }
+        }
+        value = next;
+    }
+    Ok((
+        number.ok_or_else(|| "E163Address requires number".to_string())?,
+        sub_address,
+    ))
+}
+
+fn append_x400_terminal_type(output: &mut String, value: &DerTlv<'_>) -> Result<(), String> {
+    if value.tag != 0x02 {
+        return Err("TerminalType must be encoded as a DER INTEGER".to_string());
+    }
+    let terminal_type = der_non_negative_integer_u16(value.content, "TerminalType")?;
+    let terminal_type = match terminal_type {
+        3 => "tlx".to_string(),
+        4 => "ttx".to_string(),
+        5 => "g3fax".to_string(),
+        6 => "g4fax".to_string(),
+        7 => "ia5".to_string(),
+        8 => "vtx".to_string(),
+        other => other.to_string(),
+    };
+    append_rfc2156_or_address_component(output, "T-TY", &terminal_type)
+}
+
+fn der_non_negative_integer_u16(value: &[u8], label: &str) -> Result<u16, String> {
+    if value.is_empty() {
+        return Err(format!("{label} DER INTEGER content must not be empty"));
+    }
+    if value[0] & 0x80 != 0 {
+        return Err(format!("{label} must not be negative"));
+    }
+    if value.len() > 1 && value[0] == 0 && value[1] & 0x80 == 0 {
+        return Err(format!("{label} DER INTEGER is not minimally encoded"));
+    }
+    let mut output = 0_u16;
+    for byte in value {
+        output = output
+            .checked_mul(256)
+            .and_then(|value| value.checked_add(u16::from(*byte)))
+            .ok_or_else(|| format!("{label} is too large"))?;
+    }
+    Ok(output)
+}
+
 fn parse_implicit_x400_string(value: &[u8], label: &str) -> Result<String, String> {
     std::str::from_utf8(value)
         .map(str::to_string)
@@ -5847,31 +6248,31 @@ fn parse_implicit_x400_personal_name(mut value: &[u8]) -> Result<X400PersonalNam
     while !value.is_empty() {
         let (next, field) = read_der_tlv(value)?;
         match field.tag {
-            0xa0 if personal_name.surname.is_none() => {
-                personal_name.surname = Some(parse_explicit_x400_string(
+            0x80 if personal_name.surname.is_none() => {
+                personal_name.surname = Some(parse_implicit_x400_string(
                     field.content,
                     "PersonalName surname",
                 )?);
             }
-            0xa1 if personal_name.given_name.is_none() => {
-                personal_name.given_name = Some(parse_explicit_x400_string(
+            0x81 if personal_name.given_name.is_none() => {
+                personal_name.given_name = Some(parse_implicit_x400_string(
                     field.content,
                     "PersonalName given-name",
                 )?);
             }
-            0xa2 if personal_name.initials.is_none() => {
-                personal_name.initials = Some(parse_explicit_x400_string(
+            0x82 if personal_name.initials.is_none() => {
+                personal_name.initials = Some(parse_implicit_x400_string(
                     field.content,
                     "PersonalName initials",
                 )?);
             }
-            0xa3 if personal_name.generation_qualifier.is_none() => {
-                personal_name.generation_qualifier = Some(parse_explicit_x400_string(
+            0x83 if personal_name.generation_qualifier.is_none() => {
+                personal_name.generation_qualifier = Some(parse_implicit_x400_string(
                     field.content,
                     "PersonalName generation-qualifier",
                 )?);
             }
-            0xa0..=0xa3 => {
+            0x80..=0x83 => {
                 return Err("duplicate PersonalName attribute".to_string());
             }
             other => return Err(format!("unexpected PersonalName DER tag 0x{other:02x}")),
@@ -9220,10 +9621,10 @@ mod tests {
         built_in.extend(wrap_der_value(0x84, b"12345"));
 
         let mut personal_name = Vec::new();
-        personal_name.extend(wrap_der_value(0xa0, &wrap_der_value(0x13, b"Support")));
-        personal_name.extend(wrap_der_value(0xa1, &wrap_der_value(0x13, b"Jane")));
-        personal_name.extend(wrap_der_value(0xa2, &wrap_der_value(0x13, b"Q")));
-        personal_name.extend(wrap_der_value(0xa3, &wrap_der_value(0x13, b"III")));
+        personal_name.extend(wrap_der_value(0x80, b"Support"));
+        personal_name.extend(wrap_der_value(0x81, b"Jane"));
+        personal_name.extend(wrap_der_value(0x82, b"Q"));
+        personal_name.extend(wrap_der_value(0x83, b"III"));
         built_in.extend(wrap_der_value(0xa5, &personal_name));
 
         let mut organizational_units = Vec::new();
@@ -9254,6 +9655,104 @@ mod tests {
         assert_eq!(
             x400_address_to_rfc2156_string(&or_address).unwrap(),
             "/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Ops$/Dir$=One$$/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/"
+        );
+    }
+
+    #[test]
+    fn rfc4523_x400_extension_attributes_render_rfc2156_string() {
+        fn extension_attribute(attribute_type: u8, value: Vec<u8>) -> Vec<u8> {
+            let mut content = Vec::new();
+            content.extend(wrap_der_value(0x80, &[attribute_type]));
+            content.extend(wrap_der_value(0xa1, &value));
+            wrap_der_value(0x30, &content)
+        }
+
+        fn pds_parameter(value: &[u8]) -> Vec<u8> {
+            wrap_der_value(0x31, &wrap_der_value(0x13, value))
+        }
+
+        let mut personal_name = Vec::new();
+        personal_name.extend(wrap_der_value(0x80, b"TeleSur"));
+        personal_name.extend(wrap_der_value(0x81, b"TeleGiven"));
+        personal_name.extend(wrap_der_value(0x82, b"TI"));
+        personal_name.extend(wrap_der_value(0x83, b"TGQ"));
+
+        let teletex_ous = [
+            wrap_der_value(0x14, b"TeleOU1"),
+            wrap_der_value(0x14, b"TeleOU2"),
+        ]
+        .concat();
+
+        let teletex_domain_defined = wrap_der_value(
+            0x30,
+            &[
+                wrap_der_value(0x14, b"TT"),
+                wrap_der_value(0x14, b"TeleValue"),
+            ]
+            .concat(),
+        );
+
+        let unformatted_postal_address = wrap_der_value(
+            0x31,
+            &wrap_der_value(
+                0x30,
+                &[
+                    wrap_der_value(0x13, b"Line1"),
+                    wrap_der_value(0x13, b"Line2"),
+                ]
+                .concat(),
+            ),
+        );
+
+        let mut extended_network_address = Vec::new();
+        extended_network_address.extend(wrap_der_value(0x80, b"441234"));
+        extended_network_address.extend(wrap_der_value(0x81, b"99"));
+
+        let mut extension_attributes = Vec::new();
+        extension_attributes.extend(extension_attribute(1, wrap_der_value(0x13, b"Common")));
+        extension_attributes.extend(extension_attribute(2, wrap_der_value(0x14, b"TeleCN")));
+        extension_attributes.extend(extension_attribute(3, wrap_der_value(0x14, b"TeleOrg")));
+        extension_attributes.extend(extension_attribute(4, wrap_der_value(0x31, &personal_name)));
+        extension_attributes.extend(extension_attribute(5, wrap_der_value(0x30, &teletex_ous)));
+        extension_attributes.extend(extension_attribute(
+            6,
+            wrap_der_value(0x30, &teletex_domain_defined),
+        ));
+        extension_attributes.extend(extension_attribute(7, pds_parameter(b"PDS")));
+        extension_attributes.extend(extension_attribute(8, wrap_der_value(0x13, b"GB")));
+        extension_attributes.extend(extension_attribute(9, wrap_der_value(0x13, b"SW1A")));
+        extension_attributes.extend(extension_attribute(10, pds_parameter(b"Office")));
+        extension_attributes.extend(extension_attribute(11, pds_parameter(b"OfficeNum")));
+        extension_attributes.extend(extension_attribute(12, pds_parameter(b"ExtAddr")));
+        extension_attributes.extend(extension_attribute(13, pds_parameter(b"PDPerson")));
+        extension_attributes.extend(extension_attribute(14, pds_parameter(b"PDOrg")));
+        extension_attributes.extend(extension_attribute(15, pds_parameter(b"ExtDelivery")));
+        extension_attributes.extend(extension_attribute(16, unformatted_postal_address));
+        extension_attributes.extend(extension_attribute(17, pds_parameter(b"Street")));
+        extension_attributes.extend(extension_attribute(18, pds_parameter(b"Box")));
+        extension_attributes.extend(extension_attribute(19, pds_parameter(b"Restante")));
+        extension_attributes.extend(extension_attribute(20, pds_parameter(b"Unique")));
+        extension_attributes.extend(extension_attribute(21, pds_parameter(b"Local")));
+        extension_attributes.extend(extension_attribute(
+            22,
+            wrap_der_value(0x30, &extended_network_address),
+        ));
+        extension_attributes.extend(extension_attribute(23, wrap_der_value(0x02, &[7])));
+
+        let mut or_address = wrap_der_value(0x30, &[]);
+        or_address.extend(wrap_der_value(0x31, &extension_attributes));
+
+        assert_eq!(
+            x400_address_to_rfc2156_string(&or_address).unwrap(),
+            concat!(
+                "/CN=Common/CN=TeleCN/O=TeleOrg/S=TeleSur/G=TeleGiven/I=TI/GQ=TGQ",
+                "/OU=TeleOU1/OU=TeleOU2/DD.TT=TeleValue/PD-SERVICE=PDS/PD-C=GB",
+                "/PD-CODE=SW1A/PD-OFFICE=Office/PD-OFFICE-NUM=OfficeNum",
+                "/PD-EXT-ADDRESS=ExtAddr/PD-PN=PDPerson/PD-O=PDOrg",
+                "/PD-EXT-DELIVERY=ExtDelivery/PD-ADDRESS=Line1|Line2",
+                "/PD-STREET=Street/PD-BOX=Box/PD-RESTANTE=Restante/PD-UNIQUE=Unique",
+                "/PD-LOCAL=Local/NET-NUM=441234/NET-SUB=99/T-TY=ia5/"
+            )
         );
     }
 

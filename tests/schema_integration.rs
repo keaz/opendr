@@ -160,6 +160,13 @@ fn x400_address_general_name_der(or_address: Vec<u8>) -> Vec<u8> {
     test_der_wrap(0xa3, &or_address)
 }
 
+fn x400_extension_attribute_der(attribute_type: u8, value: Vec<u8>) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.extend(test_der_wrap(0x80, &[attribute_type]));
+    content.extend(test_der_wrap(0xa1, &value));
+    test_der_wrap(0x30, &content)
+}
+
 fn x400_or_address_der() -> Vec<u8> {
     let mut built_in = Vec::new();
     built_in.extend(test_der_wrap(0x61, &test_der_wrap(0x13, b"US")));
@@ -171,10 +178,10 @@ fn x400_or_address_der() -> Vec<u8> {
     built_in.extend(test_der_wrap(0x84, b"12345"));
 
     let mut personal_name = Vec::new();
-    personal_name.extend(test_der_wrap(0xa0, &test_der_wrap(0x13, b"Support")));
-    personal_name.extend(test_der_wrap(0xa1, &test_der_wrap(0x13, b"Jane")));
-    personal_name.extend(test_der_wrap(0xa2, &test_der_wrap(0x13, b"Q")));
-    personal_name.extend(test_der_wrap(0xa3, &test_der_wrap(0x13, b"III")));
+    personal_name.extend(test_der_wrap(0x80, b"Support"));
+    personal_name.extend(test_der_wrap(0x81, b"Jane"));
+    personal_name.extend(test_der_wrap(0x82, b"Q"));
+    personal_name.extend(test_der_wrap(0x83, b"III"));
     built_in.extend(test_der_wrap(0xa5, &personal_name));
 
     let mut organizational_units = Vec::new();
@@ -202,6 +209,21 @@ fn x400_or_address_der() -> Vec<u8> {
 
     let mut or_address = test_der_wrap(0x30, &built_in);
     or_address.extend(test_der_wrap(0x30, &domain_defined));
+
+    let mut extension_attributes = Vec::new();
+    extension_attributes.extend(x400_extension_attribute_der(
+        1,
+        test_der_wrap(0x13, b"Gateway CN"),
+    ));
+    let mut extended_network_address = Vec::new();
+    extended_network_address.extend(test_der_wrap(0x80, b"441234"));
+    extended_network_address.extend(test_der_wrap(0x81, b"99"));
+    extension_attributes.extend(x400_extension_attribute_der(
+        22,
+        test_der_wrap(0x30, &extended_network_address),
+    ));
+    extension_attributes.extend(x400_extension_attribute_der(23, test_der_wrap(0x02, &[7])));
+    or_address.extend(test_der_wrap(0x31, &extension_attributes));
     or_address
 }
 
@@ -1880,7 +1902,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
         certificate_component_rule
             .values_equal(
                 &cert_pem,
-                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=ExampleOrg/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/\" } } } }",
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=ExampleOrg/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/CN=Gateway CN/NET-NUM=441234/NET-SUB=99/T-TY=ia5/\" } } } }",
             )
             .unwrap()
     );
@@ -1888,7 +1910,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
         !certificate_component_rule
             .values_equal(
                 &cert_pem,
-                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Other/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/\" } } } }",
+                "{ nameConstraints { permittedSubtrees { { base x400Address:\"/C=US/ADMD=ExampleADMD/PRMD=ExamplePRMD/X121=311040123456/T-ID=TERM1/O=Other/OU=Directory/OU=Gateway/UA-ID=12345/S=Support/G=Jane/I=Q/GQ=III/DD.RFC-822=ops@example.com/DD.A$/B=value$=one$$/CN=Gateway CN/NET-NUM=441234/NET-SUB=99/T-TY=ia5/\" } } } }",
             )
             .unwrap()
     );
