@@ -5677,6 +5677,7 @@ struct X509CertificateAssertion {
     authority_key_identifier: Option<X509AuthorityKeyIdentifierAssertion>,
     subject: Option<String>,
     certificate_valid: Option<String>,
+    private_key_valid: Option<String>,
     subject_public_key_alg_id: Option<String>,
     key_usage_flags: Option<u16>,
     subject_alt_name: Option<X509AltNameTypeAssertion>,
@@ -5698,6 +5699,28 @@ struct X509CertificateListAssertion {
 struct X509CertificatePairAssertion {
     issued_to_this_ca: Option<X509CertificateAssertion>,
     issued_by_this_ca: Option<X509CertificateAssertion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X509PrivateKeyUsagePeriod {
+    not_before: Option<String>,
+    not_after: Option<String>,
+}
+
+impl X509PrivateKeyUsagePeriod {
+    fn contains(&self, assertion: &str) -> Result<bool, String> {
+        if let Some(not_before) = self.not_before.as_deref()
+            && !normalized_time_in_range(assertion, not_before, None)?
+        {
+            return Ok(false);
+        }
+        if let Some(not_after) = self.not_after.as_deref()
+            && parse_normalized_time_key(assertion)? > parse_normalized_time_key(not_after)?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -6023,6 +6046,22 @@ fn x509_certificate_der_matches_assertion(
         let not_before = format_x509_time_key(validity.not_before);
         let not_after = format_x509_time_key(validity.not_after);
         if !normalized_time_in_range(asserted_time, &not_before, Some(&not_after))? {
+            return Ok(false);
+        }
+    }
+    if let Some(asserted_time) = assertion.private_key_valid.as_ref() {
+        let Some(private_key_usage_period) = certificate.iter_extensions().find_map(|extension| {
+            if extension.oid.to_id_string() == "2.5.29.16" {
+                Some(extension.value)
+            } else {
+                None
+            }
+        }) else {
+            return Ok(false);
+        };
+        let private_key_usage_period =
+            parse_private_key_usage_period_der(private_key_usage_period)?;
+        if !private_key_usage_period.contains(asserted_time)? {
             return Ok(false);
         }
     }
@@ -6492,6 +6531,7 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
         authority_key_identifier: None,
         subject: None,
         certificate_valid: None,
+        private_key_valid: None,
         subject_public_key_alg_id: None,
         key_usage_flags: None,
         subject_alt_name: None,
@@ -6519,6 +6559,9 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
             "certificateValid" if assertion.certificate_valid.is_none() => {
                 assertion.certificate_valid = Some(parse_rfc4523_time(rest)?);
             }
+            "privateKeyValid" if assertion.private_key_valid.is_none() => {
+                assertion.private_key_valid = Some(parse_rfc4523_generalized_time(rest)?);
+            }
             "subjectPublicKeyAlgID" if assertion.subject_public_key_alg_id.is_none() => {
                 assertion.subject_public_key_alg_id =
                     Some(parse_object_identifier_component(rest)?);
@@ -6538,6 +6581,7 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
             | "authorityKeyIdentifier"
             | "subject"
             | "certificateValid"
+            | "privateKeyValid"
             | "subjectPublicKeyAlgID"
             | "keyUsage"
             | "subjectAltName"
@@ -6546,7 +6590,7 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
                     "duplicate CertificateAssertion component {keyword}"
                 ));
             }
-            "privateKeyValid" | "pathToName" | "nameConstraints" => {
+            "pathToName" | "nameConstraints" => {
                 return Err(format!(
                     "unsupported CertificateAssertion component {keyword}"
                 ));
@@ -6758,11 +6802,60 @@ fn parse_rfc4523_time(value: &str) -> Result<String, String> {
             "Time must use utcTime:<UTCTime> or generalizedTime:<GeneralizedTime>".to_string(),
         );
     };
-    Ok(format!(
-        "{}.{:09}",
-        time.timestamp(),
-        time.timestamp_subsec_nanos()
-    ))
+    Ok(format_datetime_time_key(time))
+}
+
+fn parse_rfc4523_generalized_time(value: &str) -> Result<String, String> {
+    parse_generalized_time(value.trim()).map(format_datetime_time_key)
+}
+
+fn parse_private_key_usage_period_der(value: &[u8]) -> Result<X509PrivateKeyUsagePeriod, String> {
+    let (remainder, sequence) = read_der_tlv(value)?;
+    if sequence.tag != 0x30 {
+        return Err("privateKeyUsagePeriod extension must be a DER SEQUENCE".to_string());
+    }
+    if !remainder.is_empty() {
+        return Err("privateKeyUsagePeriod extension contains trailing data".to_string());
+    }
+
+    let mut remaining = sequence.content;
+    let mut period = X509PrivateKeyUsagePeriod {
+        not_before: None,
+        not_after: None,
+    };
+    while !remaining.is_empty() {
+        let (next, field) = read_der_tlv(remaining)?;
+        match field.tag {
+            0x80 if period.not_before.is_none() => {
+                let value = std::str::from_utf8(field.content)
+                    .map_err(|_| "privateKeyUsagePeriod notBefore is not UTF-8".to_string())?;
+                period.not_before = Some(parse_rfc4523_generalized_time(value)?);
+            }
+            0x81 if period.not_after.is_none() => {
+                let value = std::str::from_utf8(field.content)
+                    .map_err(|_| "privateKeyUsagePeriod notAfter is not UTF-8".to_string())?;
+                period.not_after = Some(parse_rfc4523_generalized_time(value)?);
+            }
+            0x80 => {
+                return Err("duplicate privateKeyUsagePeriod notBefore".to_string());
+            }
+            0x81 => {
+                return Err("duplicate privateKeyUsagePeriod notAfter".to_string());
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported privateKeyUsagePeriod field tag 0x{:02x}",
+                    field.tag
+                ));
+            }
+        }
+        remaining = next;
+    }
+
+    if period.not_before.is_none() && period.not_after.is_none() {
+        return Err("privateKeyUsagePeriod requires notBefore or notAfter".to_string());
+    }
+    Ok(period)
 }
 
 fn parse_algorithm_identifier_parameters(value: &str) -> Result<String, String> {
@@ -7100,6 +7193,10 @@ fn der_unsigned_integer_decimal(value: &[u8]) -> Result<String, String> {
 fn format_x509_time_key(time: x509_parser::time::ASN1Time) -> String {
     let time = time.to_datetime();
     format!("{}.{:09}", time.unix_timestamp(), time.nanosecond())
+}
+
+fn format_datetime_time_key(time: DateTime<Utc>) -> String {
+    format!("{}.{:09}", time.timestamp(), time.timestamp_subsec_nanos())
 }
 
 fn normalized_time_in_range(

@@ -126,6 +126,13 @@ fn certificate_policy_extension_content(policy_oid: &[u64]) -> Vec<u8> {
     test_der_wrap(0x30, &policy_information)
 }
 
+fn private_key_usage_period_extension_content(not_before: &str, not_after: &str) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.extend(test_der_wrap(0x80, not_before.as_bytes()));
+    content.extend(test_der_wrap(0x81, not_after.as_bytes()));
+    test_der_wrap(0x30, &content)
+}
+
 fn test_component_certificate_pem() -> String {
     let issuer_key = rcgen::KeyPair::generate().unwrap();
     let mut issuer_params =
@@ -155,6 +162,12 @@ fn test_component_certificate_pem() -> String {
         .push(rcgen::CustomExtension::from_oid_content(
             &[2, 5, 29, 32],
             certificate_policy_extension_content(&[1, 2, 3, 4]),
+        ));
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 16],
+            private_key_usage_period_extension_content("20240101000000Z", "20250101000000Z"),
         ));
 
     params.signed_by(&cert_key, &issuer).unwrap().pem()
@@ -1457,7 +1470,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .values_equal(
                 &cert_pem,
                 &format!(
-                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }} }}"
+                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, privateKeyValid 20240601000000Z, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }} }}"
                 ),
             )
             .unwrap()
@@ -1480,6 +1493,11 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
     assert!(
         !certificate_component_rule
             .values_equal(&cert_pem, "{ policy { 1.2.3.5 } }")
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(&cert_pem, "{ privateKeyValid 20260101000000Z }")
             .unwrap()
     );
 

@@ -369,14 +369,14 @@ Schema validation:
   assertion matching works for certificate serial/issuer, CRL issuer/thisUpdate,
   certificate-pair issued-to and issued-by, and supported-algorithm OID equality
   rules. Component matching works for certificate serial, issuer, subject, key
-  identifiers, validity, subject-public-key algorithm, key usage, subject
-  alternative name type, and certificate policy assertions; certificate pair
-  component matching delegates to those certificate components; CRL component
-  matching covers issuer, date, CRL-number ranges, authority key identifier,
-  reason flags, and full-name distribution points. The remaining RFC 4523
-  private-key-validity, path-to-name, name-constraint, `otherName` value,
-  X.400/EDI general-name, and name-relative-to-CRL-issuer components remain
-  tracked follow-up work.
+  identifiers, validity, private-key validity, subject-public-key algorithm, key
+  usage, subject alternative name type, and certificate policy assertions;
+  certificate pair component matching delegates to those certificate components;
+  CRL component matching covers issuer, date, CRL-number ranges, authority key
+  identifier, reason flags, and full-name distribution points. The remaining RFC
+  4523 path-to-name, name-constraint, `otherName` value, X.400/EDI
+  general-name, and name-relative-to-CRL-issuer components remain tracked
+  follow-up work.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active

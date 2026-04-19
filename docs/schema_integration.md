@@ -537,13 +537,13 @@ eligible for LMDB equality indexes because RFC 4523 permits partial pair
 assertions. Component matching rules `certificateMatch`, `certificateListMatch`,
 and `certificatePairMatch` execute a standards-based subset: certificate
 serial-number, issuer, subject, subject and authority key identifiers,
-certificate-valid time, subject-public-key algorithm, key usage, subject
-alternative name type, and certificate policy assertions; certificate pair
-issued-to and issued-by assertions that delegate to those certificate
-components; and CRL issuer, date-and-time, CRL-number range, authority key
-identifier, reason-flag, and full-name distribution point assertions. The
-remaining RFC 4523 components, including private-key validity, path/name
-constraints, name constraints, `otherName` values, X.400/EDI general names, and
+certificate-valid time, private-key-valid time, subject-public-key algorithm,
+key usage, subject alternative name type, and certificate policy assertions;
+certificate pair issued-to and issued-by assertions that delegate to those
+certificate components; and CRL issuer, date-and-time, CRL-number range,
+authority key identifier, reason-flag, and full-name distribution point
+assertions. The remaining RFC 4523 components, including path-to-name, name
+constraints, `otherName` values, X.400/EDI general names, and
 name-relative-to-CRL-issuer distribution points, are rejected explicitly until
 implemented.
 
