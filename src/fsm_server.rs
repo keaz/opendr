@@ -1356,11 +1356,15 @@ async fn handle_search_request_with_fsm_runtime(
     let session = legacy_session_from_fsm(fsm_set);
     let backend = fsm_set.backend().clone();
     let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
-    let attribute_selection: Vec<String> = search_req
+    let requested_attribute_selection: Vec<String> = search_req
         .attributes
         .iter()
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
+    let attribute_selection = crate::search_protocol::expand_attribute_selection_by_object_class(
+        schema,
+        &requested_attribute_selection,
+    );
 
     let filter = render_search_filter_string(&search_req.filter);
     let prepared_filter = match prepare_or_cache_search_filter(
@@ -3849,11 +3853,15 @@ async fn try_handle_virtual_search_request_with_fsm_runtime(
         }
     }
 
-    let requested_attributes: Vec<String> = search_req
+    let requested_attributes_raw: Vec<String> = search_req
         .attributes
         .iter()
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
+    let requested_attributes = crate::search_protocol::expand_attribute_selection_by_object_class(
+        schema,
+        &requested_attributes_raw,
+    );
 
     let available_attributes = if base_dn.is_empty() {
         if crate::server::security_policy(request_context).root_dse_requires_authentication

@@ -16,7 +16,7 @@ The broader production release matrix is
 | RFC 4527 | Pre-Read control | `1.3.6.1.1.13.1` | `supportedControl` | Unsupported | Not advertised. Critical requests are rejected with `unavailableCriticalExtension`; non-critical requests are ignored by the shared control pipeline. | `server::tests::unsupported_expected_controls_follow_generic_criticality_semantics` |
 | RFC 4527 | Post-Read control | `1.3.6.1.1.13.2` | `supportedControl` | Unsupported | Not advertised. Critical requests are rejected with `unavailableCriticalExtension`; non-critical requests are ignored by the shared control pipeline. | `server::tests::unsupported_expected_controls_follow_generic_criticality_semantics` |
 | RFC 4528 | Assertion control | `1.3.6.1.1.12` | `supportedControl` | Unsupported | Not advertised. Critical requests are rejected with `unavailableCriticalExtension`; non-critical requests are ignored by the shared control pipeline. | `server::tests::unsupported_expected_controls_follow_generic_criticality_semantics` |
-| RFC 4529 | Request attributes by object class | `1.3.6.1.4.1.4203.1.5.2` | `supportedFeatures` | Unsupported | Not advertised. Search attribute descriptions such as `@person` are treated as ordinary requested attribute names and do not expand to object-class attribute sets. | Root DSE capability tests ensure it is not advertised. |
+| RFC 4529 | Request attributes by object class | `1.3.6.1.4.1.4203.1.5.2` | `supportedFeatures` | Supported | Search attribute descriptions such as `@person` expand to the named object class's `MUST` and `MAY` attributes before response attribute selection. Unknown or optioned selectors remain ordinary requested attribute names. | `search_protocol::tests::expands_rfc4529_object_class_attribute_selectors`, `tests/server_handlers.rs`, `tests/rfc_controls_extensions_integration.rs` |
 
 ## Supported Behavior
 
@@ -40,6 +40,25 @@ Rules:
 
 Root DSE advertises `1.3.6.1.1.14` in `supportedFeatures`.
 
+### Request Attributes by Object Class
+
+OpenDR supports RFC 4529 object-class attribute selection in LDAP Search
+requests. Attribute selectors with the form `@objectClassName` are resolved
+against the active schema. The selected response attribute list is expanded with
+the named object class's `MUST` and `MAY` attributes, including inherited
+attributes, and duplicate attribute names are removed case-insensitively.
+
+Rules:
+
+- The feature OID `1.3.6.1.4.1.4203.1.5.2` is advertised in
+  `supportedFeatures`.
+- `@person` returns the attributes that are present on the result entry and are
+  part of `person`'s required or optional attribute set.
+- Unknown selectors and selectors with attribute options, such as
+  `@person;lang-en`, are left as ordinary requested attribute names.
+- The selector does not bypass normal search filtering, access control, or
+  operational attribute selection rules.
+
 ### Subentries Control
 
 OpenDR supports RFC 3672 by decoding the Subentries request control as a
@@ -58,9 +77,3 @@ as supported request controls. This keeps Root DSE truthful and relies on RFC
 
 OpenDR does not emit pre-read or post-read response controls and does not
 evaluate assertion-control preconditions.
-
-## Deferred Feature
-
-RFC 4529 object-class attribute selection is deferred. Root DSE does not publish
-the RFC 4529 feature OID, and search requests using `@objectClassName` are not
-expanded. Clients should request explicit attributes, `*`, or `+`.

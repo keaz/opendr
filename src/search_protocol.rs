@@ -6,6 +6,7 @@ const CANCEL_OID: &str = "1.3.6.1.1.8";
 const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
 const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
 pub const MODIFY_INCREMENT_FEATURE_OID: &str = "1.3.6.1.1.14";
+pub const REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID: &str = "1.3.6.1.4.1.4203.1.5.2";
 
 pub async fn build_root_dse_attributes(
     backend: &dyn DirectoryBackend,
@@ -142,6 +143,29 @@ pub fn select_virtual_attributes(
         .collect()
 }
 
+pub fn expand_attribute_selection_by_object_class(
+    schema: &LdapSchema,
+    requested_attributes: &[String],
+) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for requested_attribute in requested_attributes {
+        if let Some(class_attributes) = schema.object_class_attribute_selection(requested_attribute)
+        {
+            for attribute in class_attributes {
+                if !expanded
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(&attribute))
+                {
+                    expanded.push(attribute);
+                }
+            }
+        } else {
+            expanded.push(requested_attribute.clone());
+        }
+    }
+    expanded
+}
+
 pub fn supported_extensions(connection_is_secure: bool, starttls_available: bool) -> Vec<String> {
     let mut supported = Vec::new();
     if starttls_available && !connection_is_secure {
@@ -154,7 +178,10 @@ pub fn supported_extensions(connection_is_secure: bool, starttls_available: bool
 }
 
 pub fn supported_features() -> Vec<String> {
-    vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
+    vec![
+        MODIFY_INCREMENT_FEATURE_OID.to_string(),
+        REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID.to_string(),
+    ]
 }
 
 pub fn supported_sasl_mechanisms() -> Vec<String> {
@@ -229,10 +256,40 @@ mod tests {
     }
 
     #[test]
-    fn supported_features_include_modify_increment() {
+    fn supported_features_include_advertised_features() {
         assert_eq!(
             supported_features(),
-            vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
+            vec![
+                MODIFY_INCREMENT_FEATURE_OID.to_string(),
+                REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn expands_rfc4529_object_class_attribute_selectors() {
+        let schema = LdapSchema::with_core_schema();
+        let expanded = expand_attribute_selection_by_object_class(
+            &schema,
+            &[
+                "@country".to_string(),
+                "entryDN".to_string(),
+                "@doesNotExist".to_string(),
+                "@person;unsupported".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            expanded,
+            vec![
+                "c".to_string(),
+                "description".to_string(),
+                "objectClass".to_string(),
+                "searchGuide".to_string(),
+                "entryDN".to_string(),
+                "@doesNotExist".to_string(),
+                "@person;unsupported".to_string(),
+            ]
         );
     }
 
@@ -295,7 +352,7 @@ mod tests {
         );
         assert_eq!(
             as_map.get("supportedFeatures").unwrap(),
-            &vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
+            &supported_features()
         );
         assert_eq!(
             as_map.get("contextCSN").unwrap(),
@@ -331,7 +388,7 @@ mod tests {
         );
         assert_eq!(
             as_map.get("supportedFeatures").unwrap(),
-            &vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
+            &supported_features()
         );
         assert_eq!(
             as_map.get("subschemaSubentry").unwrap(),

@@ -11,7 +11,8 @@ use opendr::search_controls::{
     PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SUBENTRIES_CONTROL_OID,
 };
 use opendr::search_protocol::{
-    MODIFY_INCREMENT_FEATURE_OID, build_root_dse_attributes, build_subschema_attributes,
+    MODIFY_INCREMENT_FEATURE_OID, REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID,
+    build_root_dse_attributes, build_subschema_attributes,
 };
 use opendr::sync_controls::{SYNC_DONE_OID, SYNC_REQUEST_OID, SYNC_STATE_OID};
 
@@ -24,7 +25,6 @@ const SERVER_SIDE_SORT_RESPONSE_OID: &str = "1.2.840.113556.1.4.474";
 const ASSERTION_CONTROL_OID: &str = "1.3.6.1.1.12";
 const PRE_READ_CONTROL_OID: &str = "1.3.6.1.1.13.1";
 const POST_READ_CONTROL_OID: &str = "1.3.6.1.1.13.2";
-const REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID: &str = "1.3.6.1.4.1.4203.1.5.2";
 
 #[tokio::test]
 async fn root_dse_base_attributes_follow_rfc_4512_and_truthful_advertising() {
@@ -101,16 +101,14 @@ async fn root_dse_base_attributes_follow_rfc_4512_and_truthful_advertising() {
     expected_extensions.sort();
     assert_eq!(supported_extensions, expected_extensions);
 
+    let mut supported_features = attributes.get("supportedFeatures").unwrap().clone();
+    supported_features.sort();
     assert_eq!(
-        attributes.get("supportedFeatures").unwrap(),
-        &vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
-    );
-    assert!(
-        !attributes
-            .get("supportedFeatures")
-            .unwrap()
-            .contains(&REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID.to_string()),
-        "Root DSE must not advertise deferred RFC 4529 feature support"
+        supported_features,
+        vec![
+            MODIFY_INCREMENT_FEATURE_OID.to_string(),
+            REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID.to_string(),
+        ]
     );
 }
 

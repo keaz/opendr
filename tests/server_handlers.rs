@@ -509,6 +509,107 @@ async fn base_object_search_uses_get_entry_fast_path() {
 }
 
 #[tokio::test]
+async fn search_expands_rfc4529_object_class_attribute_selection() {
+    let mut backend = MockDirectory::new();
+    let entry = DirectoryEntry::new(
+        "cn=Alice,dc=example,dc=org",
+        HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "person".to_string()],
+            ),
+            ("cn".to_string(), vec!["Alice".to_string()]),
+            ("sn".to_string(), vec!["Smith".to_string()]),
+            (
+                "telephoneNumber".to_string(),
+                vec!["+15551234567".to_string()],
+            ),
+            (
+                "description".to_string(),
+                vec!["Directory user".to_string()],
+            ),
+            ("uid".to_string(), vec!["alice".to_string()]),
+        ]),
+    );
+
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "cn=Alice,dc=example,dc=org")
+        .times(1)
+        .return_once(|_| Ok(Some(entry)));
+    backend
+        .expect_get_entry()
+        .withf(|dn| dn == "dc=example,dc=org")
+        .times(1)
+        .return_once(|_| Ok(None));
+    backend.expect_search_entries_with_hint().times(0);
+
+    let request = SearchRequest {
+        base_object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+        scope: SearchScope::BaseObject,
+        deref_aliases: DerefAliases(0),
+        size_limit: 0,
+        time_limit: 0,
+        types_only: false,
+        filter: Filter::Present(LdapString(Cow::Owned("objectClass".to_string()))),
+        attributes: vec![LdapString(Cow::Owned("@person".to_string()))],
+    };
+
+    let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+    server::handle_search_request(&mut server_stream, &backend, 14, request)
+        .await
+        .unwrap();
+
+    let data = read_response(&mut client_stream).await;
+    let (_, messages) = parse_ldap_messages(&data).unwrap();
+    assert_eq!(messages.len(), 2);
+
+    match &messages[0].protocol_op {
+        ProtocolOp::SearchResultEntry(entry_response) => {
+            let attributes = entry_response
+                .attributes
+                .iter()
+                .map(|attribute| {
+                    (
+                        attribute.attr_type.0.as_ref().to_string(),
+                        attribute
+                            .attr_vals
+                            .iter()
+                            .map(|value| String::from_utf8(value.0.as_ref().to_vec()).unwrap())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+
+            assert_eq!(
+                attributes.get("objectClass").unwrap(),
+                &vec!["top".to_string(), "person".to_string()]
+            );
+            assert_eq!(attributes.get("cn").unwrap(), &vec!["Alice".to_string()]);
+            assert_eq!(attributes.get("sn").unwrap(), &vec!["Smith".to_string()]);
+            assert_eq!(
+                attributes.get("telephoneNumber").unwrap(),
+                &vec!["+15551234567".to_string()]
+            );
+            assert_eq!(
+                attributes.get("description").unwrap(),
+                &vec!["Directory user".to_string()]
+            );
+            assert!(!attributes.contains_key("uid"));
+        }
+        other => panic!("unexpected response: {:?}", other),
+    }
+
+    match &messages[1].protocol_op {
+        ProtocolOp::SearchResultDone(result) => {
+            assert_eq!(result.result_code, ldap_parser::ldap::ResultCode::Success);
+        }
+        other => panic!("unexpected completion: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn modify_success_returns_success_response() {
     let mut backend = MockDirectory::new();
     backend

@@ -3765,11 +3765,15 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
     starttls_available: bool,
 ) -> Result<(), ServerError> {
     let base_dn = request.base_object.0.as_ref().trim().to_owned();
-    let attribute_selection: Vec<String> = request
+    let requested_attribute_selection: Vec<String> = request
         .attributes
         .iter()
         .map(|attribute| attribute.0.as_ref().trim().to_owned())
         .collect();
+    let attribute_selection = crate::search_protocol::expand_attribute_selection_by_object_class(
+        schema,
+        &requested_attribute_selection,
+    );
     let deref_aliases = request.deref_aliases;
     if let Err(diagnostic) = validate_search_deref_aliases(deref_aliases) {
         send_result(
@@ -11097,8 +11101,15 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
             &vec!["1696680896789012#001#000001#000000".to_string()]
         );
         assert_eq!(
-            attributes.get("supportedFeatures").unwrap(),
-            &vec![crate::search_protocol::MODIFY_INCREMENT_FEATURE_OID.to_string()]
+            {
+                let mut features = attributes.get("supportedFeatures").unwrap().clone();
+                features.sort();
+                features
+            },
+            vec![
+                crate::search_protocol::MODIFY_INCREMENT_FEATURE_OID.to_string(),
+                crate::search_protocol::REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID.to_string(),
+            ]
         );
         let mut supported_extensions = attributes.get("supportedExtension").unwrap().clone();
         supported_extensions.sort();

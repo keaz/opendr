@@ -667,6 +667,32 @@ impl LdapSchema {
             .or_else(|| self.object_classes_by_oid.get(name))
     }
 
+    pub fn object_class_attribute_selection(&self, selector: &str) -> Option<Vec<String>> {
+        let object_class = selector.strip_prefix('@')?;
+        let mut parts = object_class.split(';');
+        let object_class = parts.next()?.trim();
+        if object_class.is_empty() || parts.any(|option| !option.trim().is_empty()) {
+            return None;
+        }
+
+        let object_class = self.get_object_class(object_class)?;
+        let (must, may) = self.collect_attributes(&[object_class]);
+        let mut attributes = must
+            .into_iter()
+            .chain(may)
+            .map(|attribute| self.canonical_attribute_description(&attribute))
+            .collect::<Vec<_>>();
+        attributes.sort_by_key(|attribute| attribute.to_ascii_lowercase());
+        attributes.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        Some(attributes)
+    }
+
+    fn canonical_attribute_description(&self, attribute: &str) -> String {
+        self.get_attribute_type(attribute)
+            .and_then(|attribute_type| attribute_type.names.first().cloned())
+            .unwrap_or_else(|| attribute.to_string())
+    }
+
     pub fn get_attribute_metadata(&self, name: &str) -> Option<&AttributeTypeMetadata> {
         self.get_attribute_type(name)
             .and_then(|attribute| self.attribute_metadata_by_oid.get(&attribute.oid))

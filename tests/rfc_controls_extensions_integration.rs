@@ -20,7 +20,10 @@ use opendr::search_controls::{
     encode_paged_results_control, encode_server_side_sort_request_control,
     encode_subentries_control,
 };
-use opendr::search_protocol::{MODIFY_INCREMENT_FEATURE_OID, build_root_dse_attributes};
+use opendr::search_protocol::{
+    MODIFY_INCREMENT_FEATURE_OID, REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID,
+    build_root_dse_attributes,
+};
 use opendr::server;
 use opendr::sync_controls::{
     SYNC_DONE_OID, SYNC_REQUEST_OID, SYNC_STATE_OID, SyncRefreshMode, SyncRequestControl,
@@ -40,7 +43,6 @@ const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
 const ASSERTION_CONTROL_OID: &str = "1.3.6.1.1.12";
 const PRE_READ_CONTROL_OID: &str = "1.3.6.1.1.13.1";
 const POST_READ_CONTROL_OID: &str = "1.3.6.1.1.13.2";
-const REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID: &str = "1.3.6.1.4.1.4203.1.5.2";
 
 #[tokio::test]
 async fn root_dse_advertises_only_request_usable_controls_extensions_and_features() {
@@ -97,14 +99,11 @@ async fn root_dse_advertises_only_request_usable_controls_extensions_and_feature
         ])
     );
     assert_eq!(
-        attributes.get("supportedFeatures").unwrap(),
-        &vec![MODIFY_INCREMENT_FEATURE_OID.to_string()]
-    );
-    assert!(
-        !attributes
-            .get("supportedFeatures")
-            .unwrap()
-            .contains(&REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID.to_string())
+        sorted(attributes.get("supportedFeatures").unwrap()),
+        sorted(&[
+            MODIFY_INCREMENT_FEATURE_OID.to_string(),
+            REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID.to_string(),
+        ])
     );
 
     let secure_attributes = build_root_dse_attributes(

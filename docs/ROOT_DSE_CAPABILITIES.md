@@ -38,7 +38,7 @@ controls are rejected with LDAP `unavailableCriticalExtension` semantics.
 | Feature | OID | RFC | Advertised |
 | --- | --- | --- | --- |
 | Modify-Increment | `1.3.6.1.1.14` | RFC 4525 | Yes. |
-| Request attributes by object class | `1.3.6.1.4.1.4203.1.5.2` | RFC 4529 | No, deferred. |
+| Request attributes by object class | `1.3.6.1.4.1.4203.1.5.2` | RFC 4529 | Yes. |
 
 ## `supportedSASLMechanisms`
 

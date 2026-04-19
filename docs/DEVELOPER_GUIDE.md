@@ -325,6 +325,7 @@ FSM runtime supports:
 - abandon and unbind
 - extended operations: StartTLS, Password Modify, WhoAmI, Cancel
 - Root DSE and subschema searches
+- RFC 4529 request attributes by object class, such as `@person`
 - referrals and ManageDsaIT handling
 - paged results
 - server-side sort
