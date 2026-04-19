@@ -9,7 +9,7 @@ use std::time::Duration;
 use ldap_parser::ldap::{ProtocolOp, ResultCode as ParserResultCode};
 use ldap_parser::parse_ldap_messages;
 use opendr::extended_ops::oids;
-use opendr::read_entry_controls::PRE_READ_CONTROL_OID;
+use opendr::read_entry_controls::{POST_READ_CONTROL_OID, PRE_READ_CONTROL_OID};
 use opendr::search_controls::{
     PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
     SUBENTRIES_CONTROL_OID,
@@ -490,6 +490,7 @@ fn assert_root_dse_capabilities(response: &[u8], secure_connection: bool, expect
     let mut expected_controls = vec![
         MANAGE_DSA_IT_OID.to_string(),
         PAGED_RESULTS_OID.to_string(),
+        POST_READ_CONTROL_OID.to_string(),
         PRE_READ_CONTROL_OID.to_string(),
         SERVER_SIDE_SORT_REQUEST_OID.to_string(),
         SUBENTRIES_CONTROL_OID.to_string(),

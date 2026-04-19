@@ -5,8 +5,9 @@ use std::time::Duration;
 use ldap_parser::asn1_rs::ToStatic;
 use ldap_parser::filter::Filter;
 use ldap_parser::ldap::{
-    Control, DerefAliases, ExtendedRequest, ExtendedResponse, LdapDN, LdapMessage, LdapOID,
-    LdapString, MessageID, ProtocolOp, ResultCode as ParserResultCode, SearchRequest, SearchScope,
+    AddRequest, Control, DerefAliases, ExtendedRequest, ExtendedResponse, LdapDN, LdapMessage,
+    LdapOID, LdapString, MessageID, ProtocolOp, ResultCode as ParserResultCode, SearchRequest,
+    SearchScope,
 };
 use ldap_parser::parse_ldap_messages;
 use opendr::backend::MockBackend;
@@ -15,7 +16,8 @@ use opendr::fsm_request::active_fsm_control_registry;
 use opendr::fsm_request::build_request_context;
 use opendr::ldap_controls::{LdapControl, RequestControls};
 use opendr::read_entry_controls::{
-    PRE_READ_CONTROL_OID, decode_pre_read_request_control, encode_attribute_selection,
+    POST_READ_CONTROL_OID, PRE_READ_CONTROL_OID, decode_post_read_request_control,
+    decode_pre_read_request_control, encode_attribute_selection,
 };
 use opendr::search_controls::{
     PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
@@ -45,7 +47,6 @@ const CANCEL_OID: &str = "1.3.6.1.1.8";
 const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
 const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
 const ASSERTION_CONTROL_OID: &str = "1.3.6.1.1.12";
-const POST_READ_CONTROL_OID: &str = "1.3.6.1.1.13.2";
 
 #[tokio::test]
 async fn root_dse_advertises_only_request_usable_controls_extensions_and_features() {
@@ -70,6 +71,7 @@ async fn root_dse_advertises_only_request_usable_controls_extensions_and_feature
         sorted(&[
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
+            POST_READ_CONTROL_OID.to_string(),
             PRE_READ_CONTROL_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
             SUBENTRIES_CONTROL_OID.to_string(),
@@ -81,7 +83,6 @@ async fn root_dse_advertises_only_request_usable_controls_extensions_and_feature
         SYNC_STATE_OID,
         SYNC_DONE_OID,
         ASSERTION_CONTROL_OID,
-        POST_READ_CONTROL_OID,
     ] {
         assert!(
             !attributes
@@ -140,6 +141,7 @@ fn control_registry_separates_request_response_and_root_dse_oids() {
         sorted(&[
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
+            POST_READ_CONTROL_OID.to_string(),
             PRE_READ_CONTROL_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
             SUBENTRIES_CONTROL_OID.to_string(),
@@ -152,6 +154,7 @@ fn control_registry_separates_request_response_and_root_dse_oids() {
         response_oids,
         sorted(&[
             PAGED_RESULTS_OID.to_string(),
+            POST_READ_CONTROL_OID.to_string(),
             PRE_READ_CONTROL_OID.to_string(),
             SERVER_SIDE_SORT_RESPONSE_OID.to_string(),
             SYNC_STATE_OID.to_string(),
@@ -234,6 +237,19 @@ fn advertised_request_control_codecs_round_trip_positive_values() {
         .unwrap();
     assert!(pre_read.critical());
     assert_eq!(pre_read.attributes(), pre_read_attributes.as_slice());
+
+    let post_read_attributes = vec!["cn".to_string(), "entryDN".to_string()];
+    let post_read_value = encode_attribute_selection(&post_read_attributes).unwrap();
+    let post_read_controls = RequestControls::new(vec![LdapControl::new(
+        POST_READ_CONTROL_OID,
+        true,
+        Some(post_read_value),
+    )]);
+    let post_read = decode_post_read_request_control(&post_read_controls)
+        .unwrap()
+        .unwrap();
+    assert!(post_read.critical());
+    assert_eq!(post_read.attributes(), post_read_attributes.as_slice());
 }
 
 #[test]
@@ -317,13 +333,49 @@ fn pre_read_control_is_accepted_only_on_appropriate_update_operations() {
 }
 
 #[test]
+fn post_read_control_is_accepted_only_on_appropriate_update_operations() {
+    let value = encode_attribute_selection(&["cn".to_string()]).unwrap();
+    let add = add_message_with_controls(vec![control_with_value(
+        POST_READ_CONTROL_OID,
+        true,
+        Some(value.clone()),
+    )]);
+    let context = build_request_context(&add, 77, None, Some("cn=admin"), true).unwrap();
+    assert_eq!(context.request_controls.len(), 1);
+    assert_eq!(
+        context.request_controls.iter().next().unwrap().oid(),
+        POST_READ_CONTROL_OID
+    );
+
+    let critical_delete = delete_message_with_controls(vec![control_with_value(
+        POST_READ_CONTROL_OID,
+        true,
+        Some(value.clone()),
+    )]);
+    let rejection =
+        build_request_context(&critical_delete, 77, None, Some("cn=admin"), true).unwrap_err();
+    assert_eq!(
+        rejection.result_code,
+        RasnResultCode::UnavailableCriticalExtension
+    );
+
+    let non_critical_delete = delete_message_with_controls(vec![control_with_value(
+        POST_READ_CONTROL_OID,
+        false,
+        Some(value),
+    )]);
+    let context =
+        build_request_context(&non_critical_delete, 77, None, Some("cn=admin"), true).unwrap();
+    assert!(context.request_controls.is_empty());
+}
+
+#[test]
 fn unsupported_or_response_only_controls_follow_rfc_4511_criticality_semantics() {
     for oid in [
         SERVER_SIDE_SORT_RESPONSE_OID,
         SYNC_STATE_OID,
         SYNC_DONE_OID,
         ASSERTION_CONTROL_OID,
-        POST_READ_CONTROL_OID,
         REQUEST_ATTRIBUTES_BY_OBJECT_CLASS_FEATURE_OID,
     ] {
         let critical = ldap_message_with_controls(vec![control_with_value(oid, true, None)]);
@@ -448,6 +500,17 @@ fn ldap_message_with_controls(controls: Vec<Control<'static>>) -> LdapMessage<'s
     LdapMessage {
         message_id: MessageID(10),
         protocol_op: ProtocolOp::SearchRequest(search_request()),
+        controls: Some(controls.into_iter().collect()),
+    }
+}
+
+fn add_message_with_controls(controls: Vec<Control<'static>>) -> LdapMessage<'static> {
+    LdapMessage {
+        message_id: MessageID(10),
+        protocol_op: ProtocolOp::AddRequest(AddRequest {
+            entry: LdapDN(Cow::Borrowed("cn=Alice,dc=example,dc=org")),
+            attributes: Vec::new(),
+        }),
         controls: Some(controls.into_iter().collect()),
     }
 }

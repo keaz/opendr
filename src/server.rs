@@ -54,8 +54,9 @@ use crate::parser::{
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::read_entry_controls::{
-    PRE_READ_CONTROL_OID, contains_critical_pre_read_control, decode_pre_read_request_control,
-    pre_read_response_control,
+    POST_READ_CONTROL_OID, PRE_READ_CONTROL_OID, contains_critical_post_read_control,
+    contains_critical_pre_read_control, decode_post_read_request_control,
+    decode_pre_read_request_control, post_read_response_control, pre_read_response_control,
 };
 use crate::real_time_propagation::is_dn_in_scope;
 use crate::referral::LdapReferralResolver;
@@ -1705,6 +1706,7 @@ async fn process_message_with_session(
                     modify_request,
                     session,
                     request_context,
+                    &request_controls,
                 )
                 .await?;
             } else {
@@ -1848,6 +1850,8 @@ fn active_runtime_control_registry() -> ControlRegistry {
         .register_request_control(MANAGE_DSA_IT_OID)
         .register_request_control(PRE_READ_CONTROL_OID)
         .register_response_control(PRE_READ_CONTROL_OID)
+        .register_request_control(POST_READ_CONTROL_OID)
+        .register_response_control(POST_READ_CONTROL_OID)
         .register_request_control(SYNC_REQUEST_OID)
         .register_response_control(SYNC_STATE_OID)
         .register_response_control(SYNC_DONE_OID);
@@ -2019,6 +2023,29 @@ async fn validate_message_controls(
                 }
                 accepted_controls = accepted_controls.without_oid(PRE_READ_CONTROL_OID);
             }
+            if !protocol_allows_post_read_control(&message.protocol_op) {
+                if contains_critical_post_read_control(&accepted_controls) {
+                    record_rejected_control_metric(request_context, POST_READ_CONTROL_OID);
+                    log_control_processing(
+                        request_context,
+                        session,
+                        accepted_controls.as_slice(),
+                        validated_controls.ignored(),
+                        Some(POST_READ_CONTROL_OID),
+                    )
+                    .await;
+                    send_rejection_response(
+                        socket,
+                        message_id,
+                        response_kind,
+                        ResultCode::UnavailableCriticalExtension,
+                        "post-read control is only appropriate for add, modify, and modifyDN operations",
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                accepted_controls = accepted_controls.without_oid(POST_READ_CONTROL_OID);
+            }
             record_control_metrics(
                 request_context,
                 accepted_controls.as_slice(),
@@ -2054,6 +2081,13 @@ fn protocol_allows_pre_read_control(protocol_op: &ProtocolOp<'_>) -> bool {
     matches!(
         protocol_op,
         ProtocolOp::ModifyRequest(_) | ProtocolOp::DelRequest(_) | ProtocolOp::ModDnRequest(_)
+    )
+}
+
+fn protocol_allows_post_read_control(protocol_op: &ProtocolOp<'_>) -> bool {
+    matches!(
+        protocol_op,
+        ProtocolOp::AddRequest(_) | ProtocolOp::ModifyRequest(_) | ProtocolOp::ModDnRequest(_)
     )
 }
 
@@ -2215,6 +2249,32 @@ fn pre_read_response_controls(
         entry,
         request.attributes(),
     )?])
+}
+
+fn post_read_response_controls(
+    request: &Option<crate::read_entry_controls::ReadEntryRequest>,
+    entry: &Option<DirectoryEntry>,
+) -> Result<Vec<LdapControl>, ServerError> {
+    let Some(request) = request else {
+        return Ok(Vec::new());
+    };
+    let Some(entry) = entry else {
+        return Ok(Vec::new());
+    };
+
+    Ok(vec![post_read_response_control(
+        entry,
+        request.attributes(),
+    )?])
+}
+
+fn subschema_read_entry(dn: &str, schema: &LdapSchema) -> DirectoryEntry {
+    DirectoryEntry::new(
+        dn,
+        crate::search_protocol::build_subschema_attributes(schema)
+            .into_iter()
+            .collect(),
+    )
 }
 
 pub(crate) fn parse_sync_request_control(
@@ -6881,6 +6941,7 @@ async fn handle_online_schema_modify_request_with_context(
     request: ModifyRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
+    request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.object.0.as_ref().trim().to_owned();
     let modifications = match convert_ldap_changes_to_modifications(&request.changes) {
@@ -6937,6 +6998,40 @@ async fn handle_online_schema_modify_request_with_context(
         return Ok(());
     }
 
+    let pre_read_request = match decode_pre_read_request_control(request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let post_read_request = match decode_post_read_request_control(request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let pre_read_entry = pre_read_request
+        .as_ref()
+        .map(|_| subschema_read_entry(&runtime_config.subschema_dn, &schema_snapshot(schema)));
+
     match apply_online_schema_modify(backend, schema, runtime_config, session, modifications).await
     {
         Ok(()) => {
@@ -6949,13 +7044,23 @@ async fn handle_online_schema_modify_request_with_context(
                 None,
             )
             .await;
-            send_result(
+            let post_read_entry = post_read_request.as_ref().map(|_| {
+                subschema_read_entry(&runtime_config.subschema_dn, &schema_snapshot(schema))
+            });
+            let mut response_controls =
+                pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+            response_controls.extend(post_read_response_controls(
+                &post_read_request,
+                &post_read_entry,
+            )?);
+            send_result_with_controls(
                 socket,
                 message_id,
                 ResponseOp::Modify,
                 ResultCode::Success,
                 &dn,
                 "",
+                &response_controls,
             )
             .await?;
         }
@@ -7287,6 +7392,21 @@ pub(crate) async fn handle_modify_request_with_context(
             return Ok(());
         }
     };
+    let post_read_request = match decode_post_read_request_control(request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Modify,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let pre_read_entry = if pre_read_request.is_some() {
         match backend.get_entry(&dn).await {
             Ok(entry) => entry,
@@ -7327,7 +7447,47 @@ pub(crate) async fn handle_modify_request_with_context(
                 None,
             )
             .await;
-            let response_controls = pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+            let post_read_entry = if post_read_request.is_some() {
+                match backend.get_entry(&dn).await {
+                    Ok(Some(entry)) => Some(entry),
+                    Ok(None) => {
+                        error!(
+                            "Post-read lookup after successful modify returned no entry for {dn}"
+                        );
+                        send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::Modify,
+                            ResultCode::Other,
+                            &dn,
+                            "post-read target entry was not available after modify",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        error!("Post-read lookup failed for modify {}: {}", dn, err);
+                        send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::Modify,
+                            map_backend_error(&err),
+                            &dn,
+                            diagnostic_for_error(&err),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+            let mut response_controls =
+                pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+            response_controls.extend(post_read_response_controls(
+                &post_read_request,
+                &post_read_entry,
+            )?);
             send_result_with_controls(
                 socket,
                 message_id,
@@ -7459,7 +7619,7 @@ pub(crate) async fn handle_add_request_with_context(
     request: AddRequest<'_>,
     session: &ConnectionSession,
     request_context: &RequestContext,
-    _request_controls: &RequestControls,
+    request_controls: &RequestControls,
 ) -> Result<(), ServerError> {
     let dn = request.entry.0.as_ref().trim().to_owned();
     let (entry, password) = build_entry_from_add_request(&dn, request.attributes);
@@ -7523,6 +7683,22 @@ pub(crate) async fn handle_add_request_with_context(
     {
         return Ok(());
     }
+
+    let post_read_request = match decode_post_read_request_control(request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::Add,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     let parent_attributes = if schema.requires_parent_attributes_for_entry(&entry.attributes) {
         match crate::dn::parent_dn(&dn) {
@@ -7595,13 +7771,49 @@ pub(crate) async fn handle_add_request_with_context(
     {
         Ok(()) => {
             log_add_audit_event(request_context, session, &dn, true).await;
-            send_result(
+            let post_read_entry = if post_read_request.is_some() {
+                match backend.get_entry(&dn).await {
+                    Ok(Some(entry)) => Some(entry),
+                    Ok(None) => {
+                        error!("Post-read lookup after successful add returned no entry for {dn}");
+                        send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::Add,
+                            ResultCode::Other,
+                            &dn,
+                            "post-read target entry was not available after add",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        error!("Post-read lookup failed for add {}: {}", dn, err);
+                        send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::Add,
+                            map_backend_error(&err),
+                            &dn,
+                            diagnostic_for_error(&err),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+            let response_controls =
+                post_read_response_controls(&post_read_request, &post_read_entry)?;
+            send_result_with_controls(
                 socket,
                 message_id,
                 ResponseOp::Add,
                 ResultCode::Success,
                 &dn,
                 "",
+                &response_controls,
             )
             .await?;
         }
@@ -7866,6 +8078,21 @@ pub(crate) async fn handle_moddn_request_with_context(
             return Ok(());
         }
     };
+    let post_read_request = match decode_post_read_request_control(request_controls) {
+        Ok(request) => request,
+        Err(err) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::ModifyDn,
+                ResultCode::ProtocolError,
+                &dn,
+                err.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let pre_read_entry = pre_read_request.as_ref().map(|_| existing_entry.clone());
 
     let parent_attributes =
@@ -7958,7 +8185,47 @@ pub(crate) async fn handle_moddn_request_with_context(
     {
         Ok(()) => {
             log_moddn_audit_event(request_context, session, &dn, &new_dn, true, None).await;
-            let response_controls = pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+            let post_read_entry = if post_read_request.is_some() {
+                match backend.get_entry(&new_dn).await {
+                    Ok(Some(entry)) => Some(entry),
+                    Ok(None) => {
+                        error!(
+                            "Post-read lookup after successful modifydn returned no entry for {new_dn}"
+                        );
+                        send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::ModifyDn,
+                            ResultCode::Other,
+                            &dn,
+                            "post-read target entry was not available after modifyDN",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        error!("Post-read lookup failed for modifydn {}: {}", new_dn, err);
+                        send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::ModifyDn,
+                            map_backend_error(&err),
+                            &dn,
+                            diagnostic_for_error(&err),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+            let mut response_controls =
+                pre_read_response_controls(&pre_read_request, &pre_read_entry)?;
+            response_controls.extend(post_read_response_controls(
+                &post_read_request,
+                &post_read_entry,
+            )?);
             send_result_with_controls(
                 socket,
                 message_id,
@@ -9424,35 +9691,61 @@ mod tests {
         )])
     }
 
-    fn pre_read_request_controls(attributes: &[&str]) -> RequestControls {
+    fn read_entry_request_control(oid: &str, attributes: &[&str]) -> LdapControl {
         let attributes = attributes
             .iter()
             .map(|attribute| (*attribute).to_string())
             .collect::<Vec<_>>();
-        RequestControls::new(vec![LdapControl::new(
-            crate::read_entry_controls::PRE_READ_CONTROL_OID,
+        LdapControl::new(
+            oid,
             true,
             Some(crate::read_entry_controls::encode_attribute_selection(&attributes).unwrap()),
-        )])
+        )
+    }
+
+    fn read_entry_request_controls(oid: &str, attributes: &[&str]) -> RequestControls {
+        RequestControls::new(vec![read_entry_request_control(oid, attributes)])
+    }
+
+    fn pre_read_request_controls(attributes: &[&str]) -> RequestControls {
+        read_entry_request_controls(crate::read_entry_controls::PRE_READ_CONTROL_OID, attributes)
+    }
+
+    fn post_read_request_controls(attributes: &[&str]) -> RequestControls {
+        read_entry_request_controls(
+            crate::read_entry_controls::POST_READ_CONTROL_OID,
+            attributes,
+        )
+    }
+
+    fn read_entry_response_entry(
+        message: &ldap_parser::ldap::LdapMessage<'_>,
+        oid: &str,
+    ) -> rasn_ldap::SearchResultEntry {
+        let controls = message.controls.as_ref().expect("response controls");
+        let control = controls
+            .iter()
+            .find(|control| control.control_type.0.as_ref() == oid)
+            .expect("read-entry response control");
+        ber::decode(
+            control
+                .control_value
+                .as_deref()
+                .expect("read-entry response control value"),
+        )
+        .unwrap()
     }
 
     fn pre_read_response_entry(
         message: &ldap_parser::ldap::LdapMessage<'_>,
     ) -> rasn_ldap::SearchResultEntry {
-        let controls = message.controls.as_ref().expect("response controls");
-        let control = controls
-            .iter()
-            .find(|control| {
-                control.control_type.0.as_ref() == crate::read_entry_controls::PRE_READ_CONTROL_OID
-            })
-            .expect("pre-read response control");
-        ber::decode(
-            control
-                .control_value
-                .as_deref()
-                .expect("pre-read response control value"),
-        )
-        .unwrap()
+        read_entry_response_entry(message, crate::read_entry_controls::PRE_READ_CONTROL_OID)
+    }
+
+    fn post_read_response_entry(
+        message: &ldap_parser::ldap::LdapMessage<'_>,
+    ) -> rasn_ldap::SearchResultEntry {
+        read_entry_response_entry(message, crate::read_entry_controls::POST_READ_CONTROL_OID)
     }
 
     fn rasn_search_entry_attribute_map(
@@ -10560,6 +10853,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_with_post_read_returns_added_entry_control() {
+        let backend = MockBackend::new();
+        let schema = LdapSchema::default();
+        let request = AddRequest {
+            entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            attributes: vec![
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("objectClass".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"person".to_vec()))],
+                },
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("cn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"Alice".to_vec()))],
+                },
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("sn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"User".to_vec()))],
+                },
+            ],
+        };
+        let request_controls = post_read_request_controls(&["cn", "entryDN"]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_add_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            33,
+            request,
+            &bound_schema_session(),
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::AddResponse(add_response) => {
+                assert_eq!(add_response.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let post_read_entry = post_read_response_entry(&messages[0]);
+        assert_eq!(
+            String::from_utf8(post_read_entry.object_name.to_vec()).unwrap(),
+            "cn=Alice,dc=example,dc=org"
+        );
+        let post_read_attributes = rasn_search_entry_attribute_map(&post_read_entry);
+        assert_eq!(
+            post_read_attributes.get("cn").unwrap(),
+            &vec!["Alice".to_string()]
+        );
+        assert_eq!(
+            post_read_attributes.get("entryDN").unwrap(),
+            &vec!["cn=Alice,dc=example,dc=org".to_string()]
+        );
+        assert!(!post_read_attributes.contains_key("sn"));
+    }
+
+    #[tokio::test]
+    async fn malformed_post_read_add_is_rejected_without_mutating_entry() {
+        let backend = MockBackend::new();
+        let schema = LdapSchema::default();
+        let request = AddRequest {
+            entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            attributes: vec![
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("objectClass".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"person".to_vec()))],
+                },
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("cn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"Alice".to_vec()))],
+                },
+                FilterAttribute {
+                    attr_type: LdapString(Cow::Owned("sn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"User".to_vec()))],
+                },
+            ],
+        };
+        let request_controls = RequestControls::new(vec![LdapControl::new(
+            crate::read_entry_controls::POST_READ_CONTROL_OID,
+            true,
+            Some(b"not-ber".to_vec()),
+        )]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_add_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            34,
+            request,
+            &bound_schema_session(),
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::AddResponse(add_response) => {
+                assert_eq!(add_response.result_code, ParserResultCode::ProtocolError);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+        assert!(
+            backend
+                .get_entry("cn=Alice,dc=example,dc=org")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn authenticated_modify_uses_bound_dn_for_operational_attrs() {
         let backend = MockBackend::new();
         backend
@@ -10713,6 +11127,80 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored.attributes.get("cn").unwrap(),
+            &vec!["Alice Updated".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn modify_with_pre_and_post_read_returns_prior_and_current_entry_controls() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=Alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Alice".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let request = ModifyRequest {
+            object: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            changes: vec![Change {
+                operation: Operation(2),
+                modification: PartialAttribute {
+                    attr_type: LdapString(Cow::Owned("cn".to_string())),
+                    attr_vals: vec![AttributeValue(Cow::Owned(b"Alice Updated".to_vec()))],
+                },
+            }],
+        };
+        let request_controls = RequestControls::new(vec![
+            read_entry_request_control(crate::read_entry_controls::PRE_READ_CONTROL_OID, &["cn"]),
+            read_entry_request_control(crate::read_entry_controls::POST_READ_CONTROL_OID, &["cn"]),
+        ]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_modify_request_with_context(
+            &mut server_stream,
+            &backend,
+            &LdapSchema::default(),
+            35,
+            request,
+            &bound_schema_session(),
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::ModifyResponse(modify_response) => {
+                assert_eq!(
+                    modify_response.result.result_code,
+                    ParserResultCode::Success
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let pre_read_entry = pre_read_response_entry(&messages[0]);
+        let pre_read_attributes = rasn_search_entry_attribute_map(&pre_read_entry);
+        assert_eq!(
+            pre_read_attributes.get("cn").unwrap(),
+            &vec!["Alice".to_string()]
+        );
+
+        let post_read_entry = post_read_response_entry(&messages[0]);
+        let post_read_attributes = rasn_search_entry_attribute_map(&post_read_entry);
+        assert_eq!(
+            post_read_attributes.get("cn").unwrap(),
             &vec!["Alice Updated".to_string()]
         );
     }
@@ -11176,6 +11664,71 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
     }
 
     #[tokio::test]
+    async fn moddn_with_post_read_returns_renamed_entry_control() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=Alice,dc=example,dc=org",
+                    HashMap::from([
+                        ("cn".to_string(), vec!["Alice".to_string()]),
+                        ("sn".to_string(), vec!["User".to_string()]),
+                        ("objectclass".to_string(), vec!["person".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let request = ModDnRequest {
+            entry: LdapDN(Cow::Owned("cn=Alice,dc=example,dc=org".to_string())),
+            newrdn: RelativeLdapDN(Cow::Owned("cn=Alice Renamed".to_string())),
+            deleteoldrdn: true,
+            newsuperior: None,
+        };
+        let request_controls = post_read_request_controls(&["cn", "entryDN"]);
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+
+        handle_moddn_request_with_context(
+            &mut server_stream,
+            &backend,
+            &LdapSchema::default(),
+            36,
+            request,
+            &bound_schema_session(),
+            &RequestContext::default(),
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        match &messages[0].protocol_op {
+            ProtocolOp::ModDnResponse(moddn_response) => {
+                assert_eq!(moddn_response.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        let post_read_entry = post_read_response_entry(&messages[0]);
+        assert_eq!(
+            String::from_utf8(post_read_entry.object_name.to_vec()).unwrap(),
+            "cn=alice renamed,dc=example,dc=org"
+        );
+        let post_read_attributes = rasn_search_entry_attribute_map(&post_read_entry);
+        assert_eq!(
+            post_read_attributes.get("cn").unwrap(),
+            &vec!["Alice Renamed".to_string()]
+        );
+        assert_eq!(
+            post_read_attributes.get("entryDN").unwrap(),
+            &vec!["cn=alice renamed,dc=example,dc=org".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn handle_client_accepts_fragmented_bind_request() {
         let backend = Arc::new(MockBackend::from_credentials([(
             String::from("cn=admin,dc=example,dc=org"),
@@ -11425,6 +11978,7 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
         let mut expected_controls = vec![
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
+            POST_READ_CONTROL_OID.to_string(),
             PRE_READ_CONTROL_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
             SUBENTRIES_CONTROL_OID.to_string(),

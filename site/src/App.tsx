@@ -453,7 +453,7 @@ exampleExactCode: CaseToken`;
 const operationsRows = [
   ["LDAP operations", "Simple bind, anonymous bind, search, add, modify, delete, ModifyDN, compare, abandon, and unbind."],
   ["Extended operations", "StartTLS, Password Modify, WhoAmI, and Cancel are wired in the FSM server path."],
-  ["Controls and features", "Paged results, server-side sort, ManageDsaIT, Subentries, RFC 4527 Pre-Read, LDAP Sync controls, and RFC 4529 object-class attribute selection are supported."],
+  ["Controls and features", "Paged results, server-side sort, ManageDsaIT, Subentries, RFC 4527 Pre-Read and Post-Read, LDAP Sync controls, and RFC 4529 object-class attribute selection are supported."],
   ["Schema", "Built-in, external LDIF, and authorized online schema definitions publish through `cn=Subschema` and validate add, modify, and ModifyDN writes."],
   ["ACI", "Startup loads TOML ACI rules, then applies operation-level and attribute-level checks for search and write paths."],
   ["Monitoring", "Prometheus metrics, JSON health, and the read-only management console are served from the configured monitoring listener."],

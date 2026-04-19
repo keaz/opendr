@@ -331,6 +331,7 @@ FSM runtime supports:
 - server-side sort
 - RFC 3672 Subentries request control
 - RFC 4527 Pre-Read request control on modify, delete, and ModifyDN
+- RFC 4527 Post-Read request control on add, modify, and ModifyDN
 - LDAP Sync controls for replication
 
 Controls:
@@ -340,6 +341,8 @@ Controls:
 - Duplicate singleton controls are rejected.
 - Pre-Read response controls include a BER `SearchResultEntry` for the target
   entry before a successful modify, delete, or ModifyDN.
+- Post-Read response controls include a BER `SearchResultEntry` for the target
+  entry after a successful add, modify, or ModifyDN.
 - Paged search cookies are scoped to the search sequence and cleaned on cancel
   or abandon.
 - Server-side sort rejects unsupported ordering rules.

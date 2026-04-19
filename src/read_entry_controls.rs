@@ -57,11 +57,24 @@ impl From<ControlLookupError> for ReadEntryControlError {
 pub fn decode_pre_read_request_control(
     request_controls: &RequestControls,
 ) -> Result<Option<ReadEntryRequest>, ReadEntryControlError> {
-    let Some(control) = request_controls.singleton(PRE_READ_CONTROL_OID)? else {
+    decode_read_entry_request_control(request_controls, PRE_READ_CONTROL_OID)
+}
+
+pub fn decode_post_read_request_control(
+    request_controls: &RequestControls,
+) -> Result<Option<ReadEntryRequest>, ReadEntryControlError> {
+    decode_read_entry_request_control(request_controls, POST_READ_CONTROL_OID)
+}
+
+fn decode_read_entry_request_control(
+    request_controls: &RequestControls,
+    oid: &'static str,
+) -> Result<Option<ReadEntryRequest>, ReadEntryControlError> {
+    let Some(control) = request_controls.singleton(oid)? else {
         return Ok(None);
     };
 
-    let attributes = decode_attribute_selection(control.value(), PRE_READ_CONTROL_OID)?;
+    let attributes = decode_attribute_selection(control.value(), oid)?;
     Ok(Some(ReadEntryRequest {
         attributes,
         critical: control.criticality(),
@@ -80,15 +93,41 @@ pub(crate) fn pre_read_response_control(
     entry: &DirectoryEntry,
     attributes: &[String],
 ) -> Result<LdapControl, EncodeError> {
+    read_entry_response_control(PRE_READ_CONTROL_OID, entry, attributes)
+}
+
+pub(crate) fn post_read_response_control(
+    entry: &DirectoryEntry,
+    attributes: &[String],
+) -> Result<LdapControl, EncodeError> {
+    read_entry_response_control(POST_READ_CONTROL_OID, entry, attributes)
+}
+
+fn read_entry_response_control(
+    oid: &'static str,
+    entry: &DirectoryEntry,
+    attributes: &[String],
+) -> Result<LdapControl, EncodeError> {
     let selected = select_entry_attributes(entry, attributes);
     let value = encode_search_result_entry_value(&entry.dn, &selected, false)?;
-    Ok(LdapControl::new(PRE_READ_CONTROL_OID, false, Some(value)))
+    Ok(LdapControl::new(oid, false, Some(value)))
 }
 
 pub(crate) fn contains_critical_pre_read_control(request_controls: &RequestControls) -> bool {
-    request_controls.iter().any(|control| {
-        control.oid().eq_ignore_ascii_case(PRE_READ_CONTROL_OID) && control.criticality()
-    })
+    contains_critical_read_entry_control(request_controls, PRE_READ_CONTROL_OID)
+}
+
+pub(crate) fn contains_critical_post_read_control(request_controls: &RequestControls) -> bool {
+    contains_critical_read_entry_control(request_controls, POST_READ_CONTROL_OID)
+}
+
+fn contains_critical_read_entry_control(
+    request_controls: &RequestControls,
+    oid: &'static str,
+) -> bool {
+    request_controls
+        .iter()
+        .any(|control| control.oid().eq_ignore_ascii_case(oid) && control.criticality())
 }
 
 pub(crate) fn select_entry_attributes(
@@ -207,6 +246,55 @@ mod tests {
                 oid: PRE_READ_CONTROL_OID
             })
         ));
+    }
+
+    #[test]
+    fn post_read_attribute_selection_round_trips() {
+        let encoded = encode_attribute_selection(&["cn".to_string(), "entryDN".to_string()])
+            .expect("attribute selection should encode");
+        let controls = RequestControls::new(vec![LdapControl::new(
+            POST_READ_CONTROL_OID,
+            false,
+            Some(encoded),
+        )]);
+
+        let decoded = decode_post_read_request_control(&controls)
+            .unwrap()
+            .unwrap();
+
+        assert!(!decoded.critical());
+        assert_eq!(decoded.attributes(), &["cn", "entryDN"]);
+    }
+
+    #[test]
+    fn post_read_control_requires_value() {
+        let controls =
+            RequestControls::new(vec![LdapControl::new(POST_READ_CONTROL_OID, false, None)]);
+
+        assert!(matches!(
+            decode_post_read_request_control(&controls),
+            Err(ReadEntryControlError::MissingValue {
+                oid: POST_READ_CONTROL_OID
+            })
+        ));
+    }
+
+    #[test]
+    fn post_read_response_control_uses_post_read_oid() {
+        let entry = DirectoryEntry::new(
+            "cn=Alice,dc=example,dc=org",
+            HashMap::from([
+                ("cn".to_string(), vec!["Alice".to_string()]),
+                ("sn".to_string(), vec!["User".to_string()]),
+                ("objectclass".to_string(), vec!["person".to_string()]),
+            ]),
+        );
+
+        let control = post_read_response_control(&entry, &["cn".to_string()]).unwrap();
+
+        assert_eq!(control.oid(), POST_READ_CONTROL_OID);
+        assert!(!control.criticality());
+        assert!(control.value().is_some());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use opendr::backend::{
 };
 use opendr::csn::Csn;
 use opendr::fsm_request::active_fsm_control_registry;
-use opendr::read_entry_controls::PRE_READ_CONTROL_OID;
+use opendr::read_entry_controls::{POST_READ_CONTROL_OID, PRE_READ_CONTROL_OID};
 use opendr::schema::{LdapSchema, SchemaError};
 use opendr::search_controls::{
     PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SUBENTRIES_CONTROL_OID,
@@ -24,7 +24,6 @@ const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
 const WHO_AM_I_OID: &str = "1.3.6.1.4.1.4203.1.11.3";
 const SERVER_SIDE_SORT_RESPONSE_OID: &str = "1.2.840.113556.1.4.474";
 const ASSERTION_CONTROL_OID: &str = "1.3.6.1.1.12";
-const POST_READ_CONTROL_OID: &str = "1.3.6.1.1.13.2";
 
 #[tokio::test]
 async fn root_dse_base_attributes_follow_rfc_4512_and_truthful_advertising() {
@@ -70,6 +69,7 @@ async fn root_dse_base_attributes_follow_rfc_4512_and_truthful_advertising() {
     let mut expected_controls = vec![
         MANAGE_DSA_IT_OID.to_string(),
         PAGED_RESULTS_OID.to_string(),
+        POST_READ_CONTROL_OID.to_string(),
         PRE_READ_CONTROL_OID.to_string(),
         SERVER_SIDE_SORT_REQUEST_OID.to_string(),
         SUBENTRIES_CONTROL_OID.to_string(),
@@ -82,7 +82,6 @@ async fn root_dse_base_attributes_follow_rfc_4512_and_truthful_advertising() {
         SYNC_STATE_OID,
         SYNC_DONE_OID,
         ASSERTION_CONTROL_OID,
-        POST_READ_CONTROL_OID,
     ] {
         assert!(
             !supported_controls.contains(&unsupported_or_response_only.to_string()),

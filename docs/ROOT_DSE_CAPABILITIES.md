@@ -19,12 +19,15 @@ values.
 | Content Sync done | `1.3.6.1.4.1.4203.1.9.1.3` | RFC 4533 | No, response-only control. |
 | Assertion | `1.3.6.1.1.12` | RFC 4528 | No, unsupported request control. |
 | Pre-Read | `1.3.6.1.1.13.1` | RFC 4527 | Yes, request control for modify, delete, and ModifyDN. |
-| Post-Read | `1.3.6.1.1.13.2` | RFC 4527 | No, unsupported request control. |
+| Post-Read | `1.3.6.1.1.13.2` | RFC 4527 | Yes, request control for add, modify, and ModifyDN. |
 
 Unknown non-critical request controls are ignored. Unknown critical request
 controls are rejected with LDAP `unavailableCriticalExtension` semantics.
 Critical Pre-Read controls on operations outside modify, delete, and ModifyDN
 are rejected with `unavailableCriticalExtension`; non-critical Pre-Read controls
+on other operations are ignored.
+Critical Post-Read controls on operations outside add, modify, and ModifyDN
+are rejected with `unavailableCriticalExtension`; non-critical Post-Read controls
 on other operations are ignored.
 
 ## `supportedExtension`

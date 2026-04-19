@@ -5,7 +5,10 @@ use rasn_ldap::ResultCode;
 
 use crate::ldap_controls::{ControlRegistry, ControlValidationError, RequestControls};
 use crate::parser::ResponseOp;
-use crate::read_entry_controls::{PRE_READ_CONTROL_OID, contains_critical_pre_read_control};
+use crate::read_entry_controls::{
+    POST_READ_CONTROL_OID, PRE_READ_CONTROL_OID, contains_critical_post_read_control,
+    contains_critical_pre_read_control,
+};
 use crate::search_controls::{
     PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
     SUBENTRIES_CONTROL_OID,
@@ -100,6 +103,10 @@ impl FsmRequestKind {
     fn allows_pre_read_control(self) -> bool {
         matches!(self, Self::Modify | Self::Delete | Self::ModifyDn)
     }
+
+    fn allows_post_read_control(self) -> bool {
+        matches!(self, Self::Add | Self::Modify | Self::ModifyDn)
+    }
 }
 
 /// Response kind used for early rejections before operation-specific FSMs run.
@@ -130,6 +137,8 @@ pub fn active_fsm_control_registry() -> ControlRegistry {
         .register_request_control(MANAGE_DSA_IT_OID)
         .register_request_control(PRE_READ_CONTROL_OID)
         .register_response_control(PRE_READ_CONTROL_OID)
+        .register_request_control(POST_READ_CONTROL_OID)
+        .register_response_control(POST_READ_CONTROL_OID)
         .register_request_control(SYNC_REQUEST_OID)
         .register_response_control(SYNC_STATE_OID)
         .register_response_control(SYNC_DONE_OID);
@@ -168,6 +177,18 @@ pub fn build_request_context(
             });
         }
         request_controls = request_controls.without_oid(PRE_READ_CONTROL_OID);
+    }
+    if !request_kind.allows_post_read_control() {
+        if contains_critical_post_read_control(&request_controls) {
+            return Err(FsmRequestRejection {
+                response_kind,
+                result_code: ResultCode::UnavailableCriticalExtension,
+                diagnostic_message:
+                    "post-read control is only appropriate for add, modify, and modifyDN operations"
+                        .to_string(),
+            });
+        }
+        request_controls = request_controls.without_oid(POST_READ_CONTROL_OID);
     }
 
     Ok(FsmRequestContext {
