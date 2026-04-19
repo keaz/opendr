@@ -1,6 +1,7 @@
 // Integration tests for server setup functionality
 
 use opendr::config::ServerConfig;
+use opendr::schema::LdapSchema;
 use opendr::setup::{
     BackendType, ConsumerConfig, ProviderConfig, ReplicationConfig, ReplicationRole, SetupConfig,
     SetupHandler, TlsConfig,
@@ -74,6 +75,31 @@ async fn test_setup_creates_missing_config_directory() {
     assert!(config_dir.join("log4rs.yml").is_file());
     assert!(config_dir.join("admin.ldif").is_file());
     assert!(config_dir.join("base.ldif").is_file());
+}
+
+#[tokio::test]
+async fn test_setup_generates_bundled_schema_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_dir = temp_dir.path().join("config");
+    let schema_dir = config_dir.join("schema");
+    let handler = SetupHandler::new(&config_dir);
+
+    let written = handler
+        .generate_builtin_schema_files(&schema_dir, &["all".to_string()], false)
+        .await
+        .unwrap();
+
+    let core_schema = schema_dir.join("core").join("rfc3672.ldif");
+    let posix_schema = schema_dir.join("posix").join("rfc2307.ldif");
+    assert_eq!(written, vec![core_schema.clone(), posix_schema.clone()]);
+    assert!(core_schema.is_file());
+    assert!(posix_schema.is_file());
+
+    let mut schema = LdapSchema::with_core_schema();
+    schema.load_schema_dir(&schema_dir).unwrap();
+    assert!(schema.get_object_class("subentry").is_some());
+    assert!(schema.get_object_class("posixAccount").is_some());
+    assert!(schema.get_object_class("nisNetgroup").is_some());
 }
 
 #[tokio::test]

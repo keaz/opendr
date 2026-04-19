@@ -7,6 +7,7 @@ use crate::ldap_controls::{ControlRegistry, ControlValidationError, RequestContr
 use crate::parser::ResponseOp;
 use crate::search_controls::{
     PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
+    SUBENTRIES_CONTROL_OID,
 };
 use crate::sync_controls::{SYNC_DONE_OID, SYNC_REQUEST_OID, SYNC_STATE_OID};
 
@@ -120,6 +121,7 @@ pub fn active_fsm_control_registry() -> ControlRegistry {
         .register_response_control(PAGED_RESULTS_OID)
         .register_request_control(SERVER_SIDE_SORT_REQUEST_OID)
         .register_response_control(SERVER_SIDE_SORT_RESPONSE_OID)
+        .register_request_control(SUBENTRIES_CONTROL_OID)
         .register_request_control(MANAGE_DSA_IT_OID)
         .register_request_control(SYNC_REQUEST_OID)
         .register_response_control(SYNC_STATE_OID)

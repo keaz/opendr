@@ -162,6 +162,16 @@ opendr-setup generate-config --output setup-config.toml
 opendr-setup --config-dir ./config non-interactive --config setup-config.toml
 ```
 
+Generate bundled schema LDIF files for file-based deployments or review:
+
+```bash
+opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
+```
+
+The command writes bundled schema files such as
+`config/schema/core/rfc3672.ldif` and `config/schema/posix/rfc2307.ldif`. The
+runtime also supports the same schema through `load_builtin = ["core", "posix"]`.
+
 Check setup status:
 
 ```bash
@@ -314,6 +324,7 @@ FSM runtime supports:
 - referrals and ManageDsaIT handling
 - paged results
 - server-side sort
+- RFC 3672 Subentries request control
 - LDAP Sync controls for replication
 
 Controls:
@@ -337,14 +348,14 @@ Controls:
 
 Schema validation:
 
-- The registry loads configured built-in schema and RFC-style LDIF files from
-  `[schema].schema_dir`.
+- The registry loads configured built-in schema and RFC-style LDIF files
+  recursively from `[schema].schema_dir`.
 - The core schema includes common LDAP classes such as `top`, `person`,
   `organizationalPerson`, `inetOrgPerson`, `organization`, and
-  `organizationalUnit`.
-- The optional `posix` built-in schema bundle adds RFC 2307 `posixAccount`,
-  `posixGroup`, numeric ID attributes, home directory, login shell, GECOS, and
-  `memberUid`.
+  `organizationalUnit`, plus RFC 3672 subentry schema loaded from bundled LDIF.
+- The optional `posix` built-in schema bundle adds full RFC 2307 POSIX/NIS
+  coverage, including account, group, shadow, host, network, service, protocol,
+  RPC, netgroup, NIS map, IEEE 802 device, and bootable device entries.
 - Adds require `objectClass`, required attributes, a valid structural class, and
   no single-value or syntax violations.
 - Modify and ModifyDN validate the resulting entry or RDN against the active

@@ -393,8 +393,8 @@ strict_validation = true
 allow_online_updates = false`,
     options: [
       ["enabled", "Loads the built-in and external LDAP schema registry at startup."],
-      ["schema_dir", "Directory for RFC-style LDIF schema files with `.ldif`, `.schema`, or `.conf` extensions."],
-      ["load_builtin", "Built-in schema bundle names loaded before external files. Use core by default, or add posix for RFC 2307 account and group entries."],
+      ["schema_dir", "Directory recursively loaded for RFC-style LDIF schema files with `.ldif`, `.schema`, or `.conf` extensions."],
+      ["load_builtin", "Built-in schema bundle names loaded before external files. Use core by default for RFC 3672 subentries, or add posix for RFC 2307 POSIX/NIS entries."],
       ["strict_validation", "Treats malformed schema files as startup errors."],
       ["allow_online_updates", "Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into the configured schema directory."],
     ],
@@ -453,7 +453,7 @@ exampleExactCode: CaseToken`;
 const operationsRows = [
   ["LDAP operations", "Simple bind, anonymous bind, search, add, modify, delete, ModifyDN, compare, abandon, and unbind."],
   ["Extended operations", "StartTLS, Password Modify, WhoAmI, and Cancel are wired in the FSM server path."],
-  ["Controls", "Paged results, server-side sort, ManageDsaIT, and LDAP Sync controls are supported."],
+  ["Controls", "Paged results, server-side sort, ManageDsaIT, Subentries, and LDAP Sync controls are supported."],
   ["Schema", "Built-in, external LDIF, and authorized online schema definitions publish through `cn=Subschema` and validate add, modify, and ModifyDN writes."],
   ["ACI", "Startup loads TOML ACI rules, then applies operation-level and attribute-level checks for search and write paths."],
   ["Monitoring", "Prometheus metrics, JSON health, and the read-only management console are served from the configured monitoring listener."],
@@ -1565,6 +1565,7 @@ pnpm build`}</code></pre>
               <pre><code>{`opendr-setup interactive
 opendr-setup non-interactive --config setup-config.toml
 opendr-setup generate-config --output setup-config.toml
+opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
 opendr-setup status
 opendr-setup reset --force
 opendr-setup hash-password 'StrongPass123'`}</code></pre>
@@ -1574,6 +1575,7 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
                 <li><code>server.toml</code> with canonical runtime fields.</li>
                 <li><code>setup.state</code> to block accidental reconfiguration.</li>
                 <li><code>admin.ldif</code>, <code>base.ldif</code>, and optional <code>sample.ldif</code>.</li>
+                <li>Bundled schema LDIF files when <code>generate-schema</code> is used.</li>
                 <li>Data and replication state directories.</li>
               </ul>
             </section>

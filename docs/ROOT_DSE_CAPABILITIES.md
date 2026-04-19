@@ -13,6 +13,7 @@ values.
 | Server-Side Sort request | `1.2.840.113556.1.4.473` | RFC 2891 | Yes, request control. |
 | Server-Side Sort response | `1.2.840.113556.1.4.474` | RFC 2891 | No, response-only control. |
 | ManageDsaIT | `2.16.840.1.113730.3.4.2` | RFC 3296 | Yes, request control. |
+| Subentries | `1.3.6.1.4.1.4203.1.10.1` | RFC 3672 | Yes, request control. |
 | Content Sync request | `1.3.6.1.4.1.4203.1.9.1.1` | RFC 4533 | Yes, request control. |
 | Content Sync state | `1.3.6.1.4.1.4203.1.9.1.2` | RFC 4533 | No, response-only control. |
 | Content Sync done | `1.3.6.1.4.1.4203.1.9.1.3` | RFC 4533 | No, response-only control. |

@@ -64,12 +64,14 @@ allow_online_updates = false
 ```
 
 The server loads built-in schema bundles before supported files from
-`schema_dir` in lexical order. Supported built-ins are `core` and the optional
-RFC 2307 `posix` bundle. Supported file extensions are `.ldif`, `.schema`, and
-`.conf`.
+`schema_dir` recursively in lexical path order. Supported built-ins are `core`
+and the optional RFC 2307 `posix` bundle. The `core` bundle includes the RFC
+3672 LDAP subentry definitions from bundled LDIF. Supported file extensions are
+`.ldif`, `.schema`, and `.conf`.
 
-Enable POSIX account and group schema when clients need `posixAccount`,
-`posixGroup`, `uidNumber`, `gidNumber`, or `memberUid`:
+Enable POSIX/NIS schema when clients need RFC 2307 account, group, shadow,
+host, network, service, protocol, RPC, netgroup, NIS map, IEEE 802 device, or
+bootable device entries:
 
 ```toml
 [schema]
@@ -79,6 +81,32 @@ load_builtin = ["core", "posix"]
 The example fixture
 [schema_examples/standard-directory.ldif](schema_examples/standard-directory.ldif)
 contains entries that validate against `load_builtin = ["core", "posix"]`.
+
+Bundled schema files can also be generated into a configured schema directory
+for inspection, packaging, or controlled customization:
+
+```bash
+opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
+```
+
+This writes bundled schema files such as `config/schema/core/rfc3672.ldif` and
+`config/schema/posix/rfc2307.ldif`. The generated files are the same LDIF that
+backs the built-in bundles. If both `load_builtin = ["core", "posix"]` and the
+generated files are enabled, definitions are expected to be identical.
+
+### LDAP Subentries
+
+The core schema registers RFC 3672 `subentry`, `administrativeRole`, and
+`subtreeSpecification`. `subtreeSpecification` values are validated using the
+RFC 3672 GSER-style grammar, including base, specific exclusions, minimum,
+maximum, and specification filters.
+
+Subentry entries must be subordinate to an administrative entry that carries
+`administrativeRole`. The RFC 3672 Subentries request control
+`1.3.6.1.4.1.4203.1.10.1` is advertised in Root DSE. Without the control,
+one-level and subtree searches hide subentries while base-object searches can
+return them. With a TRUE control value, search returns subentries and hides
+normal entries; with FALSE, search returns normal entries and hides subentries.
 
 ### External Schema Files
 
@@ -108,6 +136,18 @@ dITStructureRules: ( 555201 NAME 'exampleEmployeeStructureRule' FORM exampleEmpl
 ```
 
 Supported LDIF attributes: `attributeTypes`, `objectClasses`, `ldapSyntaxes`, `matchingRules`, `matchingRuleUse`, `dITContentRules`, `nameForms`, and `dITStructureRules`.
+
+Schema load and online schema updates validate cross-element dependencies before
+accepting the effective schema. This includes:
+
+- `matchingRuleUse` values referencing known matching rules and known
+  attributes in `APPLIES`.
+- `dITContentRules` targeting a known structural object class and referencing
+  known auxiliary object classes and attributes.
+- `nameForms` targeting a known structural object class and referencing known
+  naming attributes.
+- `dITStructureRules` referencing known name forms and known superior structure
+  rule IDs.
 
 Validate definitions before starting or restarting a server:
 
@@ -142,8 +182,11 @@ same attribute definitions: equality filters use the equality matching rule,
 substring filters use the substring matching rule, and ordering filters require
 an ordering matching rule.
 
-The supported RFC 4517 syntax validators and matching-rule normalizers are
-tracked in [LDAP_SYNTAX_MATCHING_SUPPORT.md](LDAP_SYNTAX_MATCHING_SUPPORT.md).
+The RFC 4517 syntax validators and matching-rule normalizers advertised by the
+generated subschema are listed in
+[LDAP_SYNTAX_MATCHING_SUPPORT.md](LDAP_SYNTAX_MATCHING_SUPPORT.md).
+String-based matching rules use RFC 4518/X.520 preparation before producing
+comparison values or typed index keys.
 
 ### Online Schema Updates
 
@@ -227,36 +270,72 @@ The schema includes these core object classes from RFC 4519:
 - **person** (Structural)
   - Superior: top
   - Required: cn, sn
-  - Optional: userPassword, description
+  - Optional: userPassword, telephoneNumber, seeAlso, description
 
 - **organizationalPerson** (Structural)
   - Superior: person
-  - Optional: title, registeredAddress, telephoneNumber, street, postOfficeBox, postalCode, postalAddress, physicalDeliveryOfficeName, st, l, ou, mail
+  - Optional: title, x121Address, registeredAddress, destinationIndicator, preferredDeliveryMethod, telexNumber, teletexTerminalIdentifier, telephoneNumber, internationalISDNNumber, facsimileTelephoneNumber, street, postOfficeBox, postalCode, postalAddress, physicalDeliveryOfficeName, ou, st, l
 
 - **inetOrgPerson** (Structural)
   - Superior: organizationalPerson
-  - Optional: businessCategory, carLicense, departmentNumber, displayName, employeeNumber, employeeType, uid, givenName, homePhone, homePostalAddress, initials, jpegPhoto, labeledURI, mail, manager, mobile, o, pager, preferredLanguage, roomNumber, secretary
+  - Optional: audio, businessCategory, carLicense, departmentNumber, displayName, employeeNumber, employeeType, givenName, homePhone, homePostalAddress, initials, jpegPhoto, labeledURI, mail, manager, mobile, o, pager, photo, roomNumber, secretary, uid, userCertificate, x500UniqueIdentifier, preferredLanguage, userSMIMECertificate, userPKCS12
+
+- **applicationProcess** (Structural)
+  - Superior: top
+  - Required: cn
+  - Optional: seeAlso, ou, l, description
+
+- **country** (Structural)
+  - Superior: top
+  - Required: c
+  - Optional: searchGuide, description
+
+- **dcObject** (Auxiliary)
+  - Superior: top
+  - Required: dc
+
+- **device** (Structural)
+  - Superior: top
+  - Required: cn
+  - Optional: serialNumber, seeAlso, owner, ou, o, l, description
+
+- **locality** (Structural)
+  - Superior: top
+  - Optional: street, seeAlso, searchGuide, st, l, description
 
 - **organization** (Structural)
   - Superior: top
   - Required: o
-  - Optional: userPassword, seeAlso, businessCategory, telephoneNumber, street, postOfficeBox, postalCode, postalAddress, registeredAddress, physicalDeliveryOfficeName, st, l, description
+  - Optional: userPassword, searchGuide, seeAlso, businessCategory, x121Address, registeredAddress, destinationIndicator, preferredDeliveryMethod, telexNumber, teletexTerminalIdentifier, telephoneNumber, internationalISDNNumber, facsimileTelephoneNumber, street, postOfficeBox, postalCode, postalAddress, physicalDeliveryOfficeName, st, l, description
+
+- **organizationalRole** (Structural)
+  - Superior: top
+  - Required: cn
+  - Optional: x121Address, registeredAddress, destinationIndicator, preferredDeliveryMethod, telexNumber, teletexTerminalIdentifier, telephoneNumber, internationalISDNNumber, facsimileTelephoneNumber, seeAlso, roleOccupant, street, postOfficeBox, postalCode, postalAddress, physicalDeliveryOfficeName, ou, st, l, description
 
 - **organizationalUnit** (Structural)
   - Superior: top
   - Required: ou
-  - Optional: userPassword, seeAlso, businessCategory, telephoneNumber, street, postOfficeBox, postalCode, postalAddress, registeredAddress, physicalDeliveryOfficeName, st, l, description
+  - Optional: businessCategory, description, destinationIndicator, facsimileTelephoneNumber, internationalISDNNumber, l, physicalDeliveryOfficeName, postalAddress, postalCode, postOfficeBox, preferredDeliveryMethod, registeredAddress, searchGuide, seeAlso, st, street, telephoneNumber, teletexTerminalIdentifier, telexNumber, userPassword, x121Address
 
 - **groupOfNames** (Structural)
   - Superior: top
-  - Required: cn
-  - Optional: member, businessCategory, seeAlso, owner, description, o, ou
-  - OpenDR permits empty `groupOfNames` entries for OpenDJ-style static group compatibility.
+  - Required: cn, member
+  - Optional: businessCategory, seeAlso, owner, ou, o, description
 
 - **groupOfUniqueNames** (Structural)
   - Superior: top
   - Required: cn, uniqueMember
   - Optional: businessCategory, seeAlso, owner, description, o, ou
+
+- **residentialPerson** (Structural)
+  - Superior: person
+  - Required: l
+  - Optional: businessCategory, x121Address, registeredAddress, destinationIndicator, preferredDeliveryMethod, telexNumber, teletexTerminalIdentifier, telephoneNumber, internationalISDNNumber, facsimileTelephoneNumber, street, postOfficeBox, postalCode, postalAddress, physicalDeliveryOfficeName, st, l
+
+- **uidObject** (Auxiliary)
+  - Superior: top
+  - Required: uid
 
 ### POSIX Object Classes
 
@@ -267,46 +346,126 @@ The optional `posix` built-in bundle includes these RFC 2307 classes:
   - Required: cn, uid, uidNumber, gidNumber, homeDirectory
   - Optional: userPassword, loginShell, gecos, description
 
+- **shadowAccount** (Auxiliary)
+  - Superior: top
+  - Required: uid
+  - Optional: userPassword, shadowLastChange, shadowMin, shadowMax, shadowWarning, shadowInactive, shadowExpire, shadowFlag, description
+
 - **posixGroup** (Structural)
   - Superior: top
   - Required: cn, gidNumber
   - Optional: userPassword, memberUid, description
 
+- **ipService** (Structural)
+  - Superior: top
+  - Required: cn, ipServicePort, ipServiceProtocol
+  - Optional: description
+
+- **ipProtocol** (Structural)
+  - Superior: top
+  - Required: cn, ipProtocolNumber, description
+  - Optional: description
+
+- **oncRpc** (Structural)
+  - Superior: top
+  - Required: cn, oncRpcNumber, description
+  - Optional: description
+
+- **ipHost** (Auxiliary)
+  - Superior: top
+  - Required: cn, ipHostNumber
+  - Optional: l, description, manager
+
+- **ipNetwork** (Structural)
+  - Superior: top
+  - Required: cn, ipNetworkNumber
+  - Optional: ipNetmaskNumber, l, description, manager
+
+- **nisNetgroup** (Structural)
+  - Superior: top
+  - Required: cn
+  - Optional: nisNetgroupTriple, memberNisNetgroup, description
+
+- **nisMap** (Structural)
+  - Superior: top
+  - Required: nisMapName
+  - Optional: description
+
+- **nisObject** (Structural)
+  - Superior: top
+  - Required: cn, nisMapEntry, nisMapName
+  - Optional: description
+
+- **ieee802Device** (Auxiliary)
+  - Superior: top
+  - Optional: macAddress
+
+- **bootableDevice** (Auxiliary)
+  - Superior: top
+  - Optional: bootFile, bootParameter
+
 ### Core Attributes
 
 - **objectClass**: Object class names
+- **name**: Name supertype
 - **cn** (commonName): Common name
 - **sn** (surname): Surname
+- **serialNumber**: Device serial number
+- **c** (countryName): Two-letter country code, single-value
 - **o** (organizationName): Organization name
 - **ou** (organizationalUnitName): Organizational unit name
 - **uid** (userid): User ID
+- **dc** (domainComponent): DNS domain component, single-value
 - **mail** (rfc822Mailbox): Email address
 - **userPassword**: User password
 - **member**: Group member DN
-- **uniqueMember**: Unique group member DN
+- **uniqueMember**: Unique group member DN with optional UID
 - **seeAlso**: Related entry DN
 - **owner**: Owner entry DN
+- **roleOccupant**: Role occupant entry DN
 - **description**: Description
+- **businessCategory**: Business category
+- **searchGuide**: Search guide
+- **enhancedSearchGuide**: Enhanced search guide
+- **distinguishedName**: Distinguished name supertype
+- **dnQualifier**: DN qualifier
+- **destinationIndicator**: Destination indicator
 - **givenName**: Given name
+- **generationQualifier**: Generation qualifier
+- **title**: Title
 - **displayName**: Display name
 - **initials**: Initials
+- **houseIdentifier**: House identifier
+- **x500UniqueIdentifier**: X.500 unique identifier
 - **carLicense**: Vehicle license or registration plate
 - **departmentNumber**: Department number
 - **employeeNumber**: Employee number, single-value
 - **employeeType**: Employee type
 - **homePhone**: Home telephone number
 - **homePostalAddress**: Home postal address
+- **audio**: Audio recording
 - **jpegPhoto**: JPEG photograph
+- **photo**: G3 fax encoded photograph
 - **labeledURI**: Labeled URI
 - **manager**: Manager entry DN
 - **mobile**: Mobile telephone number
 - **pager**: Pager telephone number
 - **preferredLanguage**: Preferred language, single-value
+- **userCertificate**: X.509 certificate; `;binary` attribute option is accepted
+- **userSMIMECertificate**: S/MIME PKCS#7 SignedData; `;binary` attribute option is accepted
+- **userPKCS12**: PKCS #12 PFX PDU; `;binary` attribute option is accepted
 - **roomNumber**: Room number
 - **secretary**: Secretary entry DN
 - **l** (localityName): Locality name
 - **st** (stateOrProvinceName): State or province name
 - **street**: Street address
+- **telephoneNumber**: Telephone number
+- **facsimileTelephoneNumber**: Facsimile telephone number
+- **telexNumber**: Telex number
+- **teletexTerminalIdentifier**: Teletex terminal identifier
+- **internationalISDNNumber**: International ISDN number
+- **x121Address**: X.121 address
+- **preferredDeliveryMethod**: Preferred delivery method, single-value
 - **postalAddress**: Postal address
 - **registeredAddress**: Registered address
 - **postalCode**: Postal code
@@ -320,7 +479,28 @@ The optional `posix` built-in bundle includes these RFC 2307 classes:
 - **gecos**: POSIX GECOS field, IA5 single-value
 - **homeDirectory**: Absolute home directory path, IA5 single-value
 - **loginShell**: Login shell path, IA5 single-value
+- **shadowLastChange**: Shadow password last-change day, integer single-value
+- **shadowMin**: Shadow password minimum age, integer single-value
+- **shadowMax**: Shadow password maximum age, integer single-value
+- **shadowWarning**: Shadow password warning period, integer single-value
+- **shadowInactive**: Shadow password inactive period, integer single-value
+- **shadowExpire**: Shadow account expiry day, integer single-value
+- **shadowFlag**: Reserved shadow password flag, integer single-value
 - **memberUid**: POSIX group member login name, IA5 multi-value
+- **memberNisNetgroup**: Nested NIS netgroup name, IA5 multi-value
+- **nisNetgroupTriple**: NIS netgroup triple in `(host,user,domain)` form
+- **ipServicePort**: Service port, integer single-value
+- **ipServiceProtocol**: Service protocol name
+- **ipProtocolNumber**: IP protocol number, integer single-value
+- **oncRpcNumber**: ONC RPC program number, integer single-value
+- **ipHostNumber**: IP host address, multi-value
+- **ipNetworkNumber**: IP network address, single-value
+- **ipNetmaskNumber**: IP netmask address, single-value
+- **macAddress**: Colon-separated six-octet MAC address
+- **bootParameter**: Boot parameter in `key=server:path` form
+- **bootFile**: Boot image name
+- **nisMapName**: NIS map name
+- **nisMapEntry**: NIS map entry, IA5 single-value
 
 ## Validation Rules
 
@@ -333,10 +513,11 @@ The optional `posix` built-in bundle includes these RFC 2307 classes:
 
 ### Attribute Validation
 
-1. **Required Attributes**: All MUST attributes from object classes must be present
-2. **Allowed Attributes**: Only MAY or MUST attributes from object classes are allowed
-3. **Single-Value Constraints**: Single-value attributes cannot have multiple values
-4. **Case Insensitive**: Attribute and object class names are case-insensitive
+1. **Required Attributes**: All MUST attributes from object classes must be present.
+2. **DIT Content Rules**: Applicable content rule MUST attributes are required, MAY attributes are allowed, NOT attributes are rejected, and auxiliary classes must be allowed by the content rule.
+3. **Allowed Attributes**: Only MAY or MUST attributes from object classes and applicable DIT content rules are allowed.
+4. **Single-Value Constraints**: Single-value attributes cannot have multiple values.
+5. **Case Insensitive**: Attribute and object class names are case-insensitive.
 
 ### Modification Validation
 
@@ -348,9 +529,10 @@ The optional `posix` built-in bundle includes these RFC 2307 classes:
 
 ### DN Modification Validation
 
-1. **RDN Format**: New RDN must be in "attribute=value" format
-2. **Attribute Exists**: RDN attribute must be defined in schema
-3. **Name Form Check**: When name forms exist for the structural object class, the RDN attribute must satisfy the configured MUST/MAY naming attributes
+1. **RDN Format**: New RDN must be in "attribute=value" format.
+2. **Attribute Exists**: RDN attribute must be defined in schema.
+3. **Name Form Check**: When name forms exist for the structural object class, every configured MUST naming attribute must appear in the RDN, every RDN attribute must be listed by the name form's MUST/MAY set, and every RDN value must be present in the candidate entry image.
+4. **DIT Structure Rule Check**: When structure rules exist, Add and ModifyDN validate the candidate entry against the parent entry's applicable DIT structure rule before the write is committed.
 
 ## Error Handling
 
@@ -365,7 +547,9 @@ The schema validator returns descriptive errors:
 - `SingleValueViolation`: Multiple values for single-value attribute
 - `InvalidSyntax`: Attribute value doesn't match syntax
 - `NoUserModification`: User attempted to modify a protected operational attribute
+- `DitContentRuleViolation`: Entry violates an applicable DIT content rule
 - `NamingViolation`: ModifyDN violates RDN or name-form rules
+- `StructureRuleViolation`: Add or ModifyDN violates a configured DIT structure rule
 
 Example error message:
 ```

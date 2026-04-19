@@ -13,20 +13,18 @@ OpenDR aligns with the common LDAP model in these areas:
 - `groupOfNames` is the right object class for DN-valued static groups using
   the `member` attribute.
 - `person`, `organizationalPerson`, and `inetOrgPerson` are available for user
-  entries, including common RFC 2798 employee and contact attributes.
-- RFC 2307 `posixAccount` and `posixGroup` are available through the optional
-  `posix` built-in schema bundle.
+  entries, including the full RFC 2798 `inetOrgPerson` attribute set.
+- RFC 2307 POSIX/NIS account, group, shadow, host, network, service, protocol,
+  RPC, netgroup, map, IEEE 802 device, and bootable device schema is available
+  through the optional `posix` built-in schema bundle.
 - `entryDN` is synthesized as an operational attribute for OpenDJ-compatible
   clients that request it explicitly.
 - Search responses preserve explicitly requested user attribute spelling, so a
   request for `objectClass` returns `objectClass` instead of the lower-case
   storage key.
 
-OpenDR intentionally differs from strict RFC 4519 in one area:
-
-- Strict RFC 4519 `groupOfNames` requires both `cn` and `member`.
-- OpenDR allows `groupOfNames` with only `cn` so empty groups can be created in
-  the same style commonly used by OpenDJ-compatible clients.
+For RFC 4519 user schema, OpenDR follows the standard `groupOfNames`
+definition: static DN groups require both `cn` and at least one `member`.
 
 Tracked follow-up work:
 
@@ -36,6 +34,22 @@ Tracked follow-up work:
 - GitHub issue #178: expand RFC 2798 `inetOrgPerson` coverage.
 - GitHub issue #179: add RFC 2307 POSIX account and group schema.
 - GitHub issue #180: add conformance fixtures, examples, and documentation.
+- GitHub issue #190: completed advanced RFC 4512 schema rule enforcement.
+- GitHub issue #191: completed RFC 4517 LDAP syntax and matching-rule registry
+  support.
+- GitHub issue #192: completed RFC 4518 internationalized string preparation
+  for schema matching rules.
+- GitHub issue #193: completed RFC 4519 user application schema coverage,
+  including strict `groupOfNames`.
+- GitHub issue #194: completed RFC 2798 `inetOrgPerson` schema coverage.
+- GitHub issue #195: completed RFC 2307 POSIX/NIS schema coverage.
+- GitHub issue #197: completed RFC 3672 LDAP subentries schema and search
+  visibility behavior.
+- GitHub issue #200: move all built-in standard schema definitions from Rust
+  literals into bundled schema files while keeping only the schema engine and
+  runtime behavior in Rust.
+- GitHub issues #196, #198, and #199: complete the remaining strict schema RFC
+  conformance work for RFC 3671, RFC 4523, and RFC 4524.
 
 ## Recommended DIT Shape
 
@@ -142,8 +156,11 @@ for a complete conformance example that uses `core` plus `posix`.
 
 | Area | Current support | Notes |
 | --- | --- | --- |
-| RFC 4519 containers | Partial, expanded core subset | `organization` and `organizationalUnit` include common contact attributes that OpenDR can validate. |
-| RFC 4519 `groupOfNames` | Supported with compatibility relaxation | `member` is allowed but not required. |
-| RFC 4519 `groupOfUniqueNames` | Supported | `uniqueMember` is required and validated as a DN. |
-| RFC 2798 `inetOrgPerson` | Partial, expanded subset | Common employee/contact attributes are built in; certificate, bit-string, and uncommon telephony syntaxes remain outside the documented subset. |
-| RFC 2307 POSIX/NIS | Optional built-in subset | Load with `load_builtin = ["core", "posix"]` for `posixAccount`, `posixGroup`, `uidNumber`, `gidNumber`, `homeDirectory`, `loginShell`, `gecos`, and `memberUid`. |
+| RFC 4517 syntaxes and matching rules | Supported | The built-in subschema advertises the RFC 4517 registry and validates or executes the advertised syntax and matching-rule surface. |
+| RFC 4518 string preparation | Supported | Directory String, Numeric String, Telephone Number, and related matching rules use X.520/RFC 4518 preparation before comparison and index key generation. |
+| RFC 4519 user schema | Supported | RFC 4519 user attributes and object classes are registered and validated, including strict `groupOfNames`. |
+| RFC 4519 `groupOfNames` | Supported | Both `cn` and `member` are required. |
+| RFC 4519 `groupOfUniqueNames` | Supported | `uniqueMember` is required and validated with Name and Optional UID syntax. |
+| RFC 2798 `inetOrgPerson` | Supported | Full RFC 2798 MAY attribute set is available, including audio/photo, binary/certificate attributes, and `preferredLanguage` validation. |
+| RFC 2307 POSIX/NIS | Optional built-in bundle | Load with `load_builtin = ["core", "posix"]` for the full RFC 2307 object class and attribute set, including shadow accounts, hosts, networks, services, protocols, RPCs, netgroups, NIS maps, IEEE 802 devices, and bootable devices. |
+| RFC 3672 LDAP subentries | Supported | The core bundle registers `subentry`, `administrativeRole`, and `subtreeSpecification`, validates subtree specifications, advertises the Subentries request control, and applies RFC 3672 search visibility rules. |

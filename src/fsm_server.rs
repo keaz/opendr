@@ -70,9 +70,9 @@ use crate::search_adapters::{
 };
 use crate::search_controls::{
     PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
-    SERVER_SIDE_SORT_RESPONSE_OID, ServerSideSortResultCode, SortKey, decode_paged_results_control,
-    decode_server_side_sort_request_control, encode_paged_results_control,
-    encode_server_side_sort_response_control,
+    SERVER_SIDE_SORT_RESPONSE_OID, SUBENTRIES_CONTROL_OID, ServerSideSortResultCode, SortKey,
+    decode_paged_results_control, decode_server_side_sort_request_control,
+    encode_paged_results_control, encode_server_side_sort_response_control,
 };
 use crate::search_fsm::{
     EntryFormatter, SearchBackend, SearchEntry, SearchFsmConfig, SearchFsmError, SearchFsmImpl,
@@ -80,16 +80,17 @@ use crate::search_fsm::{
 use crate::server::{
     CancelRequestOutcome, ConnectionOperationRegistry, ConnectionSession, LegacySecurityConfig,
     LegacyServerConfig, PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError,
-    SharedLdapSchema, SyncRequestError, apply_online_schema_modify,
-    authorize_attribute_permissions, authorize_operation, build_entry_from_add_request,
-    can_skip_search_post_filter, convert_ldap_changes_to_modifications,
-    entry_is_referral as directory_entry_is_referral, filter_search_entries_for_read_access,
+    SharedLdapSchema, SubentriesRequestError, SubentriesSearchVisibility, SyncRequestError,
+    apply_online_schema_modify, authorize_attribute_permissions, authorize_operation,
+    build_entry_from_add_request, can_skip_search_post_filter,
+    convert_ldap_changes_to_modifications, entry_is_referral as directory_entry_is_referral,
+    entry_matches_subentries_visibility, filter_search_entries_for_read_access,
     first_server_managed_operational_attribute, handle_sync_search_request,
     increment_control_counter, log_add_audit_event, log_anonymous_bind, log_compare_audit,
     log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
     log_password_modify_audit_event, log_sasl_bind, log_simple_bind_failure,
-    log_simple_bind_success, online_schema_update_result, parse_sync_request_control,
-    record_authentication_failure_metadata_with_context,
+    log_simple_bind_success, online_schema_update_result, parse_subentries_request_control,
+    parse_sync_request_control, record_authentication_failure_metadata_with_context,
     record_authentication_success_metadata_with_context, referral_urls_for_entry,
     reject_sync_request, resolve_search_base_dn, resolve_search_candidate_entry, schema_snapshot,
     server_managed_operational_attribute_diagnostic, shared_schema,
@@ -1298,6 +1299,39 @@ async fn handle_search_request_with_fsm_runtime(
             .map_err(|err| err.to_string())?;
         return Ok(());
     }
+    let subentries_visibility = match parse_subentries_request_control(&request.request_controls) {
+        Ok(visibility) => visibility,
+        Err(SubentriesRequestError::ProtocolError(diagnostic)) => {
+            send_request_result_response_with_referrals(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                search_req.base_object.0.as_ref().trim(),
+                &diagnostic,
+                &[],
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if subentries_visibility != SubentriesSearchVisibility::Default {
+        increment_control_counter(request_context, "ldap_subentries_requests_total", 1);
+    }
+    if requested_sync.is_some() && subentries_visibility != SubentriesSearchVisibility::Default {
+        let base_dn = search_req.base_object.0.as_ref().trim().to_owned();
+        let err = SyncRequestError::Unsupported(
+            "sync request control cannot be combined with subentries control".to_string(),
+        );
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        reject_sync_request(stream, request.message_id as u32, &base_dn, &err)
+            .await
+            .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
     if let Some(control) = paged_results.as_ref()
         && control.size == 0
         && control.cookie.is_empty()
@@ -1515,6 +1549,7 @@ async fn handle_search_request_with_fsm_runtime(
             &search_req,
             &attribute_selection,
             requested_sort.as_ref().map(|sort| sort.keys.as_slice()),
+            subentries_visibility,
         )
     });
     if let Some(control) = paged_results
@@ -1556,12 +1591,18 @@ async fn handle_search_request_with_fsm_runtime(
     if can_stream_index_covered_plain_search
         && matches!(search_hint, Some(SearchCandidateHint::Equality { .. }))
     {
+        let (projected_attributes, strip_internal_object_class) =
+            projected_attribute_selection_for_subentry_filtering(
+                &attribute_selection,
+                search_req.scope,
+                subentries_visibility,
+            );
         let stream_report = match backend
             .stream_projected_search_entries_with_hint_report(
                 &effective_base_dn,
                 search_req.scope,
                 search_hint.clone(),
-                attribute_selection.clone(),
+                projected_attributes,
             )
             .await
         {
@@ -1591,6 +1632,8 @@ async fn handle_search_request_with_fsm_runtime(
                 stream_report.entries,
                 manage_dsa_it,
                 search_req.scope,
+                subentries_visibility,
+                strip_internal_object_class,
                 search_req.types_only,
                 search_started_at,
                 search_req.time_limit,
@@ -1637,6 +1680,7 @@ async fn handle_search_request_with_fsm_runtime(
                 stream_report.entries,
                 manage_dsa_it,
                 search_req.scope,
+                subentries_visibility,
                 &attribute_selection,
                 search_req.types_only,
                 search_started_at,
@@ -1655,6 +1699,7 @@ async fn handle_search_request_with_fsm_runtime(
             stream_report.entries,
             manage_dsa_it,
             search_req.scope,
+            subentries_visibility,
             &attribute_selection,
             search_req.types_only,
             search_started_at,
@@ -1808,6 +1853,9 @@ async fn handle_search_request_with_fsm_runtime(
         )
         .await;
     }
+    preloaded_entries.retain(|entry| {
+        entry_matches_subentries_visibility(entry, search_req.scope, subentries_visibility)
+    });
     if let Some(requested_sort) = requested_sort.as_ref() {
         sort_native_search_entries(&mut preloaded_entries, requested_sort);
     }
@@ -2841,6 +2889,8 @@ async fn emit_projected_index_covered_plain_search_stream(
     mut entries: ProjectedSearchEntryStreamReceiver,
     manage_dsa_it: bool,
     scope: ldap_parser::ldap::SearchScope,
+    subentries_visibility: SubentriesSearchVisibility,
+    strip_internal_object_class: bool,
     types_only: bool,
     started_at: Instant,
     time_limit: u32,
@@ -2884,6 +2934,10 @@ async fn emit_projected_index_covered_plain_search_stream(
                 return Ok(());
             }
         };
+
+        if !projected_entry_matches_subentries_visibility(&entry, scope, subentries_visibility) {
+            continue;
+        }
 
         if !manage_dsa_it && entry.is_referral() {
             let referrals = match referral_urls_for_projected_entry(&entry) {
@@ -2938,10 +2992,12 @@ async fn emit_projected_index_covered_plain_search_stream(
             return Ok(());
         }
 
+        let response_attributes =
+            projected_response_attributes(&entry, strip_internal_object_class);
         let encoded_entry = encode_search_entry_parts_with_controls(
             request.message_id as u32,
             &entry.dn,
-            &entry.attributes,
+            &response_attributes,
             types_only,
             &[],
         )
@@ -2968,6 +3024,83 @@ async fn emit_projected_index_covered_plain_search_stream(
         &response_controls,
     )
     .await
+}
+
+fn projected_attribute_selection_for_subentry_filtering(
+    requested_attributes: &[String],
+    scope: ldap_parser::ldap::SearchScope,
+    visibility: SubentriesSearchVisibility,
+) -> (Vec<String>, bool) {
+    if !subentries_visibility_needs_object_class(scope, visibility)
+        || attribute_selection_includes_object_class(requested_attributes)
+    {
+        return (requested_attributes.to_vec(), false);
+    }
+
+    let mut projected_attributes = requested_attributes.to_vec();
+    projected_attributes.push("objectClass".to_string());
+    (projected_attributes, true)
+}
+
+fn subentries_visibility_needs_object_class(
+    scope: ldap_parser::ldap::SearchScope,
+    visibility: SubentriesSearchVisibility,
+) -> bool {
+    match visibility {
+        SubentriesSearchVisibility::Default => scope != ldap_parser::ldap::SearchScope::BaseObject,
+        SubentriesSearchVisibility::NormalEntriesOnly
+        | SubentriesSearchVisibility::SubentriesOnly => true,
+    }
+}
+
+fn attribute_selection_includes_object_class(requested_attributes: &[String]) -> bool {
+    requested_attributes.is_empty()
+        || requested_attributes
+            .iter()
+            .any(|attribute| attribute == "*" || attribute.eq_ignore_ascii_case("objectClass"))
+}
+
+fn projected_entry_matches_subentries_visibility(
+    entry: &ProjectedDirectoryEntry,
+    scope: ldap_parser::ldap::SearchScope,
+    visibility: SubentriesSearchVisibility,
+) -> bool {
+    match visibility {
+        SubentriesSearchVisibility::Default => {
+            scope == ldap_parser::ldap::SearchScope::BaseObject
+                || !projected_entry_is_subentry(entry)
+        }
+        SubentriesSearchVisibility::NormalEntriesOnly => !projected_entry_is_subentry(entry),
+        SubentriesSearchVisibility::SubentriesOnly => projected_entry_is_subentry(entry),
+    }
+}
+
+fn projected_entry_is_subentry(entry: &ProjectedDirectoryEntry) -> bool {
+    entry
+        .attributes
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("objectClass"))
+        .is_some_and(|(_, values)| {
+            values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case("subentry"))
+        })
+}
+
+fn projected_response_attributes(
+    entry: &ProjectedDirectoryEntry,
+    strip_internal_object_class: bool,
+) -> Vec<(String, Vec<String>)> {
+    if !strip_internal_object_class {
+        return entry.attributes.clone();
+    }
+
+    entry
+        .attributes
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("objectClass"))
+        .cloned()
+        .collect()
 }
 
 fn referral_urls_for_projected_entry(
@@ -3006,6 +3139,7 @@ async fn emit_index_covered_plain_search_stream(
     mut entries: SearchEntryStreamReceiver,
     manage_dsa_it: bool,
     scope: ldap_parser::ldap::SearchScope,
+    subentries_visibility: SubentriesSearchVisibility,
     requested_attributes: &[String],
     types_only: bool,
     started_at: Instant,
@@ -3051,6 +3185,10 @@ async fn emit_index_covered_plain_search_stream(
                 return Ok(());
             }
         };
+
+        if !entry_matches_subentries_visibility(&entry, scope, subentries_visibility) {
+            continue;
+        }
 
         if !manage_dsa_it && directory_entry_is_referral(&entry) {
             let referrals = match referral_urls_for_entry(&entry) {
@@ -3147,6 +3285,7 @@ async fn emit_filtering_plain_search_stream(
     mut entries: SearchEntryStreamReceiver,
     manage_dsa_it: bool,
     scope: ldap_parser::ldap::SearchScope,
+    subentries_visibility: SubentriesSearchVisibility,
     requested_attributes: &[String],
     types_only: bool,
     started_at: Instant,
@@ -3194,6 +3333,10 @@ async fn emit_filtering_plain_search_stream(
                 return Ok(());
             }
         };
+
+        if !entry_matches_subentries_visibility(&entry, scope, subentries_visibility) {
+            continue;
+        }
 
         if !manage_dsa_it && directory_entry_is_referral(&entry) {
             let referrals = match referral_urls_for_entry(&entry) {
@@ -3530,6 +3673,26 @@ async fn try_handle_virtual_search_request_with_fsm_runtime(
         return Ok(true);
     }
 
+    let subentries_visibility = match parse_subentries_request_control(&request.request_controls) {
+        Ok(visibility) => visibility,
+        Err(SubentriesRequestError::ProtocolError(diagnostic)) => {
+            send_request_result_response_with_referrals(
+                fsm_set,
+                request.message_id as u32,
+                request.response_kind,
+                ResultCode::ProtocolError,
+                base_dn,
+                &diagnostic,
+                &[],
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+    if subentries_visibility != SubentriesSearchVisibility::Default {
+        increment_control_counter(request_context, "ldap_subentries_requests_total", 1);
+    }
+
     if let Some(control) = paged_results.as_ref() {
         if control.size == 0 && control.cookie.is_empty() {
             reject_native_paged_search_request(
@@ -3616,27 +3779,35 @@ async fn try_handle_virtual_search_request_with_fsm_runtime(
         return Ok(false);
     };
 
-    let selected_attributes = crate::search_protocol::select_virtual_attributes(
-        &available_attributes,
-        &requested_attributes,
-    );
-    let synthetic_entry = crate::backend::DirectoryEntry::new(base_dn, HashMap::new());
-    let encoded = crate::parser::encode_search_entry(
-        request.message_id as u32,
-        &synthetic_entry,
-        &selected_attributes,
-        search_req.types_only,
-    )
-    .map_err(|err| format!("failed to encode virtual search entry: {err:?}"))?;
+    let virtual_is_subentry =
+        base_dn.eq_ignore_ascii_case(&runtime_context.legacy_runtime_config.subschema_dn);
+    if match subentries_visibility {
+        SubentriesSearchVisibility::Default => true,
+        SubentriesSearchVisibility::NormalEntriesOnly => !virtual_is_subentry,
+        SubentriesSearchVisibility::SubentriesOnly => virtual_is_subentry,
+    } {
+        let selected_attributes = crate::search_protocol::select_virtual_attributes(
+            &available_attributes,
+            &requested_attributes,
+        );
+        let synthetic_entry = crate::backend::DirectoryEntry::new(base_dn, HashMap::new());
+        let encoded = crate::parser::encode_search_entry(
+            request.message_id as u32,
+            &synthetic_entry,
+            &selected_attributes,
+            search_req.types_only,
+        )
+        .map_err(|err| format!("failed to encode virtual search entry: {err:?}"))?;
 
-    let stream = fsm_set
-        .connection_mut()
-        .stream_mut()
-        .ok_or("No active stream")?;
-    stream
-        .write_all(&encoded)
-        .await
-        .map_err(|err| format!("Write error: {err}"))?;
+        let stream = fsm_set
+            .connection_mut()
+            .stream_mut()
+            .ok_or("No active stream")?;
+        stream
+            .write_all(&encoded)
+            .await
+            .map_err(|err| format!("Write error: {err}"))?;
+    }
     let mut response_controls =
         native_search_done_controls(requested_sort.as_ref(), ResultCode::Success)?;
     if paged_results.is_some() {
@@ -3665,6 +3836,7 @@ fn native_search_control_oids_supported(
             || control
                 .oid()
                 .eq_ignore_ascii_case(SERVER_SIDE_SORT_REQUEST_OID)
+            || control.oid().eq_ignore_ascii_case(SUBENTRIES_CONTROL_OID)
             || control.oid().eq_ignore_ascii_case(SYNC_REQUEST_OID)
     })
 }
@@ -4420,6 +4592,59 @@ async fn handle_add_request_with_fsm_runtime(
         return Ok(());
     }
 
+    let parent_attributes = if schema.requires_parent_attributes_for_entry(&entry.attributes) {
+        match crate::dn::parent_dn(&dn) {
+            Ok(Some(parent_dn)) => match backend.get_entry(&parent_dn).await {
+                Ok(parent_entry) => parent_entry.map(|entry| entry.attributes),
+                Err(err) => {
+                    let diagnostic = backend_diagnostic(&err);
+                    error!("Parent lookup failed for add {}: {}", dn, err);
+                    log_add_audit_event(request_context, &session, &dn, false).await;
+                    send_request_result_response(
+                        fsm_set,
+                        request.message_id as u32,
+                        request.response_kind,
+                        map_backend_error_code(&err),
+                        diagnostic,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+            Ok(None) => None,
+            Err(err) => {
+                send_request_result_response(
+                    fsm_set,
+                    request.message_id as u32,
+                    request.response_kind,
+                    ResultCode::InvalidDnSyntax,
+                    &format!("invalid DN syntax: {}", err),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(schema_error) =
+        schema.validate_entry_at_dn(&dn, &entry.attributes, parent_attributes.as_ref())
+    {
+        let diagnostic = format!("Schema validation failed: {}", schema_error);
+        error!("Schema validation failed for add {}: {}", dn, schema_error);
+        log_add_audit_event(request_context, &session, &dn, false).await;
+        send_request_result_response(
+            fsm_set,
+            request.message_id as u32,
+            request.response_kind,
+            ResultCode::ObjectClassViolation,
+            &diagnostic,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let write_config = WriteFsmConfig {
         enable_aci_checks: false,
         enable_audit_logging: false,
@@ -4560,7 +4785,58 @@ async fn handle_moddn_request_with_fsm_runtime(
             return Ok(());
         }
     };
-    if let Err(schema_error) = schema.validate_rdn_for_entry(&existing_entry.attributes, &new_rdn) {
+    let parent_attributes =
+        if schema.requires_parent_attributes_for_entry(&existing_entry.attributes) {
+            match crate::dn::parent_dn(&new_dn) {
+                Ok(Some(parent_dn)) => match backend.get_entry(&parent_dn).await {
+                    Ok(parent_entry) => parent_entry.map(|entry| entry.attributes),
+                    Err(err) => {
+                        let diagnostic = backend_diagnostic(&err);
+                        error!("Parent lookup failed for modifydn {}: {}", dn, err);
+                        log_moddn_audit_event(
+                            request_context,
+                            &session,
+                            &dn,
+                            &new_dn,
+                            false,
+                            Some(diagnostic),
+                        )
+                        .await;
+                        send_request_result_response(
+                            fsm_set,
+                            request.message_id as u32,
+                            request.response_kind,
+                            map_backend_error_code(&err),
+                            diagnostic,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+                Ok(None) => None,
+                Err(err) => {
+                    send_request_result_response(
+                        fsm_set,
+                        request.message_id as u32,
+                        request.response_kind,
+                        ResultCode::InvalidDnSyntax,
+                        &format!("invalid DN syntax: {}", err),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+    if let Err(schema_error) = schema.validate_renamed_entry(
+        &dn,
+        &existing_entry.attributes,
+        &new_rdn,
+        delete_old,
+        parent_attributes.as_ref(),
+    ) {
         let diagnostic = format!("Schema validation failed: {}", schema_error);
         error!(
             "Schema validation failed for modifydn {}: {}",
@@ -6750,6 +7026,15 @@ mod tests {
         )
     }
 
+    fn subentries_control(visible: bool) -> RasnControl {
+        let value = crate::search_controls::encode_subentries_control(visible).unwrap();
+        RasnControl::new(
+            SUBENTRIES_CONTROL_OID.as_bytes().to_vec().into(),
+            false,
+            Some(value.into()),
+        )
+    }
+
     fn sync_request_control(mode: SyncRefreshMode, cookie: Option<&[u8]>) -> RasnControl {
         let value = encode_sync_request_control(&SyncRequestControl {
             mode,
@@ -6774,6 +7059,24 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn first_search_entry_attribute_names(
+        messages: &[ldap_parser::ldap::LdapMessage<'_>],
+    ) -> Vec<String> {
+        messages
+            .iter()
+            .find_map(|message| match &message.protocol_op {
+                ProtocolOp::SearchResultEntry(entry) => Some(
+                    entry
+                        .attributes
+                        .iter()
+                        .map(|attribute| attribute.attr_type.0.as_ref().to_string())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     fn response_sort_result(
@@ -7669,6 +7972,123 @@ mod tests {
                 value: "alice".to_string(),
             })]
         );
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_projected_stream_hides_subentries_by_default() {
+        let backend = Arc::new(HintTrackingBackend::new_streaming());
+        backend
+            .insert_entry(DirectoryEntry::new(
+                "cn=shared,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    ("objectClass".to_string(), vec!["person".to_string()]),
+                    ("cn".to_string(), vec!["shared".to_string()]),
+                ]),
+            ))
+            .await;
+        backend
+            .insert_entry(DirectoryEntry::new(
+                "cn=shared,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "subentry".to_string()],
+                    ),
+                    ("cn".to_string(), vec!["shared".to_string()]),
+                    ("subtreeSpecification".to_string(), vec!["{}".to_string()]),
+                ]),
+            ))
+            .await;
+
+        let backend_for_server: Arc<dyn DirectoryBackend> = backend.clone();
+        let (server_task, mut client_stream) = spawn_test_connection(backend_for_server).await;
+
+        client_stream
+            .write_all(&encode_search_request(
+                126,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::EqualityMatch(RasnAttributeValueAssertion::new(
+                    b"cn".to_vec().into(),
+                    b"shared".to_vec().into(),
+                )),
+                &["cn"],
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=shared,ou=People,dc=example,dc=org".to_string()]
+        );
+        assert_eq!(first_search_entry_attribute_names(&messages), vec!["cn"]);
+        assert_eq!(backend.projected_stream_search_calls(), 1);
+
+        client_stream.shutdown().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_projected_stream_honors_subentries_control() {
+        let backend = Arc::new(HintTrackingBackend::new_streaming());
+        backend
+            .insert_entry(DirectoryEntry::new(
+                "cn=shared,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    ("objectClass".to_string(), vec!["person".to_string()]),
+                    ("cn".to_string(), vec!["shared".to_string()]),
+                ]),
+            ))
+            .await;
+        backend
+            .insert_entry(DirectoryEntry::new(
+                "cn=shared,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "subentry".to_string()],
+                    ),
+                    ("cn".to_string(), vec!["shared".to_string()]),
+                    ("subtreeSpecification".to_string(), vec!["{}".to_string()]),
+                ]),
+            ))
+            .await;
+
+        let backend_for_server: Arc<dyn DirectoryBackend> = backend.clone();
+        let (server_task, mut client_stream) = spawn_test_connection(backend_for_server).await;
+
+        client_stream
+            .write_all(&encode_search_request_with_controls(
+                127,
+                "dc=example,dc=org",
+                SearchRequestScope::WholeSubtree,
+                RasnFilter::EqualityMatch(RasnAttributeValueAssertion::new(
+                    b"cn".to_vec().into(),
+                    b"shared".to_vec().into(),
+                )),
+                &["cn"],
+                false,
+                vec![subentries_control(true)],
+            ))
+            .await
+            .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 2).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=shared,dc=example,dc=org".to_string()]
+        );
+        assert_eq!(first_search_entry_attribute_names(&messages), vec!["cn"]);
+        assert_eq!(backend.projected_stream_search_calls(), 1);
 
         client_stream.shutdown().await.unwrap();
         server_task.await.unwrap();

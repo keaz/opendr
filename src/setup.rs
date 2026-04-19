@@ -2,6 +2,7 @@
 // Inspired by OpenDJ setup process
 
 use crate::config::ServerConfig;
+use crate::schema::bundled_schema_files;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
@@ -319,6 +320,18 @@ fn default_setup_replica_id() -> u16 {
     1
 }
 
+fn requested_schema_bundles(bundles: &[String]) -> Vec<String> {
+    if bundles.is_empty()
+        || bundles
+            .iter()
+            .any(|bundle| bundle.eq_ignore_ascii_case("all"))
+    {
+        vec!["core".to_string(), "posix".to_string()]
+    } else {
+        bundles.to_vec()
+    }
+}
+
 impl Default for SetupConfig {
     fn default() -> Self {
         Self {
@@ -488,6 +501,40 @@ impl SetupHandler {
 
     fn log_config_path(&self) -> PathBuf {
         self.config_dir().join("log4rs.yml")
+    }
+
+    pub async fn generate_builtin_schema_files(
+        &self,
+        output_dir: impl AsRef<Path>,
+        bundles: &[String],
+        overwrite: bool,
+    ) -> Result<Vec<PathBuf>, String> {
+        let output_dir = output_dir.as_ref();
+        let requested_bundles = requested_schema_bundles(bundles);
+        let mut written = Vec::new();
+
+        for bundle in requested_bundles {
+            for schema_file in bundled_schema_files(&bundle).map_err(|err| err.to_string())? {
+                let output_path = output_dir.join(schema_file.relative_path);
+                if output_path.exists() && !overwrite {
+                    return Err(format!(
+                        "schema file already exists: {}. Re-run with --overwrite to replace it",
+                        output_path.display()
+                    ));
+                }
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent)
+                        .await
+                        .map_err(|err| format!("Failed to create schema directory: {}", err))?;
+                }
+                fs::write(&output_path, schema_file.contents)
+                    .await
+                    .map_err(|err| format!("Failed to write schema file: {}", err))?;
+                written.push(output_path);
+            }
+        }
+
+        Ok(written)
     }
 
     /// Check if server has been set up
@@ -1670,6 +1717,71 @@ mod tests {
             change_buffer_size: 2048,
             state_storage_path: PathBuf::from("/tmp/opendr/replication_state"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_generate_builtin_schema_files_writes_loadable_posix_schema() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let handler = SetupHandler::new(temp_dir.path().join("config"));
+        let output_dir = temp_dir.path().join("config").join("schema");
+
+        let written = handler
+            .generate_builtin_schema_files(&output_dir, &["posix".to_string()], false)
+            .await
+            .unwrap();
+
+        let schema_path = output_dir.join("posix").join("rfc2307.ldif");
+        assert_eq!(written, vec![schema_path.clone()]);
+        assert!(schema_path.is_file());
+
+        let mut schema = crate::schema::LdapSchema::with_core_schema();
+        schema.load_schema_dir(&output_dir).unwrap();
+        assert!(schema.get_object_class("posixAccount").is_some());
+        assert!(schema.get_object_class("nisObject").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_generate_builtin_schema_files_writes_loadable_core_schema_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let handler = SetupHandler::new(temp_dir.path().join("config"));
+        let output_dir = temp_dir.path().join("config").join("schema");
+
+        let written = handler
+            .generate_builtin_schema_files(&output_dir, &["core".to_string()], false)
+            .await
+            .unwrap();
+
+        let schema_path = output_dir.join("core").join("rfc3672.ldif");
+        assert_eq!(written, vec![schema_path.clone()]);
+        assert!(schema_path.is_file());
+
+        let mut schema = crate::schema::LdapSchema::with_core_schema();
+        schema.load_schema_dir(&output_dir).unwrap();
+        assert!(schema.get_attribute_type("subtreeSpecification").is_some());
+        assert!(schema.get_object_class("subentry").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_generate_builtin_schema_files_requires_overwrite_for_existing_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let handler = SetupHandler::new(temp_dir.path().join("config"));
+        let output_dir = temp_dir.path().join("config").join("schema");
+
+        handler
+            .generate_builtin_schema_files(&output_dir, &["posix".to_string()], false)
+            .await
+            .unwrap();
+        let error = handler
+            .generate_builtin_schema_files(&output_dir, &["posix".to_string()], false)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("--overwrite"));
+
+        handler
+            .generate_builtin_schema_files(&output_dir, &["posix".to_string()], true)
+            .await
+            .unwrap();
     }
 
     #[test]

@@ -7,7 +7,9 @@ use opendr::backend::{
 use opendr::csn::Csn;
 use opendr::fsm_request::active_fsm_control_registry;
 use opendr::schema::{LdapSchema, SchemaError};
-use opendr::search_controls::{PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID};
+use opendr::search_controls::{
+    PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SUBENTRIES_CONTROL_OID,
+};
 use opendr::search_protocol::{
     MODIFY_INCREMENT_FEATURE_OID, build_root_dse_attributes, build_subschema_attributes,
 };
@@ -69,6 +71,7 @@ async fn root_dse_base_attributes_follow_rfc_4512_and_truthful_advertising() {
         MANAGE_DSA_IT_OID.to_string(),
         PAGED_RESULTS_OID.to_string(),
         SERVER_SIDE_SORT_REQUEST_OID.to_string(),
+        SUBENTRIES_CONTROL_OID.to_string(),
         SYNC_REQUEST_OID.to_string(),
     ];
     expected_controls.sort();
@@ -258,6 +261,79 @@ fn schema_enforces_structural_required_single_value_and_syntax_rules() {
         posix_schema.validate_entry(&duplicate_single_value),
         Err(SchemaError::SingleValueViolation(attribute)) if attribute == "uidNumber"
     ));
+}
+
+#[test]
+fn schema_enforces_name_forms_and_structure_rules_for_add_and_modifydn_candidates() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(
+            "
+dn: cn=schema
+objectClasses: ( 1.3.6.1.4.1.55555.4512.40 NAME 'rfc4512IntegrationDepartment' SUP organizationalUnit STRUCTURAL )
+objectClasses: ( 1.3.6.1.4.1.55555.4512.41 NAME 'rfc4512IntegrationPerson' SUP person STRUCTURAL )
+nameForms: ( 1.3.6.1.4.1.55555.4512.42 NAME 'rfc4512IntegrationDepartmentForm' OC rfc4512IntegrationDepartment MUST ou )
+nameForms: ( 1.3.6.1.4.1.55555.4512.43 NAME 'rfc4512IntegrationPersonForm' OC rfc4512IntegrationPerson MUST cn )
+dITStructureRules: ( 451240 NAME 'rfc4512IntegrationDepartmentRule' FORM rfc4512IntegrationDepartmentForm )
+dITStructureRules: ( 451241 NAME 'rfc4512IntegrationPersonRule' FORM rfc4512IntegrationPersonForm SUP 451240 )
+",
+        )
+        .unwrap();
+
+    let parent = HashMap::from([
+        (
+            "objectClass".to_string(),
+            vec![
+                "top".to_string(),
+                "organizationalUnit".to_string(),
+                "rfc4512IntegrationDepartment".to_string(),
+            ],
+        ),
+        ("ou".to_string(), vec!["Engineering".to_string()]),
+    ]);
+    let child = HashMap::from([
+        (
+            "objectClass".to_string(),
+            vec![
+                "top".to_string(),
+                "person".to_string(),
+                "rfc4512IntegrationPerson".to_string(),
+            ],
+        ),
+        ("cn".to_string(), vec!["Alice Example".to_string()]),
+        ("sn".to_string(), vec!["Example".to_string()]),
+    ]);
+
+    assert!(
+        schema
+            .validate_entry_at_dn(
+                "cn=Alice Example,ou=Engineering,dc=example,dc=org",
+                &child,
+                Some(&parent),
+            )
+            .is_ok(),
+        "Add-style validation should accept an entry named by a valid name form under the permitted structure rule parent"
+    );
+    assert!(matches!(
+        schema.validate_entry_at_dn(
+            "uid=alice,ou=Engineering,dc=example,dc=org",
+            &child,
+            Some(&parent),
+        ),
+        Err(SchemaError::NamingViolation(_))
+    ));
+    assert!(
+        schema
+            .validate_renamed_entry(
+                "cn=Alice Example,ou=Engineering,dc=example,dc=org",
+                &child,
+                "cn=Alice Renamed",
+                true,
+                Some(&parent),
+            )
+            .is_ok(),
+        "ModifyDN validation should evaluate the candidate entry after adding the new RDN value"
+    );
 }
 
 fn valid_posix_account_with(uid_number_values: Vec<String>) -> HashMap<String, Vec<String>> {

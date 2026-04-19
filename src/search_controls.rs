@@ -4,6 +4,7 @@ use rasn::{AsnType, Decode, Encode};
 pub const PAGED_RESULTS_OID: &str = "1.2.840.113556.1.4.319";
 pub const SERVER_SIDE_SORT_REQUEST_OID: &str = "1.2.840.113556.1.4.473";
 pub const SERVER_SIDE_SORT_RESPONSE_OID: &str = "1.2.840.113556.1.4.474";
+pub const SUBENTRIES_CONTROL_OID: &str = "1.3.6.1.4.1.4203.1.10.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PagedResultsControl {
@@ -27,6 +28,28 @@ impl std::fmt::Display for PagedResultsControlError {
 }
 
 impl std::error::Error for PagedResultsControlError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubentriesControl {
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubentriesControlError {
+    MissingValue,
+    InvalidAsn1(String),
+}
+
+impl std::fmt::Display for SubentriesControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingValue => write!(f, "subentries control requires a controlValue"),
+            Self::InvalidAsn1(err) => write!(f, "invalid subentries control BER: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SubentriesControlError {}
 
 #[derive(AsnType, Decode, Encode)]
 struct RealPagedResultsControlValue {
@@ -55,6 +78,19 @@ pub fn encode_paged_results_control(
         cookie: cookie.to_vec().into(),
     })
     .map_err(|err| PagedResultsControlError::InvalidAsn1(err.to_string()))
+}
+
+pub fn decode_subentries_control(
+    value: Option<&[u8]>,
+) -> Result<SubentriesControl, SubentriesControlError> {
+    let value = value.ok_or(SubentriesControlError::MissingValue)?;
+    let visible: bool = rasn::ber::decode(value)
+        .map_err(|err| SubentriesControlError::InvalidAsn1(err.to_string()))?;
+    Ok(SubentriesControl { visible })
+}
+
+pub fn encode_subentries_control(visible: bool) -> Result<Vec<u8>, SubentriesControlError> {
+    rasn::ber::encode(&visible).map_err(|err| SubentriesControlError::InvalidAsn1(err.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +309,27 @@ mod tests {
     fn paged_results_control_requires_value() {
         let err = decode_paged_results_control(None).unwrap_err();
         assert_eq!(err, PagedResultsControlError::MissingValue);
+    }
+
+    #[test]
+    fn subentries_control_round_trips_visibility_values() {
+        let visible = encode_subentries_control(true).unwrap();
+        let hidden = encode_subentries_control(false).unwrap();
+
+        assert_eq!(
+            decode_subentries_control(Some(&visible)).unwrap(),
+            SubentriesControl { visible: true }
+        );
+        assert_eq!(
+            decode_subentries_control(Some(&hidden)).unwrap(),
+            SubentriesControl { visible: false }
+        );
+    }
+
+    #[test]
+    fn subentries_control_requires_value() {
+        let err = decode_subentries_control(None).unwrap_err();
+        assert_eq!(err, SubentriesControlError::MissingValue);
     }
 
     #[test]

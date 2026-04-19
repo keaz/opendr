@@ -10,8 +10,14 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use x520_stringprep::{
+    x520_stringprep_to_case_exact_string, x520_stringprep_to_case_ignore_string,
+};
 
-use crate::dn::{canonicalize_dn, parse_rdn};
+use crate::dn::{canonicalize_dn, parse_dn, parse_rdn, rdn_attribute_values};
+
+const RFC3672_SCHEMA_LDIF: &str = include_str!("../resources/schema/core/rfc3672.ldif");
+const RFC2307_SCHEMA_LDIF: &str = include_str!("../resources/schema/posix/rfc2307.ldif");
 
 /// LDAP Schema containing attribute types and object classes
 #[derive(Debug, Clone)]
@@ -42,6 +48,13 @@ pub struct AttributeType {
     pub equality: Option<String>,
     pub syntax: String,
     pub single_value: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinSchemaFile {
+    pub bundle: &'static str,
+    pub relative_path: &'static str,
+    pub contents: &'static str,
 }
 
 /// Additional RFC 4512 attribute type fields kept outside [`AttributeType`] for
@@ -364,7 +377,16 @@ impl ResolvedMatchingRule {
     }
 
     pub fn values_equal(&self, left: &str, right: &str) -> Result<bool, MatchingRuleError> {
-        Ok(self.normalize_value(left)? == self.normalize_value(right)?)
+        let normalized_assertion = self.normalize_value(right)?;
+        self.value_matches_normalized_assertion(left, &normalized_assertion)
+    }
+
+    pub fn value_matches_normalized_assertion(
+        &self,
+        candidate: &str,
+        normalized_assertion: &str,
+    ) -> Result<bool, MatchingRuleError> {
+        value_matches_normalized_assertion(self, candidate, normalized_assertion)
     }
 
     pub fn compare_values(
@@ -395,6 +417,25 @@ impl AttributeMatchingProfile {
             AttributeMatchingUse::Ordering => self.ordering.as_ref(),
             AttributeMatchingUse::Substring => self.substring.as_ref(),
         }
+    }
+}
+
+pub fn bundled_schema_files(bundle: &str) -> Result<Vec<BuiltinSchemaFile>, SchemaError> {
+    match bundle.to_ascii_lowercase().as_str() {
+        "core" => Ok(vec![BuiltinSchemaFile {
+            bundle: "core",
+            relative_path: "core/rfc3672.ldif",
+            contents: RFC3672_SCHEMA_LDIF,
+        }]),
+        "posix" => Ok(vec![BuiltinSchemaFile {
+            bundle: "posix",
+            relative_path: "posix/rfc2307.ldif",
+            contents: RFC2307_SCHEMA_LDIF,
+        }]),
+        _ => Err(SchemaError::ParseError(format!(
+            "unsupported builtin schema bundle: {}",
+            bundle
+        ))),
     }
 }
 
@@ -434,10 +475,7 @@ impl LdapSchema {
                 self.load_core_schema();
                 Ok(())
             }
-            "posix" => {
-                self.load_posix_schema();
-                Ok(())
-            }
+            "posix" => self.load_posix_schema(),
             _ => Err(SchemaError::ParseError(format!(
                 "unsupported builtin schema bundle: {}",
                 bundle
@@ -445,7 +483,7 @@ impl LdapSchema {
         }
     }
 
-    /// Load core LDAP schema (RFC 4519, 4524)
+    /// Load core LDAP schema (RFC 4519, 4524, and file-backed core extensions).
     fn load_core_schema(&mut self) {
         // Core attribute types
         let core_attributes = vec![
@@ -455,6 +493,14 @@ impl LdapSchema {
                 description: Some("Object class".to_string()),
                 equality: Some("objectIdentifierMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.38".to_string(), // OID syntax
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.41".to_string(),
+                names: vec!["name".to_string()],
+                description: Some("Name supertype".to_string()),
+                equality: Some("caseIgnoreMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(), // Directory String
                 single_value: false,
             },
             AttributeType {
@@ -472,6 +518,22 @@ impl LdapSchema {
                 equality: Some("caseIgnoreMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
                 single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.5".to_string(),
+                names: vec!["serialNumber".to_string()],
+                description: Some("Serial number".to_string()),
+                equality: Some("caseIgnoreMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.44".to_string(), // Printable String
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.6".to_string(),
+                names: vec!["c".to_string(), "countryName".to_string()],
+                description: Some("Country name".to_string()),
+                equality: Some("caseIgnoreMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.11".to_string(), // Country String
+                single_value: true,
             },
             AttributeType {
                 oid: "2.5.4.10".to_string(),
@@ -514,11 +576,67 @@ impl LdapSchema {
                 single_value: false,
             },
             AttributeType {
+                oid: "2.5.4.36".to_string(),
+                names: vec!["userCertificate".to_string()],
+                description: Some("User X.509 certificate".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.8".to_string(), // Certificate
+                single_value: false,
+            },
+            AttributeType {
                 oid: "2.5.4.13".to_string(),
                 names: vec!["description".to_string()],
                 description: Some("Description".to_string()),
                 equality: Some("caseIgnoreMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.14".to_string(),
+                names: vec!["searchGuide".to_string()],
+                description: Some("Search guide".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.25".to_string(), // Guide
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.27".to_string(),
+                names: vec!["destinationIndicator".to_string()],
+                description: Some("Destination indicator".to_string()),
+                equality: Some("caseIgnoreMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.44".to_string(), // Printable String
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.49".to_string(),
+                names: vec!["distinguishedName".to_string()],
+                description: Some("Distinguished name supertype".to_string()),
+                equality: Some("distinguishedNameMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.12".to_string(), // DN
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.46".to_string(),
+                names: vec!["dnQualifier".to_string()],
+                description: Some("DN qualifier".to_string()),
+                equality: Some("caseIgnoreMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.44".to_string(), // Printable String
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.47".to_string(),
+                names: vec!["enhancedSearchGuide".to_string()],
+                description: Some("Enhanced search guide".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.21".to_string(), // Enhanced Guide
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.23".to_string(),
+                names: vec!["facsimileTelephoneNumber".to_string()],
+                description: Some("Facsimile telephone number".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.22".to_string(), // Facsimile Telephone Number
                 single_value: false,
             },
             AttributeType {
@@ -535,6 +653,38 @@ impl LdapSchema {
                 description: Some("Initials".to_string()),
                 equality: Some("caseIgnoreMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.44".to_string(),
+                names: vec!["generationQualifier".to_string()],
+                description: Some("Generation qualifier".to_string()),
+                equality: Some("caseIgnoreMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.51".to_string(),
+                names: vec!["houseIdentifier".to_string()],
+                description: Some("House identifier".to_string()),
+                equality: Some("caseIgnoreMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.15".to_string(),
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.25".to_string(),
+                names: vec!["internationalISDNNumber".to_string()],
+                description: Some("International ISDN number".to_string()),
+                equality: Some("numericStringMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.36".to_string(), // Numeric String
+                single_value: false,
+            },
+            AttributeType {
+                oid: "0.9.2342.19200300.100.1.55".to_string(),
+                names: vec!["audio".to_string()],
+                description: Some("Audio recording".to_string()),
+                equality: Some("octetStringMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.40{250000}".to_string(),
                 single_value: false,
             },
             AttributeType {
@@ -621,7 +771,7 @@ impl LdapSchema {
                 oid: "0.9.2342.19200300.100.1.39".to_string(),
                 names: vec!["homePostalAddress".to_string()],
                 description: Some("Home postal address".to_string()),
-                equality: None,
+                equality: Some("caseIgnoreListMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.41".to_string(),
                 single_value: false,
             },
@@ -642,11 +792,35 @@ impl LdapSchema {
                 single_value: false,
             },
             AttributeType {
+                oid: "0.9.2342.19200300.100.1.7".to_string(),
+                names: vec!["photo".to_string()],
+                description: Some("G3 fax encoded photograph".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.23".to_string(), // Fax
+                single_value: false,
+            },
+            AttributeType {
                 oid: "0.9.2342.19200300.100.1.60".to_string(),
                 names: vec!["jpegPhoto".to_string()],
                 description: Some("JPEG photograph".to_string()),
                 equality: None,
                 syntax: "1.3.6.1.4.1.1466.115.121.1.28".to_string(),
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.16.840.1.113730.3.1.40".to_string(),
+                names: vec!["userSMIMECertificate".to_string()],
+                description: Some("PKCS#7 SignedData used to support S/MIME".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.5".to_string(), // Binary
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.16.840.1.113730.3.1.216".to_string(),
+                names: vec!["userPKCS12".to_string()],
+                description: Some("PKCS #12 PFX PDU".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.5".to_string(), // Binary
                 single_value: false,
             },
             AttributeType {
@@ -663,7 +837,7 @@ impl LdapSchema {
                 description: Some("Domain component".to_string()),
                 equality: Some("caseIgnoreIA5Match".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.26".to_string(),
-                single_value: false,
+                single_value: true,
             },
             AttributeType {
                 oid: "2.5.4.31".to_string(),
@@ -688,6 +862,38 @@ impl LdapSchema {
                 equality: Some("telephoneNumberMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.50".to_string(),
                 single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.21".to_string(),
+                names: vec!["telexNumber".to_string()],
+                description: Some("Telex number".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.52".to_string(), // Telex Number
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.22".to_string(),
+                names: vec!["teletexTerminalIdentifier".to_string()],
+                description: Some("Teletex terminal identifier".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.51".to_string(), // Teletex Terminal Identifier
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.24".to_string(),
+                names: vec!["x121Address".to_string()],
+                description: Some("X.121 address".to_string()),
+                equality: Some("numericStringMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.36".to_string(), // Numeric String
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.28".to_string(),
+                names: vec!["preferredDeliveryMethod".to_string()],
+                description: Some("Preferred delivery method".to_string()),
+                equality: None,
+                syntax: "1.3.6.1.4.1.1466.115.121.1.14".to_string(), // Delivery Method
+                single_value: true,
             },
             AttributeType {
                 oid: "2.5.4.15".to_string(),
@@ -725,7 +931,7 @@ impl LdapSchema {
                 oid: "2.5.4.16".to_string(),
                 names: vec!["postalAddress".to_string()],
                 description: Some("Postal address".to_string()),
-                equality: None,
+                equality: Some("caseIgnoreListMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.41".to_string(),
                 single_value: false,
             },
@@ -757,8 +963,16 @@ impl LdapSchema {
                 oid: "2.5.4.26".to_string(),
                 names: vec!["registeredAddress".to_string()],
                 description: Some("Registered address".to_string()),
-                equality: None,
+                equality: Some("caseIgnoreListMatch".to_string()),
                 syntax: "1.3.6.1.4.1.1466.115.121.1.41".to_string(),
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.33".to_string(),
+                names: vec!["roleOccupant".to_string()],
+                description: Some("Role occupant".to_string()),
+                equality: Some("distinguishedNameMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.12".to_string(),
                 single_value: false,
             },
             AttributeType {
@@ -781,8 +995,16 @@ impl LdapSchema {
                 oid: "2.5.4.50".to_string(),
                 names: vec!["uniqueMember".to_string()],
                 description: Some("Unique group member".to_string()),
-                equality: Some("distinguishedNameMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.12".to_string(),
+                equality: Some("uniqueMemberMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.34".to_string(),
+                single_value: false,
+            },
+            AttributeType {
+                oid: "2.5.4.45".to_string(),
+                names: vec!["x500UniqueIdentifier".to_string()],
+                description: Some("X.500 unique identifier".to_string()),
+                equality: Some("bitStringMatch".to_string()),
+                syntax: "1.3.6.1.4.1.1466.115.121.1.6".to_string(),
                 single_value: false,
             },
         ];
@@ -791,14 +1013,21 @@ impl LdapSchema {
             self.add_attribute_type(attr);
         }
         for attr_name in [
+            "name",
             "cn",
             "sn",
+            "serialNumber",
+            "c",
             "o",
             "ou",
             "uid",
             "description",
+            "destinationIndicator",
+            "dnQualifier",
             "givenName",
             "initials",
+            "generationQualifier",
+            "houseIdentifier",
             "displayName",
             "carLicense",
             "departmentNumber",
@@ -820,6 +1049,14 @@ impl LdapSchema {
         }
         self.set_attribute_substring_rule("mail", "caseIgnoreIA5SubstringsMatch");
         self.set_attribute_substring_rule("labeledURI", "caseExactSubstringsMatch");
+        self.set_attribute_substring_rule("homePostalAddress", "caseIgnoreListSubstringsMatch");
+        self.set_attribute_substring_rule("postalAddress", "caseIgnoreListSubstringsMatch");
+        self.set_attribute_substring_rule("registeredAddress", "caseIgnoreListSubstringsMatch");
+        self.set_attribute_substring_rule(
+            "internationalISDNNumber",
+            "numericStringSubstringsMatch",
+        );
+        self.set_attribute_substring_rule("x121Address", "numericStringSubstringsMatch");
         self.set_attribute_substring_rule("telephoneNumber", "telephoneNumberSubstringsMatch");
         self.set_attribute_substring_rule("homePhone", "telephoneNumberSubstringsMatch");
         self.set_attribute_substring_rule("mobile", "telephoneNumberSubstringsMatch");
@@ -844,6 +1081,7 @@ impl LdapSchema {
                 may: vec![
                     "userPassword".to_string(),
                     "telephoneNumber".to_string(),
+                    "seeAlso".to_string(),
                     "description".to_string(),
                 ],
             },
@@ -855,8 +1093,15 @@ impl LdapSchema {
                 must: vec![],
                 may: vec![
                     "title".to_string(),
+                    "x121Address".to_string(),
                     "registeredAddress".to_string(),
+                    "destinationIndicator".to_string(),
+                    "preferredDeliveryMethod".to_string(),
+                    "telexNumber".to_string(),
+                    "teletexTerminalIdentifier".to_string(),
                     "telephoneNumber".to_string(),
+                    "internationalISDNNumber".to_string(),
+                    "facsimileTelephoneNumber".to_string(),
                     "street".to_string(),
                     "postOfficeBox".to_string(),
                     "postalCode".to_string(),
@@ -865,7 +1110,6 @@ impl LdapSchema {
                     "st".to_string(),
                     "l".to_string(),
                     "ou".to_string(),
-                    "mail".to_string(),
                 ],
             },
             ObjectClass {
@@ -876,6 +1120,7 @@ impl LdapSchema {
                 must: vec![],
                 may: vec![
                     "businessCategory".to_string(),
+                    "audio".to_string(),
                     "carLicense".to_string(),
                     "departmentNumber".to_string(),
                     "displayName".to_string(),
@@ -893,9 +1138,66 @@ impl LdapSchema {
                     "mobile".to_string(),
                     "o".to_string(),
                     "pager".to_string(),
+                    "photo".to_string(),
                     "preferredLanguage".to_string(),
                     "roomNumber".to_string(),
                     "secretary".to_string(),
+                    "userCertificate".to_string(),
+                    "x500UniqueIdentifier".to_string(),
+                    "userSMIMECertificate".to_string(),
+                    "userPKCS12".to_string(),
+                ],
+            },
+            ObjectClass {
+                oid: "2.5.6.11".to_string(),
+                names: vec!["applicationProcess".to_string()],
+                sup: vec!["top".to_string()],
+                kind: ObjectClassKind::Structural,
+                must: vec!["cn".to_string()],
+                may: vec![
+                    "seeAlso".to_string(),
+                    "ou".to_string(),
+                    "l".to_string(),
+                    "description".to_string(),
+                ],
+            },
+            ObjectClass {
+                oid: "2.5.6.2".to_string(),
+                names: vec!["country".to_string()],
+                sup: vec!["top".to_string()],
+                kind: ObjectClassKind::Structural,
+                must: vec!["c".to_string()],
+                may: vec!["searchGuide".to_string(), "description".to_string()],
+            },
+            ObjectClass {
+                oid: "2.5.6.14".to_string(),
+                names: vec!["device".to_string()],
+                sup: vec!["top".to_string()],
+                kind: ObjectClassKind::Structural,
+                must: vec!["cn".to_string()],
+                may: vec![
+                    "serialNumber".to_string(),
+                    "seeAlso".to_string(),
+                    "owner".to_string(),
+                    "ou".to_string(),
+                    "o".to_string(),
+                    "l".to_string(),
+                    "description".to_string(),
+                ],
+            },
+            ObjectClass {
+                oid: "2.5.6.3".to_string(),
+                names: vec!["locality".to_string()],
+                sup: vec!["top".to_string()],
+                kind: ObjectClassKind::Structural,
+                must: vec![],
+                may: vec![
+                    "street".to_string(),
+                    "seeAlso".to_string(),
+                    "searchGuide".to_string(),
+                    "st".to_string(),
+                    "l".to_string(),
+                    "description".to_string(),
                 ],
             },
             ObjectClass {
@@ -906,15 +1208,52 @@ impl LdapSchema {
                 must: vec!["o".to_string()],
                 may: vec![
                     "userPassword".to_string(),
+                    "searchGuide".to_string(),
                     "seeAlso".to_string(),
                     "businessCategory".to_string(),
+                    "x121Address".to_string(),
+                    "registeredAddress".to_string(),
+                    "destinationIndicator".to_string(),
+                    "preferredDeliveryMethod".to_string(),
+                    "telexNumber".to_string(),
+                    "teletexTerminalIdentifier".to_string(),
                     "telephoneNumber".to_string(),
+                    "internationalISDNNumber".to_string(),
+                    "facsimileTelephoneNumber".to_string(),
                     "street".to_string(),
                     "postOfficeBox".to_string(),
                     "postalCode".to_string(),
                     "postalAddress".to_string(),
-                    "registeredAddress".to_string(),
                     "physicalDeliveryOfficeName".to_string(),
+                    "st".to_string(),
+                    "l".to_string(),
+                    "description".to_string(),
+                ],
+            },
+            ObjectClass {
+                oid: "2.5.6.8".to_string(),
+                names: vec!["organizationalRole".to_string()],
+                sup: vec!["top".to_string()],
+                kind: ObjectClassKind::Structural,
+                must: vec!["cn".to_string()],
+                may: vec![
+                    "x121Address".to_string(),
+                    "registeredAddress".to_string(),
+                    "destinationIndicator".to_string(),
+                    "preferredDeliveryMethod".to_string(),
+                    "telexNumber".to_string(),
+                    "teletexTerminalIdentifier".to_string(),
+                    "telephoneNumber".to_string(),
+                    "internationalISDNNumber".to_string(),
+                    "facsimileTelephoneNumber".to_string(),
+                    "seeAlso".to_string(),
+                    "roleOccupant".to_string(),
+                    "street".to_string(),
+                    "postOfficeBox".to_string(),
+                    "postalCode".to_string(),
+                    "postalAddress".to_string(),
+                    "physicalDeliveryOfficeName".to_string(),
+                    "ou".to_string(),
                     "st".to_string(),
                     "l".to_string(),
                     "description".to_string(),
@@ -927,19 +1266,27 @@ impl LdapSchema {
                 kind: ObjectClassKind::Structural,
                 must: vec!["ou".to_string()],
                 may: vec![
-                    "userPassword".to_string(),
-                    "seeAlso".to_string(),
                     "businessCategory".to_string(),
-                    "telephoneNumber".to_string(),
-                    "street".to_string(),
-                    "postOfficeBox".to_string(),
-                    "postalCode".to_string(),
-                    "postalAddress".to_string(),
-                    "registeredAddress".to_string(),
-                    "physicalDeliveryOfficeName".to_string(),
-                    "st".to_string(),
-                    "l".to_string(),
                     "description".to_string(),
+                    "destinationIndicator".to_string(),
+                    "facsimileTelephoneNumber".to_string(),
+                    "internationalISDNNumber".to_string(),
+                    "l".to_string(),
+                    "physicalDeliveryOfficeName".to_string(),
+                    "postalAddress".to_string(),
+                    "postalCode".to_string(),
+                    "postOfficeBox".to_string(),
+                    "preferredDeliveryMethod".to_string(),
+                    "registeredAddress".to_string(),
+                    "searchGuide".to_string(),
+                    "seeAlso".to_string(),
+                    "st".to_string(),
+                    "street".to_string(),
+                    "telephoneNumber".to_string(),
+                    "teletexTerminalIdentifier".to_string(),
+                    "telexNumber".to_string(),
+                    "userPassword".to_string(),
+                    "x121Address".to_string(),
                 ],
             },
             ObjectClass {
@@ -963,15 +1310,14 @@ impl LdapSchema {
                 names: vec!["groupOfNames".to_string()],
                 sup: vec!["top".to_string()],
                 kind: ObjectClassKind::Structural,
-                must: vec!["cn".to_string()],
+                must: vec!["member".to_string(), "cn".to_string()],
                 may: vec![
-                    "member".to_string(),
                     "businessCategory".to_string(),
                     "seeAlso".to_string(),
                     "owner".to_string(),
-                    "description".to_string(),
-                    "o".to_string(),
                     "ou".to_string(),
+                    "o".to_string(),
+                    "description".to_string(),
                 ],
             },
             ObjectClass {
@@ -989,6 +1335,40 @@ impl LdapSchema {
                     "ou".to_string(),
                 ],
             },
+            ObjectClass {
+                oid: "2.5.6.10".to_string(),
+                names: vec!["residentialPerson".to_string()],
+                sup: vec!["person".to_string()],
+                kind: ObjectClassKind::Structural,
+                must: vec!["l".to_string()],
+                may: vec![
+                    "businessCategory".to_string(),
+                    "x121Address".to_string(),
+                    "registeredAddress".to_string(),
+                    "destinationIndicator".to_string(),
+                    "preferredDeliveryMethod".to_string(),
+                    "telexNumber".to_string(),
+                    "teletexTerminalIdentifier".to_string(),
+                    "telephoneNumber".to_string(),
+                    "internationalISDNNumber".to_string(),
+                    "facsimileTelephoneNumber".to_string(),
+                    "street".to_string(),
+                    "postOfficeBox".to_string(),
+                    "postalCode".to_string(),
+                    "postalAddress".to_string(),
+                    "physicalDeliveryOfficeName".to_string(),
+                    "st".to_string(),
+                    "l".to_string(),
+                ],
+            },
+            ObjectClass {
+                oid: "1.3.6.1.1.3.1".to_string(),
+                names: vec!["uidObject".to_string()],
+                sup: vec!["top".to_string()],
+                kind: ObjectClassKind::Auxiliary,
+                must: vec!["uid".to_string()],
+                may: vec![],
+            },
         ];
 
         for oc in core_classes {
@@ -996,126 +1376,76 @@ impl LdapSchema {
         }
 
         self.load_standard_syntaxes_and_matching_rules();
+        self.load_core_schema_files();
     }
 
-    /// Load RFC 2307 POSIX account and group schema definitions.
-    fn load_posix_schema(&mut self) {
+    fn load_core_schema_files(&mut self) {
+        self.load_ldif_str(RFC3672_SCHEMA_LDIF)
+            .expect("bundled RFC 3672 schema must load");
+    }
+
+    /// Load RFC 2307 POSIX and NIS schema definitions.
+    fn load_posix_schema(&mut self) -> Result<(), SchemaError> {
         if self.get_object_class("top").is_none() {
             self.load_core_schema();
         }
 
-        let posix_attributes = vec![
-            AttributeType {
-                oid: "1.3.6.1.1.1.1.0".to_string(),
-                names: vec!["uidNumber".to_string()],
-                description: Some(
-                    "Integer uniquely identifying a user in an administrative domain".to_string(),
-                ),
-                equality: Some("integerMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.27".to_string(),
-                single_value: true,
-            },
-            AttributeType {
-                oid: "1.3.6.1.1.1.1.1".to_string(),
-                names: vec!["gidNumber".to_string()],
-                description: Some(
-                    "Integer uniquely identifying a group in an administrative domain".to_string(),
-                ),
-                equality: Some("integerMatch".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.27".to_string(),
-                single_value: true,
-            },
-            AttributeType {
-                oid: "1.3.6.1.1.1.1.2".to_string(),
-                names: vec!["gecos".to_string()],
-                description: Some("GECOS field".to_string()),
-                equality: Some("caseIgnoreIA5Match".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.26".to_string(),
-                single_value: true,
-            },
-            AttributeType {
-                oid: "1.3.6.1.1.1.1.3".to_string(),
-                names: vec!["homeDirectory".to_string()],
-                description: Some("Absolute path to the home directory".to_string()),
-                equality: Some("caseExactIA5Match".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.26".to_string(),
-                single_value: true,
-            },
-            AttributeType {
-                oid: "1.3.6.1.1.1.1.4".to_string(),
-                names: vec!["loginShell".to_string()],
-                description: Some("Path to the login shell".to_string()),
-                equality: Some("caseExactIA5Match".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.26".to_string(),
-                single_value: true,
-            },
-            AttributeType {
-                oid: "1.3.6.1.1.1.1.12".to_string(),
-                names: vec!["memberUid".to_string()],
-                description: Some("POSIX group member login name".to_string()),
-                equality: Some("caseExactIA5Match".to_string()),
-                syntax: "1.3.6.1.4.1.1466.115.121.1.26".to_string(),
-                single_value: false,
-            },
-        ];
-
-        for attr in posix_attributes {
-            self.add_attribute_type(attr);
-        }
-        self.set_attribute_substring_rule("gecos", "caseIgnoreIA5SubstringsMatch");
-
-        let posix_classes = vec![
-            ObjectClass {
-                oid: "1.3.6.1.1.1.2.0".to_string(),
-                names: vec!["posixAccount".to_string()],
-                sup: vec!["top".to_string()],
-                kind: ObjectClassKind::Auxiliary,
-                must: vec![
-                    "cn".to_string(),
-                    "uid".to_string(),
-                    "uidNumber".to_string(),
-                    "gidNumber".to_string(),
-                    "homeDirectory".to_string(),
-                ],
-                may: vec![
-                    "userPassword".to_string(),
-                    "loginShell".to_string(),
-                    "gecos".to_string(),
-                    "description".to_string(),
-                ],
-            },
-            ObjectClass {
-                oid: "1.3.6.1.1.1.2.2".to_string(),
-                names: vec!["posixGroup".to_string()],
-                sup: vec!["top".to_string()],
-                kind: ObjectClassKind::Structural,
-                must: vec!["cn".to_string(), "gidNumber".to_string()],
-                may: vec![
-                    "userPassword".to_string(),
-                    "memberUid".to_string(),
-                    "description".to_string(),
-                ],
-            },
-        ];
-
-        for oc in posix_classes {
-            self.add_object_class(oc);
-        }
+        self.load_ldif_str(RFC2307_SCHEMA_LDIF)
     }
 
     fn load_standard_syntaxes_and_matching_rules(&mut self) {
         let syntaxes = [
+            ("1.3.6.1.4.1.1466.115.121.1.3", "Attribute Type Description"),
+            ("1.3.6.1.4.1.1466.115.121.1.5", "Binary"),
+            ("1.3.6.1.4.1.1466.115.121.1.6", "Bit String"),
             ("1.3.6.1.4.1.1466.115.121.1.7", "Boolean"),
+            ("1.3.6.1.4.1.1466.115.121.1.8", "Certificate"),
+            ("1.3.6.1.4.1.1466.115.121.1.11", "Country String"),
             ("1.3.6.1.4.1.1466.115.121.1.12", "DN"),
+            ("1.3.6.1.4.1.1466.115.121.1.14", "Delivery Method"),
             ("1.3.6.1.4.1.1466.115.121.1.15", "Directory String"),
+            (
+                "1.3.6.1.4.1.1466.115.121.1.16",
+                "DIT Content Rule Description",
+            ),
+            (
+                "1.3.6.1.4.1.1466.115.121.1.17",
+                "DIT Structure Rule Description",
+            ),
+            ("1.3.6.1.4.1.1466.115.121.1.21", "Enhanced Guide"),
+            (
+                "1.3.6.1.4.1.1466.115.121.1.22",
+                "Facsimile Telephone Number",
+            ),
+            ("1.3.6.1.4.1.1466.115.121.1.23", "Fax"),
             ("1.3.6.1.4.1.1466.115.121.1.24", "Generalized Time"),
+            ("1.3.6.1.4.1.1466.115.121.1.25", "Guide"),
             ("1.3.6.1.4.1.1466.115.121.1.26", "IA5 String"),
             ("1.3.6.1.4.1.1466.115.121.1.27", "Integer"),
             ("1.3.6.1.4.1.1466.115.121.1.28", "JPEG"),
+            ("1.3.6.1.4.1.1466.115.121.1.30", "Matching Rule Description"),
+            (
+                "1.3.6.1.4.1.1466.115.121.1.31",
+                "Matching Rule Use Description",
+            ),
+            ("1.3.6.1.4.1.1466.115.121.1.34", "Name And Optional UID"),
+            ("1.3.6.1.4.1.1466.115.121.1.35", "Name Form Description"),
+            ("1.3.6.1.4.1.1466.115.121.1.36", "Numeric String"),
+            ("1.3.6.1.4.1.1466.115.121.1.37", "Object Class Description"),
             ("1.3.6.1.4.1.1466.115.121.1.38", "OID"),
+            ("1.3.6.1.4.1.1466.115.121.1.39", "Other Mailbox"),
             ("1.3.6.1.4.1.1466.115.121.1.40", "Octet String"),
             ("1.3.6.1.4.1.1466.115.121.1.41", "Postal Address"),
+            ("1.3.6.1.4.1.1466.115.121.1.44", "Printable String"),
             ("1.3.6.1.4.1.1466.115.121.1.50", "Telephone Number"),
+            (
+                "1.3.6.1.4.1.1466.115.121.1.51",
+                "Teletex Terminal Identifier",
+            ),
+            ("1.3.6.1.4.1.1466.115.121.1.52", "Telex Number"),
+            ("1.3.6.1.4.1.1466.115.121.1.53", "UTC Time"),
+            ("1.3.6.1.4.1.1466.115.121.1.54", "LDAP Syntax Description"),
+            ("1.3.6.1.4.1.1466.115.121.1.58", "Substring Assertion"),
         ];
         for (oid, description) in syntaxes {
             let _ = self.try_add_ldap_syntax(LdapSyntax {
@@ -1128,13 +1458,23 @@ impl LdapSchema {
 
         let matching_rules = [
             (
+                "2.5.13.0",
+                "objectIdentifierMatch",
+                "1.3.6.1.4.1.1466.115.121.1.38",
+            ),
+            (
+                "2.5.13.1",
+                "distinguishedNameMatch",
+                "1.3.6.1.4.1.1466.115.121.1.12",
+            ),
+            (
                 "2.5.13.2",
                 "caseIgnoreMatch",
                 "1.3.6.1.4.1.1466.115.121.1.15",
             ),
             (
-                "2.5.13.5",
-                "caseExactMatch",
+                "2.5.13.3",
+                "caseIgnoreOrderingMatch",
                 "1.3.6.1.4.1.1466.115.121.1.15",
             ),
             (
@@ -1143,9 +1483,44 @@ impl LdapSchema {
                 "1.3.6.1.4.1.1466.115.121.1.15",
             ),
             (
+                "2.5.13.5",
+                "caseExactMatch",
+                "1.3.6.1.4.1.1466.115.121.1.15",
+            ),
+            (
+                "2.5.13.6",
+                "caseExactOrderingMatch",
+                "1.3.6.1.4.1.1466.115.121.1.15",
+            ),
+            (
                 "2.5.13.7",
                 "caseExactSubstringsMatch",
                 "1.3.6.1.4.1.1466.115.121.1.15",
+            ),
+            (
+                "2.5.13.8",
+                "numericStringMatch",
+                "1.3.6.1.4.1.1466.115.121.1.36",
+            ),
+            (
+                "2.5.13.9",
+                "numericStringOrderingMatch",
+                "1.3.6.1.4.1.1466.115.121.1.36",
+            ),
+            (
+                "2.5.13.10",
+                "numericStringSubstringsMatch",
+                "1.3.6.1.4.1.1466.115.121.1.36",
+            ),
+            (
+                "2.5.13.11",
+                "caseIgnoreListMatch",
+                "1.3.6.1.4.1.1466.115.121.1.41",
+            ),
+            (
+                "2.5.13.12",
+                "caseIgnoreListSubstringsMatch",
+                "1.3.6.1.4.1.1466.115.121.1.41",
             ),
             ("2.5.13.13", "booleanMatch", "1.3.6.1.4.1.1466.115.121.1.7"),
             ("2.5.13.14", "integerMatch", "1.3.6.1.4.1.1466.115.121.1.27"),
@@ -1153,6 +1528,36 @@ impl LdapSchema {
                 "2.5.13.15",
                 "integerOrderingMatch",
                 "1.3.6.1.4.1.1466.115.121.1.27",
+            ),
+            (
+                "2.5.13.16",
+                "bitStringMatch",
+                "1.3.6.1.4.1.1466.115.121.1.6",
+            ),
+            (
+                "2.5.13.17",
+                "octetStringMatch",
+                "1.3.6.1.4.1.1466.115.121.1.40",
+            ),
+            (
+                "2.5.13.18",
+                "octetStringOrderingMatch",
+                "1.3.6.1.4.1.1466.115.121.1.40",
+            ),
+            (
+                "2.5.13.20",
+                "telephoneNumberMatch",
+                "1.3.6.1.4.1.1466.115.121.1.50",
+            ),
+            (
+                "2.5.13.21",
+                "telephoneNumberSubstringsMatch",
+                "1.3.6.1.4.1.1466.115.121.1.50",
+            ),
+            (
+                "2.5.13.23",
+                "uniqueMemberMatch",
+                "1.3.6.1.4.1.1466.115.121.1.34",
             ),
             (
                 "2.5.13.27",
@@ -1165,20 +1570,22 @@ impl LdapSchema {
                 "1.3.6.1.4.1.1466.115.121.1.24",
             ),
             (
-                "2.5.13.1",
-                "distinguishedNameMatch",
-                "1.3.6.1.4.1.1466.115.121.1.12",
+                "2.5.13.29",
+                "integerFirstComponentMatch",
+                "1.3.6.1.4.1.1466.115.121.1.27",
             ),
             (
-                "2.5.13.0",
-                "objectIdentifierMatch",
+                "2.5.13.30",
+                "objectIdentifierFirstComponentMatch",
                 "1.3.6.1.4.1.1466.115.121.1.38",
             ),
             (
-                "2.5.13.17",
-                "octetStringMatch",
-                "1.3.6.1.4.1.1466.115.121.1.40",
+                "2.5.13.31",
+                "directoryStringFirstComponentMatch",
+                "1.3.6.1.4.1.1466.115.121.1.15",
             ),
+            ("2.5.13.32", "wordMatch", "1.3.6.1.4.1.1466.115.121.1.15"),
+            ("2.5.13.33", "keywordMatch", "1.3.6.1.4.1.1466.115.121.1.15"),
             (
                 "1.3.6.1.4.1.1466.109.114.2",
                 "caseIgnoreIA5Match",
@@ -1195,14 +1602,9 @@ impl LdapSchema {
                 "1.3.6.1.4.1.1466.115.121.1.26",
             ),
             (
-                "2.5.13.20",
-                "telephoneNumberMatch",
-                "1.3.6.1.4.1.1466.115.121.1.50",
-            ),
-            (
-                "2.5.13.21",
-                "telephoneNumberSubstringsMatch",
-                "1.3.6.1.4.1.1466.115.121.1.50",
+                "1.3.6.1.4.1.4203.1.2.1",
+                "caseExactIA5SubstringsMatch",
+                "1.3.6.1.4.1.1466.115.121.1.26",
             ),
         ];
         for (oid, name, syntax) in matching_rules {
@@ -1264,9 +1666,10 @@ impl LdapSchema {
 
     /// Get an attribute type by name
     pub fn get_attribute_type(&self, name: &str) -> Option<&AttributeType> {
+        let type_name = attribute_description_type_name(name);
         self.attribute_types
-            .get(&name.to_lowercase())
-            .or_else(|| self.attribute_types_by_oid.get(name))
+            .get(&type_name.to_lowercase())
+            .or_else(|| self.attribute_types_by_oid.get(type_name))
     }
 
     /// Get an object class by name
@@ -1565,21 +1968,8 @@ impl LdapSchema {
         if !schema_dir.exists() {
             return Ok(());
         }
-        let mut files = fs::read_dir(schema_dir)
-            .map_err(|err| SchemaError::IoError(format!("{}: {}", schema_dir.display(), err)))?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| {
-                            extension.eq_ignore_ascii_case("ldif")
-                                || extension.eq_ignore_ascii_case("schema")
-                                || extension.eq_ignore_ascii_case("conf")
-                        })
-            })
-            .collect::<Vec<PathBuf>>();
+        let mut files = Vec::new();
+        collect_schema_files(schema_dir, &mut files)?;
         files.sort();
 
         for file in files {
@@ -1811,7 +2201,15 @@ impl LdapSchema {
         attr: AttributeType,
         metadata: AttributeTypeMetadata,
     ) -> Result<(), SchemaError> {
-        if self.attribute_types_by_oid.contains_key(&attr.oid) {
+        if let Some(existing) = self.attribute_types_by_oid.get(&attr.oid) {
+            let existing_metadata = self
+                .attribute_metadata_by_oid
+                .get(&attr.oid)
+                .cloned()
+                .unwrap_or_default();
+            if existing == &attr && existing_metadata == metadata {
+                return Ok(());
+            }
             return Err(SchemaError::DuplicateOid(attr.oid));
         }
         for name in &attr.names {
@@ -1829,7 +2227,15 @@ impl LdapSchema {
         object_class: ObjectClass,
         metadata: SchemaElementMetadata,
     ) -> Result<(), SchemaError> {
-        if self.object_classes_by_oid.contains_key(&object_class.oid) {
+        if let Some(existing) = self.object_classes_by_oid.get(&object_class.oid) {
+            let existing_metadata = self
+                .object_class_metadata_by_oid
+                .get(&object_class.oid)
+                .cloned()
+                .unwrap_or_default();
+            if existing == &object_class && existing_metadata == metadata {
+                return Ok(());
+            }
             return Err(SchemaError::DuplicateOid(object_class.oid));
         }
         for name in &object_class.names {
@@ -1843,7 +2249,10 @@ impl LdapSchema {
     }
 
     fn try_add_ldap_syntax(&mut self, syntax: LdapSyntax) -> Result<(), SchemaError> {
-        if self.ldap_syntaxes.contains_key(&syntax.oid) {
+        if let Some(existing) = self.ldap_syntaxes.get(&syntax.oid) {
+            if existing == &syntax {
+                return Ok(());
+            }
             return Err(SchemaError::DuplicateOid(syntax.oid));
         }
         self.ldap_syntaxes.insert(syntax.oid.clone(), syntax);
@@ -1851,7 +2260,10 @@ impl LdapSchema {
     }
 
     fn try_add_matching_rule(&mut self, rule: MatchingRule) -> Result<(), SchemaError> {
-        if self.matching_rules_by_oid.contains_key(&rule.oid) {
+        if let Some(existing) = self.matching_rules_by_oid.get(&rule.oid) {
+            if existing == &rule {
+                return Ok(());
+            }
             return Err(SchemaError::DuplicateOid(rule.oid));
         }
         for name in &rule.names {
@@ -1869,7 +2281,10 @@ impl LdapSchema {
     }
 
     fn try_add_matching_rule_use(&mut self, rule_use: MatchingRuleUse) -> Result<(), SchemaError> {
-        if self.matching_rule_uses_by_oid.contains_key(&rule_use.oid) {
+        if let Some(existing) = self.matching_rule_uses_by_oid.get(&rule_use.oid) {
+            if existing == &rule_use {
+                return Ok(());
+            }
             return Err(SchemaError::DuplicateOid(rule_use.oid));
         }
         for name in &rule_use.names {
@@ -1882,7 +2297,10 @@ impl LdapSchema {
     }
 
     fn try_add_dit_content_rule(&mut self, rule: DitContentRule) -> Result<(), SchemaError> {
-        if self.dit_content_rules.contains_key(&rule.oid) {
+        if let Some(existing) = self.dit_content_rules.get(&rule.oid) {
+            if existing == &rule {
+                return Ok(());
+            }
             return Err(SchemaError::DuplicateOid(rule.oid));
         }
         self.dit_content_rules.insert(rule.oid.clone(), rule);
@@ -1890,7 +2308,10 @@ impl LdapSchema {
     }
 
     fn try_add_name_form(&mut self, name_form: NameForm) -> Result<(), SchemaError> {
-        if self.name_forms_by_oid.contains_key(&name_form.oid) {
+        if let Some(existing) = self.name_forms_by_oid.get(&name_form.oid) {
+            if existing == &name_form {
+                return Ok(());
+            }
             return Err(SchemaError::DuplicateOid(name_form.oid));
         }
         for name in &name_form.names {
@@ -1909,7 +2330,10 @@ impl LdapSchema {
     }
 
     fn try_add_dit_structure_rule(&mut self, rule: DitStructureRule) -> Result<(), SchemaError> {
-        if self.dit_structure_rules.contains_key(&rule.rule_id) {
+        if let Some(existing) = self.dit_structure_rules.get(&rule.rule_id) {
+            if existing == &rule {
+                return Ok(());
+            }
             return Err(SchemaError::DuplicateOid(rule.rule_id.to_string()));
         }
         self.dit_structure_rules.insert(rule.rule_id, rule);
@@ -2072,6 +2496,141 @@ impl LdapSchema {
             }
         }
 
+        for rule_use in self.matching_rule_uses_by_oid.values() {
+            if self.get_matching_rule(&rule_use.oid).is_none() {
+                return Err(SchemaError::MissingDependency(format!(
+                    "matching rule use {} references unknown matching rule {}",
+                    rule_use
+                        .names
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(&rule_use.oid),
+                    rule_use.oid
+                )));
+            }
+            for attribute in &rule_use.applies {
+                if self.get_attribute_type(attribute).is_none() {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "matching rule use {} applies to unknown attribute {}",
+                        rule_use
+                            .names
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or(&rule_use.oid),
+                        attribute
+                    )));
+                }
+            }
+        }
+
+        for rule in self.dit_content_rules.values() {
+            let Some(structural_class) = self.get_object_class(&rule.oid) else {
+                return Err(SchemaError::MissingDependency(format!(
+                    "DIT content rule {} references unknown structural object class {}",
+                    rule.names.first().map(String::as_str).unwrap_or(&rule.oid),
+                    rule.oid
+                )));
+            };
+            if structural_class.kind != ObjectClassKind::Structural {
+                return Err(SchemaError::MissingDependency(format!(
+                    "DIT content rule {} references non-structural object class {}",
+                    rule.names.first().map(String::as_str).unwrap_or(&rule.oid),
+                    structural_class
+                        .names
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(&structural_class.oid)
+                )));
+            }
+            for auxiliary in &rule.auxiliary {
+                let Some(object_class) = self.get_object_class(auxiliary) else {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "DIT content rule {} references unknown auxiliary class {}",
+                        rule.names.first().map(String::as_str).unwrap_or(&rule.oid),
+                        auxiliary
+                    )));
+                };
+                if object_class.kind != ObjectClassKind::Auxiliary {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "DIT content rule {} references non-auxiliary class {}",
+                        rule.names.first().map(String::as_str).unwrap_or(&rule.oid),
+                        auxiliary
+                    )));
+                }
+            }
+            for attribute in rule
+                .must
+                .iter()
+                .chain(rule.may.iter())
+                .chain(rule.not.iter())
+            {
+                if self.get_attribute_type(attribute).is_none() {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "DIT content rule {} references unknown attribute {}",
+                        rule.names.first().map(String::as_str).unwrap_or(&rule.oid),
+                        attribute
+                    )));
+                }
+            }
+        }
+
+        for name_form in self.name_forms_by_oid.values() {
+            let Some(object_class) = self.get_object_class(&name_form.object_class) else {
+                return Err(SchemaError::MissingDependency(format!(
+                    "name form {} references unknown object class {}",
+                    name_form
+                        .names
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(&name_form.oid),
+                    name_form.object_class
+                )));
+            };
+            if object_class.kind != ObjectClassKind::Structural {
+                return Err(SchemaError::MissingDependency(format!(
+                    "name form {} references non-structural object class {}",
+                    name_form
+                        .names
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(&name_form.oid),
+                    name_form.object_class
+                )));
+            }
+            for attribute in name_form.must.iter().chain(name_form.may.iter()) {
+                if self.get_attribute_type(attribute).is_none() {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "name form {} references unknown attribute {}",
+                        name_form
+                            .names
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or(&name_form.oid),
+                        attribute
+                    )));
+                }
+            }
+        }
+
+        for structure_rule in self.dit_structure_rules.values() {
+            if self.get_name_form(&structure_rule.name_form).is_none() {
+                return Err(SchemaError::MissingDependency(format!(
+                    "DIT structure rule {} references unknown name form {}",
+                    structure_rule_label(structure_rule),
+                    structure_rule.name_form
+                )));
+            }
+            for superior_rule in &structure_rule.superior_rules {
+                if !self.dit_structure_rules.contains_key(superior_rule) {
+                    return Err(SchemaError::MissingDependency(format!(
+                        "DIT structure rule {} references unknown superior rule {}",
+                        structure_rule_label(structure_rule),
+                        superior_rule
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2108,12 +2667,18 @@ impl LdapSchema {
         self.validate_structural_classes(&oc_definitions)?;
 
         // Collect all required and allowed attributes
-        let (must_attrs, may_attrs) = self.collect_attributes(&oc_definitions);
+        let (mut must_attrs, mut may_attrs) = self.collect_attributes(&oc_definitions);
+        if let Some(rule) = self.applicable_dit_content_rule(&oc_definitions)? {
+            must_attrs.extend(rule.must.iter().cloned());
+            may_attrs.extend(rule.may.iter().cloned());
+        }
 
         // Validate required attributes are present
         for must_attr in &must_attrs {
             let attr_lower = must_attr.to_lowercase();
-            let found = attributes.keys().any(|k| k.to_lowercase() == attr_lower);
+            let found = attributes
+                .keys()
+                .any(|k| attribute_description_type_name(k).to_lowercase() == attr_lower);
             if !found {
                 return Err(SchemaError::MissingRequiredAttribute(must_attr.clone()));
             }
@@ -2127,11 +2692,14 @@ impl LdapSchema {
             .collect();
 
         for attr_name in attributes.keys() {
-            let attr_lower = attr_name.to_lowercase();
+            let attr_lower = attribute_description_type_name(attr_name).to_lowercase();
             if !all_allowed.contains(&attr_lower) {
                 // Check if attribute exists in schema
-                if self.get_attribute_type(attr_name).is_none() {
+                let Some(attr_type) = self.get_attribute_type(attr_name) else {
                     return Err(SchemaError::AttributeNotFound(attr_name.clone()));
+                };
+                if self.attribute_is_globally_allowed_operational(attr_type) {
+                    continue;
                 }
                 return Err(SchemaError::AttributeNotAllowed(attr_name.clone()));
             }
@@ -2168,6 +2736,158 @@ impl LdapSchema {
         Ok(())
     }
 
+    pub fn has_dit_structure_rules(&self) -> bool {
+        !self.dit_structure_rules.is_empty()
+    }
+
+    pub fn requires_parent_attributes_for_entry(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> bool {
+        self.has_dit_structure_rules() || entry_declares_object_class(attributes, "subentry")
+    }
+
+    pub fn validate_entry_at_dn(
+        &self,
+        dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+        parent_attributes: Option<&HashMap<String, Vec<String>>>,
+    ) -> Result<(), SchemaError> {
+        self.validate_entry(attributes)?;
+        let rdn = parse_dn(dn)
+            .map_err(|err| SchemaError::NamingViolation(format!("Invalid DN syntax: {}", err)))?
+            .rdns()
+            .first()
+            .ok_or_else(|| SchemaError::NamingViolation("DN must not be empty".to_string()))?
+            .to_canonical_string();
+        self.validate_rdn_for_entry(attributes, &rdn)?;
+        self.validate_subentry_administrative_parent(attributes, parent_attributes)?;
+        self.validate_dit_structure_for_entry(attributes, parent_attributes)
+    }
+
+    pub fn validate_renamed_entry(
+        &self,
+        original_dn: &str,
+        attributes: &HashMap<String, Vec<String>>,
+        new_rdn: &str,
+        delete_old: bool,
+        parent_attributes: Option<&HashMap<String, Vec<String>>>,
+    ) -> Result<(), SchemaError> {
+        let candidate_attributes =
+            candidate_attributes_for_rename(original_dn, attributes, new_rdn, delete_old)?;
+        self.validate_rdn_for_entry(&candidate_attributes, new_rdn)?;
+        self.validate_entry(&candidate_attributes)?;
+        self.validate_subentry_administrative_parent(&candidate_attributes, parent_attributes)?;
+        self.validate_dit_structure_for_entry(&candidate_attributes, parent_attributes)
+    }
+
+    fn attribute_is_globally_allowed_operational(&self, attr_type: &AttributeType) -> bool {
+        attr_type.oid == "2.5.18.5"
+            && self
+                .attribute_metadata_by_oid
+                .get(&attr_type.oid)
+                .and_then(|metadata| metadata.usage.as_deref())
+                .is_some_and(|usage| usage.eq_ignore_ascii_case("directoryOperation"))
+    }
+
+    fn validate_subentry_administrative_parent(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+        parent_attributes: Option<&HashMap<String, Vec<String>>>,
+    ) -> Result<(), SchemaError> {
+        if !entry_declares_object_class(attributes, "subentry") {
+            return Ok(());
+        }
+        let Some(parent_attributes) = parent_attributes else {
+            return Err(SchemaError::StructureRuleViolation(
+                "subentry requires a parent administrative entry with administrativeRole"
+                    .to_string(),
+            ));
+        };
+        if attribute_values(parent_attributes, "administrativeRole").is_none_or(|roles| {
+            roles
+                .iter()
+                .all(|role| !is_valid_oid_or_descriptor(role.as_str()))
+        }) {
+            return Err(SchemaError::StructureRuleViolation(
+                "subentry parent must define administrativeRole".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_dit_structure_for_entry(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+        parent_attributes: Option<&HashMap<String, Vec<String>>>,
+    ) -> Result<(), SchemaError> {
+        let entry_rules = self.applicable_dit_structure_rules_for_attributes(attributes)?;
+        if entry_rules.is_empty() {
+            return Ok(());
+        }
+        for rule in &entry_rules {
+            if rule.obsolete {
+                return Err(SchemaError::StructureRuleViolation(format!(
+                    "DIT structure rule {} is obsolete",
+                    structure_rule_label(rule)
+                )));
+            }
+        }
+        if entry_rules
+            .iter()
+            .any(|rule| rule.superior_rules.is_empty())
+        {
+            return Ok(());
+        }
+
+        let Some(parent_attributes) = parent_attributes else {
+            let expected = entry_rules
+                .iter()
+                .flat_map(|rule| rule.superior_rules.iter())
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(SchemaError::StructureRuleViolation(format!(
+                "entry requires a parent governed by one of DIT structure rules: {}",
+                expected
+            )));
+        };
+
+        let parent_rule_ids = self
+            .applicable_dit_structure_rules_for_attributes(parent_attributes)?
+            .into_iter()
+            .map(|rule| rule.rule_id)
+            .collect::<HashSet<_>>();
+
+        if entry_rules.iter().any(|rule| {
+            rule.superior_rules
+                .iter()
+                .any(|superior| parent_rule_ids.contains(superior))
+        }) {
+            return Ok(());
+        }
+
+        let expected = entry_rules
+            .iter()
+            .flat_map(|rule| rule.superior_rules.iter())
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let actual = if parent_rule_ids.is_empty() {
+            "no applicable DIT structure rule".to_string()
+        } else {
+            parent_rule_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Err(SchemaError::StructureRuleViolation(format!(
+            "parent is governed by {}, but entry requires one of DIT structure rules: {}",
+            actual, expected
+        )))
+    }
+
     pub fn validate_modified_entry(
         &self,
         original: &HashMap<String, Vec<String>>,
@@ -2197,54 +2917,20 @@ impl LdapSchema {
                 return Err(SchemaError::AttributeNotFound(ava.attribute().to_string()));
             }
         }
-        let rdn_attr = rdn
-            .avas()
-            .first()
-            .map(|ava| ava.attribute())
-            .ok_or_else(|| SchemaError::NamingViolation("RDN must not be empty".to_string()))?;
+        let applicable_name_forms = self.applicable_name_forms_for_attributes(attributes)?;
+        if applicable_name_forms.is_empty() {
+            return Ok(());
+        }
 
-        let object_classes = attributes
-            .get("objectclass")
-            .or_else(|| attributes.get("objectClass"))
-            .ok_or(SchemaError::MissingRequiredAttribute(
-                "objectClass".to_string(),
-            ))?;
-        let structural = self.structural_class_names(attributes)?;
-        let Some(leaf_structural) = structural.last() else {
-            return Err(SchemaError::NoStructuralClass);
-        };
-
-        for name_form in self.name_forms_by_oid.values() {
-            if self
-                .get_object_class(&name_form.object_class)
-                .is_some_and(|object_class| {
-                    object_class.names[0].eq_ignore_ascii_case(leaf_structural)
-                })
-                || object_classes
-                    .iter()
-                    .any(|object_class| object_class.eq_ignore_ascii_case(&name_form.object_class))
-            {
-                let rdn_lower = rdn_attr.to_lowercase();
-                if !name_form
-                    .must
-                    .iter()
-                    .chain(name_form.may.iter())
-                    .any(|candidate| candidate.eq_ignore_ascii_case(&rdn_lower))
-                {
-                    return Err(SchemaError::NamingViolation(format!(
-                        "RDN attribute {} is not allowed by name form {}",
-                        rdn_attr,
-                        name_form
-                            .names
-                            .first()
-                            .map(String::as_str)
-                            .unwrap_or(&name_form.oid)
-                    )));
-                }
+        let mut diagnostics = Vec::new();
+        for name_form in applicable_name_forms {
+            match self.rdn_satisfies_name_form(attributes, &rdn, name_form) {
+                Ok(()) => return Ok(()),
+                Err(err) => diagnostics.push(err),
             }
         }
 
-        Ok(())
+        Err(SchemaError::NamingViolation(diagnostics.join("; ")))
     }
 
     /// Validate structural object class rules
@@ -2309,15 +2995,207 @@ impl LdapSchema {
         Ok(structural)
     }
 
+    fn structural_class_definitions_for_attributes(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> Result<Vec<&ObjectClass>, SchemaError> {
+        let object_classes = attributes
+            .get("objectclass")
+            .or_else(|| attributes.get("objectClass"))
+            .ok_or(SchemaError::MissingRequiredAttribute(
+                "objectClass".to_string(),
+            ))?;
+        Ok(object_classes
+            .iter()
+            .filter_map(|object_class| self.get_object_class(object_class))
+            .filter(|object_class| object_class.kind == ObjectClassKind::Structural)
+            .collect())
+    }
+
+    fn leaf_structural_class<'a>(
+        &self,
+        oc_definitions: &'a [&ObjectClass],
+    ) -> Result<Option<&'a ObjectClass>, SchemaError> {
+        let structural = oc_definitions
+            .iter()
+            .copied()
+            .filter(|object_class| object_class.kind == ObjectClassKind::Structural)
+            .collect::<Vec<_>>();
+        if structural.is_empty() {
+            return Ok(None);
+        }
+
+        let leaves = structural
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !structural.iter().any(|other| {
+                    candidate.oid != other.oid && self.object_class_is_superior_of(candidate, other)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        match leaves.as_slice() {
+            [leaf] => Ok(Some(*leaf)),
+            _ => Err(SchemaError::MultipleStructuralClasses),
+        }
+    }
+
+    fn object_class_is_superior_of(&self, superior: &ObjectClass, child: &ObjectClass) -> bool {
+        let mut superiors = HashSet::new();
+        self.collect_superior_classes(&child.names[0], &mut superiors);
+        superiors.iter().any(|candidate| {
+            candidate.eq_ignore_ascii_case(&superior.oid)
+                || superior
+                    .names
+                    .iter()
+                    .any(|name| candidate.eq_ignore_ascii_case(name))
+        })
+    }
+
+    fn applicable_dit_content_rule<'a>(
+        &'a self,
+        oc_definitions: &[&ObjectClass],
+    ) -> Result<Option<&'a DitContentRule>, SchemaError> {
+        let Some(structural) = self.leaf_structural_class(oc_definitions)? else {
+            return Ok(None);
+        };
+        Ok(self.dit_content_rules.get(&structural.oid))
+    }
+
+    fn get_name_form(&self, name_or_oid: &str) -> Option<&NameForm> {
+        self.name_forms
+            .get(&name_or_oid.to_lowercase())
+            .or_else(|| self.name_forms_by_oid.get(name_or_oid))
+    }
+
+    fn applicable_name_forms_for_attributes(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> Result<Vec<&NameForm>, SchemaError> {
+        let structural = self.structural_class_definitions_for_attributes(attributes)?;
+        let Some(leaf) = self.leaf_structural_class(&structural)? else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .name_forms_by_oid
+            .values()
+            .filter(|name_form| {
+                self.get_object_class(&name_form.object_class)
+                    .is_some_and(|object_class| object_class.oid == leaf.oid)
+            })
+            .collect())
+    }
+
+    fn applicable_dit_structure_rules_for_attributes(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+    ) -> Result<Vec<&DitStructureRule>, SchemaError> {
+        let structural = self.structural_class_definitions_for_attributes(attributes)?;
+        let Some(leaf) = self.leaf_structural_class(&structural)? else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .dit_structure_rules
+            .values()
+            .filter(|rule| {
+                self.get_name_form(&rule.name_form)
+                    .and_then(|name_form| self.get_object_class(&name_form.object_class))
+                    .is_some_and(|object_class| object_class.oid == leaf.oid)
+            })
+            .collect())
+    }
+
+    fn rdn_satisfies_name_form(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+        rdn: &crate::dn::Rdn,
+        name_form: &NameForm,
+    ) -> Result<(), String> {
+        let name_form_name = name_form
+            .names
+            .first()
+            .map(String::as_str)
+            .unwrap_or(&name_form.oid);
+        let rdn_attributes = rdn
+            .avas()
+            .iter()
+            .map(|ava| ava.attribute().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+
+        for required in &name_form.must {
+            if !rdn_attributes.contains(&required.to_ascii_lowercase()) {
+                return Err(format!(
+                    "RDN is missing required attribute {} from name form {}",
+                    required, name_form_name
+                ));
+            }
+        }
+
+        for ava in rdn.avas() {
+            if !name_form
+                .must
+                .iter()
+                .chain(name_form.may.iter())
+                .any(|candidate| candidate.eq_ignore_ascii_case(ava.attribute()))
+            {
+                return Err(format!(
+                    "RDN attribute {} is not allowed by name form {}",
+                    ava.attribute(),
+                    name_form_name
+                ));
+            }
+            if !self.entry_contains_attribute_value(attributes, ava.attribute(), ava.value())? {
+                return Err(format!(
+                    "RDN value {}={} is not present in the entry",
+                    ava.attribute(),
+                    ava.value()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn entry_contains_attribute_value(
+        &self,
+        attributes: &HashMap<String, Vec<String>>,
+        attribute: &str,
+        value: &str,
+    ) -> Result<bool, String> {
+        let Some((stored_name, values)) = attributes
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(attribute))
+        else {
+            return Ok(false);
+        };
+
+        let equality = self
+            .get_attribute_type(stored_name)
+            .and_then(|attribute_type| attribute_type.equality.as_deref())
+            .and_then(|rule| self.resolve_matching_rule(rule).ok());
+
+        for candidate in values {
+            let matches = if let Some(rule) = &equality {
+                rule.values_equal(candidate, value)
+                    .map_err(|err| err.to_string())?
+            } else {
+                candidate == value
+            };
+            if matches {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     fn validate_dit_content_rules(
         &self,
         oc_definitions: &[&ObjectClass],
         attributes: &HashMap<String, Vec<String>>,
     ) -> Result<(), SchemaError> {
-        let structural = oc_definitions
-            .iter()
-            .find(|object_class| object_class.kind == ObjectClassKind::Structural);
-        let Some(structural) = structural else {
+        let Some(structural) = self.leaf_structural_class(oc_definitions)? else {
             return Ok(());
         };
         let Some(rule) = self.dit_content_rules.get(&structural.oid) else {
@@ -2413,7 +3291,16 @@ impl LdapSchema {
                     effective.syntax_oid, reason
                 ),
             )
-        })
+        })?;
+
+        if effective.oid == "2.16.840.1.113730.3.1.39" {
+            validate_preferred_language(value)
+                .map_err(|reason| SchemaError::InvalidSyntax(attr_name.to_string(), reason))?;
+        }
+        validate_rfc2307_attribute_semantics(&effective.oid, value)
+            .map_err(|reason| SchemaError::InvalidSyntax(attr_name.to_string(), reason))?;
+
+        Ok(())
     }
 
     /// Collect all superior class names recursively
@@ -2463,6 +3350,34 @@ impl LdapSchema {
     }
 }
 
+fn collect_schema_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), SchemaError> {
+    for entry in fs::read_dir(dir)
+        .map_err(|err| SchemaError::IoError(format!("{}: {}", dir.display(), err)))?
+    {
+        let entry =
+            entry.map_err(|err| SchemaError::IoError(format!("{}: {}", dir.display(), err)))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_schema_files(&path, files)?;
+        } else if is_schema_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_schema_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("ldif")
+                    || extension.eq_ignore_ascii_case("schema")
+                    || extension.eq_ignore_ascii_case("conf")
+            })
+}
+
 impl AttributeType {
     pub fn to_schema_description(&self) -> String {
         self.to_schema_description_with_metadata(None)
@@ -2495,7 +3410,9 @@ impl AttributeType {
         if let Some(substring) = metadata.and_then(|metadata| metadata.substring.as_ref()) {
             parts.push(format!("SUBSTR {}", substring));
         }
-        parts.push(format!("SYNTAX {}", self.syntax));
+        if !self.syntax.is_empty() {
+            parts.push(format!("SYNTAX {}", self.syntax));
+        }
         if self.single_value {
             parts.push("SINGLE-VALUE".to_string());
         }
@@ -2786,34 +3703,550 @@ fn base_syntax_oid(syntax: &str) -> &str {
     syntax.split_once('{').map_or(syntax, |(oid, _)| oid)
 }
 
+fn structure_rule_label(rule: &DitStructureRule) -> String {
+    rule.names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| rule.rule_id.to_string())
+}
+
+fn candidate_attributes_for_rename(
+    original_dn: &str,
+    attributes: &HashMap<String, Vec<String>>,
+    new_rdn: &str,
+    delete_old: bool,
+) -> Result<HashMap<String, Vec<String>>, SchemaError> {
+    let mut candidate = attributes.clone();
+
+    if delete_old
+        && let Some(old_rdn) = parse_dn(original_dn)
+            .map_err(|err| SchemaError::NamingViolation(format!("Invalid DN syntax: {}", err)))?
+            .rdns()
+            .first()
+            .cloned()
+    {
+        for ava in old_rdn.avas() {
+            if let Some(key) = attribute_key_case_insensitive(&candidate, ava.attribute()) {
+                let values = candidate
+                    .get_mut(&key)
+                    .expect("key was selected from the same attributes map");
+                values.retain(|candidate| candidate != ava.value());
+                if values.is_empty() {
+                    candidate.remove(&key);
+                }
+            }
+        }
+    }
+
+    for (attribute, value) in rdn_attribute_values(new_rdn)
+        .map_err(|err| SchemaError::NamingViolation(format!("Invalid RDN syntax: {}", err)))?
+    {
+        let key = attribute_key_case_insensitive(&candidate, &attribute).unwrap_or(attribute);
+        let values = candidate.entry(key).or_default();
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+
+    Ok(candidate)
+}
+
+fn attribute_key_case_insensitive(
+    attributes: &HashMap<String, Vec<String>>,
+    attribute: &str,
+) -> Option<String> {
+    attributes
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(attribute))
+        .cloned()
+}
+
+fn attribute_description_type_name(attribute_description: &str) -> &str {
+    attribute_description
+        .split_once(';')
+        .map_or(attribute_description, |(attribute_type, _)| attribute_type)
+}
+
+fn attribute_values<'a>(
+    attributes: &'a HashMap<String, Vec<String>>,
+    attribute_type: &str,
+) -> Option<&'a Vec<String>> {
+    attributes
+        .iter()
+        .find(|(name, _)| {
+            attribute_description_type_name(name).eq_ignore_ascii_case(attribute_type)
+        })
+        .map(|(_, values)| values)
+}
+
+fn entry_declares_object_class(
+    attributes: &HashMap<String, Vec<String>>,
+    object_class: &str,
+) -> bool {
+    attribute_values(attributes, "objectClass").is_some_and(|values| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(object_class))
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubtreeSpecification {
+    pub(crate) base: Option<String>,
+    pub(crate) specific_exclusions: Vec<SpecificExclusion>,
+    pub(crate) minimum: u32,
+    pub(crate) maximum: Option<u32>,
+    pub(crate) specification_filter: Option<Refinement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpecificExclusion {
+    pub(crate) kind: SpecificExclusionKind,
+    pub(crate) local_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpecificExclusionKind {
+    ChopBefore,
+    ChopAfter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refinement {
+    Item(String),
+    And(Vec<Refinement>),
+    Or(Vec<Refinement>),
+    Not(Box<Refinement>),
+}
+
+#[cfg(test)]
+impl SubtreeSpecification {
+    pub(crate) fn contains_entry(
+        &self,
+        administrative_point_dn: &str,
+        entry_dn: &str,
+        object_classes: &[String],
+    ) -> bool {
+        let base_dn = self
+            .base
+            .as_deref()
+            .filter(|base| !base.is_empty())
+            .map(|base| format!("{base},{administrative_point_dn}"))
+            .unwrap_or_else(|| administrative_point_dn.to_string());
+        if !crate::dn::dn_is_in_scope(entry_dn, &base_dn, ldap_parser::ldap::SearchScope(2)) {
+            return false;
+        }
+
+        let Some(distance) = subtree_base_distance(&base_dn, entry_dn) else {
+            return false;
+        };
+        if distance < self.minimum {
+            return false;
+        }
+        if self.maximum.is_some_and(|maximum| distance > maximum) {
+            return false;
+        }
+        if self
+            .specific_exclusions
+            .iter()
+            .any(|exclusion| exclusion.excludes(&base_dn, entry_dn))
+        {
+            return false;
+        }
+        self.specification_filter
+            .as_ref()
+            .is_none_or(|filter| filter.matches(object_classes))
+    }
+}
+
+#[cfg(test)]
+impl SpecificExclusion {
+    fn excludes(&self, base_dn: &str, entry_dn: &str) -> bool {
+        let excluded_dn = if self.local_name.is_empty() {
+            base_dn.to_string()
+        } else {
+            format!("{},{}", self.local_name, base_dn)
+        };
+        match self.kind {
+            SpecificExclusionKind::ChopBefore => {
+                crate::dn::dn_is_in_scope(entry_dn, &excluded_dn, ldap_parser::ldap::SearchScope(2))
+            }
+            SpecificExclusionKind::ChopAfter => {
+                !crate::dn::dn_eq(entry_dn, &excluded_dn)
+                    && crate::dn::dn_is_in_scope(
+                        entry_dn,
+                        &excluded_dn,
+                        ldap_parser::ldap::SearchScope(2),
+                    )
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Refinement {
+    fn matches(&self, object_classes: &[String]) -> bool {
+        match self {
+            Self::Item(expected) => object_classes
+                .iter()
+                .any(|object_class| object_class.eq_ignore_ascii_case(expected)),
+            Self::And(children) => children.iter().all(|child| child.matches(object_classes)),
+            Self::Or(children) => children.iter().any(|child| child.matches(object_classes)),
+            Self::Not(child) => !child.matches(object_classes),
+        }
+    }
+}
+
+pub(crate) fn parse_subtree_specification(value: &str) -> Result<SubtreeSpecification, String> {
+    let inner = braced_inner(value, "SubtreeSpecification")?;
+    let components = split_gser_components(inner)?;
+    let mut seen = HashSet::new();
+    let mut last_order = 0usize;
+    let mut spec = SubtreeSpecification {
+        base: None,
+        specific_exclusions: Vec::new(),
+        minimum: 0,
+        maximum: None,
+        specification_filter: None,
+    };
+
+    for component in components {
+        let (keyword, rest) = split_gser_keyword(component)?;
+        let (order, normalized_keyword) = match keyword {
+            "base" => (1, "base"),
+            "specificExclusions" => (2, "specificExclusions"),
+            "minimum" => (3, "minimum"),
+            "maximum" => (4, "maximum"),
+            "specificationFilter" => (5, "specificationFilter"),
+            _ => {
+                return Err(format!("unknown SubtreeSpecification component {keyword}"));
+            }
+        };
+        if order < last_order {
+            return Err("SubtreeSpecification components must follow RFC 3672 order".to_string());
+        }
+        if !seen.insert(normalized_keyword) {
+            return Err(format!(
+                "duplicate SubtreeSpecification component {normalized_keyword}"
+            ));
+        }
+        last_order = order;
+
+        match normalized_keyword {
+            "base" => spec.base = Some(parse_local_name(rest)?),
+            "specificExclusions" => {
+                spec.specific_exclusions = parse_specific_exclusions(rest)?;
+            }
+            "minimum" => spec.minimum = parse_base_distance(rest, "minimum")?,
+            "maximum" => spec.maximum = Some(parse_base_distance(rest, "maximum")?),
+            "specificationFilter" => {
+                spec.specification_filter = Some(parse_refinement(rest, 0)?);
+            }
+            _ => unreachable!("keyword match above restricts components"),
+        }
+    }
+
+    if let Some(maximum) = spec.maximum
+        && spec.minimum > maximum
+    {
+        return Err("SubtreeSpecification minimum must not exceed maximum".to_string());
+    }
+
+    Ok(spec)
+}
+
+fn validate_subtree_specification(value: &str) -> Result<(), String> {
+    parse_subtree_specification(value).map(|_| ())
+}
+
+#[cfg(test)]
+fn subtree_base_distance(base_dn: &str, entry_dn: &str) -> Option<u32> {
+    let base = parse_dn(base_dn).ok()?;
+    let entry = parse_dn(entry_dn).ok()?;
+    if !entry.is_descendant_or_equal_of(&base) {
+        return None;
+    }
+    let distance = entry.rdns().len().checked_sub(base.rdns().len())?;
+    u32::try_from(distance).ok()
+}
+
+fn braced_inner<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
+    let trimmed = value.trim();
+    let Some(inner) = trimmed
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return Err(format!("{label} must be enclosed in braces"));
+    };
+    Ok(inner.trim())
+}
+
+fn split_gser_keyword(component: &str) -> Result<(&str, &str), String> {
+    let component = component.trim();
+    let Some(index) = component.find(char::is_whitespace) else {
+        return Err(format!(
+            "SubtreeSpecification component {component} has no value"
+        ));
+    };
+    let keyword = &component[..index];
+    let rest = component[index..].trim();
+    if rest.is_empty() {
+        return Err(format!(
+            "SubtreeSpecification component {keyword} has no value"
+        ));
+    }
+    Ok((keyword, rest))
+}
+
+fn split_gser_components(value: &str) -> Result<Vec<&str>, String> {
+    let mut components = Vec::new();
+    let mut depth = 0_i32;
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+
+    for (index, ch) in value.char_indices() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quote = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("unbalanced braces in SubtreeSpecification".to_string());
+                }
+            }
+            ',' if depth == 0 => {
+                let component = value[start..index].trim();
+                if component.is_empty() {
+                    return Err("empty component in SubtreeSpecification".to_string());
+                }
+                components.push(component);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    if in_quote {
+        return Err("unterminated quoted value in SubtreeSpecification".to_string());
+    }
+    if depth != 0 {
+        return Err("unbalanced braces in SubtreeSpecification".to_string());
+    }
+
+    let trailing = value[start..].trim();
+    if !trailing.is_empty() {
+        components.push(trailing);
+    } else if !value.trim().is_empty() && value.trim_end().ends_with(',') {
+        return Err("trailing comma in SubtreeSpecification".to_string());
+    }
+    Ok(components)
+}
+
+fn parse_local_name(value: &str) -> Result<String, String> {
+    let value = unquote_gser_string(value.trim())?;
+    if value.is_empty() {
+        return Ok(value);
+    }
+    canonicalize_dn(&value).map_err(|err| format!("invalid LocalName {value}: {err}"))?;
+    Ok(value)
+}
+
+fn unquote_gser_string(value: &str) -> Result<String, String> {
+    if value.starts_with('"') || value.ends_with('"') {
+        if !(value.starts_with('"') && value.ends_with('"') && value.len() >= 2) {
+            return Err("quoted LocalName must have both opening and closing quotes".to_string());
+        }
+        let inner = &value[1..value.len() - 1];
+        let mut decoded = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                let Some(next) = chars.next() else {
+                    return Err("quoted LocalName has a dangling escape".to_string());
+                };
+                decoded.push(next);
+            } else {
+                decoded.push(ch);
+            }
+        }
+        return Ok(decoded);
+    }
+    Ok(value.to_string())
+}
+
+fn parse_specific_exclusions(value: &str) -> Result<Vec<SpecificExclusion>, String> {
+    let inner = braced_inner(value, "specificExclusions")?;
+    split_gser_components(inner)?
+        .into_iter()
+        .map(parse_specific_exclusion)
+        .collect()
+}
+
+fn parse_specific_exclusion(value: &str) -> Result<SpecificExclusion, String> {
+    let Some((kind, local_name)) = value.split_once(':') else {
+        return Err("specificExclusions entries must use chopBefore: or chopAfter:".to_string());
+    };
+    let kind = match kind.trim() {
+        "chopBefore" => SpecificExclusionKind::ChopBefore,
+        "chopAfter" => SpecificExclusionKind::ChopAfter,
+        other => return Err(format!("unknown specificExclusions form {other}")),
+    };
+    Ok(SpecificExclusion {
+        kind,
+        local_name: parse_local_name(local_name.trim())?,
+    })
+}
+
+fn parse_base_distance(value: &str, label: &str) -> Result<u32, String> {
+    let parsed = parse_integer_syntax(value.trim())?;
+    if parsed < 0 {
+        return Err(format!("{label} must be a non-negative integer"));
+    }
+    u32::try_from(parsed).map_err(|_| format!("{label} is outside the supported u32 range"))
+}
+
+fn parse_refinement(value: &str, depth: usize) -> Result<Refinement, String> {
+    if depth > 32 {
+        return Err("specificationFilter nesting is too deep".to_string());
+    }
+    let Some((kind, rest)) = value.trim().split_once(':') else {
+        return Err("specificationFilter refinement must use item, and, or, or not".to_string());
+    };
+    let kind = kind.trim();
+    let rest = rest.trim();
+    match kind {
+        "item" => {
+            if is_valid_oid_or_descriptor(rest) {
+                Ok(Refinement::Item(rest.to_string()))
+            } else {
+                Err("specificationFilter item must be an object identifier".to_string())
+            }
+        }
+        "and" | "or" => {
+            let children = parse_refinement_set(rest, depth + 1)?;
+            if children.is_empty() {
+                return Err(format!(
+                    "specificationFilter {kind} requires at least one child"
+                ));
+            }
+            if kind == "and" {
+                Ok(Refinement::And(children))
+            } else {
+                Ok(Refinement::Or(children))
+            }
+        }
+        "not" => Ok(Refinement::Not(Box::new(parse_refinement(
+            rest,
+            depth + 1,
+        )?))),
+        other => Err(format!("unknown specificationFilter refinement {other}")),
+    }
+}
+
+fn parse_refinement_set(value: &str, depth: usize) -> Result<Vec<Refinement>, String> {
+    let inner = braced_inner(value, "Refinements")?;
+    split_gser_components(inner)?
+        .into_iter()
+        .map(|component| parse_refinement(component, depth))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedSyntaxKind {
+    AttributeTypeDescription,
+    Binary,
+    BitString,
     Boolean,
+    BootParameter,
+    Certificate,
+    CountryString,
+    DeliveryMethod,
     DistinguishedName,
     DirectoryString,
+    DitContentRuleDescription,
+    DitStructureRuleDescription,
+    EnhancedGuide,
+    FacsimileTelephoneNumber,
+    Fax,
     GeneralizedTime,
+    Guide,
     Ia5String,
     Integer,
     Jpeg,
+    LdapSyntaxDescription,
+    MatchingRuleDescription,
+    MatchingRuleUseDescription,
+    NameAndOptionalUid,
+    NameFormDescription,
+    NisNetgroupTriple,
+    NumericString,
+    ObjectClassDescription,
     ObjectIdentifier,
+    OtherMailbox,
     OctetString,
     PostalAddress,
+    PrintableString,
+    SubtreeSpecification,
+    SubstringAssertion,
+    TeletexTerminalIdentifier,
     TelephoneNumber,
+    TelexNumber,
+    UtcTime,
 }
 
 fn supported_syntax_kind(syntax_oid: &str) -> Option<SupportedSyntaxKind> {
     match syntax_oid {
+        "1.3.6.1.1.1.0.0" => Some(SupportedSyntaxKind::NisNetgroupTriple),
+        "1.3.6.1.1.1.0.1" => Some(SupportedSyntaxKind::BootParameter),
+        "1.3.6.1.4.1.1466.115.121.1.3" => Some(SupportedSyntaxKind::AttributeTypeDescription),
+        "1.3.6.1.4.1.1466.115.121.1.5" => Some(SupportedSyntaxKind::Binary),
+        "1.3.6.1.4.1.1466.115.121.1.6" => Some(SupportedSyntaxKind::BitString),
         "1.3.6.1.4.1.1466.115.121.1.7" => Some(SupportedSyntaxKind::Boolean),
+        "1.3.6.1.4.1.1466.115.121.1.8" => Some(SupportedSyntaxKind::Certificate),
+        "1.3.6.1.4.1.1466.115.121.1.11" => Some(SupportedSyntaxKind::CountryString),
         "1.3.6.1.4.1.1466.115.121.1.12" => Some(SupportedSyntaxKind::DistinguishedName),
+        "1.3.6.1.4.1.1466.115.121.1.14" => Some(SupportedSyntaxKind::DeliveryMethod),
         "1.3.6.1.4.1.1466.115.121.1.15" => Some(SupportedSyntaxKind::DirectoryString),
+        "1.3.6.1.4.1.1466.115.121.1.16" => Some(SupportedSyntaxKind::DitContentRuleDescription),
+        "1.3.6.1.4.1.1466.115.121.1.17" => Some(SupportedSyntaxKind::DitStructureRuleDescription),
+        "1.3.6.1.4.1.1466.115.121.1.21" => Some(SupportedSyntaxKind::EnhancedGuide),
+        "1.3.6.1.4.1.1466.115.121.1.22" => Some(SupportedSyntaxKind::FacsimileTelephoneNumber),
+        "1.3.6.1.4.1.1466.115.121.1.23" => Some(SupportedSyntaxKind::Fax),
         "1.3.6.1.4.1.1466.115.121.1.24" => Some(SupportedSyntaxKind::GeneralizedTime),
+        "1.3.6.1.4.1.1466.115.121.1.25" => Some(SupportedSyntaxKind::Guide),
         "1.3.6.1.4.1.1466.115.121.1.26" => Some(SupportedSyntaxKind::Ia5String),
         "1.3.6.1.4.1.1466.115.121.1.27" => Some(SupportedSyntaxKind::Integer),
         "1.3.6.1.4.1.1466.115.121.1.28" => Some(SupportedSyntaxKind::Jpeg),
+        "1.3.6.1.4.1.1466.115.121.1.30" => Some(SupportedSyntaxKind::MatchingRuleDescription),
+        "1.3.6.1.4.1.1466.115.121.1.31" => Some(SupportedSyntaxKind::MatchingRuleUseDescription),
+        "1.3.6.1.4.1.1466.115.121.1.34" => Some(SupportedSyntaxKind::NameAndOptionalUid),
+        "1.3.6.1.4.1.1466.115.121.1.35" => Some(SupportedSyntaxKind::NameFormDescription),
+        "1.3.6.1.4.1.1466.115.121.1.36" => Some(SupportedSyntaxKind::NumericString),
+        "1.3.6.1.4.1.1466.115.121.1.37" => Some(SupportedSyntaxKind::ObjectClassDescription),
         "1.3.6.1.4.1.1466.115.121.1.38" => Some(SupportedSyntaxKind::ObjectIdentifier),
+        "1.3.6.1.4.1.1466.115.121.1.39" => Some(SupportedSyntaxKind::OtherMailbox),
         "1.3.6.1.4.1.1466.115.121.1.40" => Some(SupportedSyntaxKind::OctetString),
         "1.3.6.1.4.1.1466.115.121.1.41" => Some(SupportedSyntaxKind::PostalAddress),
+        "1.3.6.1.4.1.1466.115.121.1.44" => Some(SupportedSyntaxKind::PrintableString),
+        "1.3.6.1.4.1.1466.115.121.1.45" => Some(SupportedSyntaxKind::SubtreeSpecification),
         "1.3.6.1.4.1.1466.115.121.1.50" => Some(SupportedSyntaxKind::TelephoneNumber),
+        "1.3.6.1.4.1.1466.115.121.1.51" => Some(SupportedSyntaxKind::TeletexTerminalIdentifier),
+        "1.3.6.1.4.1.1466.115.121.1.52" => Some(SupportedSyntaxKind::TelexNumber),
+        "1.3.6.1.4.1.1466.115.121.1.53" => Some(SupportedSyntaxKind::UtcTime),
+        "1.3.6.1.4.1.1466.115.121.1.54" => Some(SupportedSyntaxKind::LdapSyntaxDescription),
+        "1.3.6.1.4.1.1466.115.121.1.58" => Some(SupportedSyntaxKind::SubstringAssertion),
         _ => None,
     }
 }
@@ -2824,6 +4257,12 @@ fn validate_ldap_syntax_value(syntax_oid: &str, value: &str) -> Result<(), Strin
     };
 
     match kind {
+        SupportedSyntaxKind::AttributeTypeDescription => parse_attribute_type_description(value)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        SupportedSyntaxKind::Binary => Ok(()),
+        SupportedSyntaxKind::BitString => validate_bit_string(value),
+        SupportedSyntaxKind::BootParameter => validate_boot_parameter(value),
         SupportedSyntaxKind::Boolean => {
             if matches!(value, "TRUE" | "FALSE") {
                 Ok(())
@@ -2831,14 +4270,49 @@ fn validate_ldap_syntax_value(syntax_oid: &str, value: &str) -> Result<(), Strin
                 Err("boolean values must be TRUE or FALSE".to_string())
             }
         }
+        SupportedSyntaxKind::Certificate => validate_certificate(value),
+        SupportedSyntaxKind::CountryString => validate_country_string(value),
+        SupportedSyntaxKind::DeliveryMethod => validate_delivery_method(value),
         SupportedSyntaxKind::DistinguishedName => canonicalize_dn(value)
             .map(|_| ())
             .map_err(|err| err.to_string()),
         SupportedSyntaxKind::DirectoryString => prepare_directory_string(value).map(|_| ()),
+        SupportedSyntaxKind::DitContentRuleDescription => parse_dit_content_rule_description(value)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        SupportedSyntaxKind::DitStructureRuleDescription => {
+            parse_dit_structure_rule_description(value)
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        }
+        SupportedSyntaxKind::EnhancedGuide => validate_guide(value, true),
+        SupportedSyntaxKind::FacsimileTelephoneNumber => validate_facsimile_telephone_number(value),
+        SupportedSyntaxKind::Fax => Ok(()),
         SupportedSyntaxKind::GeneralizedTime => parse_generalized_time(value).map(|_| ()),
+        SupportedSyntaxKind::Guide => validate_guide(value, false),
         SupportedSyntaxKind::Ia5String => validate_ia5_string(value),
         SupportedSyntaxKind::Integer => parse_integer_syntax(value).map(|_| ()),
         SupportedSyntaxKind::Jpeg => Ok(()),
+        SupportedSyntaxKind::LdapSyntaxDescription => parse_ldap_syntax_description(value)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        SupportedSyntaxKind::MatchingRuleDescription => parse_matching_rule_description(value)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        SupportedSyntaxKind::MatchingRuleUseDescription => {
+            parse_matching_rule_use_description(value)
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        }
+        SupportedSyntaxKind::NameAndOptionalUid => validate_name_and_optional_uid(value),
+        SupportedSyntaxKind::NameFormDescription => parse_name_form_description(value)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        SupportedSyntaxKind::NisNetgroupTriple => validate_nis_netgroup_triple(value),
+        SupportedSyntaxKind::NumericString => validate_numeric_string(value),
+        SupportedSyntaxKind::ObjectClassDescription => parse_object_class_description(value)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
         SupportedSyntaxKind::ObjectIdentifier => {
             if is_valid_oid_or_descriptor(value) {
                 Ok(())
@@ -2846,9 +4320,20 @@ fn validate_ldap_syntax_value(syntax_oid: &str, value: &str) -> Result<(), Strin
                 Err("value must be a numeric OID or descriptor".to_string())
             }
         }
+        SupportedSyntaxKind::OtherMailbox => validate_other_mailbox(value),
         SupportedSyntaxKind::OctetString => Ok(()),
         SupportedSyntaxKind::PostalAddress => validate_postal_address(value),
+        SupportedSyntaxKind::PrintableString => {
+            validate_printable_string(value, "Printable String")
+        }
+        SupportedSyntaxKind::SubtreeSpecification => validate_subtree_specification(value),
+        SupportedSyntaxKind::SubstringAssertion => validate_substring_assertion(value),
+        SupportedSyntaxKind::TeletexTerminalIdentifier => {
+            validate_teletex_terminal_identifier(value)
+        }
         SupportedSyntaxKind::TelephoneNumber => validate_telephone_number(value),
+        SupportedSyntaxKind::TelexNumber => validate_telex_number(value),
+        SupportedSyntaxKind::UtcTime => parse_utc_time(value).map(|_| ()),
     }
 }
 
@@ -2877,30 +4362,52 @@ fn matching_rules_are_same(left: &ResolvedMatchingRule, right: &ResolvedMatching
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedMatchingRuleKind {
+    BitString,
     Boolean,
     CaseIgnore,
+    CaseIgnoreOrdering,
     CaseExact,
+    CaseExactOrdering,
     CaseIgnoreIa5,
     CaseExactIa5,
+    NumericString,
+    NumericStringOrdering,
+    NumericStringSubstring,
+    CaseIgnoreList,
+    CaseIgnoreListSubstring,
     Integer,
     IntegerOrdering,
     GeneralizedTime,
     GeneralizedTimeOrdering,
+    IntegerFirstComponent,
+    ObjectIdentifierFirstComponent,
+    DirectoryStringFirstComponent,
     DistinguishedName,
     ObjectIdentifier,
     OctetString,
+    OctetStringOrdering,
+    UniqueMember,
+    Word,
+    Keyword,
     TelephoneNumber,
     TelephoneNumberSubstring,
     CaseIgnoreSubstring,
     CaseExactSubstring,
     CaseIgnoreIa5Substring,
+    CaseExactIa5Substring,
 }
 
 fn supported_matching_rule_kind(rule: &ResolvedMatchingRule) -> Option<SupportedMatchingRuleKind> {
     let name = rule.primary_name.to_ascii_lowercase();
     match (rule.oid.as_str(), name.as_str()) {
         ("2.5.13.2", _) | (_, "caseignorematch") => Some(SupportedMatchingRuleKind::CaseIgnore),
+        ("2.5.13.3", _) | (_, "caseignoreorderingmatch") => {
+            Some(SupportedMatchingRuleKind::CaseIgnoreOrdering)
+        }
         ("2.5.13.5", _) | (_, "caseexactmatch") => Some(SupportedMatchingRuleKind::CaseExact),
+        ("2.5.13.6", _) | (_, "caseexactorderingmatch") => {
+            Some(SupportedMatchingRuleKind::CaseExactOrdering)
+        }
         ("1.3.6.1.4.1.1466.109.114.2", _) | (_, "caseignoreia5match") => {
             Some(SupportedMatchingRuleKind::CaseIgnoreIa5)
         }
@@ -2910,11 +4417,30 @@ fn supported_matching_rule_kind(rule: &ResolvedMatchingRule) -> Option<Supported
         ("1.3.6.1.4.1.1466.109.114.3", _) | (_, "caseignoreia5substringsmatch") => {
             Some(SupportedMatchingRuleKind::CaseIgnoreIa5Substring)
         }
+        ("1.3.6.1.4.1.4203.1.2.1", _) | (_, "caseexactia5substringsmatch") => {
+            Some(SupportedMatchingRuleKind::CaseExactIa5Substring)
+        }
+        ("2.5.13.8", _) | (_, "numericstringmatch") => {
+            Some(SupportedMatchingRuleKind::NumericString)
+        }
+        ("2.5.13.9", _) | (_, "numericstringorderingmatch") => {
+            Some(SupportedMatchingRuleKind::NumericStringOrdering)
+        }
+        ("2.5.13.10", _) | (_, "numericstringsubstringsmatch") => {
+            Some(SupportedMatchingRuleKind::NumericStringSubstring)
+        }
+        ("2.5.13.11", _) | (_, "caseignorelistmatch") => {
+            Some(SupportedMatchingRuleKind::CaseIgnoreList)
+        }
+        ("2.5.13.12", _) | (_, "caseignorelistsubstringsmatch") => {
+            Some(SupportedMatchingRuleKind::CaseIgnoreListSubstring)
+        }
         ("2.5.13.13", _) | (_, "booleanmatch") => Some(SupportedMatchingRuleKind::Boolean),
         ("2.5.13.14", _) | (_, "integermatch") => Some(SupportedMatchingRuleKind::Integer),
         ("2.5.13.15", _) | (_, "integerorderingmatch") => {
             Some(SupportedMatchingRuleKind::IntegerOrdering)
         }
+        ("2.5.13.16", _) | (_, "bitstringmatch") => Some(SupportedMatchingRuleKind::BitString),
         ("2.5.13.27", _) | (_, "generalizedtimematch") => {
             Some(SupportedMatchingRuleKind::GeneralizedTime)
         }
@@ -2928,6 +4454,9 @@ fn supported_matching_rule_kind(rule: &ResolvedMatchingRule) -> Option<Supported
             Some(SupportedMatchingRuleKind::ObjectIdentifier)
         }
         ("2.5.13.17", _) | (_, "octetstringmatch") => Some(SupportedMatchingRuleKind::OctetString),
+        ("2.5.13.18", _) | (_, "octetstringorderingmatch") => {
+            Some(SupportedMatchingRuleKind::OctetStringOrdering)
+        }
         ("2.5.13.20", _) | (_, "telephonenumbermatch") => {
             Some(SupportedMatchingRuleKind::TelephoneNumber)
         }
@@ -2940,6 +4469,20 @@ fn supported_matching_rule_kind(rule: &ResolvedMatchingRule) -> Option<Supported
         ("2.5.13.7", _) | (_, "caseexactsubstringsmatch") => {
             Some(SupportedMatchingRuleKind::CaseExactSubstring)
         }
+        ("2.5.13.23", _) | (_, "uniquemembermatch") => {
+            Some(SupportedMatchingRuleKind::UniqueMember)
+        }
+        ("2.5.13.29", _) | (_, "integerfirstcomponentmatch") => {
+            Some(SupportedMatchingRuleKind::IntegerFirstComponent)
+        }
+        ("2.5.13.30", _) | (_, "objectidentifierfirstcomponentmatch") => {
+            Some(SupportedMatchingRuleKind::ObjectIdentifierFirstComponent)
+        }
+        ("2.5.13.31", _) | (_, "directorystringfirstcomponentmatch") => {
+            Some(SupportedMatchingRuleKind::DirectoryStringFirstComponent)
+        }
+        ("2.5.13.32", _) | (_, "wordmatch") => Some(SupportedMatchingRuleKind::Word),
+        ("2.5.13.33", _) | (_, "keywordmatch") => Some(SupportedMatchingRuleKind::Keyword),
         _ => None,
     }
 }
@@ -2952,19 +4495,26 @@ fn normalize_matching_rule_value(
         return Err(MatchingRuleError::UnsupportedRule(rule.label().to_string()));
     };
     match kind {
+        SupportedMatchingRuleKind::BitString => {
+            validate_bit_string(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))?;
+            Ok(normalize_bit_string(value))
+        }
         SupportedMatchingRuleKind::Boolean => {
             validate_ldap_syntax_value("1.3.6.1.4.1.1466.115.121.1.7", value)
                 .map_err(|reason| invalid_matching_syntax(rule, value, &reason))?;
             Ok(value.to_string())
         }
-        SupportedMatchingRuleKind::CaseIgnore | SupportedMatchingRuleKind::CaseIgnoreSubstring => {
+        SupportedMatchingRuleKind::CaseIgnore
+        | SupportedMatchingRuleKind::CaseIgnoreOrdering
+        | SupportedMatchingRuleKind::CaseIgnoreSubstring => {
             normalize_directory_string_case_ignore(value)
                 .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
-        SupportedMatchingRuleKind::CaseExact | SupportedMatchingRuleKind::CaseExactSubstring => {
-            normalize_directory_string(value)
-                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
-        }
+        SupportedMatchingRuleKind::CaseExact
+        | SupportedMatchingRuleKind::CaseExactOrdering
+        | SupportedMatchingRuleKind::CaseExactSubstring => normalize_directory_string(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
         SupportedMatchingRuleKind::CaseIgnoreIa5 => normalize_ia5_string_case_ignore(value)
             .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
         SupportedMatchingRuleKind::CaseExactIa5 => normalize_ia5_string(value)
@@ -2973,12 +4523,40 @@ fn normalize_matching_rule_value(
             normalize_ia5_string_case_ignore(value)
                 .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
+        SupportedMatchingRuleKind::CaseExactIa5Substring => normalize_ia5_string(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
+        SupportedMatchingRuleKind::NumericString
+        | SupportedMatchingRuleKind::NumericStringOrdering
+        | SupportedMatchingRuleKind::NumericStringSubstring => normalize_numeric_string(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
+        SupportedMatchingRuleKind::CaseIgnoreList
+        | SupportedMatchingRuleKind::CaseIgnoreListSubstring => normalize_case_ignore_list(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
         SupportedMatchingRuleKind::Integer | SupportedMatchingRuleKind::IntegerOrdering => {
             parse_integer_for_rule(rule, value).map(|value| value.to_string())
         }
         SupportedMatchingRuleKind::GeneralizedTime
         | SupportedMatchingRuleKind::GeneralizedTimeOrdering => {
             normalize_generalized_time_for_rule(rule, value)
+        }
+        SupportedMatchingRuleKind::IntegerFirstComponent => {
+            let component = first_component(value);
+            parse_integer_for_rule(rule, component).map(|value| value.to_string())
+        }
+        SupportedMatchingRuleKind::ObjectIdentifierFirstComponent => {
+            let component = first_component(value);
+            if !is_valid_oid_or_descriptor(component) {
+                return Err(invalid_matching_syntax(
+                    rule,
+                    value,
+                    "first component must be a numeric OID or descriptor",
+                ));
+            }
+            Ok(component.to_ascii_lowercase())
+        }
+        SupportedMatchingRuleKind::DirectoryStringFirstComponent => {
+            normalize_directory_string_case_ignore(first_component(value))
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
         SupportedMatchingRuleKind::DistinguishedName => normalize_dn_value_for_matching(value)
             .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
@@ -2992,7 +4570,15 @@ fn normalize_matching_rule_value(
             }
             Ok(value.to_ascii_lowercase())
         }
-        SupportedMatchingRuleKind::OctetString => Ok(value.to_string()),
+        SupportedMatchingRuleKind::OctetString | SupportedMatchingRuleKind::OctetStringOrdering => {
+            Ok(value.to_string())
+        }
+        SupportedMatchingRuleKind::UniqueMember => normalize_name_and_optional_uid(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
+        SupportedMatchingRuleKind::Word | SupportedMatchingRuleKind::Keyword => {
+            normalize_directory_string_case_ignore(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+        }
         SupportedMatchingRuleKind::TelephoneNumber
         | SupportedMatchingRuleKind::TelephoneNumberSubstring => {
             normalize_telephone_number_for_matching(value)
@@ -3009,6 +4595,14 @@ fn matching_rule_ordering_key(
         return Err(MatchingRuleError::UnsupportedRule(rule.label().to_string()));
     };
     match kind {
+        SupportedMatchingRuleKind::CaseIgnoreOrdering => {
+            normalize_directory_string_case_ignore(value)
+                .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
+        }
+        SupportedMatchingRuleKind::CaseExactOrdering => normalize_directory_string(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
+        SupportedMatchingRuleKind::NumericStringOrdering => normalize_numeric_string(value)
+            .map_err(|reason| invalid_matching_syntax(rule, value, &reason)),
         SupportedMatchingRuleKind::Integer | SupportedMatchingRuleKind::IntegerOrdering => {
             let value = parse_integer_for_rule(rule, value)?;
             let sortable = (value as u128) ^ (1_u128 << 127);
@@ -3019,6 +4613,7 @@ fn matching_rule_ordering_key(
             generalized_time_ordering_key(value)
                 .map_err(|reason| invalid_matching_syntax(rule, value, &reason))
         }
+        SupportedMatchingRuleKind::OctetStringOrdering => Ok(value.to_string()),
         _ => Err(MatchingRuleError::UnsupportedRule(format!(
             "{} is not an ordering rule",
             rule.label()
@@ -3043,21 +4638,48 @@ fn compare_matching_rule_values(
             Ok(matching_rule_ordering_key(rule, left)?
                 .cmp(&matching_rule_ordering_key(rule, right)?))
         }
+        SupportedMatchingRuleKind::CaseIgnoreOrdering
+        | SupportedMatchingRuleKind::CaseExactOrdering
+        | SupportedMatchingRuleKind::NumericStringOrdering
+        | SupportedMatchingRuleKind::OctetStringOrdering => {
+            Ok(matching_rule_ordering_key(rule, left)?
+                .cmp(&matching_rule_ordering_key(rule, right)?))
+        }
         _ => Ok(normalize_matching_rule_value(rule, left)?
             .cmp(&normalize_matching_rule_value(rule, right)?)),
     }
 }
 
+fn value_matches_normalized_assertion(
+    rule: &ResolvedMatchingRule,
+    candidate: &str,
+    normalized_assertion: &str,
+) -> Result<bool, MatchingRuleError> {
+    let Some(kind) = supported_matching_rule_kind(rule) else {
+        return Err(MatchingRuleError::UnsupportedRule(rule.label().to_string()));
+    };
+
+    match kind {
+        SupportedMatchingRuleKind::Word => Ok(word_tokens(candidate, rule)?
+            .iter()
+            .any(|token| token == normalized_assertion)),
+        SupportedMatchingRuleKind::Keyword => Ok(keyword_tokens(candidate, rule)?
+            .iter()
+            .any(|token| token == normalized_assertion)),
+        _ => Ok(normalize_matching_rule_value(rule, candidate)? == normalized_assertion),
+    }
+}
+
 fn normalize_directory_string(value: &str) -> Result<String, String> {
-    prepare_directory_string(value)
+    prepare_x520_string(value, false)
 }
 
 fn normalize_directory_string_case_ignore(value: &str) -> Result<String, String> {
-    prepare_directory_string(value).map(|value| rfc4518_case_fold(&value))
+    prepare_x520_string(value, true)
 }
 
 fn prepare_directory_string(value: &str) -> Result<String, String> {
-    let prepared = prepare_unicode_string(value)?;
+    let prepared = normalize_directory_string(value)?;
     if prepared.is_empty() {
         Err("Directory String values must not be empty".to_string())
     } else {
@@ -3065,35 +4687,14 @@ fn prepare_directory_string(value: &str) -> Result<String, String> {
     }
 }
 
-fn prepare_unicode_string(value: &str) -> Result<String, String> {
-    let mut mapped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if is_prohibited_string_char(ch) {
-            return Err(format!(
-                "value contains prohibited code point U+{:04X}",
-                ch as u32
-            ));
-        }
-        if ch.is_whitespace() {
-            mapped.push(' ');
-        } else {
-            mapped.push(ch);
-        }
+fn prepare_x520_string(value: &str, case_fold: bool) -> Result<String, String> {
+    let prepared = if case_fold {
+        x520_stringprep_to_case_ignore_string(value)
+    } else {
+        x520_stringprep_to_case_exact_string(value)
     }
-
-    Ok(mapped.split_whitespace().collect::<Vec<_>>().join(" "))
-}
-
-fn rfc4518_case_fold(value: &str) -> String {
-    let mut folded = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\u{00DF}' | '\u{1E9E}' => folded.push_str("ss"),
-            '\u{03C2}' => folded.push('\u{03C3}'),
-            _ => folded.extend(ch.to_lowercase()),
-        }
-    }
-    folded
+    .map_err(|ch| format!("value contains prohibited code point U+{:04X}", ch as u32))?;
+    Ok(prepared.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn is_prohibited_string_char(ch: char) -> bool {
@@ -3122,6 +4723,681 @@ fn normalize_ia5_string_case_ignore(value: &str) -> Result<String, String> {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase())
+}
+
+fn validate_bit_string(value: &str) -> Result<(), String> {
+    let Some(bits) = bit_string_bits(value) else {
+        return Err("Bit String values must use the form '0101'B".to_string());
+    };
+    if bits.is_empty() {
+        return Err("Bit String values must contain at least one bit".to_string());
+    }
+    if !bits.chars().all(|ch| matches!(ch, '0' | '1')) {
+        return Err("Bit String values may contain only 0 and 1 bits".to_string());
+    }
+    Ok(())
+}
+
+fn bit_string_bits(value: &str) -> Option<&str> {
+    value.strip_prefix('\'')?.strip_suffix("'B")
+}
+
+fn normalize_bit_string(value: &str) -> String {
+    format!("'{}'B", bit_string_bits(value).unwrap_or_default())
+}
+
+fn validate_country_string(value: &str) -> Result<(), String> {
+    if value.chars().count() != 2 {
+        return Err("Country String values must contain exactly two characters".to_string());
+    }
+    validate_printable_string(value, "Country String")
+}
+
+fn validate_printable_string(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} values must not be empty"));
+    }
+    if value.chars().all(is_printable_string_char) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} values must use PrintableString characters"
+        ))
+    }
+}
+
+fn validate_numeric_string(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("Numeric String values must not be empty".to_string());
+    }
+    if value.chars().all(|ch| ch.is_ascii_digit() || ch == ' ') {
+        Ok(())
+    } else {
+        Err("Numeric String values may contain only digits and spaces".to_string())
+    }
+}
+
+fn normalize_numeric_string(value: &str) -> Result<String, String> {
+    let prepared = prepare_x520_string(value, true)?;
+    if prepared.chars().all(|ch| ch.is_ascii_digit() || ch == ' ') {
+        Ok(prepared.chars().filter(|ch| *ch != ' ').collect())
+    } else {
+        Err("Numeric String values may contain only digits and spaces".to_string())
+    }
+}
+
+fn validate_delivery_method(value: &str) -> Result<(), String> {
+    const ALLOWED: &[&str] = &[
+        "any",
+        "mhs",
+        "physical",
+        "telex",
+        "teletex",
+        "g3fax",
+        "g4fax",
+        "ia5",
+        "videotex",
+        "telephone",
+    ];
+    if value.is_empty() {
+        return Err("Delivery Method values must not be empty".to_string());
+    }
+    for method in value.split('$') {
+        let method = method.trim();
+        if method.is_empty() || !ALLOWED.contains(&method) {
+            return Err(format!("unsupported Delivery Method value: {method}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_facsimile_telephone_number(value: &str) -> Result<(), String> {
+    const ALLOWED: &[&str] = &[
+        "twoDimensional",
+        "fineResolution",
+        "unlimitedLength",
+        "b4Length",
+        "a3Width",
+        "b4Width",
+        "uncompressed",
+    ];
+    let mut parts = value.split('$');
+    let number = parts
+        .next()
+        .ok_or_else(|| "Facsimile Telephone Number is empty".to_string())?;
+    validate_telephone_number(number)?;
+    for parameter in parts {
+        if parameter.is_empty() || !ALLOWED.contains(&parameter) {
+            return Err(format!(
+                "unsupported Facsimile Telephone Number parameter: {parameter}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_other_mailbox(value: &str) -> Result<(), String> {
+    let Some((mailbox_type, mailbox)) = value.split_once('$') else {
+        return Err("Other Mailbox values must use mailbox-type$mailbox".to_string());
+    };
+    validate_printable_string(mailbox_type, "Other Mailbox type")?;
+    if mailbox.is_empty() {
+        return Err("Other Mailbox address must not be empty".to_string());
+    }
+    validate_ia5_string(mailbox)
+}
+
+fn validate_teletex_terminal_identifier(value: &str) -> Result<(), String> {
+    const ALLOWED_KEYS: &[&str] = &["graphic", "control", "misc", "page", "private"];
+    let mut parts = value.split('$');
+    let terminal = parts
+        .next()
+        .ok_or_else(|| "Teletex Terminal Identifier is empty".to_string())?;
+    validate_printable_string(terminal, "Teletex terminal identifier")?;
+    for parameter in parts {
+        let Some((key, raw_value)) = parameter.split_once(':') else {
+            return Err("Teletex parameters must use key:value".to_string());
+        };
+        if !ALLOWED_KEYS.contains(&key) {
+            return Err(format!("unsupported Teletex parameter key: {key}"));
+        }
+        validate_teletex_parameter_value(raw_value)?;
+    }
+    Ok(())
+}
+
+fn validate_teletex_parameter_value(value: &str) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            let Some(escape) = value.get(index + 1..index + 3) else {
+                return Err("Teletex parameter escape is incomplete".to_string());
+            };
+            if !matches!(escape, "24" | "5C") {
+                return Err("Teletex parameter escapes may only be \\24 or \\5C".to_string());
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn validate_telex_number(value: &str) -> Result<(), String> {
+    let parts = value.split('$').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err("Telex Number values must use number$country-code$answerback".to_string());
+    }
+    for part in parts {
+        validate_printable_string(part, "Telex Number component")?;
+    }
+    Ok(())
+}
+
+fn validate_name_and_optional_uid(value: &str) -> Result<(), String> {
+    normalize_name_and_optional_uid(value).map(|_| ())
+}
+
+fn normalize_name_and_optional_uid(value: &str) -> Result<String, String> {
+    if let Some((dn, uid)) = value.rsplit_once('#') {
+        let dn = canonicalize_dn(dn).map_err(|err| err.to_string())?;
+        validate_bit_string(uid)?;
+        Ok(format!("{dn}#{}", normalize_bit_string(uid)))
+    } else {
+        canonicalize_dn(value).map_err(|err| err.to_string())
+    }
+}
+
+fn validate_substring_assertion(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("Substring Assertion values must not be empty".to_string());
+    }
+    if !value.contains('*') {
+        return prepare_directory_string(value).map(|_| ());
+    }
+    if value.contains("**") {
+        return Err(
+            "Substring Assertion values must not contain empty interior fragments".to_string(),
+        );
+    }
+    for fragment in value.split('*').filter(|fragment| !fragment.is_empty()) {
+        prepare_directory_string(fragment)?;
+    }
+    Ok(())
+}
+
+fn validate_guide(value: &str, enhanced: bool) -> Result<(), String> {
+    let parts = value.split('#').collect::<Vec<_>>();
+    let expected_parts = if enhanced { 3 } else { 2 };
+    if parts.len() != expected_parts {
+        return Err(if enhanced {
+            "Enhanced Guide values must use objectClass#criteria#subset".to_string()
+        } else {
+            "Guide values must use objectClass#criteria".to_string()
+        });
+    }
+    if !is_valid_oid_or_descriptor(parts[0]) {
+        return Err("Guide objectClass must be a descriptor or numeric OID".to_string());
+    }
+    validate_guide_criteria(parts[1])?;
+    if enhanced {
+        validate_guide_subset(parts[2])?;
+    }
+    Ok(())
+}
+
+fn validate_certificate(value: &str) -> Result<(), String> {
+    let raw = value.as_bytes();
+    if certificate_der_is_valid(raw) {
+        return Ok(());
+    }
+
+    let trimmed = value.trim();
+    if trimmed.starts_with("-----BEGIN CERTIFICATE-----") {
+        let (remainder, pem) = x509_parser::pem::parse_x509_pem(trimmed.as_bytes())
+            .map_err(|err| format!("certificate PEM could not be parsed: {err}"))?;
+        if !remainder.iter().all(u8::is_ascii_whitespace) {
+            return Err("certificate PEM contains trailing non-whitespace data".to_string());
+        }
+        if pem.label != "CERTIFICATE" {
+            return Err("certificate PEM block must use CERTIFICATE label".to_string());
+        }
+        return validate_certificate_der_bytes(&pem.contents);
+    }
+
+    let compact_base64 = trimmed
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>();
+    if compact_base64.is_empty() {
+        return Err("certificate value must not be empty".to_string());
+    }
+    let decoded = general_purpose::STANDARD
+        .decode(compact_base64)
+        .map_err(|_| "certificate value must be DER, PEM, or base64 DER".to_string())?;
+    validate_certificate_der_bytes(&decoded)
+}
+
+fn validate_certificate_der_bytes(value: &[u8]) -> Result<(), String> {
+    if certificate_der_is_valid(value) {
+        Ok(())
+    } else {
+        Err("certificate DER could not be parsed as X.509".to_string())
+    }
+}
+
+fn certificate_der_is_valid(value: &[u8]) -> bool {
+    matches!(
+        x509_parser::parse_x509_certificate(value),
+        Ok((remainder, _certificate)) if remainder.is_empty()
+    )
+}
+
+fn validate_rfc2307_attribute_semantics(oid: &str, value: &str) -> Result<(), String> {
+    match oid {
+        "1.3.6.1.1.1.1.15" => validate_integer_range(value, "ipServicePort", 0, 65_535),
+        "1.3.6.1.1.1.1.17" => validate_integer_range(value, "ipProtocolNumber", 0, 255),
+        "1.3.6.1.1.1.1.18" => {
+            validate_integer_range(value, "oncRpcNumber", 0, i128::from(u32::MAX))
+        }
+        "1.3.6.1.1.1.1.19" => validate_ip_host_number(value),
+        "1.3.6.1.1.1.1.20" => validate_ip_network_number(value),
+        "1.3.6.1.1.1.1.21" => validate_ipv4_octets(value, 4)
+            .map(|_| ())
+            .map_err(|reason| format!("ipNetmaskNumber {reason}")),
+        "1.3.6.1.1.1.1.22" => validate_mac_address(value),
+        _ => Ok(()),
+    }
+}
+
+fn validate_integer_range(value: &str, label: &str, min: i128, max: i128) -> Result<(), String> {
+    let number = parse_integer_syntax(value)?;
+    if (min..=max).contains(&number) {
+        Ok(())
+    } else {
+        Err(format!("{label} must be between {min} and {max}"))
+    }
+}
+
+fn validate_ip_host_number(value: &str) -> Result<(), String> {
+    validate_ia5_string(value)?;
+    if validate_ipv4_octets(value, 4).is_ok() || validate_preferred_ipv6_address(value).is_ok() {
+        Ok(())
+    } else {
+        Err("ipHostNumber must be an IPv4 dotted decimal address without leading zeros or an RFC 2307 preferred IPv6 address".to_string())
+    }
+}
+
+fn validate_ip_network_number(value: &str) -> Result<(), String> {
+    validate_ia5_string(value)?;
+    let (address, prefix) = value
+        .split_once('/')
+        .map_or((value, None), |(address, prefix)| (address, Some(prefix)));
+
+    if address.contains(':') {
+        validate_preferred_ipv6_address(address)?;
+        if let Some(prefix) = prefix {
+            validate_prefix_length(prefix, 128)?;
+        }
+        return Ok(());
+    }
+
+    let octets = validate_ipv4_octet_count(address, 1, 4)?;
+    if octets.len() > 1 && octets.last() == Some(&0) {
+        return Err("ipNetworkNumber must omit trailing zero octets".to_string());
+    }
+    if let Some(prefix) = prefix {
+        validate_prefix_length(prefix, 32)?;
+    }
+    Ok(())
+}
+
+fn validate_ipv4_octets(value: &str, expected_count: usize) -> Result<Vec<u8>, String> {
+    validate_ipv4_octet_count(value, expected_count, expected_count)
+}
+
+fn validate_ipv4_octet_count(
+    value: &str,
+    min_count: usize,
+    max_count: usize,
+) -> Result<Vec<u8>, String> {
+    if value.is_empty() {
+        return Err("IPv4 address must not be empty".to_string());
+    }
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() < min_count || parts.len() > max_count {
+        return Err(format!(
+            "IPv4 address must contain {min_count} to {max_count} octets"
+        ));
+    }
+
+    let mut octets = Vec::with_capacity(parts.len());
+    for part in parts {
+        if part.is_empty() {
+            return Err("IPv4 octets must not be empty".to_string());
+        }
+        if part.len() > 1 && part.starts_with('0') {
+            return Err("IPv4 octets must omit leading zeros".to_string());
+        }
+        if !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("IPv4 octets must contain only decimal digits".to_string());
+        }
+        let octet = part
+            .parse::<u16>()
+            .map_err(|_| "IPv4 octet is outside the supported range".to_string())?;
+        if octet > 255 {
+            return Err("IPv4 octets must be between 0 and 255".to_string());
+        }
+        octets.push(octet as u8);
+    }
+    Ok(octets)
+}
+
+fn validate_preferred_ipv6_address(value: &str) -> Result<(), String> {
+    let address = value
+        .parse::<std::net::Ipv6Addr>()
+        .map_err(|_| "IPv6 address could not be parsed".to_string())?;
+    let preferred = address
+        .segments()
+        .iter()
+        .map(|segment| format!("{segment:x}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    if value.eq_ignore_ascii_case(&preferred) {
+        Ok(())
+    } else {
+        Err("IPv6 addresses must use RFC 2307 preferred form with all components and no leading zeros".to_string())
+    }
+}
+
+fn validate_prefix_length(value: &str, max: u8) -> Result<(), String> {
+    let prefix = parse_integer_syntax(value)?;
+    if (0..=i128::from(max)).contains(&prefix) {
+        Ok(())
+    } else {
+        Err(format!("CIDR prefix length must be between 0 and {max}"))
+    }
+}
+
+fn validate_mac_address(value: &str) -> Result<(), String> {
+    validate_ia5_string(value)?;
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return Err("macAddress must contain six colon-separated octets".to_string());
+    }
+    for part in parts {
+        if part.len() != 2 || !part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("macAddress octets must use two hexadecimal characters each".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_nis_netgroup_triple(value: &str) -> Result<(), String> {
+    let Some(inner) = value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return Err("nisNetgroupTriple values must use (hostname,username,domainname)".to_string());
+    };
+    let components = inner.split(',').collect::<Vec<_>>();
+    if components.len() != 3 {
+        return Err(
+            "nisNetgroupTriple values must contain three comma-separated fields".to_string(),
+        );
+    }
+    for component in components {
+        validate_nis_key_field(component, &[',', '(', ')'], "nisNetgroupTriple")?;
+    }
+    Ok(())
+}
+
+fn validate_boot_parameter(value: &str) -> Result<(), String> {
+    let Some((key, server_and_path)) = value.split_once('=') else {
+        return Err("bootParameter values must use key=server:path".to_string());
+    };
+    let Some((server, path)) = server_and_path.split_once(':') else {
+        return Err("bootParameter values must use key=server:path".to_string());
+    };
+    validate_required_nis_key_field(key, &['=', ':'], "bootParameter key")?;
+    validate_required_nis_key_field(server, &['=', ':'], "bootParameter server")?;
+    validate_required_nis_key_field(path, &['=', ':'], "bootParameter path")
+}
+
+fn validate_required_nis_key_field(
+    value: &str,
+    forbidden: &[char],
+    label: &str,
+) -> Result<(), String> {
+    if value.is_empty() || value == "-" {
+        return Err(format!("{label} must not be empty or '-'"));
+    }
+    validate_nis_key_field(value, forbidden, label)
+}
+
+fn validate_nis_key_field(value: &str, forbidden: &[char], label: &str) -> Result<(), String> {
+    if value.is_empty() || value == "-" {
+        return Ok(());
+    }
+    validate_ia5_string(value)?;
+    if value
+        .chars()
+        .any(|ch| ch.is_ascii_whitespace() || forbidden.contains(&ch))
+    {
+        Err(format!(
+            "{label} fields must not contain whitespace or separators"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_preferred_language(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("preferredLanguage must not be empty".to_string());
+    }
+    if trimmed.to_ascii_lowercase().starts_with("accept-language:") {
+        return Err("preferredLanguage omits the Accept-Language header name".to_string());
+    }
+    for language_item in trimmed.split(',') {
+        let language_item = language_item.trim();
+        if language_item.is_empty() {
+            return Err("preferredLanguage contains an empty language range".to_string());
+        }
+        let mut parts = language_item.split(';');
+        let language_range = parts.next().unwrap_or_default().trim();
+        validate_language_range(language_range)?;
+        for parameter in parts {
+            let Some((name, value)) = parameter.trim().split_once('=') else {
+                return Err("preferredLanguage parameters must use name=value".to_string());
+            };
+            if !name.trim().eq_ignore_ascii_case("q") {
+                return Err("preferredLanguage only supports q quality parameters".to_string());
+            }
+            validate_quality_value(value.trim())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_language_range(value: &str) -> Result<(), String> {
+    if value == "*" {
+        return Ok(());
+    }
+    let mut subtags = value.split('-');
+    let first = subtags.next().unwrap_or_default();
+    validate_language_subtag(first)?;
+    for subtag in subtags {
+        validate_language_subtag(subtag)?;
+    }
+    Ok(())
+}
+
+fn validate_language_subtag(value: &str) -> Result<(), String> {
+    if (1..=8).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        Ok(())
+    } else {
+        Err(
+            "preferredLanguage language tags must use 1-8 alphabetic characters per subtag"
+                .to_string(),
+        )
+    }
+}
+
+fn validate_quality_value(value: &str) -> Result<(), String> {
+    let Some((whole, fraction)) = value.split_once('.') else {
+        return match value {
+            "0" | "1" => Ok(()),
+            _ => Err("preferredLanguage q values must be between 0 and 1".to_string()),
+        };
+    };
+    if fraction.is_empty() || fraction.len() > 3 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("preferredLanguage q values may use up to three decimal digits".to_string());
+    }
+    match whole {
+        "0" => Ok(()),
+        "1" if fraction.bytes().all(|byte| byte == b'0') => Ok(()),
+        _ => Err("preferredLanguage q values must be between 0 and 1".to_string()),
+    }
+}
+
+fn validate_guide_subset(value: &str) -> Result<(), String> {
+    match value {
+        "baseObject" | "oneLevel" | "wholeSubtree" => Ok(()),
+        _ => Err("Enhanced Guide subset must be baseObject, oneLevel, or wholeSubtree".to_string()),
+    }
+}
+
+fn validate_guide_criteria(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Guide criteria must not be empty".to_string());
+    }
+    if matches!(value, "?true" | "?false") {
+        return Ok(());
+    }
+    if let Some(rest) = value.strip_prefix('!') {
+        return validate_guide_criteria(rest);
+    }
+    if let Some(inner) = parenthesized_inner(value) {
+        if let Some(parts) = split_guide_criteria(inner, '&') {
+            for part in parts {
+                validate_guide_criteria(part)?;
+            }
+            return Ok(());
+        }
+        if let Some(parts) = split_guide_criteria(inner, '|') {
+            for part in parts {
+                validate_guide_criteria(part)?;
+            }
+            return Ok(());
+        }
+        return validate_guide_criteria(inner);
+    }
+    let Some((attribute, match_type)) = value.split_once('$') else {
+        return Err("Guide item criteria must use attribute$match-type".to_string());
+    };
+    if !is_valid_oid_or_descriptor(attribute) {
+        return Err("Guide item attribute must be a descriptor or numeric OID".to_string());
+    }
+    if ["eq", "substr", "ge", "le", "approx"]
+        .iter()
+        .any(|allowed| match_type.eq_ignore_ascii_case(allowed))
+    {
+        Ok(())
+    } else {
+        Err("Guide match type must be eq, substr, ge, le, or approx".to_string())
+    }
+}
+
+fn parenthesized_inner(value: &str) -> Option<&str> {
+    value.strip_prefix('(')?.strip_suffix(')')
+}
+
+fn split_guide_criteria(value: &str, separator: char) -> Option<Vec<&str>> {
+    let mut depth = 0_i32;
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if ch == separator && depth == 0 => {
+                parts.push(value[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+        if depth < 0 {
+            return None;
+        }
+    }
+    if depth != 0 || parts.is_empty() {
+        return None;
+    }
+    parts.push(value[start..].trim());
+    if parts.iter().any(|part| part.is_empty()) {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
+fn normalize_case_ignore_list(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("caseIgnoreList values must not be empty".to_string());
+    }
+    value
+        .split('$')
+        .map(normalize_directory_string_case_ignore)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join("$"))
+}
+
+fn first_component(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(schema_body) = value
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return schema_body
+            .split_whitespace()
+            .next()
+            .unwrap_or(schema_body)
+            .trim_matches('\'');
+    }
+    value
+        .split(['$', '#'])
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .trim_matches('\'')
+}
+
+fn word_tokens(value: &str, rule: &ResolvedMatchingRule) -> Result<Vec<String>, MatchingRuleError> {
+    let normalized = normalize_directory_string_case_ignore(value)
+        .map_err(|reason| invalid_matching_syntax(rule, value, &reason))?;
+    Ok(normalized
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn keyword_tokens(
+    value: &str,
+    rule: &ResolvedMatchingRule,
+) -> Result<Vec<String>, MatchingRuleError> {
+    let normalized = normalize_directory_string_case_ignore(value)
+        .map_err(|reason| invalid_matching_syntax(rule, value, &reason))?;
+    Ok(normalized
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn parse_integer_for_rule(
@@ -3268,6 +5544,71 @@ fn parse_generalized_time(value: &str) -> Result<DateTime<Utc>, String> {
     Ok(local.with_timezone(&Utc))
 }
 
+fn parse_utc_time(value: &str) -> Result<DateTime<Utc>, String> {
+    if value.is_empty() {
+        return Err("UTC Time value is empty".to_string());
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err("UTC Time values must not contain whitespace".to_string());
+    }
+
+    let upper = value.to_ascii_uppercase();
+    let (time_part, offset_seconds) = if let Some(time_part) = upper.strip_suffix('Z') {
+        (time_part, 0)
+    } else if let Some((offset_start, sign)) = upper
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| matches!(ch, '+' | '-'))
+    {
+        let offset = &upper[offset_start + 1..];
+        if offset.len() != 4 || !offset.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err("UTC Time timezone offset must use +/-HHMM".to_string());
+        }
+        let hours = parse_utc_decimal_u32(&offset[..2], "timezone hour")?;
+        let minutes = parse_utc_decimal_u32(&offset[2..], "timezone minute")?;
+        if hours > 23 || minutes > 59 {
+            return Err("UTC Time timezone offset is out of range".to_string());
+        }
+        let seconds = (hours as i32 * 3600) + (minutes as i32 * 60);
+        let signed_seconds = if sign == '-' { -seconds } else { seconds };
+        (&upper[..offset_start], signed_seconds)
+    } else {
+        (upper.as_str(), 0)
+    };
+
+    if !matches!(time_part.len(), 10 | 12) || !time_part.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("expected YYMMDDHHMM[SS] UTC Time".to_string());
+    }
+
+    let year = parse_utc_decimal_u32(&time_part[0..2], "year")?;
+    let full_year = if year >= 50 {
+        1900 + year as i32
+    } else {
+        2000 + year as i32
+    };
+    let month = parse_utc_decimal_u32(&time_part[2..4], "month")?;
+    let day = parse_utc_decimal_u32(&time_part[4..6], "day")?;
+    let hour = parse_utc_decimal_u32(&time_part[6..8], "hour")?;
+    let minute = parse_utc_decimal_u32(&time_part[8..10], "minute")?;
+    let second = if time_part.len() == 12 {
+        parse_utc_decimal_u32(&time_part[10..12], "second")?
+    } else {
+        0
+    };
+
+    let date = NaiveDate::from_ymd_opt(full_year, month, day)
+        .ok_or_else(|| "UTC Time date is out of range".to_string())?;
+    let time = NaiveTime::from_hms_opt(hour, minute, second)
+        .ok_or_else(|| "UTC Time clock value is out of range".to_string())?;
+    let offset = FixedOffset::east_opt(offset_seconds)
+        .ok_or_else(|| "UTC Time timezone offset is out of range".to_string())?;
+    let local = offset
+        .from_local_datetime(&NaiveDateTime::new(date, time))
+        .single()
+        .ok_or_else(|| "UTC Time value is ambiguous for timezone".to_string())?;
+    Ok(local.with_timezone(&Utc))
+}
+
 fn format_generalized_time(time: &DateTime<Utc>, fixed_fraction: bool) -> String {
     let base = format!(
         "{:04}{:02}{:02}{:02}{:02}{:02}",
@@ -3326,6 +5667,12 @@ fn parse_decimal_i32(value: &str, label: &str) -> Result<i32, String> {
         .map_err(|_| format!("invalid generalized time {}", label))
 }
 
+fn parse_utc_decimal_u32(value: &str, label: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid UTC Time {}", label))
+}
+
 fn validate_postal_address(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("Postal Address values must not be empty".to_string());
@@ -3351,15 +5698,25 @@ fn validate_telephone_number(value: &str) -> Result<(), String> {
 }
 
 fn normalize_telephone_number_for_matching(value: &str) -> Result<String, String> {
-    validate_telephone_number(value)?;
+    let prepared = prepare_x520_string(value, true)?;
     let mut normalized = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, ' ' | '-') {
+    for ch in prepared.chars() {
+        if is_insignificant_telephone_char(ch) {
             continue;
         }
-        normalized.extend(ch.to_lowercase());
+        if !is_printable_string_char(ch) {
+            return Err("Telephone Number values must use PrintableString characters".to_string());
+        }
+        normalized.push(ch);
     }
     Ok(normalized)
+}
+
+fn is_insignificant_telephone_char(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '-' | '\u{058A}' | '\u{2010}' | '\u{2011}' | '\u{2212}' | '\u{FE63}' | '\u{FF0D}'
+    )
 }
 
 fn is_printable_string_char(ch: char) -> bool {
@@ -3862,6 +6219,12 @@ fn parse_ldap_syntax_description(input: &str) -> Result<LdapSyntax, SchemaError>
     let mut parser = SchemaParser::new(input)?;
     parser.expect_lparen()?;
     let oid = parser.expect_word("LDAP syntax OID")?;
+    if !is_valid_numeric_oid(&oid) {
+        return Err(SchemaError::ParseError(format!(
+            "invalid LDAP syntax OID: {}",
+            oid
+        )));
+    }
     let mut description = None;
     let mut obsolete = false;
     let mut extensions = BTreeMap::new();
@@ -3892,6 +6255,12 @@ fn parse_matching_rule_description(input: &str) -> Result<MatchingRule, SchemaEr
     let mut parser = SchemaParser::new(input)?;
     parser.expect_lparen()?;
     let oid = parser.expect_word("matching rule OID")?;
+    if !is_valid_numeric_oid(&oid) {
+        return Err(SchemaError::ParseError(format!(
+            "invalid matching rule OID: {}",
+            oid
+        )));
+    }
     let mut names = Vec::new();
     let mut description = None;
     let mut obsolete = false;
@@ -3930,6 +6299,12 @@ fn parse_matching_rule_use_description(input: &str) -> Result<MatchingRuleUse, S
     let mut parser = SchemaParser::new(input)?;
     parser.expect_lparen()?;
     let oid = parser.expect_word("matching rule use OID")?;
+    if !is_valid_numeric_oid(&oid) {
+        return Err(SchemaError::ParseError(format!(
+            "invalid matching rule use OID: {}",
+            oid
+        )));
+    }
     let mut names = Vec::new();
     let mut description = None;
     let mut obsolete = false;
@@ -3966,6 +6341,12 @@ fn parse_dit_content_rule_description(input: &str) -> Result<DitContentRule, Sch
     let mut parser = SchemaParser::new(input)?;
     parser.expect_lparen()?;
     let oid = parser.expect_word("DIT content rule OID")?;
+    if !is_valid_numeric_oid(&oid) {
+        return Err(SchemaError::ParseError(format!(
+            "invalid DIT content rule OID: {}",
+            oid
+        )));
+    }
     let mut rule = DitContentRule {
         oid,
         names: Vec::new(),
@@ -4004,6 +6385,12 @@ fn parse_name_form_description(input: &str) -> Result<NameForm, SchemaError> {
     let mut parser = SchemaParser::new(input)?;
     parser.expect_lparen()?;
     let oid = parser.expect_word("name form OID")?;
+    if !is_valid_numeric_oid(&oid) {
+        return Err(SchemaError::ParseError(format!(
+            "invalid name form OID: {}",
+            oid
+        )));
+    }
     let mut rule = NameForm {
         oid,
         names: Vec::new(),
@@ -4125,6 +6512,125 @@ mod tests {
         assert!(schema.get_object_class("top").is_some());
         assert!(schema.get_object_class("person").is_some());
         assert!(schema.get_object_class("inetOrgPerson").is_some());
+    }
+
+    #[test]
+    fn core_schema_loads_file_backed_rfc3672_definitions() {
+        let mut schema = LdapSchema::with_core_schema();
+
+        assert!(schema.get_attribute_type("administrativeRole").is_some());
+        assert!(schema.get_attribute_type("subtreeSpecification").is_some());
+        assert!(schema.get_object_class("subentry").is_some());
+        assert!(
+            schema
+                .ldap_syntax_descriptions_unique_sorted()
+                .iter()
+                .any(|description| description.contains("1.3.6.1.4.1.1466.115.121.1.45"))
+        );
+
+        schema.load_builtin_schema("core").unwrap();
+        assert!(schema.get_object_class("subentry").is_some());
+    }
+
+    #[test]
+    fn subtree_specification_parser_accepts_rfc3672_components() {
+        let spec = parse_subtree_specification(
+            r#"{ base "ou=People", specificExclusions { chopBefore:"ou=Skip" }, minimum 1, maximum 2, specificationFilter item:person }"#,
+        )
+        .unwrap();
+
+        assert_eq!(spec.base.as_deref(), Some("ou=People"));
+        assert_eq!(spec.minimum, 1);
+        assert_eq!(spec.maximum, Some(2));
+        assert!(spec.contains_entry(
+            "dc=example,dc=org",
+            "cn=Alice,ou=People,dc=example,dc=org",
+            &["person".to_string()]
+        ));
+        assert!(!spec.contains_entry(
+            "dc=example,dc=org",
+            "cn=Bob,ou=Skip,ou=People,dc=example,dc=org",
+            &["person".to_string()]
+        ));
+        assert!(!spec.contains_entry(
+            "dc=example,dc=org",
+            "cn=Carol,ou=People,dc=example,dc=org",
+            &["organizationalUnit".to_string()]
+        ));
+    }
+
+    #[test]
+    fn subtree_specification_parser_rejects_malformed_values() {
+        for value in [
+            "base \"ou=People\"",
+            "{ maximum 1, minimum 2 }",
+            "{ minimum -1 }",
+            "{ specificationFilter item:2.05 }",
+            "{ specificExclusions { chopSideways:\"ou=Skip\" } }",
+        ] {
+            assert!(
+                parse_subtree_specification(value).is_err(),
+                "{value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc3672_subentry_requires_administrative_parent() {
+        let schema = LdapSchema::with_core_schema();
+        let parent = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
+            ("ou".to_string(), vec!["People".to_string()]),
+            (
+                "administrativeRole".to_string(),
+                vec!["collectiveAttributeSpecificArea".to_string()],
+            ),
+        ]);
+        let parent_without_role = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "organizationalUnit".to_string()],
+            ),
+            ("ou".to_string(), vec!["People".to_string()]),
+        ]);
+        let subentry = HashMap::from([
+            (
+                "objectClass".to_string(),
+                vec!["top".to_string(), "subentry".to_string()],
+            ),
+            ("cn".to_string(), vec!["Collective People".to_string()]),
+            ("subtreeSpecification".to_string(), vec!["{}".to_string()]),
+        ]);
+
+        assert!(schema.validate_entry(&parent).is_ok());
+        assert!(
+            schema
+                .validate_entry_at_dn(
+                    "cn=Collective People,ou=People,dc=example,dc=org",
+                    &subentry,
+                    Some(&parent)
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            schema.validate_entry_at_dn(
+                "cn=Collective People,ou=People,dc=example,dc=org",
+                &subentry,
+                None
+            ),
+            Err(SchemaError::StructureRuleViolation(_))
+        ));
+        assert!(matches!(
+            schema.validate_entry_at_dn(
+                "cn=Collective People,ou=People,dc=example,dc=org",
+                &subentry,
+                Some(&parent_without_role)
+            ),
+            Err(SchemaError::StructureRuleViolation(_))
+        ));
     }
 
     #[test]
@@ -4380,10 +6886,22 @@ mod tests {
             .unwrap()
             .to_schema_description();
 
-        assert_eq!(
-            description,
-            "( 2.16.840.1.113730.3.2.2 NAME 'inetOrgPerson' SUP organizationalPerson STRUCTURAL MAY ( businessCategory $ carLicense $ departmentNumber $ displayName $ employeeNumber $ employeeType $ uid $ givenName $ homePhone $ homePostalAddress $ initials $ jpegPhoto $ labeledURI $ mail $ manager $ mobile $ o $ pager $ preferredLanguage $ roomNumber $ secretary ) )"
-        );
+        assert!(description.starts_with(
+            "( 2.16.840.1.113730.3.2.2 NAME 'inetOrgPerson' SUP organizationalPerson STRUCTURAL"
+        ));
+        for attribute in [
+            "audio",
+            "photo",
+            "userCertificate",
+            "x500UniqueIdentifier",
+            "userSMIMECertificate",
+            "userPKCS12",
+        ] {
+            assert!(
+                description.contains(attribute),
+                "schema description should include RFC 2798 attribute {attribute}"
+            );
+        }
     }
 
     #[test]

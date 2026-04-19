@@ -15,9 +15,10 @@ use opendr::fsm_request::active_fsm_control_registry;
 use opendr::fsm_request::build_request_context;
 use opendr::search_controls::{
     PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
-    SERVER_SIDE_SORT_RESPONSE_OID, ServerSideSortRequestControl, SortKey,
+    SERVER_SIDE_SORT_RESPONSE_OID, SUBENTRIES_CONTROL_OID, ServerSideSortRequestControl, SortKey,
     decode_paged_results_control, decode_server_side_sort_request_control,
     encode_paged_results_control, encode_server_side_sort_request_control,
+    encode_subentries_control,
 };
 use opendr::search_protocol::{MODIFY_INCREMENT_FEATURE_OID, build_root_dse_attributes};
 use opendr::server;
@@ -65,6 +66,7 @@ async fn root_dse_advertises_only_request_usable_controls_extensions_and_feature
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
+            SUBENTRIES_CONTROL_OID.to_string(),
             SYNC_REQUEST_OID.to_string(),
         ])
     );
@@ -137,6 +139,7 @@ fn control_registry_separates_request_response_and_root_dse_oids() {
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
+            SUBENTRIES_CONTROL_OID.to_string(),
             SYNC_REQUEST_OID.to_string(),
         ])
     );
@@ -231,16 +234,18 @@ fn supported_request_controls_are_accepted_by_shared_request_pipeline() {
         reload_hint: false,
     })
     .unwrap();
+    let subentries_value = encode_subentries_control(true).unwrap();
 
     let message = ldap_message_with_controls(vec![
         control_with_value(PAGED_RESULTS_OID, false, Some(paged_value)),
         control_with_value(SERVER_SIDE_SORT_REQUEST_OID, false, Some(sort_value)),
+        control_with_value(SUBENTRIES_CONTROL_OID, false, Some(subentries_value)),
         control_with_value(MANAGE_DSA_IT_OID, false, None),
         control_with_value(SYNC_REQUEST_OID, false, Some(sync_value)),
     ]);
 
     let context = build_request_context(&message, 77, None, Some("cn=admin"), true).unwrap();
-    assert_eq!(context.request_controls.len(), 4);
+    assert_eq!(context.request_controls.len(), 5);
     assert_eq!(
         context
             .request_controls
@@ -250,6 +255,7 @@ fn supported_request_controls_are_accepted_by_shared_request_pipeline() {
         vec![
             PAGED_RESULTS_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
+            SUBENTRIES_CONTROL_OID.to_string(),
             MANAGE_DSA_IT_OID.to_string(),
             SYNC_REQUEST_OID.to_string(),
         ]

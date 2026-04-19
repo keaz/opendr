@@ -1,8 +1,8 @@
 # LDAP Control and Extension Compatibility
 
 This matrix records the OpenDR compatibility decision for commonly expected
-LDAP controls and extensions from RFC 4525, RFC 4527, RFC 4528, RFC 4529, RFC
-4511, and RFC 4512.
+LDAP controls and extensions from RFC 3672, RFC 4525, RFC 4527, RFC 4528, RFC
+4529, RFC 4511, and RFC 4512.
 
 The broader production release matrix is
 [LDAP_RFC_COMPLIANCE_MATRIX.md](LDAP_RFC_COMPLIANCE_MATRIX.md).
@@ -12,6 +12,7 @@ The broader production release matrix is
 | RFC | Capability | OID | Root DSE attribute | Status | Behavior | Coverage |
 | --- | --- | --- | --- | --- | --- | --- |
 | RFC 4525 | Modify-Increment feature | `1.3.6.1.1.14` | `supportedFeatures` | Supported | LDAP Modify operation code `increment(3)` atomically increments existing integer attribute values. Invalid increment requests fail without mutating the entry. | `server::tests::modify_increment_updates_integer_attribute_atomically`, `server::tests::modify_increment_rejects_malformed_increment_without_mutating_entry`, `server::tests::convert_modifications_translates_operations_and_values` |
+| RFC 3672 | Subentries control | `1.3.6.1.4.1.4203.1.10.1` | `supportedControl` | Supported | BER BOOLEAN TRUE returns subentries and hides normal entries. FALSE returns normal entries and hides subentries. Without the control, subtree and one-level searches hide subentries while base-object searches may return them. | `server::tests::subentries_*`, `tests/rfc_controls_extensions_integration.rs` |
 | RFC 4527 | Pre-Read control | `1.3.6.1.1.13.1` | `supportedControl` | Unsupported | Not advertised. Critical requests are rejected with `unavailableCriticalExtension`; non-critical requests are ignored by the shared control pipeline. | `server::tests::unsupported_expected_controls_follow_generic_criticality_semantics` |
 | RFC 4527 | Post-Read control | `1.3.6.1.1.13.2` | `supportedControl` | Unsupported | Not advertised. Critical requests are rejected with `unavailableCriticalExtension`; non-critical requests are ignored by the shared control pipeline. | `server::tests::unsupported_expected_controls_follow_generic_criticality_semantics` |
 | RFC 4528 | Assertion control | `1.3.6.1.1.12` | `supportedControl` | Unsupported | Not advertised. Critical requests are rejected with `unavailableCriticalExtension`; non-critical requests are ignored by the shared control pipeline. | `server::tests::unsupported_expected_controls_follow_generic_criticality_semantics` |
@@ -38,6 +39,13 @@ Rules:
   `protocolError`; they are not treated as replace.
 
 Root DSE advertises `1.3.6.1.1.14` in `supportedFeatures`.
+
+### Subentries Control
+
+OpenDR supports RFC 3672 by decoding the Subentries request control as a
+required BER BOOLEAN. The control is valid only for Search requests through the
+shared request-control registry. Root DSE advertises
+`1.3.6.1.4.1.4203.1.10.1` in `supportedControl`.
 
 ## Unsupported Controls
 

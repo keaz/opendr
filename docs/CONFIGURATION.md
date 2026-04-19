@@ -467,13 +467,26 @@ allow_online_updates = false
 | Key | Default | Notes |
 | --- | --- | --- |
 | `enabled` | `true` | Loads the built-in and external LDAP schema registry |
-| `schema_dir` | `config/schema` | Directory containing `.ldif`, `.schema`, or `.conf` schema definition files |
-| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files. Supported values are `core` and optional RFC 2307 `posix`. |
+| `schema_dir` | `config/schema` | Directory recursively loaded for `.ldif`, `.schema`, or `.conf` schema definition files |
+| `load_builtin` | `["core"]` | Built-in schema bundles loaded before external files. Supported values are `core` and optional RFC 2307 `posix`. The `core` bundle includes RFC 3672 subentries. |
 | `strict_validation` | `true` | Treats malformed schema files as startup errors |
 | `allow_online_updates` | `false` | Allows authenticated Modify requests on `cn=Subschema` to persist safe schema changes into `schema_dir/99-online.ldif` |
 
-Use `load_builtin = ["core", "posix"]` when clients need `posixAccount`,
-`posixGroup`, `uidNumber`, `gidNumber`, or `memberUid`.
+Use `load_builtin = ["core", "posix"]` when clients need RFC 2307 POSIX/NIS
+entries such as `posixAccount`, `shadowAccount`, `posixGroup`, `ipHost`,
+`ipNetwork`, `ipService`, `ipProtocol`, `oncRpc`, `nisNetgroup`, `nisMap`,
+`nisObject`, `ieee802Device`, or `bootableDevice`.
+
+Generate bundled schema files when a deployment needs file-based schema
+artifacts instead of relying only on `load_builtin`:
+
+```bash
+opendr-setup --config-dir ./config generate-schema --bundle all --overwrite
+```
+
+The command writes files such as `config/schema/core/rfc3672.ldif` and
+`config/schema/posix/rfc2307.ldif`. Keep generated standard files unchanged
+unless you intentionally fork compatibility behavior.
 
 Schema files use RFC-style subschema attributes:
 

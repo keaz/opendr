@@ -17,7 +17,9 @@ use opendr::backend::{DirectoryBackend, DirectoryEntry, MockBackend};
 use opendr::fsm_request::{FsmRequestKind, FsmResponseKind, build_request_context};
 use opendr::parser::ResponseOp;
 use opendr::schema::LdapSchema;
-use opendr::search_controls::{PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID};
+use opendr::search_controls::{
+    PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SUBENTRIES_CONTROL_OID,
+};
 use opendr::server;
 use opendr::sync_controls::SYNC_REQUEST_OID;
 use rasn_ldap::ResultCode as RasnResultCode;
@@ -122,12 +124,13 @@ fn request_context_applies_rfc_4511_control_criticality_semantics() {
         vec![
             control(PAGED_RESULTS_OID, false),
             control(SERVER_SIDE_SORT_REQUEST_OID, false),
+            control(SUBENTRIES_CONTROL_OID, false),
             control(MANAGE_DSA_IT_OID, false),
             control(SYNC_REQUEST_OID, false),
         ],
     );
     let context = build_request_context(&accepted, 1, None, None, false).unwrap();
-    assert_eq!(context.request_controls.len(), 4);
+    assert_eq!(context.request_controls.len(), 5);
 
     for unsupported_oid in [ASSERTION_CONTROL_OID, SERVER_SIDE_SORT_RESPONSE_OID] {
         let critical = ldap_message_with_controls(

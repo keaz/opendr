@@ -60,8 +60,9 @@ use crate::replication::RenameChange;
 use crate::schema::{LdapSchema, SchemaError, canonical_schema_attr_name, schema_definition_key};
 use crate::search_controls::{
     PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
-    SERVER_SIDE_SORT_RESPONSE_OID, ServerSideSortResultCode, SortKey, decode_paged_results_control,
-    decode_server_side_sort_request_control, encode_paged_results_control,
+    SERVER_SIDE_SORT_RESPONSE_OID, SUBENTRIES_CONTROL_OID, ServerSideSortResultCode, SortKey,
+    decode_paged_results_control, decode_server_side_sort_request_control,
+    decode_subentries_control, encode_paged_results_control,
     encode_server_side_sort_response_control,
 };
 use crate::sync_controls::{
@@ -190,6 +191,7 @@ pub(crate) struct SearchRequestSignature {
     filter_repr: String,
     attributes: Vec<String>,
     sort_keys: Option<Vec<SortKey>>,
+    subentries_visibility: SubentriesSearchVisibility,
 }
 
 impl SearchRequestSignature {
@@ -198,6 +200,7 @@ impl SearchRequestSignature {
         request: &SearchRequest<'_>,
         attribute_selection: &[String],
         sort_keys: Option<&[SortKey]>,
+        subentries_visibility: SubentriesSearchVisibility,
     ) -> Self {
         let mut attributes = attribute_selection
             .iter()
@@ -216,6 +219,7 @@ impl SearchRequestSignature {
             filter_repr: format!("{:?}", request.filter),
             attributes,
             sort_keys: sort_keys.map(|keys| keys.to_vec()),
+            subentries_visibility,
         }
     }
 }
@@ -1836,6 +1840,7 @@ fn active_runtime_control_registry() -> ControlRegistry {
         .register_response_control(PAGED_RESULTS_OID)
         .register_request_control(SERVER_SIDE_SORT_REQUEST_OID)
         .register_response_control(SERVER_SIDE_SORT_RESPONSE_OID)
+        .register_request_control(SUBENTRIES_CONTROL_OID)
         .register_request_control(MANAGE_DSA_IT_OID)
         .register_request_control(SYNC_REQUEST_OID)
         .register_response_control(SYNC_STATE_OID)
@@ -2083,6 +2088,18 @@ enum ManageDsaItRequestError {
     ProtocolError(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubentriesSearchVisibility {
+    Default,
+    NormalEntriesOnly,
+    SubentriesOnly,
+}
+
+#[derive(Debug)]
+pub(crate) enum SubentriesRequestError {
+    ProtocolError(String),
+}
+
 impl PagedSearchRequestError {
     fn result_code(&self) -> ResultCode {
         match self {
@@ -2183,6 +2200,26 @@ fn parse_manage_dsa_it_request(
     }
 
     Ok(true)
+}
+
+pub(crate) fn parse_subentries_request_control(
+    request_controls: &RequestControls,
+) -> Result<SubentriesSearchVisibility, SubentriesRequestError> {
+    let control = request_controls
+        .singleton(SUBENTRIES_CONTROL_OID)
+        .map_err(|err| SubentriesRequestError::ProtocolError(err.to_string()))?;
+    let Some(control) = control else {
+        return Ok(SubentriesSearchVisibility::Default);
+    };
+
+    let decoded = decode_subentries_control(control.value()).map_err(|err| {
+        SubentriesRequestError::ProtocolError(format!("malformed subentries control: {err}"))
+    })?;
+    if decoded.visible {
+        Ok(SubentriesSearchVisibility::SubentriesOnly)
+    } else {
+        Ok(SubentriesSearchVisibility::NormalEntriesOnly)
+    }
 }
 
 fn parse_paged_results_request(
@@ -3441,6 +3478,7 @@ async fn try_handle_virtual_search_request(
     request_context: &RequestContext,
     requested_attributes: &[String],
     types_only: bool,
+    subentries_visibility: SubentriesSearchVisibility,
     result_controls: &[LdapControl],
     connection_is_secure: bool,
     starttls_available: bool,
@@ -3496,15 +3534,17 @@ async fn try_handle_virtual_search_request(
                 return Ok(true);
             }
         };
-        send_virtual_search_entry(
-            socket,
-            message_id,
-            "",
-            &attributes,
-            requested_attributes,
-            types_only,
-        )
-        .await?;
+        if virtual_entry_matches_subentries_visibility(false, scope, subentries_visibility) {
+            send_virtual_search_entry(
+                socket,
+                message_id,
+                "",
+                &attributes,
+                requested_attributes,
+                types_only,
+            )
+            .await?;
+        }
         send_result_with_controls(
             socket,
             message_id,
@@ -3520,15 +3560,17 @@ async fn try_handle_virtual_search_request(
 
     if base_dn.eq_ignore_ascii_case(&runtime_config.subschema_dn) {
         let attributes = crate::search_protocol::build_subschema_attributes(schema);
-        send_virtual_search_entry(
-            socket,
-            message_id,
-            &runtime_config.subschema_dn,
-            &attributes,
-            requested_attributes,
-            types_only,
-        )
-        .await?;
+        if virtual_entry_matches_subentries_visibility(true, scope, subentries_visibility) {
+            send_virtual_search_entry(
+                socket,
+                message_id,
+                &runtime_config.subschema_dn,
+                &attributes,
+                requested_attributes,
+                types_only,
+            )
+            .await?;
+        }
         send_result_with_controls(
             socket,
             message_id,
@@ -3567,6 +3609,40 @@ async fn send_virtual_search_entry(
         &[],
     )
     .await
+}
+
+fn virtual_entry_matches_subentries_visibility(
+    is_subentry: bool,
+    scope: ldap_parser::ldap::SearchScope,
+    visibility: SubentriesSearchVisibility,
+) -> bool {
+    match visibility {
+        SubentriesSearchVisibility::Default => {
+            scope == ldap_parser::ldap::SearchScope::BaseObject || !is_subentry
+        }
+        SubentriesSearchVisibility::NormalEntriesOnly => !is_subentry,
+        SubentriesSearchVisibility::SubentriesOnly => is_subentry,
+    }
+}
+
+pub(crate) fn entry_matches_subentries_visibility(
+    entry: &DirectoryEntry,
+    scope: ldap_parser::ldap::SearchScope,
+    visibility: SubentriesSearchVisibility,
+) -> bool {
+    virtual_entry_matches_subentries_visibility(entry_is_subentry(entry), scope, visibility)
+}
+
+pub(crate) fn entry_is_subentry(entry: &DirectoryEntry) -> bool {
+    entry
+        .attributes
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("objectClass"))
+        .is_some_and(|(_, values)| {
+            values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case("subentry"))
+        })
 }
 
 fn map_backend_error(err: &BackendError) -> ResultCode {
@@ -3816,6 +3892,34 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         increment_control_counter(request_context, "ldap_manage_dsa_it_requests_total", 1);
     }
 
+    let subentries_visibility = match parse_subentries_request_control(request_controls) {
+        Ok(visibility) => visibility,
+        Err(SubentriesRequestError::ProtocolError(diagnostic)) => {
+            send_result(
+                socket,
+                message_id,
+                ResponseOp::SearchDone,
+                ResultCode::ProtocolError,
+                &base_dn,
+                diagnostic,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if subentries_visibility != SubentriesSearchVisibility::Default {
+        increment_control_counter(request_context, "ldap_subentries_requests_total", 1);
+    }
+
+    if requested_sync.is_some() && subentries_visibility != SubentriesSearchVisibility::Default {
+        let err = SyncRequestError::Unsupported(
+            "sync request control cannot be combined with subentries control".to_string(),
+        );
+        reject_sync_request(socket, message_id, &base_dn, &err).await?;
+        return Ok(());
+    }
+
     if let Some(control) = paged_results.as_ref()
         && control.size == 0
         && control.cookie.is_empty()
@@ -3871,6 +3975,7 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         request_context,
         &attribute_selection,
         request.types_only,
+        subentries_visibility,
         &virtual_result_controls,
         connection_is_secure,
         starttls_available,
@@ -4039,6 +4144,7 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
             &request,
             &attribute_selection,
             requested_sort.as_ref().map(|sort| sort.keys.as_slice()),
+            subentries_visibility,
         )
     });
 
@@ -4184,6 +4290,7 @@ pub(crate) async fn handle_search_request_with_context_and_registry(
         &request,
         deref_aliases,
         manage_dsa_it,
+        subentries_visibility,
         session,
         request_context,
         search_deadline,
@@ -4448,6 +4555,7 @@ async fn collect_search_result_set(
     request: &SearchRequest<'_>,
     deref_aliases: ldap_parser::ldap::DerefAliases,
     manage_dsa_it: bool,
+    subentries_visibility: SubentriesSearchVisibility,
     session: &ConnectionSession,
     request_context: &RequestContext,
     search_deadline: Option<Instant>,
@@ -4472,6 +4580,7 @@ async fn collect_search_result_set(
             request,
             deref_aliases,
             manage_dsa_it,
+            subentries_visibility,
             session,
             request_context,
             search_deadline,
@@ -4548,6 +4657,10 @@ async fn collect_search_result_set(
             continue;
         };
 
+        if !entry_matches_subentries_visibility(&entry, request.scope, subentries_visibility) {
+            continue;
+        }
+
         if !index_covers_filter
             && !prepared_filter
                 .matches_entry(&entry)
@@ -4589,9 +4702,10 @@ async fn collect_base_object_search_result_set(
     prepared_filter: &PreparedLdapFilter,
     effective_base_dn: &str,
     base_object_entry: Option<DirectoryEntry>,
-    _request: &SearchRequest<'_>,
+    request: &SearchRequest<'_>,
     deref_aliases: ldap_parser::ldap::DerefAliases,
     manage_dsa_it: bool,
+    subentries_visibility: SubentriesSearchVisibility,
     session: &ConnectionSession,
     request_context: &RequestContext,
     search_deadline: Option<Instant>,
@@ -4681,6 +4795,15 @@ async fn collect_base_object_search_result_set(
             time_limit_hit: false,
         });
     };
+
+    if !entry_matches_subentries_visibility(&entry, request.scope, subentries_visibility) {
+        return Ok(SearchResultSet {
+            entries: Vec::new(),
+            references: Vec::new(),
+            size_limit_hit: false,
+            time_limit_hit: false,
+        });
+    }
 
     if !prepared_filter
         .matches_entry(&entry)
@@ -5635,6 +5758,7 @@ pub(crate) async fn handle_sync_search_request(
             request,
             request.deref_aliases,
             manage_dsa_it,
+            SubentriesSearchVisibility::Default,
             connection_session,
             request_context,
             search_deadline,
@@ -7279,8 +7403,46 @@ pub(crate) async fn handle_add_request_with_context(
         return Ok(());
     }
 
+    let parent_attributes = if schema.requires_parent_attributes_for_entry(&entry.attributes) {
+        match crate::dn::parent_dn(&dn) {
+            Ok(Some(parent_dn)) => match backend.get_entry(&parent_dn).await {
+                Ok(parent_entry) => parent_entry.map(|entry| entry.attributes),
+                Err(err) => {
+                    error!("Parent lookup failed for add {}: {}", dn, err);
+                    send_result(
+                        socket,
+                        message_id,
+                        ResponseOp::Add,
+                        map_backend_error(&err),
+                        &dn,
+                        diagnostic_for_error(&err),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+            Ok(None) => None,
+            Err(err) => {
+                send_result(
+                    socket,
+                    message_id,
+                    ResponseOp::Add,
+                    ResultCode::InvalidDnSyntax,
+                    &dn,
+                    &format!("invalid DN syntax: {}", err),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     // Perform schema validation before adding
-    if let Err(schema_error) = schema.validate_entry(&entry.attributes) {
+    if let Err(schema_error) =
+        schema.validate_entry_at_dn(&dn, &entry.attributes, parent_attributes.as_ref())
+    {
         error!("Schema validation failed for {}: {}", dn, schema_error);
         log_generic_audit_event(
             request_context,
@@ -7531,7 +7693,59 @@ pub(crate) async fn handle_moddn_request_with_context(
         }
     };
 
-    if let Err(schema_error) = schema.validate_rdn_for_entry(&existing_entry.attributes, &new_rdn) {
+    let parent_attributes =
+        if schema.requires_parent_attributes_for_entry(&existing_entry.attributes) {
+            match crate::dn::parent_dn(&new_dn) {
+                Ok(Some(parent_dn)) => match backend.get_entry(&parent_dn).await {
+                    Ok(parent_entry) => parent_entry.map(|entry| entry.attributes),
+                    Err(err) => {
+                        error!("Parent lookup failed for modifydn {}: {}", dn, err);
+                        log_moddn_audit_event(
+                            request_context,
+                            session,
+                            &dn,
+                            &new_dn,
+                            false,
+                            Some(diagnostic_for_error(&err)),
+                        )
+                        .await;
+                        send_result(
+                            socket,
+                            message_id,
+                            ResponseOp::ModifyDn,
+                            map_backend_error(&err),
+                            &dn,
+                            diagnostic_for_error(&err),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+                Ok(None) => None,
+                Err(err) => {
+                    send_result(
+                        socket,
+                        message_id,
+                        ResponseOp::ModifyDn,
+                        ResultCode::InvalidDnSyntax,
+                        &dn,
+                        &format!("invalid DN syntax: {}", err),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
+    if let Err(schema_error) = schema.validate_renamed_entry(
+        &dn,
+        &existing_entry.attributes,
+        &new_rdn,
+        delete_old,
+        parent_attributes.as_ref(),
+    ) {
         error!(
             "Schema validation failed for modifydn {}: {}",
             dn, schema_error
@@ -8612,9 +8826,10 @@ mod tests {
     use crate::schema::LdapSchema;
     use crate::search_controls::{
         PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
-        SERVER_SIDE_SORT_RESPONSE_OID, ServerSideSortResponseControl, ServerSideSortResultCode,
-        SortKey, decode_paged_results_control, decode_server_side_sort_response_control,
-        encode_paged_results_control, encode_server_side_sort_request_control,
+        SERVER_SIDE_SORT_RESPONSE_OID, SUBENTRIES_CONTROL_OID, ServerSideSortResponseControl,
+        ServerSideSortResultCode, SortKey, decode_paged_results_control,
+        decode_server_side_sort_response_control, encode_paged_results_control,
+        encode_server_side_sort_request_control, encode_subentries_control,
     };
     use crate::sync_controls::{
         SYNC_DONE_OID, SYNC_INFO_OID, SYNC_REQUEST_OID, SYNC_STATE_OID, SyncDoneControl,
@@ -9058,6 +9273,14 @@ mod tests {
         )])
     }
 
+    fn subentries_request_controls(visible: bool) -> RequestControls {
+        RequestControls::new(vec![LdapControl::new(
+            SUBENTRIES_CONTROL_OID,
+            false,
+            Some(encode_subentries_control(visible).unwrap()),
+        )])
+    }
+
     fn paged_and_sort_request_controls(
         size: u32,
         cookie: &[u8],
@@ -9099,6 +9322,176 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn subentries_control_filters_search_visibility() {
+        let backend = MockBackend::new();
+        for entry in [
+            DirectoryEntry::new(
+                "ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "organizationalUnit".to_string()],
+                    ),
+                    ("ou".to_string(), vec!["People".to_string()]),
+                    (
+                        "administrativeRole".to_string(),
+                        vec!["collectiveAttributeSpecificArea".to_string()],
+                    ),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=Alice,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "person".to_string()],
+                    ),
+                    ("cn".to_string(), vec!["Alice".to_string()]),
+                    ("sn".to_string(), vec!["Example".to_string()]),
+                ]),
+            ),
+            DirectoryEntry::new(
+                "cn=People Policy,ou=People,dc=example,dc=org",
+                HashMap::from([
+                    (
+                        "objectClass".to_string(),
+                        vec!["top".to_string(), "subentry".to_string()],
+                    ),
+                    ("cn".to_string(), vec!["People Policy".to_string()]),
+                    ("subtreeSpecification".to_string(), vec!["{}".to_string()]),
+                ]),
+            ),
+        ] {
+            backend.add_entry(entry, Vec::new()).await.unwrap();
+        }
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig {
+            naming_contexts: vec!["dc=example,dc=org".to_string()],
+            ..LegacyServerConfig::default()
+        };
+
+        let run_search = |controls: RequestControls| {
+            let backend = &backend;
+            let schema = &schema;
+            let runtime_config = &runtime_config;
+            async move {
+                let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+                handle_search_request_with_context(
+                    &mut server_stream,
+                    backend,
+                    schema,
+                    runtime_config,
+                    61,
+                    subtree_search_request("ou=People,dc=example,dc=org", &["cn"]),
+                    &ConnectionSession::default(),
+                    &RequestContext::default(),
+                    &controls,
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+                let response = read_response(&mut client_stream).await;
+                let (_, messages) = parse_ldap_messages(&response).unwrap();
+                let mut dns = search_result_dns(&messages);
+                dns.sort();
+                dns
+            }
+        };
+
+        let default_dns = run_search(RequestControls::default()).await;
+        assert!(default_dns.contains(&"ou=People,dc=example,dc=org".to_string()));
+        assert!(default_dns.contains(&"cn=Alice,ou=People,dc=example,dc=org".to_string()));
+        assert!(!default_dns.contains(&"cn=People Policy,ou=People,dc=example,dc=org".to_string()));
+
+        let subentry_dns = run_search(subentries_request_controls(true)).await;
+        assert_eq!(
+            subentry_dns,
+            vec!["cn=People Policy,ou=People,dc=example,dc=org".to_string()]
+        );
+
+        let normal_dns = run_search(subentries_request_controls(false)).await;
+        assert_eq!(normal_dns, default_dns);
+    }
+
+    #[tokio::test]
+    async fn subentries_are_visible_to_base_search_without_control() {
+        let backend = MockBackend::new();
+        backend
+            .add_entry(
+                DirectoryEntry::new(
+                    "cn=People Policy,ou=People,dc=example,dc=org",
+                    HashMap::from([
+                        (
+                            "objectClass".to_string(),
+                            vec!["top".to_string(), "subentry".to_string()],
+                        ),
+                        ("cn".to_string(), vec!["People Policy".to_string()]),
+                        ("subtreeSpecification".to_string(), vec!["{}".to_string()]),
+                    ]),
+                ),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let schema = LdapSchema::with_core_schema();
+        let runtime_config = LegacyServerConfig::default();
+        let request = search_request_for_base(
+            "cn=People Policy,ou=People,dc=example,dc=org",
+            &["objectClass"],
+        );
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            62,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &RequestControls::default(),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert_eq!(
+            search_result_dns(&messages),
+            vec!["cn=People Policy,ou=People,dc=example,dc=org".to_string()]
+        );
+
+        let request = search_request_for_base(
+            "cn=People Policy,ou=People,dc=example,dc=org",
+            &["objectClass"],
+        );
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        handle_search_request_with_context(
+            &mut server_stream,
+            &backend,
+            &schema,
+            &runtime_config,
+            63,
+            request,
+            &ConnectionSession::default(),
+            &RequestContext::default(),
+            &subentries_request_controls(false),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+        assert!(search_result_dns(&messages).is_empty());
     }
 
     #[test]
@@ -9561,6 +9954,7 @@ mod tests {
             filter_repr: "present".to_string(),
             attributes: vec!["cn".to_string()],
             sort_keys: None,
+            subentries_visibility: SubentriesSearchVisibility::Default,
         };
 
         let cancel_cookie = registry.remember_paged_search(PagedSearchCursor {
@@ -10477,6 +10871,7 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
             MANAGE_DSA_IT_OID.to_string(),
             PAGED_RESULTS_OID.to_string(),
             SERVER_SIDE_SORT_REQUEST_OID.to_string(),
+            SUBENTRIES_CONTROL_OID.to_string(),
             SYNC_REQUEST_OID.to_string(),
         ];
         expected_controls.sort();
@@ -12528,7 +12923,8 @@ objectClasses: ( 1.3.6.1.4.1.55555.152.2 NAME 'exampleCounterObject' SUP top AUX
                 );
                 assert!(
                     attributes
-                        .get("objectclass")
+                        .get("objectClass")
+                        .or_else(|| attributes.get("objectclass"))
                         .unwrap()
                         .iter()
                         .any(|value| value.eq_ignore_ascii_case("referral"))

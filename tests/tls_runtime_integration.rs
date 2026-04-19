@@ -11,6 +11,7 @@ use ldap_parser::parse_ldap_messages;
 use opendr::extended_ops::oids;
 use opendr::search_controls::{
     PAGED_RESULTS_OID, SERVER_SIDE_SORT_REQUEST_OID, SERVER_SIDE_SORT_RESPONSE_OID,
+    SUBENTRIES_CONTROL_OID,
 };
 use opendr::sync_controls::{SYNC_DONE_OID, SYNC_REQUEST_OID, SYNC_STATE_OID};
 use rasn::der;
@@ -489,6 +490,7 @@ fn assert_root_dse_capabilities(response: &[u8], secure_connection: bool, expect
         MANAGE_DSA_IT_OID.to_string(),
         PAGED_RESULTS_OID.to_string(),
         SERVER_SIDE_SORT_REQUEST_OID.to_string(),
+        SUBENTRIES_CONTROL_OID.to_string(),
         SYNC_REQUEST_OID.to_string(),
     ];
     expected_controls.sort();
