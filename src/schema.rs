@@ -10,6 +10,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use x509_parser::prelude::FromDer;
 use x520_stringprep::{
     x520_stringprep_to_case_exact_string, x520_stringprep_to_case_ignore_string,
 };
@@ -5761,6 +5762,21 @@ struct X509NameConstraintsAssertion {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct X509GeneralSubtreeAssertion {
     base: X509GeneralNameAssertion,
+    minimum: Option<String>,
+    maximum: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct X509NameConstraintsCandidate<'a> {
+    permitted_subtrees: Option<Vec<X509GeneralSubtreeCandidate<'a>>>,
+    excluded_subtrees: Option<Vec<X509GeneralSubtreeCandidate<'a>>>,
+}
+
+#[derive(Debug, Clone)]
+struct X509GeneralSubtreeCandidate<'a> {
+    base: x509_parser::extensions::GeneralName<'a>,
+    minimum: Option<String>,
+    maximum: Option<String>,
 }
 
 fn normalize_x509_certificate_exact_match_value(value: &str) -> Result<String, String> {
@@ -6140,15 +6156,14 @@ fn x509_certificate_der_matches_assertion(
         }
     }
     if let Some(asserted_name_constraints) = assertion.name_constraints.as_ref() {
-        let Some(name_constraints) = certificate.iter_extensions().find_map(|extension| {
-            match extension.parsed_extension() {
-                x509_parser::extensions::ParsedExtension::NameConstraints(value) => Some(value),
-                _ => None,
-            }
-        }) else {
+        let Some(name_constraints) = certificate
+            .iter_extensions()
+            .find(|extension| extension.oid.to_id_string() == "2.5.29.30")
+        else {
             return Ok(false);
         };
-        if !name_constraints_match(name_constraints, asserted_name_constraints) {
+        let parsed_name_constraints = parse_name_constraints_candidate_der(name_constraints.value)?;
+        if !name_constraints_match(&parsed_name_constraints, asserted_name_constraints) {
             return Ok(false);
         }
     }
@@ -6268,7 +6283,7 @@ fn distribution_point_name_matches(
 }
 
 fn name_constraints_match(
-    candidate: &x509_parser::extensions::NameConstraints<'_>,
+    candidate: &X509NameConstraintsCandidate<'_>,
     assertion: &X509NameConstraintsAssertion,
 ) -> bool {
     if let Some(asserted_permitted) = assertion.permitted_subtrees.as_ref()
@@ -6285,17 +6300,38 @@ fn name_constraints_match(
 }
 
 fn general_subtrees_match(
-    candidate: Option<&[x509_parser::extensions::GeneralSubtree<'_>]>,
+    candidate: Option<&[X509GeneralSubtreeCandidate<'_>]>,
     assertion: &[X509GeneralSubtreeAssertion],
 ) -> bool {
     let Some(candidate) = candidate else {
         return assertion.is_empty();
     };
     assertion.iter().all(|asserted_subtree| {
-        candidate.iter().any(|candidate_subtree| {
-            general_name_matches(&candidate_subtree.base, &asserted_subtree.base)
-        })
+        candidate
+            .iter()
+            .any(|candidate_subtree| general_subtree_matches(candidate_subtree, asserted_subtree))
     })
+}
+
+fn general_subtree_matches(
+    candidate: &X509GeneralSubtreeCandidate<'_>,
+    assertion: &X509GeneralSubtreeAssertion,
+) -> bool {
+    if !general_name_matches(&candidate.base, &assertion.base) {
+        return false;
+    }
+    if let Some(asserted_minimum) = assertion.minimum.as_deref() {
+        let candidate_minimum = candidate.minimum.as_deref().unwrap_or("0");
+        if candidate_minimum != asserted_minimum {
+            return false;
+        }
+    }
+    if let Some(asserted_maximum) = assertion.maximum.as_deref()
+        && candidate.maximum.as_deref() != Some(asserted_maximum)
+    {
+        return false;
+    }
+    true
 }
 
 fn general_name_matches(
@@ -7066,25 +7102,19 @@ fn parse_general_subtrees(value: &str) -> Result<Vec<X509GeneralSubtreeAssertion
 fn parse_general_subtree(value: &str) -> Result<X509GeneralSubtreeAssertion, String> {
     let components = parse_gser_sequence_fields(value, "GeneralSubtree")?;
     let mut base = None;
-    let mut minimum_seen = false;
+    let mut minimum = None;
+    let mut maximum = None;
 
     for (keyword, rest) in components {
         match keyword {
             "base" if base.is_none() => base = Some(parse_general_name(rest)?),
-            "minimum" if !minimum_seen => {
-                minimum_seen = true;
-                let minimum = normalize_unsigned_decimal_integer(rest)?;
-                if minimum != "0" {
-                    return Err(
-                        "GeneralSubtree minimum values other than 0 are not supported yet"
-                            .to_string(),
-                    );
-                }
+            "minimum" if minimum.is_none() => {
+                minimum = Some(normalize_unsigned_decimal_integer(rest)?);
             }
-            "maximum" => {
-                return Err("GeneralSubtree maximum is not supported yet".to_string());
+            "maximum" if maximum.is_none() => {
+                maximum = Some(normalize_unsigned_decimal_integer(rest)?);
             }
-            "base" | "minimum" => {
+            "base" | "minimum" | "maximum" => {
                 return Err(format!("duplicate GeneralSubtree component {keyword}"));
             }
             other => return Err(format!("unknown GeneralSubtree component {other}")),
@@ -7093,7 +7123,118 @@ fn parse_general_subtree(value: &str) -> Result<X509GeneralSubtreeAssertion, Str
 
     Ok(X509GeneralSubtreeAssertion {
         base: base.ok_or_else(|| "GeneralSubtree requires a base component".to_string())?,
+        minimum,
+        maximum,
     })
+}
+
+fn parse_name_constraints_candidate_der(
+    value: &[u8],
+) -> Result<X509NameConstraintsCandidate<'_>, String> {
+    let (remainder, sequence) = read_der_tlv(value)?;
+    if sequence.tag != 0x30 {
+        return Err("NameConstraints extension must be a DER SEQUENCE".to_string());
+    }
+    if !remainder.is_empty() {
+        return Err("NameConstraints extension has trailing DER data".to_string());
+    }
+
+    let mut permitted_subtrees = None;
+    let mut excluded_subtrees = None;
+    let mut remaining = sequence.content;
+    while !remaining.is_empty() {
+        let (next, field) = read_der_tlv(remaining)?;
+        match field.tag {
+            0xa0 if permitted_subtrees.is_none() => {
+                permitted_subtrees = Some(parse_general_subtree_candidates(field.content)?);
+            }
+            0xa1 if excluded_subtrees.is_none() => {
+                excluded_subtrees = Some(parse_general_subtree_candidates(field.content)?);
+            }
+            0xa0 => return Err("duplicate permittedSubtrees in NameConstraints".to_string()),
+            0xa1 => return Err("duplicate excludedSubtrees in NameConstraints".to_string()),
+            other => {
+                return Err(format!(
+                    "unexpected NameConstraints DER field tag 0x{other:02x}"
+                ));
+            }
+        }
+        remaining = next;
+    }
+
+    Ok(X509NameConstraintsCandidate {
+        permitted_subtrees,
+        excluded_subtrees,
+    })
+}
+
+fn parse_general_subtree_candidates(
+    mut value: &[u8],
+) -> Result<Vec<X509GeneralSubtreeCandidate<'_>>, String> {
+    let mut subtrees = Vec::new();
+    while !value.is_empty() {
+        let (next, subtree) = read_der_tlv(value)?;
+        if subtree.tag != 0x30 {
+            return Err("GeneralSubtree must be encoded as a DER SEQUENCE".to_string());
+        }
+        subtrees.push(parse_general_subtree_candidate(subtree.content)?);
+        value = next;
+    }
+    if subtrees.is_empty() {
+        return Err("GeneralSubtrees must contain at least one GeneralSubtree".to_string());
+    }
+    Ok(subtrees)
+}
+
+fn parse_general_subtree_candidate(
+    value: &[u8],
+) -> Result<X509GeneralSubtreeCandidate<'_>, String> {
+    let (mut remaining, base_tlv) = read_der_tlv(value)?;
+    let (_, base) = x509_parser::extensions::GeneralName::from_der(base_tlv.full)
+        .map_err(|err| format!("GeneralSubtree base GeneralName could not be parsed: {err}"))?;
+
+    let mut minimum = None;
+    let mut maximum = None;
+    while !remaining.is_empty() {
+        let (next, field) = read_der_tlv(remaining)?;
+        match field.tag {
+            0x80 if minimum.is_none() => {
+                minimum = Some(der_base_distance_decimal(
+                    field.content,
+                    "GeneralSubtree minimum",
+                )?);
+            }
+            0x81 if maximum.is_none() => {
+                maximum = Some(der_base_distance_decimal(
+                    field.content,
+                    "GeneralSubtree maximum",
+                )?);
+            }
+            0x80 => return Err("duplicate GeneralSubtree minimum".to_string()),
+            0x81 => return Err("duplicate GeneralSubtree maximum".to_string()),
+            other => return Err(format!("unexpected GeneralSubtree DER tag 0x{other:02x}")),
+        }
+        remaining = next;
+    }
+
+    Ok(X509GeneralSubtreeCandidate {
+        base,
+        minimum,
+        maximum,
+    })
+}
+
+fn der_base_distance_decimal(value: &[u8], label: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{label} DER INTEGER content must not be empty"));
+    }
+    if value[0] & 0x80 != 0 {
+        return Err(format!("{label} must not be negative"));
+    }
+    if value.len() > 1 && value[0] == 0 && value[1] & 0x80 == 0 {
+        return Err(format!("{label} DER INTEGER is not minimally encoded"));
+    }
+    der_unsigned_integer_decimal(value)
 }
 
 fn parse_distribution_point_name(

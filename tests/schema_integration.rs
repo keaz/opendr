@@ -133,6 +133,40 @@ fn private_key_usage_period_extension_content(not_before: &str, not_after: &str)
     test_der_wrap(0x30, &content)
 }
 
+fn test_der_unsigned_integer_content(value: u8) -> Vec<u8> {
+    if value & 0x80 == 0 {
+        vec![value]
+    } else {
+        vec![0, value]
+    }
+}
+
+fn general_subtree_der(base: Vec<u8>, minimum: Option<u8>, maximum: Option<u8>) -> Vec<u8> {
+    let mut content = base;
+    if let Some(minimum) = minimum {
+        content.extend(test_der_wrap(
+            0x80,
+            &test_der_unsigned_integer_content(minimum),
+        ));
+    }
+    if let Some(maximum) = maximum {
+        content.extend(test_der_wrap(
+            0x81,
+            &test_der_unsigned_integer_content(maximum),
+        ));
+    }
+    test_der_wrap(0x30, &content)
+}
+
+fn name_constraints_extension_content() -> Vec<u8> {
+    let permitted = general_subtree_der(test_der_wrap(0x82, b"example.org"), Some(0), Some(3));
+    let excluded = general_subtree_der(test_der_wrap(0x81, b"blocked@example.org"), Some(1), None);
+    let mut content = Vec::new();
+    content.extend(test_der_wrap(0xa0, &permitted));
+    content.extend(test_der_wrap(0xa1, &excluded));
+    test_der_wrap(0x30, &content)
+}
+
 fn test_component_certificate_pem() -> String {
     let issuer_key = rcgen::KeyPair::generate().unwrap();
     let mut issuer_params =
@@ -157,17 +191,17 @@ fn test_component_certificate_pem() -> String {
         rcgen::KeyUsagePurpose::DigitalSignature,
         rcgen::KeyUsagePurpose::KeyEncipherment,
     ];
-    params.name_constraints = Some(rcgen::NameConstraints {
-        permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("example.org".to_string())],
-        excluded_subtrees: vec![rcgen::GeneralSubtree::Rfc822Name(
-            "blocked@example.org".to_string(),
-        )],
-    });
     params
         .custom_extensions
         .push(rcgen::CustomExtension::from_oid_content(
             &[2, 5, 29, 32],
             certificate_policy_extension_content(&[1, 2, 3, 4]),
+        ));
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 30],
+            name_constraints_extension_content(),
         ));
     params
         .custom_extensions
@@ -1476,7 +1510,7 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .values_equal(
                 &cert_pem,
                 &format!(
-                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, privateKeyValid 20240601000000Z, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }}, nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{} }} }}, excludedSubtrees {{ {{ base rfc822Name:{} }} }} }} }}",
+                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, privateKeyValid 20240601000000Z, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }}, nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{}, minimum 0, maximum 3 }} }}, excludedSubtrees {{ {{ base rfc822Name:{}, minimum 1 }} }} }} }}",
                     gser_quote("example.org"),
                     gser_quote("blocked@example.org")
                 ),
@@ -1515,6 +1549,17 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
                 &format!(
                     "{{ nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{} }} }} }} }}",
                     gser_quote("other.org")
+                )
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{}, maximum 4 }} }} }} }}",
+                    gser_quote("example.org")
                 )
             )
             .unwrap()

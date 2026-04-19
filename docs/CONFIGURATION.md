@@ -492,9 +492,10 @@ search filters and Compare operations. Component assertions are also available
 for `certificateMatch`, `certificatePairMatch`, and `certificateListMatch` when
 they use the implemented certificate serial, issuer, subject, key identifiers,
 validity, private-key validity, subject-public-key algorithm, key usage, subject
-alternative name type, certificate policy, base-subtree name constraints, CRL
-issuer, CRL date, CRL-number range, CRL authority key identifier, reason-flag,
-or full-name distribution point components.
+alternative name type, certificate policy, name constraints including asserted
+GeneralSubtree minimum/maximum bounds, CRL issuer, CRL date, CRL-number range,
+CRL authority key identifier, reason-flag, or full-name distribution point
+components.
 
 Generate bundled schema files when a deployment needs file-based schema
 artifacts instead of relying only on `load_builtin`:

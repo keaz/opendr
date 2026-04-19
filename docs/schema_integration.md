@@ -538,14 +538,14 @@ assertions. Component matching rules `certificateMatch`, `certificateListMatch`,
 and `certificatePairMatch` execute a standards-based subset: certificate
 serial-number, issuer, subject, subject and authority key identifiers,
 certificate-valid time, private-key-valid time, subject-public-key algorithm,
-key usage, subject alternative name type, certificate policy, and base-subtree
-name-constraint assertions; certificate pair issued-to and issued-by assertions
-that delegate to those certificate components; and CRL issuer, date-and-time,
-CRL-number range, authority key identifier, reason-flag, and full-name
-distribution point assertions. The remaining RFC 4523 components,
-including path-to-name, GeneralSubtree min/max, `otherName` values, X.400/EDI
-general names, and name-relative-to-CRL-issuer distribution points, are rejected
-explicitly until implemented.
+key usage, subject alternative name type, certificate policy, and
+name-constraint assertions including asserted GeneralSubtree minimum/maximum
+bounds; certificate pair issued-to and issued-by assertions that delegate to
+those certificate components; and CRL issuer, date-and-time, CRL-number range,
+authority key identifier, reason-flag, and full-name distribution point
+assertions. The remaining RFC 4523 components, including path-to-name,
+`otherName` values, X.400/EDI general names, and name-relative-to-CRL-issuer
+distribution points, are rejected explicitly until implemented.
 
 ### Core Attributes
 
