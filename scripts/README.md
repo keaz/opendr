@@ -85,7 +85,9 @@ evidence.
 ```
 
 **Prerequisites**:
-- Python 3.11 or newer for `tomllib`.
+- Python 3.11 or newer uses the standard-library `tomllib` parser. Older
+  Python 3 runtimes use the script's fallback parser for the simple OpenDR
+  server TOML shape checked by this gate.
 
 ### tls_rotation_gate.sh
 

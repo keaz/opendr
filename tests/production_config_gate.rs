@@ -9,12 +9,19 @@ fn repo_root() -> PathBuf {
 }
 
 fn run_gate(config_path: &std::path::Path) -> std::process::Output {
-    Command::new("bash")
+    run_gate_with_env(config_path, &[])
+}
+
+fn run_gate_with_env(config_path: &std::path::Path, env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new("bash");
+    command
         .arg(repo_root().join("scripts/production_config_gate.sh"))
         .arg(config_path)
-        .current_dir(repo_root())
-        .output()
-        .expect("production config gate should run")
+        .current_dir(repo_root());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("production config gate should run")
 }
 
 #[test]
@@ -24,6 +31,22 @@ fn production_template_passes_hardening_gate() {
     assert!(
         output.status.success(),
         "gate failed unexpectedly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Production config gate passed"));
+}
+
+#[test]
+fn production_template_passes_hardening_gate_with_fallback_toml_parser() {
+    let output = run_gate_with_env(
+        &repo_root().join("config/production.toml"),
+        &[("OPENDR_PRODUCTION_GATE_TOML_PARSER", "fallback")],
+    );
+
+    assert!(
+        output.status.success(),
+        "fallback gate failed unexpectedly\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

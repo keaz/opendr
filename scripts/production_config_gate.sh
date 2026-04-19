@@ -35,21 +35,149 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 python3 - "${CONFIG_PATH}" "${ROOT_DIR}" <<'PY'
+import ast
+import os
 import pathlib
 import sys
-import tomllib
 
 config_path = pathlib.Path(sys.argv[1]).resolve()
 repo_root = pathlib.Path(sys.argv[2]).resolve()
 
+class ConfigParseError(Exception):
+    pass
+
+
+def strip_inline_comment(value):
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if in_double and char == "\\":
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == "#" and not in_single and not in_double:
+            return value[:index]
+    return value
+
+
+def split_array_items(value):
+    items = []
+    current = []
+    in_single = False
+    in_double = False
+    escaped = False
+    for char in value:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if in_double and char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            current.append(char)
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            current.append(char)
+            continue
+        if char == "," and not in_single and not in_double:
+            items.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if current or value.strip():
+        items.append("".join(current).strip())
+    return [item for item in items if item]
+
+
+def parse_fallback_value(value):
+    value = strip_inline_comment(value).strip()
+    lower = value.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if value.startswith("[") and value.endswith("]"):
+        return [parse_fallback_value(item) for item in split_array_items(value[1:-1])]
+    if (
+        (value.startswith('"') and value.endswith('"'))
+        or (value.startswith("'") and value.endswith("'"))
+    ):
+        try:
+            return ast.literal_eval(value)
+        except (SyntaxError, ValueError) as exc:
+            raise ConfigParseError(f"invalid quoted string {value!r}: {exc}") from exc
+    try:
+        return int(value, 0)
+    except ValueError:
+        return value
+
+
+def parse_fallback_toml(path):
+    config = {}
+    current = config
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = strip_inline_comment(raw_line).strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]") and not line.startswith("[["):
+            current = config
+            for part in line[1:-1].split("."):
+                key = part.strip()
+                if not key:
+                    raise ConfigParseError(f"empty table name on line {line_number}")
+                current = current.setdefault(key, {})
+                if not isinstance(current, dict):
+                    raise ConfigParseError(f"table conflicts with scalar on line {line_number}")
+            continue
+        if "=" not in line:
+            raise ConfigParseError(f"expected key/value pair on line {line_number}")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ConfigParseError(f"empty key on line {line_number}")
+        current[key] = parse_fallback_value(value)
+    return config
+
+
+def load_toml(path):
+    parser = os.environ.get("OPENDR_PRODUCTION_GATE_TOML_PARSER", "").lower()
+    if parser != "fallback":
+        try:
+            import tomllib
+
+            with path.open("rb") as handle:
+                return tomllib.load(handle)
+        except ModuleNotFoundError:
+            try:
+                import tomli
+
+                with path.open("rb") as handle:
+                    return tomli.load(handle)
+            except ModuleNotFoundError:
+                pass
+    return parse_fallback_toml(path)
+
+
 try:
-    with config_path.open("rb") as handle:
-        config = tomllib.load(handle)
-except tomllib.TOMLDecodeError as exc:
+    config = load_toml(config_path)
+except Exception as exc:
     print(f"production config gate failed: invalid TOML: {exc}", file=sys.stderr)
     sys.exit(1)
 
-failures: list[str] = []
+failures = []
 
 
 def table(name: str) -> dict:
