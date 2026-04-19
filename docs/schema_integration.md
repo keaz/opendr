@@ -539,13 +539,14 @@ and `certificatePairMatch` execute a standards-based subset: certificate
 serial-number, issuer, subject, subject and authority key identifiers,
 certificate-valid time, private-key-valid time, subject-public-key algorithm,
 key usage, subject alternative name type, certificate policy, and
-name-constraint assertions including asserted GeneralSubtree minimum/maximum
-bounds; certificate pair issued-to and issued-by assertions that delegate to
-those certificate components; and CRL issuer, date-and-time, CRL-number range,
+path-to-name checks against certificate NameConstraints, plus name-constraint
+assertions including asserted GeneralSubtree minimum/maximum bounds;
+certificate pair issued-to and issued-by assertions that delegate to those
+certificate components; and CRL issuer, date-and-time, CRL-number range,
 authority key identifier, reason-flag, full-name distribution point, and
 name-relative-to-CRL-issuer distribution point assertions. The remaining RFC
-4523 components, including path-to-name, `otherName` values, and X.400/EDI
-general names, are rejected explicitly until implemented.
+4523 components, including `otherName` values and X.400/EDI general names, are
+rejected explicitly until implemented.
 
 ### Core Attributes
 

@@ -121,6 +121,20 @@ fn test_der_oid(arcs: &[u64]) -> Vec<u8> {
     test_der_wrap(0x06, &content)
 }
 
+fn x509_name_der(rdns: &[(&[u64], &str)]) -> Vec<u8> {
+    let mut name = Vec::new();
+    for (oid, value) in rdns {
+        let mut attribute = test_der_oid(oid);
+        attribute.extend(test_der_wrap(0x0c, value.as_bytes()));
+        name.extend(test_der_wrap(0x31, &test_der_wrap(0x30, &attribute)));
+    }
+    test_der_wrap(0x30, &name)
+}
+
+fn directory_name_general_name_der(rdns: &[(&[u64], &str)]) -> Vec<u8> {
+    test_der_wrap(0xa4, &x509_name_der(rdns))
+}
+
 fn certificate_policy_extension_content(policy_oid: &[u64]) -> Vec<u8> {
     let policy_information = test_der_wrap(0x30, &test_der_oid(policy_oid));
     test_der_wrap(0x30, &policy_information)
@@ -160,10 +174,30 @@ fn general_subtree_der(base: Vec<u8>, minimum: Option<u8>, maximum: Option<u8>) 
 
 fn name_constraints_extension_content() -> Vec<u8> {
     let permitted = general_subtree_der(test_der_wrap(0x82, b"example.org"), Some(0), Some(3));
+    let permitted_directory = general_subtree_der(
+        directory_name_general_name_der(&[
+            (&[2, 5, 4, 11], "Allowed"),
+            (&[2, 5, 4, 10], "Example"),
+        ]),
+        Some(1),
+        Some(2),
+    );
     let excluded = general_subtree_der(test_der_wrap(0x81, b"blocked@example.org"), Some(1), None);
+    let excluded_directory = general_subtree_der(
+        directory_name_general_name_der(&[
+            (&[2, 5, 4, 11], "Blocked"),
+            (&[2, 5, 4, 10], "Example"),
+        ]),
+        None,
+        None,
+    );
     let mut content = Vec::new();
-    content.extend(test_der_wrap(0xa0, &permitted));
-    content.extend(test_der_wrap(0xa1, &excluded));
+    let mut permitted_subtrees = permitted;
+    permitted_subtrees.extend(permitted_directory);
+    let mut excluded_subtrees = excluded;
+    excluded_subtrees.extend(excluded_directory);
+    content.extend(test_der_wrap(0xa0, &permitted_subtrees));
+    content.extend(test_der_wrap(0xa1, &excluded_subtrees));
     test_der_wrap(0x30, &content)
 }
 
@@ -1510,7 +1544,8 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
             .values_equal(
                 &cert_pem,
                 &format!(
-                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, privateKeyValid 20240601000000Z, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }}, nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{}, minimum 0, maximum 3 }} }}, excludedSubtrees {{ {{ base rfc822Name:{}, minimum 1 }} }} }} }}",
+                    "{{ subject rdnSequence:{subject}, certificateValid generalizedTime:{valid_time_assertion}, privateKeyValid 20240601000000Z, subjectPublicKeyAlgID {subject_public_key_alg_id}, subjectKeyIdentifier {subject_key_identifier}, authorityKeyIdentifier {{ keyIdentifier {authority_key_identifier} }}, subjectAltName builtinNameForm:dNSName, policy {{ 1.2.3.4 }}, pathToName rdnSequence:{}, nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{}, minimum 0, maximum 3 }} }}, excludedSubtrees {{ {{ base rfc822Name:{}, minimum 1 }} }} }} }}",
+                    gser_quote("cn=Alice,ou=Allowed,o=Example"),
                     gser_quote("example.org"),
                     gser_quote("blocked@example.org")
                 ),
@@ -1560,6 +1595,39 @@ fn test_rfc4523_x509_exact_matching_rules_execute_gser_assertions() {
                 &format!(
                     "{{ nameConstraints {{ permittedSubtrees {{ {{ base dNSName:{}, maximum 4 }} }} }} }}",
                     gser_quote("example.org")
+                )
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ pathToName rdnSequence:{} }}",
+                    gser_quote("cn=Mallory,ou=Blocked,o=Example")
+                )
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ pathToName rdnSequence:{} }}",
+                    gser_quote("cn=Eve,ou=Other,o=Example")
+                )
+            )
+            .unwrap()
+    );
+    assert!(
+        !certificate_component_rule
+            .values_equal(
+                &cert_pem,
+                &format!(
+                    "{{ pathToName rdnSequence:{} }}",
+                    gser_quote("ou=Allowed,o=Example")
                 )
             )
             .unwrap()

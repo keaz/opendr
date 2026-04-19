@@ -5683,6 +5683,7 @@ struct X509CertificateAssertion {
     key_usage_flags: Option<u16>,
     subject_alt_name: Option<X509AltNameTypeAssertion>,
     policy_oids: Option<Vec<String>>,
+    path_to_name: Option<String>,
     name_constraints: Option<X509NameConstraintsAssertion>,
 }
 
@@ -6156,6 +6157,11 @@ fn x509_certificate_der_matches_assertion(
             return Ok(false);
         }
     }
+    if let Some(asserted_path_to_name) = assertion.path_to_name.as_ref()
+        && !certificate_allows_path_to_name(&certificate, asserted_path_to_name)?
+    {
+        return Ok(false);
+    }
     if let Some(asserted_name_constraints) = assertion.name_constraints.as_ref() {
         let Some(name_constraints) = certificate
             .iter_extensions()
@@ -6169,6 +6175,85 @@ fn x509_certificate_der_matches_assertion(
         }
     }
 
+    Ok(true)
+}
+
+fn certificate_allows_path_to_name(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+    asserted_name: &str,
+) -> Result<bool, String> {
+    let Some(name_constraints) = certificate
+        .iter_extensions()
+        .find(|extension| extension.oid.to_id_string() == "2.5.29.30")
+    else {
+        return Ok(true);
+    };
+
+    let name_constraints = parse_name_constraints_candidate_der(name_constraints.value)?;
+    path_to_name_allowed_by_name_constraints(asserted_name, &name_constraints)
+}
+
+fn path_to_name_allowed_by_name_constraints(
+    asserted_name: &str,
+    constraints: &X509NameConstraintsCandidate<'_>,
+) -> Result<bool, String> {
+    if let Some(excluded_subtrees) = constraints.excluded_subtrees.as_deref() {
+        for subtree in excluded_subtrees {
+            if directory_name_matches_subtree(asserted_name, subtree)? {
+                return Ok(false);
+            }
+        }
+    }
+
+    let Some(permitted_subtrees) = constraints.permitted_subtrees.as_deref() else {
+        return Ok(true);
+    };
+    let has_directory_name_constraint = permitted_subtrees.iter().any(|subtree| {
+        matches!(
+            subtree.base,
+            x509_parser::extensions::GeneralName::DirectoryName(_)
+        )
+    });
+    if !has_directory_name_constraint {
+        return Ok(true);
+    }
+
+    for subtree in permitted_subtrees {
+        if directory_name_matches_subtree(asserted_name, subtree)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn directory_name_matches_subtree(
+    asserted_name: &str,
+    subtree: &X509GeneralSubtreeCandidate<'_>,
+) -> Result<bool, String> {
+    let x509_parser::extensions::GeneralName::DirectoryName(base) = &subtree.base else {
+        return Ok(false);
+    };
+
+    let asserted = parse_dn(asserted_name)
+        .map_err(|err| format!("invalid pathToName assertion {asserted_name}: {err}"))?;
+    let base = normalize_x509_name(base)?;
+    let base =
+        parse_dn(&base).map_err(|err| format!("invalid directoryName subtree base: {err}"))?;
+    if !asserted.is_descendant_or_equal_of(&base) {
+        return Ok(false);
+    }
+
+    let distance = asserted.rdns().len() - base.rdns().len();
+    let distance = distance.to_string();
+    let minimum = subtree.minimum.as_deref().unwrap_or("0");
+    if compare_unsigned_decimal_strings(&distance, minimum)? == CmpOrdering::Less {
+        return Ok(false);
+    }
+    if let Some(maximum) = subtree.maximum.as_deref()
+        && compare_unsigned_decimal_strings(&distance, maximum)? == CmpOrdering::Greater
+    {
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -6639,6 +6724,7 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
         key_usage_flags: None,
         subject_alt_name: None,
         policy_oids: None,
+        path_to_name: None,
         name_constraints: None,
     };
 
@@ -6679,6 +6765,9 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
             "policy" if assertion.policy_oids.is_none() => {
                 assertion.policy_oids = Some(parse_cert_policy_set(rest)?);
             }
+            "pathToName" if assertion.path_to_name.is_none() => {
+                assertion.path_to_name = Some(parse_rfc4523_name(rest)?);
+            }
             "nameConstraints" if assertion.name_constraints.is_none() => {
                 assertion.name_constraints = Some(parse_name_constraints_assertion(rest)?);
             }
@@ -6693,14 +6782,10 @@ fn parse_certificate_assertion(value: &str) -> Result<X509CertificateAssertion, 
             | "keyUsage"
             | "subjectAltName"
             | "policy"
+            | "pathToName"
             | "nameConstraints" => {
                 return Err(format!(
                     "duplicate CertificateAssertion component {keyword}"
-                ));
-            }
-            "pathToName" => {
-                return Err(format!(
-                    "unsupported CertificateAssertion component {keyword}"
                 ));
             }
             other => {
