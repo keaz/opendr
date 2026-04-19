@@ -666,6 +666,19 @@ fn test_inet_org_person_employee_number_is_single_value() {
 }
 
 #[test]
+fn test_rfc4519_user_schema_loads_from_bundled_ldif_file() {
+    let mut schema = LdapSchema::with_core_schema();
+    schema
+        .load_ldif_str(include_str!("../resources/schema/core/rfc4519.ldif"))
+        .unwrap();
+
+    assert!(schema.get_attribute_type("objectClass").is_some());
+    assert!(schema.get_attribute_type("uniqueMember").is_some());
+    assert!(schema.get_object_class("person").is_some());
+    assert!(schema.get_object_class("groupOfNames").is_some());
+}
+
+#[test]
 fn test_rfc2798_inetorgperson_schema_loads_from_bundled_ldif_file() {
     let mut schema = LdapSchema::with_core_schema();
     schema

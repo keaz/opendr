@@ -1575,7 +1575,7 @@ opendr-setup hash-password 'StrongPass123'`}</code></pre>
                 <li><code>server.toml</code> with canonical runtime fields.</li>
                 <li><code>setup.state</code> to block accidental reconfiguration.</li>
                 <li><code>admin.ldif</code>, <code>base.ldif</code>, and optional <code>sample.ldif</code>.</li>
-                <li>Bundled schema LDIF files such as <code>core/rfc2798.ldif</code>, <code>core/rfc3672.ldif</code>, <code>core/rfc3671.ldif</code>, <code>posix/rfc2307.ldif</code>, <code>cosine/rfc4524.ldif</code>, and <code>x509/rfc4523.ldif</code> when <code>generate-schema</code> is used.</li>
+                <li>Bundled schema LDIF files such as <code>core/rfc4519.ldif</code>, <code>core/rfc2798.ldif</code>, <code>core/rfc3672.ldif</code>, <code>core/rfc3671.ldif</code>, <code>posix/rfc2307.ldif</code>, <code>cosine/rfc4524.ldif</code>, and <code>x509/rfc4523.ldif</code> when <code>generate-schema</code> is used.</li>
                 <li>Data and replication state directories.</li>
               </ul>
             </section>
@@ -1638,7 +1638,7 @@ opendr-setup --config-dir ./config generate-schema --bundle all --overwrite`}</c
                   <KeyValueTable
                     headings={["Bundle", "Standard coverage"]}
                     rows={[
-                      ["core", "RFC 4519 core user schema plus file-backed RFC 2798 inetOrgPerson, RFC 3672 LDAP subentries, and RFC 3671 collective attributes."],
+                      ["core", "File-backed RFC 4519 core user schema, RFC 2798 inetOrgPerson, RFC 3672 LDAP subentries, and RFC 3671 collective attributes."],
                       ["posix", "RFC 2307 POSIX/NIS account, group, shadow, host, network, service, protocol, RPC, netgroup, map, IEEE 802 device, and bootable device schema."],
                       ["cosine", "RFC 4524 COSINE account, document, domain, domain-related object, friendly country, RFC 822 local part, room, and simple security object schema."],
                       ["x509", "RFC 4523 X.509 certificate, CRL, certificate pair, supported algorithm, PKI user, PKI CA, and CRL distribution point schema. DER-backed values are validated; exact and component GSER assertions cover certificate identity, key identifiers, validity, private-key validity, key usage, subject alternative name types, policies, path-to-name checks, otherName string/OCTET STRING values, ediPartyName values, name constraints with asserted GeneralSubtree bounds, CRL date/range, CRL authority keys, full-name and name-relative distribution points, certificate pairs, and algorithm OIDs."],
