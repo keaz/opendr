@@ -89,6 +89,16 @@ verified client certificate that resolves to an existing LDAP DN.
   `replication.allow_insecure_provider_bind` development escape hatch is
   rejected under the production profile.
 
+## RFC 4513 Release Gate
+
+Run `scripts/ldap_interop_gate.sh` before claiming RFC 4513 production
+readiness. The gate starts production-profile fixtures, validates cleartext bind
+rejection, SASL PLAIN over StartTLS and LDAPS, malformed SASL PLAIN rejection,
+Root DSE SASL mechanism visibility, and SASL EXTERNAL over generated mutual-TLS
+client certificates. It writes sanitized command transcripts and server logs to
+`target/ldap-interop-gate/<timestamp>` unless `OPENDR_INTEROP_ARTIFACT_DIR` is
+set.
+
 ## Audit And Authorization Checklist
 
 - Keep `[audit].enabled = true`.

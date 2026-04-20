@@ -1121,8 +1121,10 @@ pnpm build`}</code></pre>
                 self <code>dn:</code> and <code>u:</code> authzid forms; proxy
                 authorization remains unsupported. SASL EXTERNAL is accepted
                 over verified mutual TLS when the client certificate maps to an
-                LDAP DN. User bind metadata is recorded through server-managed
-                operational attributes including{" "}
+                LDAP DN. The release gate in <code>scripts/ldap_interop_gate.sh</code>
+                must pass before claiming RFC 4513 production readiness. User
+                bind metadata is recorded through server-managed operational
+                attributes including{" "}
                 <code>lastSuccessfulLogin</code>, <code>lastFailedLogin</code>,
                 and <code>failedLoginCount</code>.
               </div>

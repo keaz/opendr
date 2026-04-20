@@ -28,20 +28,34 @@ OPENDR_ALIAS_DN=cn=alias,dc=example,dc=org \
 **Purpose**: Production-readiness interoperability gate for the advertised LDAP
 surface. The script can start an isolated OpenDR server, then runs OpenLDAP CLI,
 Python `ldap3`, and the Rust `ldap_ops_client` against the same StartTLS
-endpoint.
+endpoint. It writes a sanitized transcript, server stdout, and server stderr to
+`target/ldap-interop-gate/<timestamp>` by default.
 
 **What it covers**:
 1. OpenLDAP CLI Bind, StartTLS, Root DSE, Search, Add, Modify, Delete,
-   ModifyDN, Compare, paged results, server-side sort, subschema, and
-   operational attribute reads.
+   ModifyDN, Compare, paged results, server-side sort, subschema, operational
+   attribute reads, RFC 4513 cleartext-bind rejection, SASL PLAIN over StartTLS
+   and LDAPS, unsupported SASL proxy authzid rejection, and WhoAmI after simple
+   and SASL bind.
 2. Python `ldap3` Bind, StartTLS, Root DSE, and subschema reads.
 3. Rust `ldap_ops_client` Bind, Root DSE, Search, Add, Modify, Delete,
    ModifyDN, Compare, WhoAmI, and Password Modify.
+4. Generated mTLS fixtures for SASL EXTERNAL Root DSE advertising and bind over
+   StartTLS and LDAPS. OpenLDAP mTLS is attempted first; on SecureTransport
+   clients that cannot use PEM `TLS_CERT`/`TLS_KEY`, the script falls back to a
+   raw Python TLS client-cert LDAP check. Set
+   `OPENDR_INTEROP_REQUIRE_OPENLDAP_MTLS=1` to require OpenLDAP mTLS support.
 
 **Usage**:
 ```bash
 python3 -m pip install ldap3
 ./scripts/ldap_interop_gate.sh
+```
+
+To run the OpenLDAP/Rust checks without Python `ldap3`:
+
+```bash
+OPENDR_INTEROP_SKIP_LDAP3=1 ./scripts/ldap_interop_gate.sh
 ```
 
 To run against an already running server:
@@ -58,7 +72,7 @@ OPENDR_BIND_PW="$LOCAL_TEST_BIND_PASSWORD" \
 **Prerequisites**:
 - Rust and Cargo.
 - OpenLDAP command-line tools: `ldapsearch`, `ldapadd`, `ldapmodify`,
-  `ldapdelete`, `ldapcompare`, and `ldapmodrdn`.
+  `ldapdelete`, `ldapcompare`, `ldapmodrdn`, and `ldapwhoami`.
 - Python 3 with the `ldap3` package.
 - `openssl` when the script starts its own temporary server.
 
