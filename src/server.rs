@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use ldap_parser::filter::Filter;
 use ldap_parser::ldap::{
     AddRequest, AuthenticationChoice, BindRequest, Change, CompareRequest, ExtendedRequest,
-    MessageID, ModDnRequest, ModifyRequest, ProtocolOp, SearchRequest,
+    MessageID, ModDnRequest, ModifyRequest, ProtocolOp, SearchRequest, SearchScope,
 };
 use ldap_parser::parse_ldap_messages;
 use log::{error, info, warn};
@@ -26,7 +26,6 @@ use tokio_rustls::server::TlsStream;
 use crate::aci::{AciEngine, Permission};
 use crate::audit::{AuditEvent, AuditEventType, AuditLevel, AuditLogger};
 use crate::auth_metadata::AuthMetadataRecorder;
-#[cfg(test)]
 use crate::backend::SearchCandidateHint;
 use crate::backend::{
     BackendError, DirectoryBackend, DirectoryEntry, Modification, ModifyOperation,
@@ -34,7 +33,7 @@ use crate::backend::{
 };
 use crate::ber_decoder_fsm::BerDecoderFsmImpl;
 use crate::connection_pool::{ConnectionId, ConnectionPool, ResourceLimits};
-use crate::dn::dn_eq;
+use crate::dn::{dn_eq, parse_dn};
 use crate::extended_ops::{
     encode_password_modify_response_value, oids, parse_cancel_request_value,
     parse_password_modify_request_value,
@@ -62,9 +61,7 @@ use crate::real_time_propagation::is_dn_in_scope;
 use crate::referral::LdapReferralResolver;
 use crate::referral_fsm::ReferralResolver;
 use crate::replication::RenameChange;
-use crate::sasl_mechanisms::{
-    parse_sasl_external_authzid, plain_authzid_matches_authenticated_identity,
-};
+use crate::sasl_mechanisms::parse_sasl_external_authzid;
 use crate::schema::{LdapSchema, SchemaError, canonical_schema_attr_name, schema_definition_key};
 use crate::search_controls::{
     PAGED_RESULTS_OID, PagedResultsControl, SERVER_SIDE_SORT_REQUEST_OID,
@@ -84,6 +81,7 @@ use crate::sync_controls::{
     encode_sync_state_control,
 };
 use crate::tls::RustlsTlsHandler;
+use stringprep::saslprep;
 use uuid::Uuid;
 
 const MANAGE_DSA_IT_OID: &str = "2.16.840.1.113730.3.4.2";
@@ -472,6 +470,7 @@ impl Default for LegacyAuditConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LegacySecurityPolicy {
     pub allow_anonymous_bind: bool,
+    pub allow_unauthenticated_bind: bool,
     pub allow_cleartext_simple_bind: bool,
     pub allow_sasl_plain: bool,
     pub allow_sasl_external: bool,
@@ -483,6 +482,7 @@ impl LegacySecurityPolicy {
     pub const fn development() -> Self {
         Self {
             allow_anonymous_bind: true,
+            allow_unauthenticated_bind: false,
             allow_cleartext_simple_bind: true,
             allow_sasl_plain: true,
             allow_sasl_external: true,
@@ -494,6 +494,7 @@ impl LegacySecurityPolicy {
     pub const fn production() -> Self {
         Self {
             allow_anonymous_bind: false,
+            allow_unauthenticated_bind: false,
             allow_cleartext_simple_bind: false,
             allow_sasl_plain: true,
             allow_sasl_external: true,
@@ -524,6 +525,8 @@ pub struct LegacySecurityConfig {
     pub root_dn: Option<String>,
     pub security_policy: LegacySecurityPolicy,
     pub sasl_external_identity_map: HashMap<String, String>,
+    pub sasl_identity_search_attributes: Vec<String>,
+    pub naming_contexts: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -610,6 +613,20 @@ impl RequestContext {
         }
 
         crate::dn::canonicalize_dn(subject_common_name).ok()
+    }
+
+    fn sasl_identity_search_attributes(&self) -> &[String] {
+        self.security
+            .as_ref()
+            .map(|security| security.sasl_identity_search_attributes.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn naming_contexts(&self) -> &[String] {
+        self.security
+            .as_ref()
+            .map(|security| security.naming_contexts.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -3100,6 +3117,263 @@ pub(crate) async fn filter_search_entries_for_read_access(
     readable_entries
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SaslAuthorizationIdentity {
+    Dn(String),
+    User(String),
+}
+
+fn authzid_prefix_value<'a>(authzid: &'a str, prefix: &str) -> Option<&'a str> {
+    if authzid.len() < prefix.len() {
+        return None;
+    }
+    let (candidate, value) = authzid.split_at(prefix.len());
+    candidate.eq_ignore_ascii_case(prefix).then_some(value)
+}
+
+fn prepare_sasl_user_identity(identity: &str) -> Result<String, &'static str> {
+    saslprep(identity)
+        .map(|prepared| prepared.into_owned())
+        .map_err(|_| "invalid SASL authorization identity")
+}
+
+fn sasl_user_identities_match(left: &str, right: &str) -> bool {
+    match (
+        prepare_sasl_user_identity(left),
+        prepare_sasl_user_identity(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn parse_sasl_authorization_identity(
+    authzid: &str,
+) -> Result<Option<SaslAuthorizationIdentity>, &'static str> {
+    if authzid.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(dn) = authzid_prefix_value(authzid, "dn:") {
+        return crate::dn::canonicalize_dn(dn)
+            .map(SaslAuthorizationIdentity::Dn)
+            .map(Some)
+            .map_err(|_| "invalid SASL authorization identity");
+    }
+
+    if let Some(user) = authzid_prefix_value(authzid, "u:") {
+        return prepare_sasl_user_identity(user)
+            .map(SaslAuthorizationIdentity::User)
+            .map(Some);
+    }
+
+    Err("invalid SASL authorization identity")
+}
+
+fn authorization_identity_is_self(
+    requested: &SaslAuthorizationIdentity,
+    authcid: &str,
+    authenticated_dn: &str,
+) -> bool {
+    match requested {
+        SaslAuthorizationIdentity::Dn(dn) => crate::dn::dn_eq(dn, authenticated_dn),
+        SaslAuthorizationIdentity::User(user) => sasl_user_identities_match(user, authcid),
+    }
+}
+
+fn bind_identity_matches_entry(
+    entry: &DirectoryEntry,
+    identity: &str,
+    prepared_identity: Option<&str>,
+    search_attributes: &[String],
+) -> bool {
+    let rdn_matches = parse_dn(&entry.dn)
+        .ok()
+        .map(|dn| {
+            dn.rdns()
+                .first()
+                .into_iter()
+                .flat_map(|rdn| rdn.avas().iter().map(|ava| ava.value().to_string()))
+                .any(|value| {
+                    prepared_identity.map_or_else(
+                        || value == identity,
+                        |prepared| sasl_user_identities_match(&value, prepared),
+                    )
+                })
+        })
+        .unwrap_or(false);
+    if rdn_matches {
+        return true;
+    }
+
+    for attribute in search_attributes {
+        if let Some(values) = entry.attributes.get(&attribute.to_ascii_lowercase())
+            && values.iter().any(|value| {
+                prepared_identity.map_or_else(
+                    || value == identity,
+                    |prepared| sasl_user_identities_match(value, prepared),
+                )
+            })
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub(crate) async fn resolve_bind_identity(
+    backend: &dyn DirectoryBackend,
+    request_context: &RequestContext,
+    identity: &str,
+) -> Result<Option<String>, String> {
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return Ok(None);
+    }
+
+    let mut matches = HashSet::new();
+
+    if let Ok(canonical_dn) = crate::dn::canonicalize_dn(identity)
+        && backend
+            .get_entry(&canonical_dn)
+            .await
+            .map_err(|err| err.to_string())?
+            .is_some()
+    {
+        matches.insert(canonical_dn);
+    }
+
+    let prepared_identity = prepare_sasl_user_identity(identity).ok();
+    let naming_contexts = request_context.naming_contexts();
+    let search_attributes = request_context.sasl_identity_search_attributes();
+
+    for attribute in search_attributes {
+        for base_dn in naming_contexts {
+            let report = backend
+                .search_entries_with_hint_report(
+                    base_dn,
+                    SearchScope(2),
+                    Some(SearchCandidateHint::Equality {
+                        attribute: attribute.clone(),
+                        value: identity.to_string(),
+                    }),
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            for entry in report.entries {
+                if bind_identity_matches_entry(
+                    &entry,
+                    identity,
+                    prepared_identity.as_deref(),
+                    std::slice::from_ref(attribute),
+                ) {
+                    matches.insert(entry.dn);
+                }
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        for base_dn in naming_contexts {
+            let entries = backend
+                .search_entries(base_dn, SearchScope(2))
+                .await
+                .map_err(|err| err.to_string())?;
+            for entry in entries {
+                if bind_identity_matches_entry(
+                    &entry,
+                    identity,
+                    prepared_identity.as_deref(),
+                    search_attributes,
+                ) {
+                    matches.insert(entry.dn);
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err("ambiguous SASL identity".to_string()),
+    }
+}
+
+fn bind_identity_is_root_dn(identity: &str, request_context: &RequestContext) -> bool {
+    request_context
+        .security
+        .as_ref()
+        .and_then(|security| security.root_dn.as_deref())
+        .map(|root_dn| dn_eq(identity, root_dn))
+        .unwrap_or(false)
+}
+
+pub(crate) async fn authorize_sasl_authorization_identity(
+    backend: &dyn DirectoryBackend,
+    request_context: &RequestContext,
+    authenticated_dn: &str,
+    authcid: &str,
+    authzid: &str,
+) -> Result<String, (&'static str, ResultCode)> {
+    let Some(requested_authzid) = parse_sasl_authorization_identity(authzid)
+        .map_err(|diagnostic| (diagnostic, ResultCode::InvalidCredentials))?
+    else {
+        return Ok(authenticated_dn.to_string());
+    };
+
+    if authorization_identity_is_self(&requested_authzid, authcid, authenticated_dn) {
+        return Ok(authenticated_dn.to_string());
+    }
+
+    let requested_dn = match requested_authzid {
+        SaslAuthorizationIdentity::Dn(dn) => dn,
+        SaslAuthorizationIdentity::User(user) => {
+            resolve_bind_identity(backend, request_context, &user)
+                .await
+                .map_err(|_| ("invalid credentials", ResultCode::InvalidCredentials))?
+                .ok_or(("invalid credentials", ResultCode::InvalidCredentials))?
+        }
+    };
+
+    if backend
+        .get_entry(&requested_dn)
+        .await
+        .map_err(|_| ("backend failure", ResultCode::Unavailable))?
+        .is_none()
+    {
+        return Err(("invalid credentials", ResultCode::InvalidCredentials));
+    }
+
+    if dn_eq(&requested_dn, authenticated_dn) {
+        return Ok(requested_dn);
+    }
+
+    if bind_identity_is_root_dn(authenticated_dn, request_context) {
+        return Ok(requested_dn);
+    }
+
+    let Some(security) = request_context.security.as_ref() else {
+        return Err(("proxy authorization denied", ResultCode::InvalidCredentials));
+    };
+    let Some(aci_engine) = security.access_control.as_ref() else {
+        return Err(("proxy authorization denied", ResultCode::InvalidCredentials));
+    };
+
+    aci_engine
+        .check_permission_with_backend(
+            Some(authenticated_dn),
+            &requested_dn,
+            None,
+            Permission::Proxy,
+            backend,
+        )
+        .await
+        .map_err(|_| ("proxy authorization denied", ResultCode::InvalidCredentials))?;
+
+    Ok(requested_dn)
+}
+
 struct SaslPlainCredentialsRef<'a> {
     authzid: &'a str,
     authcid: &'a str,
@@ -3165,8 +3439,8 @@ async fn handle_bind_request_with_session_and_context(
 
     match request.authentication {
         AuthenticationChoice::Simple(password) => {
-            let dn = request.name.0.as_ref().trim().to_owned();
-            if dn.is_empty() && password.as_ref().is_empty() {
+            let trace_dn = request.name.0.as_ref().trim().to_owned();
+            if trace_dn.is_empty() && password.as_ref().is_empty() {
                 if !security_policy(request_context).allow_anonymous_bind {
                     session.clear();
                     log_simple_bind_failure(
@@ -3190,13 +3464,53 @@ async fn handle_bind_request_with_session_and_context(
                 return Ok(());
             }
 
+            if !trace_dn.is_empty() && password.as_ref().is_empty() {
+                if !security_policy(request_context).allow_unauthenticated_bind {
+                    session.clear();
+                    log_simple_bind_failure(
+                        request_context,
+                        &trace_dn,
+                        "unauthenticated bind is disabled by security policy",
+                    )
+                    .await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::UnwillingToPerform,
+                        "unauthenticated bind is disabled by security policy",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                session.clear();
+                log_anonymous_bind(request_context).await;
+                send_bind_success(socket, message_id).await?;
+                return Ok(());
+            }
+
+            let dn = match crate::dn::canonicalize_dn(&trace_dn) {
+                Ok(dn) if !dn.is_empty() => dn,
+                _ => {
+                    session.clear();
+                    log_simple_bind_failure(request_context, &trace_dn, "invalid DN syntax").await;
+                    send_bind_response(
+                        socket,
+                        message_id,
+                        ResultCode::InvalidDnSyntax,
+                        "invalid DN syntax",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
             if !connection_is_secure
                 && !security_policy(request_context).allow_cleartext_simple_bind
             {
                 session.clear();
                 log_simple_bind_failure(
                     request_context,
-                    &dn,
+                    &trace_dn,
                     "simple bind requires TLS by security policy",
                 )
                 .await;
@@ -3212,18 +3526,14 @@ async fn handle_bind_request_with_session_and_context(
 
             match backend.authenticate(&dn, password.as_ref()).await {
                 Ok(true) => {
-                    session.bind(dn);
+                    session.bind(dn.clone());
                     record_authentication_success_metadata_with_context(
                         request_context,
                         backend,
-                        session.bound_dn().unwrap_or(""),
+                        &dn,
                     )
                     .await;
-                    log_simple_bind_success(
-                        request_context,
-                        session.bound_dn().unwrap_or("anonymous"),
-                    )
-                    .await;
+                    log_simple_bind_success(request_context, &dn).await;
                     send_bind_success(socket, message_id).await?;
                 }
                 Ok(false) => {
@@ -3246,7 +3556,7 @@ async fn handle_bind_request_with_session_and_context(
                 Err(err) => {
                     session.clear();
                     error!("Backend authentication error for {}: {}", dn, err);
-                    log_simple_bind_failure(request_context, &dn, "backend failure").await;
+                    log_simple_bind_failure(request_context, &trace_dn, "backend failure").await;
                     send_bind_response(
                         socket,
                         message_id,
@@ -3313,7 +3623,7 @@ async fn handle_bind_request_with_session_and_context(
                     send_bind_response(
                         socket,
                         message_id,
-                        ResultCode::InvalidCredentials,
+                        ResultCode::InappropriateAuthentication,
                         "SASL EXTERNAL requires a verified client certificate",
                     )
                     .await?;
@@ -3344,40 +3654,41 @@ async fn handle_bind_request_with_session_and_context(
                     }
                 };
 
-                if !plain_authzid_matches_authenticated_identity(
-                    authzid,
-                    &external_dn,
-                    &external_dn,
-                ) {
-                    session.clear();
-                    log_sasl_bind(
-                        request_context,
-                        external_dn.as_str(),
-                        "EXTERNAL",
-                        false,
-                        Some("proxy authorization is not supported"),
-                    )
-                    .await;
-                    send_bind_response(
-                        socket,
-                        message_id,
-                        ResultCode::InappropriateAuthentication,
-                        "proxy authorization is not supported",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
                 match backend.get_entry(&external_dn).await {
                     Ok(Some(_)) => {
-                        session.bind(external_dn.clone());
+                        let authz_dn = match authorize_sasl_authorization_identity(
+                            backend,
+                            request_context,
+                            &external_dn,
+                            &external_dn,
+                            authzid,
+                        )
+                        .await
+                        {
+                            Ok(authz_dn) => authz_dn,
+                            Err((diagnostic, result_code)) => {
+                                session.clear();
+                                log_sasl_bind(
+                                    request_context,
+                                    external_dn.as_str(),
+                                    "EXTERNAL",
+                                    false,
+                                    Some(diagnostic),
+                                )
+                                .await;
+                                send_bind_response(socket, message_id, result_code, diagnostic)
+                                    .await?;
+                                return Ok(());
+                            }
+                        };
+                        session.bind(authz_dn.clone());
                         record_authentication_success_metadata_with_context(
                             request_context,
                             backend,
                             &external_dn,
                         )
                         .await;
-                        log_sasl_bind(request_context, &external_dn, "EXTERNAL", true, None).await;
+                        log_sasl_bind(request_context, &authz_dn, "EXTERNAL", true, None).await;
                         send_bind_success(socket, message_id).await?;
                     }
                     Ok(None) => {
@@ -3494,27 +3805,14 @@ async fn handle_bind_request_with_session_and_context(
                 Ok(parsed) => parsed,
                 Err(err) => {
                     session.clear();
-                    log_sasl_bind(
-                        request_context,
-                        request.name.0.as_ref().trim(),
-                        "PLAIN",
-                        false,
-                        Some(err),
-                    )
-                    .await;
+                    log_sasl_bind(request_context, "anonymous", "PLAIN", false, Some(err)).await;
                     send_bind_response(socket, message_id, ResultCode::InvalidCredentials, err)
                         .await?;
                     return Ok(());
                 }
             };
 
-            let bind_dn = if request.name.0.as_ref().trim().is_empty() {
-                parsed.authcid.to_owned()
-            } else {
-                request.name.0.as_ref().trim().to_owned()
-            };
-
-            if bind_dn.is_empty() {
+            if parsed.authcid.is_empty() {
                 session.clear();
                 log_sasl_bind(
                     request_context,
@@ -3534,53 +3832,46 @@ async fn handle_bind_request_with_session_and_context(
                 return Ok(());
             }
 
-            if !plain_authzid_matches_authenticated_identity(
-                parsed.authzid,
-                parsed.authcid,
-                &bind_dn,
-            ) {
-                session.clear();
-                log_sasl_bind(
-                    request_context,
-                    &bind_dn,
-                    "PLAIN",
-                    false,
-                    Some("proxy authorization is not supported"),
-                )
-                .await;
-                send_bind_response(
-                    socket,
-                    message_id,
-                    ResultCode::InappropriateAuthentication,
-                    "proxy authorization is not supported",
-                )
-                .await?;
-                return Ok(());
-            }
+            let authenticated_dn =
+                match resolve_bind_identity(backend, request_context, parsed.authcid).await {
+                    Ok(Some(bind_dn)) => bind_dn,
+                    Ok(None) | Err(_) => {
+                        session.clear();
+                        log_sasl_bind(
+                            request_context,
+                            parsed.authcid,
+                            "PLAIN",
+                            false,
+                            Some("invalid credentials"),
+                        )
+                        .await;
+                        send_bind_response(
+                            socket,
+                            message_id,
+                            ResultCode::InvalidCredentials,
+                            "invalid credentials",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
 
-            match backend.authenticate(&bind_dn, parsed.password).await {
-                Ok(true) => {
-                    session.bind(bind_dn.clone());
-                    record_authentication_success_metadata_with_context(
-                        request_context,
-                        backend,
-                        &bind_dn,
-                    )
-                    .await;
-                    log_sasl_bind(request_context, &bind_dn, "PLAIN", true, None).await;
-                    send_bind_success(socket, message_id).await?;
-                }
+            match backend
+                .authenticate(&authenticated_dn, parsed.password)
+                .await
+            {
+                Ok(true) => {}
                 Ok(false) => {
                     session.clear();
                     record_authentication_failure_metadata_with_context(
                         request_context,
                         backend,
-                        &bind_dn,
+                        &authenticated_dn,
                     )
                     .await;
                     log_sasl_bind(
                         request_context,
-                        &bind_dn,
+                        parsed.authcid,
                         "PLAIN",
                         false,
                         Some("invalid credentials"),
@@ -3593,13 +3884,17 @@ async fn handle_bind_request_with_session_and_context(
                         "invalid credentials",
                     )
                     .await?;
+                    return Ok(());
                 }
                 Err(err) => {
                     session.clear();
-                    error!("Backend SASL authentication error for {}: {}", bind_dn, err);
+                    error!(
+                        "Backend SASL authentication error for {}: {}",
+                        authenticated_dn, err
+                    );
                     log_sasl_bind(
                         request_context,
-                        &bind_dn,
+                        parsed.authcid,
                         "PLAIN",
                         false,
                         Some("backend failure"),
@@ -3612,8 +3907,44 @@ async fn handle_bind_request_with_session_and_context(
                         "backend failure",
                     )
                     .await?;
+                    return Ok(());
                 }
             }
+
+            let authz_dn = match authorize_sasl_authorization_identity(
+                backend,
+                request_context,
+                &authenticated_dn,
+                parsed.authcid,
+                parsed.authzid,
+            )
+            .await
+            {
+                Ok(authz_dn) => authz_dn,
+                Err((diagnostic, result_code)) => {
+                    session.clear();
+                    log_sasl_bind(
+                        request_context,
+                        &authenticated_dn,
+                        "PLAIN",
+                        false,
+                        Some(diagnostic),
+                    )
+                    .await;
+                    send_bind_response(socket, message_id, result_code, diagnostic).await?;
+                    return Ok(());
+                }
+            };
+
+            session.bind(authz_dn.clone());
+            record_authentication_success_metadata_with_context(
+                request_context,
+                backend,
+                &authenticated_dn,
+            )
+            .await;
+            log_sasl_bind(request_context, &authz_dn, "PLAIN", true, None).await;
+            send_bind_success(socket, message_id).await?;
         }
     }
 
@@ -8875,23 +9206,6 @@ async fn handle_extended_request_with_session_and_registry(
 
     if oid == WHO_AM_I_OID {
         let target_dn = session.bound_dn().unwrap_or("");
-        if !authorize_operation(
-            socket,
-            None,
-            message_id,
-            ResponseOp::Extended,
-            session,
-            request_context,
-            Permission::Read,
-            "whoami",
-            target_dn,
-            None,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-
         let authz_id = session
             .bound_dn()
             .map(|dn| format!("dn:{}", dn))
@@ -9561,6 +9875,12 @@ mod tests {
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
                 security_policy: LegacySecurityPolicy::default(),
                 sasl_external_identity_map: HashMap::new(),
+                sasl_identity_search_attributes: vec![
+                    "uid".to_string(),
+                    "cn".to_string(),
+                    "mail".to_string(),
+                ],
+                naming_contexts: vec!["dc=example,dc=org".to_string()],
             })),
             metrics: None,
             auth_metadata: None,
@@ -10703,6 +11023,12 @@ mod tests {
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
                 security_policy: LegacySecurityPolicy::default(),
                 sasl_external_identity_map: HashMap::new(),
+                sasl_identity_search_attributes: vec![
+                    "uid".to_string(),
+                    "cn".to_string(),
+                    "mail".to_string(),
+                ],
+                naming_contexts: vec!["dc=example,dc=org".to_string()],
             })),
             metrics: None,
             auth_metadata: None,
@@ -10795,6 +11121,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sasl_plain_bind_ignores_name_and_honors_proxy_authorization_policy() {
+        let backend = MockBackend::from_credentials([
+            ("cn=proxy-agent,dc=example,dc=org", b"agent-secret".to_vec()),
+            (
+                "cn=proxy-target,dc=example,dc=org",
+                b"target-secret".to_vec(),
+            ),
+        ]);
+        let aci_engine = Arc::new(AciEngine::restrictive());
+        aci_engine
+            .add_rule(
+                crate::aci::AciRuleBuilder::grant("proxy-agent-may-proxy-target")
+                    .target_dn("cn=proxy-target,dc=example,dc=org")
+                    .permission(crate::aci::Permission::Proxy)
+                    .subject_user("cn=proxy-agent,dc=example,dc=org")
+                    .build()
+                    .unwrap(),
+            )
+            .await;
+        let request_context = RequestContext {
+            client_ip: None,
+            session_id: None,
+            security: Some(Arc::new(LegacySecurityConfig {
+                audit_logger: None,
+                audit_config: LegacyAuditConfig::default(),
+                access_control: Some(aci_engine),
+                root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
+                security_policy: LegacySecurityPolicy::default(),
+                sasl_external_identity_map: HashMap::new(),
+                sasl_identity_search_attributes: vec![
+                    "uid".to_string(),
+                    "cn".to_string(),
+                    "mail".to_string(),
+                ],
+                naming_contexts: vec!["dc=example,dc=org".to_string()],
+            })),
+            metrics: None,
+            auth_metadata: None,
+            client_certificate_authz_dn: Arc::new(RwLock::new(None)),
+        };
+        let mut session = ConnectionSession::default();
+        let request = BindRequest {
+            version: 3,
+            name: LdapDN(Cow::Owned("cn=ignored,dc=example,dc=org".to_string())),
+            authentication: AuthenticationChoice::Sasl(SaslCredentials {
+                mechanism: LdapString(Cow::Owned("PLAIN".to_string())),
+                credentials: Some(Cow::Owned(
+                    b"u:proxy-target\0proxy-agent\0agent-secret".to_vec(),
+                )),
+            }),
+        };
+
+        let (mut server_stream, mut client_stream) = connected_stream_pair().await;
+        let request_controls = RequestControls::default();
+        handle_bind_request_with_session_and_context(
+            &mut server_stream,
+            &backend,
+            5,
+            request,
+            &mut session,
+            &request_context,
+            true,
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            session.bound_dn(),
+            Some("cn=proxy-target,dc=example,dc=org")
+        );
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn compare_denial_returns_insufficient_access_and_audits_denial() {
         let backend = MockBackend::new();
         let temp_file = NamedTempFile::new().unwrap();
@@ -10810,6 +11219,12 @@ mod tests {
                 root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
                 security_policy: LegacySecurityPolicy::default(),
                 sasl_external_identity_map: HashMap::new(),
+                sasl_identity_search_attributes: vec![
+                    "uid".to_string(),
+                    "cn".to_string(),
+                    "mail".to_string(),
+                ],
+                naming_contexts: vec!["dc=example,dc=org".to_string()],
             })),
             metrics: None,
             auth_metadata: None,
@@ -10907,6 +11322,74 @@ mod tests {
                         .as_ref()
                         .map(|value| value.as_ref()),
                     Some(b"dn:cn=admin,dc=example,dc=org".as_ref())
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn whoami_extended_request_does_not_require_read_access_to_bound_entry() {
+        let request = ExtendedRequest {
+            request_name: LdapOID(Cow::Owned("1.3.6.1.4.1.4203.1.11.3".to_string())),
+            request_value: None,
+        };
+        let request_context = RequestContext {
+            client_ip: Some("127.0.0.1".parse().unwrap()),
+            session_id: Some(88),
+            security: Some(Arc::new(LegacySecurityConfig {
+                audit_logger: None,
+                audit_config: LegacyAuditConfig::default(),
+                access_control: Some(Arc::new(AciEngine::restrictive())),
+                root_dn: Some("cn=directory manager,dc=example,dc=org".to_string()),
+                security_policy: LegacySecurityPolicy::default(),
+                sasl_external_identity_map: HashMap::new(),
+                sasl_identity_search_attributes: vec![
+                    "uid".to_string(),
+                    "cn".to_string(),
+                    "mail".to_string(),
+                ],
+                naming_contexts: vec!["dc=example,dc=org".to_string()],
+            })),
+            metrics: None,
+            auth_metadata: None,
+            client_certificate_authz_dn: Arc::new(RwLock::new(None)),
+        };
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut server_stream = ConnectionStream::Plain(server_stream);
+        let backend = MockBackend::default();
+        let mut session = ConnectionSession::default();
+        session.bind("cn=proxy-target,dc=example,dc=org".to_string());
+        let request_controls = RequestControls::default();
+
+        handle_extended_request_with_session(
+            &mut server_stream,
+            &backend,
+            6,
+            request,
+            &mut session,
+            None,
+            &request_context,
+            &request_controls,
+        )
+        .await
+        .unwrap();
+
+        let response = read_response(&mut client_stream).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        match &messages[0].protocol_op {
+            ProtocolOp::ExtendedResponse(extended_response) => {
+                assert_eq!(
+                    extended_response.result.result_code,
+                    ParserResultCode::Success
+                );
+                assert_eq!(
+                    extended_response
+                        .response_value
+                        .as_ref()
+                        .map(|value| value.as_ref()),
+                    Some(b"dn:cn=proxy-target,dc=example,dc=org".as_ref())
                 );
             }
             other => panic!("unexpected response: {:?}", other),

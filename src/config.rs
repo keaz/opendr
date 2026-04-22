@@ -635,6 +635,10 @@ pub struct SecuritySettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_anonymous_bind: Option<bool>,
 
+    /// Override whether the simple unauthenticated mechanism is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_unauthenticated_bind: Option<bool>,
+
     /// Override whether non-anonymous simple bind is accepted before TLS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_cleartext_simple_bind: Option<bool>,
@@ -650,6 +654,10 @@ pub struct SecuritySettings {
     /// Map verified client certificate subject CN values to LDAP authorization DNs.
     #[serde(default)]
     pub sasl_external_identity_map: HashMap<String, String>,
+
+    /// Ordered attributes consulted when resolving SASL authcid or `u:` authzid values.
+    #[serde(default = "default_sasl_identity_search_attributes")]
+    pub sasl_identity_search_attributes: Vec<String>,
 
     /// Override whether the Password Modify extended operation is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -739,6 +747,10 @@ fn default_cleanup_interval_secs() -> u64 {
 }
 fn default_max_concurrent_operations() -> usize {
     100
+}
+
+fn default_sasl_identity_search_attributes() -> Vec<String> {
+    vec!["uid".to_string(), "cn".to_string(), "mail".to_string()]
 }
 
 fn default_backend_type() -> String {
@@ -1159,10 +1171,12 @@ impl Default for SecuritySettings {
         Self {
             profile: default_security_profile(),
             allow_anonymous_bind: None,
+            allow_unauthenticated_bind: None,
             allow_cleartext_simple_bind: None,
             allow_sasl_plain: None,
             allow_sasl_external: None,
             sasl_external_identity_map: HashMap::new(),
+            sasl_identity_search_attributes: default_sasl_identity_search_attributes(),
             allow_password_modify: None,
             root_dse_requires_authentication: None,
         }
@@ -1179,6 +1193,9 @@ impl SecuritySettings {
 
         if let Some(value) = self.allow_anonymous_bind {
             policy.allow_anonymous_bind = value;
+        }
+        if let Some(value) = self.allow_unauthenticated_bind {
+            policy.allow_unauthenticated_bind = value;
         }
         if let Some(value) = self.allow_cleartext_simple_bind {
             policy.allow_cleartext_simple_bind = value;
@@ -1976,6 +1993,19 @@ impl ServerConfig {
                 ))
             })?;
         }
+        if self.security.sasl_identity_search_attributes.is_empty() {
+            return Err(ConfigError::ValidationError(
+                "security.sasl_identity_search_attributes must not be empty".to_string(),
+            ));
+        }
+        for attribute in &self.security.sasl_identity_search_attributes {
+            if attribute.trim().is_empty() {
+                return Err(ConfigError::ValidationError(
+                    "security.sasl_identity_search_attributes cannot contain an empty attribute name"
+                        .to_string(),
+                ));
+            }
+        }
         self.validate_production_root_secret_source(&resolved_root_password)?;
 
         // Validate replication settings
@@ -2188,6 +2218,7 @@ profile = "Production"
         let policy = config.security.effective_policy();
 
         assert!(!policy.allow_anonymous_bind);
+        assert!(!policy.allow_unauthenticated_bind);
         assert!(!policy.allow_cleartext_simple_bind);
         assert!(policy.allow_sasl_plain);
         assert!(policy.allow_sasl_external);
@@ -2199,18 +2230,21 @@ profile = "Production"
 [security]
 profile = "production"
 allow_anonymous_bind = true
+allow_unauthenticated_bind = true
 allow_cleartext_simple_bind = true
 allow_sasl_plain = false
 allow_sasl_external = false
 allow_password_modify = false
 root_dse_requires_authentication = true
 sasl_external_identity_map = { "opendr-client" = "CN=admin,DC=example,DC=org" }
+sasl_identity_search_attributes = ["uid", "mail"]
 "#,
         )
         .unwrap();
         let policy = config.security.effective_policy();
 
         assert!(policy.allow_anonymous_bind);
+        assert!(policy.allow_unauthenticated_bind);
         assert!(policy.allow_cleartext_simple_bind);
         assert!(!policy.allow_sasl_plain);
         assert!(!policy.allow_sasl_external);
@@ -2223,6 +2257,28 @@ sasl_external_identity_map = { "opendr-client" = "CN=admin,DC=example,DC=org" }
                 .get("opendr-client")
                 .map(String::as_str),
             Some("CN=admin,DC=example,DC=org")
+        );
+        assert_eq!(
+            config.security.sasl_identity_search_attributes,
+            vec!["uid".to_string(), "mail".to_string()]
+        );
+    }
+
+    #[test]
+    fn security_identity_search_attributes_must_not_be_empty() {
+        let err = ServerConfig::from_toml_str(
+            r#"
+[security]
+sasl_identity_search_attributes = []
+"#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("security.sasl_identity_search_attributes must not be empty")
         );
     }
 

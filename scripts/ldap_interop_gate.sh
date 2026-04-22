@@ -8,6 +8,16 @@ BIND_DN="${OPENDR_BIND_DN:-cn=admin,${BASE_DN}}"
 BIND_PW="${OPENDR_BIND_PW:-InteropSecret-${RANDOM}-$$}"
 SASL_AUTHCID="${OPENDR_SASL_AUTHCID:-${BIND_DN%%,*}}"
 SASL_AUTHCID="${SASL_AUTHCID#*=}"
+PROXY_AGENT_DN="${OPENDR_PROXY_AGENT_DN:-cn=proxy-agent,${BASE_DN}}"
+PROXY_AGENT_PW="${OPENDR_PROXY_AGENT_PW:-ProxyAgentSecret-${RANDOM}-$$}"
+PROXY_AUTHCID="${OPENDR_PROXY_AUTHCID:-${PROXY_AGENT_DN%%,*}}"
+PROXY_AUTHCID="${PROXY_AUTHCID#*=}"
+PROXY_TARGET_DN="${OPENDR_PROXY_TARGET_DN:-cn=proxy-target,${BASE_DN}}"
+PROXY_TARGET_AUTHCID="${OPENDR_PROXY_TARGET_AUTHCID:-${PROXY_TARGET_DN%%,*}}"
+PROXY_TARGET_AUTHCID="${PROXY_TARGET_AUTHCID#*=}"
+PROXY_DENIED_DN="${OPENDR_PROXY_DENIED_DN:-cn=proxy-denied,${BASE_DN}}"
+PROXY_DENIED_AUTHCID="${OPENDR_PROXY_DENIED_AUTHCID:-${PROXY_DENIED_DN%%,*}}"
+PROXY_DENIED_AUTHCID="${PROXY_DENIED_AUTHCID#*=}"
 RUNTIME="${OPENDR_RUNTIME:-fsm}"
 START_SERVER="${OPENDR_INTEROP_START_SERVER:-1}"
 LDAP_URL="${OPENDR_LDAP_URL:-}"
@@ -47,6 +57,7 @@ init_artifacts() {
 redact_text() {
   local text="$1"
   text="${text//${BIND_PW}/<redacted-password>}"
+  text="${text//${PROXY_AGENT_PW}/<redacted-password>}"
   printf '%s' "${text}"
 }
 
@@ -236,6 +247,21 @@ expect_mtls_whoami() {
   fi
 }
 
+expect_mtls_ldapwhoami_failure() {
+  local label="$1"
+  shift
+  local output status
+  set +e
+  output="$(run_mtls_ldapwhoami "$@" 2>&1)"
+  status=$?
+  set -e
+  record_command_result "${label}" "${status}" "${output}"
+  if [[ "${status}" -eq 0 ]]; then
+    echo "${label}: expected ldapwhoami to fail" >&2
+    return 1
+  fi
+}
+
 expect_ldapcompare_true() {
   set +e
   run_ldapcompare "$@" >/dev/null
@@ -289,6 +315,50 @@ start_temp_server() {
   mkdir -p "${WORK_DIR}/config" "${WORK_DIR}/certs" "${WORK_DIR}/data"
   printf '%s' "${BIND_PW}" >"${WORK_DIR}/config/root_password.txt"
   chmod 600 "${WORK_DIR}/config/root_password.txt"
+  cat >"${WORK_DIR}/config/base.ldif" <<EOF
+dn: ${BASE_DN}
+objectClass: top
+objectClass: domain
+dc: example
+EOF
+  cat >"${WORK_DIR}/config/admin.ldif" <<EOF
+dn: ${BIND_DN}
+objectClass: top
+objectClass: person
+cn: ${SASL_AUTHCID}
+sn: Administrator
+userPassword: ${BIND_PW}
+
+dn: ${PROXY_AGENT_DN}
+objectClass: top
+objectClass: person
+cn: ${PROXY_AUTHCID}
+sn: Agent
+userPassword: ${PROXY_AGENT_PW}
+
+dn: ${PROXY_TARGET_DN}
+objectClass: top
+objectClass: person
+cn: ${PROXY_TARGET_AUTHCID}
+sn: Target
+userPassword: ProxyTargetSecret123!
+
+dn: ${PROXY_DENIED_DN}
+objectClass: top
+objectClass: person
+cn: ${PROXY_DENIED_AUTHCID}
+sn: Denied
+userPassword: ProxyDeniedSecret123!
+EOF
+  cat >"${WORK_DIR}/config/aci.toml" <<EOF
+[[rules]]
+name = "proxy-agent-may-proxy-target"
+effect = "grant"
+priority = 100
+permissions = ["proxy"]
+target = { dn = "${PROXY_TARGET_DN}" }
+subject = { user = "${PROXY_AGENT_DN}" }
+EOF
 
   openssl req -x509 -newkey rsa:2048 -nodes \
     -subj "/CN=localhost" \
@@ -339,7 +409,9 @@ enabled = false
 enabled = false
 
 [access_control]
-enabled = false
+enabled = true
+default_policy = "deny"
+rules_file = "config/aci.toml"
 
 [rate_limit]
 enabled = false
@@ -424,6 +496,50 @@ start_mtls_temp_server() {
   mkdir -p "${MTLS_WORK_DIR}/config" "${MTLS_WORK_DIR}/certs" "${MTLS_WORK_DIR}/data"
   printf '%s' "${BIND_PW}" >"${MTLS_WORK_DIR}/config/root_password.txt"
   chmod 600 "${MTLS_WORK_DIR}/config/root_password.txt"
+  cat >"${MTLS_WORK_DIR}/config/base.ldif" <<EOF
+dn: ${BASE_DN}
+objectClass: top
+objectClass: domain
+dc: example
+EOF
+  cat >"${MTLS_WORK_DIR}/config/admin.ldif" <<EOF
+dn: ${BIND_DN}
+objectClass: top
+objectClass: person
+cn: ${SASL_AUTHCID}
+sn: Administrator
+userPassword: ${BIND_PW}
+
+dn: ${PROXY_AGENT_DN}
+objectClass: top
+objectClass: person
+cn: ${PROXY_AUTHCID}
+sn: Agent
+userPassword: ${PROXY_AGENT_PW}
+
+dn: ${PROXY_TARGET_DN}
+objectClass: top
+objectClass: person
+cn: ${PROXY_TARGET_AUTHCID}
+sn: Target
+userPassword: ProxyTargetSecret123!
+
+dn: ${PROXY_DENIED_DN}
+objectClass: top
+objectClass: person
+cn: ${PROXY_DENIED_AUTHCID}
+sn: Denied
+userPassword: ProxyDeniedSecret123!
+EOF
+  cat >"${MTLS_WORK_DIR}/config/aci.toml" <<EOF
+[[rules]]
+name = "proxy-agent-may-proxy-target"
+effect = "grant"
+priority = 100
+permissions = ["proxy"]
+target = { dn = "${PROXY_TARGET_DN}" }
+subject = { user = "${PROXY_AGENT_DN}" }
+EOF
   generate_mtls_certificates "${MTLS_WORK_DIR}/certs"
 
   cat >"${MTLS_WORK_DIR}/config/server.toml" <<EOF
@@ -459,7 +575,7 @@ profile = "production"
 allow_anonymous_bind = true
 allow_sasl_plain = true
 allow_sasl_external = true
-sasl_external_identity_map = { "opendr-client" = "${BIND_DN}" }
+sasl_external_identity_map = { "opendr-client" = "${PROXY_AGENT_DN}" }
 
 [monitoring]
 enabled = false
@@ -471,7 +587,9 @@ enabled = false
 enabled = false
 
 [access_control]
-enabled = false
+enabled = true
+default_policy = "deny"
+rules_file = "config/aci.toml"
 
 [rate_limit]
 enabled = false
@@ -653,9 +771,17 @@ run_rfc4513_auth_cli_checks() {
       "SASL PLAIN WhoAmI over StartTLS" \
       "dn:${BIND_DN}" \
       "${sasl_plain_args[@]}"
+    local sasl_plain_proxy_args=(-Q -Y PLAIN -D "cn=ignored,${BASE_DN}" -U "${PROXY_AUTHCID}" -w "${PROXY_AGENT_PW}" -H "${LDAP_URL}")
+    if [[ "${STARTTLS}" == "1" ]]; then
+      sasl_plain_proxy_args=(-ZZ "${sasl_plain_proxy_args[@]}")
+    fi
     expect_ldapwhoami_failure \
-      "SASL PLAIN proxy authzid rejected over StartTLS" \
-      "${sasl_plain_args[@]}" -X "dn:cn=proxy,${BASE_DN}"
+      "SASL PLAIN proxy authzid denied over StartTLS" \
+      "${sasl_plain_proxy_args[@]}" -X "u:${PROXY_DENIED_AUTHCID}"
+    expect_whoami \
+      "SASL PLAIN proxy authzid granted over StartTLS" \
+      "dn:${PROXY_TARGET_DN}" \
+      "${sasl_plain_proxy_args[@]}" -X "u:${PROXY_TARGET_AUTHCID}"
     run_raw_malformed_sasl_plain_check \
       "Python raw LDAP: malformed SASL PLAIN over StartTLS" \
       "${LDAP_URL}" \
@@ -672,8 +798,12 @@ run_rfc4513_auth_cli_checks() {
       "dn:${BIND_DN}" \
       -Q -Y PLAIN -D "${BIND_DN}" -U "${SASL_AUTHCID}" -w "${BIND_PW}" -H "${LDAPS_URL}"
     expect_ldapwhoami_failure \
-      "SASL PLAIN proxy authzid rejected over LDAPS" \
-      -Q -Y PLAIN -D "${BIND_DN}" -U "${SASL_AUTHCID}" -w "${BIND_PW}" -H "${LDAPS_URL}" -X "dn:cn=proxy,${BASE_DN}"
+      "SASL PLAIN proxy authzid denied over LDAPS" \
+      -Q -Y PLAIN -D "cn=ignored,${BASE_DN}" -U "${PROXY_AUTHCID}" -w "${PROXY_AGENT_PW}" -H "${LDAPS_URL}" -X "u:${PROXY_DENIED_AUTHCID}"
+    expect_whoami \
+      "SASL PLAIN proxy authzid granted over LDAPS" \
+      "dn:${PROXY_TARGET_DN}" \
+      -Q -Y PLAIN -D "cn=ignored,${BASE_DN}" -U "${PROXY_AUTHCID}" -w "${PROXY_AGENT_PW}" -H "${LDAPS_URL}" -X "u:${PROXY_TARGET_AUTHCID}"
     run_raw_malformed_sasl_plain_check \
       "Python raw LDAP: malformed SASL PLAIN over LDAPS" \
       "${LDAPS_URL}" \
@@ -749,26 +879,27 @@ run_openldap_mtls_external_checks() {
 
   expect_mtls_whoami \
     "SASL EXTERNAL WhoAmI over StartTLS" \
-    "dn:${BIND_DN}" \
+    "dn:${PROXY_AGENT_DN}" \
     -Q -Y EXTERNAL -ZZ -H "${MTLS_LDAP_URL}" || return 1
   expect_mtls_whoami \
     "SASL EXTERNAL WhoAmI over LDAPS" \
-    "dn:${BIND_DN}" \
+    "dn:${PROXY_AGENT_DN}" \
     -Q -Y EXTERNAL -H "${MTLS_LDAPS_URL}" || return 1
   expect_mtls_whoami \
     "SASL EXTERNAL explicit authzid over StartTLS" \
-    "dn:${BIND_DN}" \
-    -Q -Y EXTERNAL -X "dn:${BIND_DN}" -ZZ -H "${MTLS_LDAP_URL}" || return 1
-  set +e
-  local output status
-  output="$(run_mtls_ldapwhoami -Q -Y EXTERNAL -X "dn:cn=proxy,${BASE_DN}" -ZZ -H "${MTLS_LDAP_URL}" 2>&1)"
-  status=$?
-  set -e
-  record_command_result "SASL EXTERNAL proxy authzid rejected over StartTLS" "${status}" "${output}"
-  if [[ "${status}" -eq 0 ]]; then
-    echo "SASL EXTERNAL proxy authzid unexpectedly succeeded" >&2
-    return 1
-  fi
+    "dn:${PROXY_AGENT_DN}" \
+    -Q -Y EXTERNAL -X "dn:${PROXY_AGENT_DN}" -ZZ -H "${MTLS_LDAP_URL}" || return 1
+  expect_mtls_ldapwhoami_failure \
+    "SASL EXTERNAL proxy authzid denied over StartTLS" \
+    -Q -Y EXTERNAL -X "dn:${PROXY_DENIED_DN}" -ZZ -H "${MTLS_LDAP_URL}" || return 1
+  expect_mtls_whoami \
+    "SASL EXTERNAL proxy authzid granted over StartTLS" \
+    "dn:${PROXY_TARGET_DN}" \
+    -Q -Y EXTERNAL -X "dn:${PROXY_TARGET_DN}" -ZZ -H "${MTLS_LDAP_URL}" || return 1
+  expect_mtls_whoami \
+    "SASL EXTERNAL proxy authzid granted over LDAPS" \
+    "dn:${PROXY_TARGET_DN}" \
+    -Q -Y EXTERNAL -X "dn:${PROXY_TARGET_DN}" -H "${MTLS_LDAPS_URL}" || return 1
 }
 
 run_raw_mtls_external_check() {
@@ -781,7 +912,9 @@ run_raw_mtls_external_check() {
   OPENDR_LDAP_URL="${url}" \
   OPENDR_STARTTLS="${starttls}" \
   OPENDR_BASE_DN="${BASE_DN}" \
-  OPENDR_BIND_DN="${BIND_DN}" \
+  OPENDR_PROXY_AGENT_DN="${PROXY_AGENT_DN}" \
+  OPENDR_PROXY_TARGET_DN="${PROXY_TARGET_DN}" \
+  OPENDR_PROXY_DENIED_DN="${PROXY_DENIED_DN}" \
   OPENDR_MTLS_CLIENT_CERT="${MTLS_CLIENT_CERT}" \
   OPENDR_MTLS_CLIENT_KEY="${MTLS_CLIENT_KEY}" \
   OPENDR_MTLS_CA_CERT="${MTLS_CA_CERT}" \
@@ -928,7 +1061,8 @@ def whoami(stream):
     return read_ldap_message(stream)
 
 
-expected = f"dn:{os.environ['OPENDR_BIND_DN']}".encode()
+expected = f"dn:{os.environ['OPENDR_PROXY_AGENT_DN']}".encode()
+proxy_target = f"dn:{os.environ['OPENDR_PROXY_TARGET_DN']}".encode()
 with connect() as stream:
     search_root_dse(stream)
     assert sasl_external_bind(stream) == 0
@@ -937,12 +1071,18 @@ with connect() as stream:
         raise AssertionError(f"WhoAmI response {response!r} did not include {expected!r}")
 
 with connect() as stream:
-    assert sasl_external_bind(stream, f"dn:{os.environ['OPENDR_BIND_DN']}") == 0
+    assert sasl_external_bind(stream, f"dn:{os.environ['OPENDR_PROXY_AGENT_DN']}") == 0
 
 with connect() as stream:
-    code = sasl_external_bind(stream, f"dn:cn=proxy,{os.environ['OPENDR_BASE_DN']}")
+    assert sasl_external_bind(stream, f"dn:{os.environ['OPENDR_PROXY_TARGET_DN']}") == 0
+    response = whoami(stream)
+    if proxy_target not in response:
+        raise AssertionError(f"WhoAmI response {response!r} did not include {proxy_target!r}")
+
+with connect() as stream:
+    code = sasl_external_bind(stream, f"dn:{os.environ['OPENDR_PROXY_DENIED_DN']}")
     if code == 0:
-        raise AssertionError("SASL EXTERNAL proxy authzid unexpectedly succeeded")
+        raise AssertionError("SASL EXTERNAL denied proxy authzid unexpectedly succeeded")
 PY
 }
 

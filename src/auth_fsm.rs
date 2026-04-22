@@ -237,6 +237,7 @@ impl AuthFsmImpl {
         &mut self,
         dn: String,
     ) -> Result<Option<AuthUserInfo>, AuthError> {
+        let count_success = !matches!(self.state, AuthState::SimpleBound { .. });
         match &self.state {
             AuthState::Anonymous
             | AuthState::AuthenticationFailed
@@ -270,7 +271,9 @@ impl AuthFsmImpl {
                 .map_err(|e| AuthError::DirectoryError { message: e })?;
             self.state = AuthState::SimpleBound { dn };
             self.user_info = Some(user_info.clone());
-            self.stats.successful_auths += 1;
+            if count_success {
+                self.stats.successful_auths += 1;
+            }
             self.stats.current_auth_attempts = 0;
             self.auth_start_time = None;
             return Ok(Some(user_info));
@@ -278,7 +281,9 @@ impl AuthFsmImpl {
 
         self.state = AuthState::SimpleBound { dn };
         self.user_info = None;
-        self.stats.successful_auths += 1;
+        if count_success {
+            self.stats.successful_auths += 1;
+        }
         self.stats.current_auth_attempts = 0;
         self.auth_start_time = None;
         Ok(None)

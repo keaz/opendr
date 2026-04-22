@@ -52,24 +52,30 @@ verified client certificate that resolves to an existing LDAP DN.
 ## RFC 4513 Guarantees
 
 - Anonymous bind is disabled by default in the production profile.
+- Unauthenticated simple bind is disabled by default in the production profile.
 - Non-anonymous simple bind over cleartext LDAP is rejected with
   `confidentialityRequired` by default in the production profile.
+- SASL bind requests ignore the LDAP `name` field and resolve the
+  authentication identity from SASL credentials, as required by RFC 4513.
 - SASL PLAIN is supported only over LDAPS or StartTLS. Empty authzid,
   self-authzid in `dn:<distinguishedName>` form, and self-authzid in
-  `u:<authcid>` form are accepted; proxy authorization is not enabled.
+  `u:<authcid>` form are accepted. Proxy authorization is supported when local
+  policy allows it through ACI `proxy` permission. The configured `root_dn`
+  remains a local superuser exception.
 - SASL EXTERNAL is supported over verified mutual TLS. The client certificate
   subject common name is mapped through `security.sasl_external_identity_map`;
   when no mapping exists, the common name may be used directly if it is a valid
-  LDAP DN. Empty authzid and self `dn:<distinguishedName>` authzid are accepted;
-  proxy authorization is not enabled.
+  LDAP DN. Empty authzid plus `dn:<distinguishedName>` and resolvable
+  `u:<userid>` authzid forms are accepted. Proxy authorization is supported
+  when local policy allows it through ACI `proxy` permission.
 - GSSAPI, DIGEST-MD5, CRAM-MD5, SCRAM, and other multi-step SASL mechanisms are
   not production-enabled.
 - StartTLS succeeds only when TLS is configured, rejects already-secure
   sequencing, clears authentication state, and requires clients to bind again.
 - Password Modify requires a confidential channel and can be disabled by
   `allow_password_modify = false`.
-- WhoAmI returns the current authorization identity and reflects the post-StartTLS
-  authentication reset.
+- WhoAmI returns the current authorization identity, reflects the post-StartTLS
+  authentication reset, and does not require read access to the bound entry.
 - Unknown critical controls continue to be rejected before operation dispatch.
 
 ## TLS Checklist
@@ -94,8 +100,9 @@ verified client certificate that resolves to an existing LDAP DN.
 Run `scripts/ldap_interop_gate.sh` before claiming RFC 4513 production
 readiness. The gate starts production-profile fixtures, validates cleartext bind
 rejection, SASL PLAIN over StartTLS and LDAPS, malformed SASL PLAIN rejection,
-Root DSE SASL mechanism visibility, and SASL EXTERNAL over generated mutual-TLS
-client certificates. It writes sanitized command transcripts and server logs to
+Root DSE SASL mechanism visibility, granted and denied SASL proxy
+authorization, and SASL EXTERNAL over generated mutual-TLS client certificates.
+It writes sanitized command transcripts and server logs to
 `target/ldap-interop-gate/<timestamp>` unless `OPENDR_INTEROP_ARTIFACT_DIR` is
 set.
 

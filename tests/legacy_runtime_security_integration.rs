@@ -111,6 +111,12 @@ async fn build_security_config_with_policy(
         root_dn,
         security_policy,
         sasl_external_identity_map: std::collections::HashMap::new(),
+        sasl_identity_search_attributes: vec![
+            "uid".to_string(),
+            "cn".to_string(),
+            "mail".to_string(),
+        ],
+        naming_contexts: vec!["dc=example,dc=org".to_string()],
     })
 }
 

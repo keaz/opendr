@@ -35,8 +35,8 @@ endpoint. It writes a sanitized transcript, server stdout, and server stderr to
 1. OpenLDAP CLI Bind, StartTLS, Root DSE, Search, Add, Modify, Delete,
    ModifyDN, Compare, paged results, server-side sort, subschema, operational
    attribute reads, RFC 4513 cleartext-bind rejection, SASL PLAIN over StartTLS
-   and LDAPS, unsupported SASL proxy authzid rejection, and WhoAmI after simple
-   and SASL bind.
+   and LDAPS, granted and denied SASL proxy authzid policy, and WhoAmI after
+   simple and SASL bind.
 2. Python `ldap3` Bind, StartTLS, Root DSE, and subschema reads.
 3. Rust `ldap_ops_client` Bind, Root DSE, Search, Add, Modify, Delete,
    ModifyDN, Compare, WhoAmI, and Password Modify.

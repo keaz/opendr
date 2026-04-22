@@ -37,6 +37,10 @@ use tokio_rustls::TlsConnector;
 const MANAGE_DSA_IT_OID: &str = "2.16.840.1.113730.3.4.2";
 const DEFAULT_TEST_ROOT_PASSWORD: &str = "secret";
 const PRODUCTION_TEST_ROOT_PASSWORD: &str = "TlsRuntimeProductionRootSecret123!";
+const PROXY_AGENT_DN: &str = "cn=proxy-agent,dc=example,dc=org";
+const PROXY_AGENT_PASSWORD: &str = "ProxyAgentSecret123!";
+const PROXY_TARGET_DN: &str = "cn=proxy-target,dc=example,dc=org";
+const PROXY_DENIED_DN: &str = "cn=proxy-denied,dc=example,dc=org";
 
 struct TestBinaryServer {
     _tempdir: TempDir,
@@ -59,6 +63,9 @@ struct TlsFixtureConfig<'a> {
     require_client_cert: bool,
     sasl_external_identity_map: Option<(&'a str, &'a str)>,
     security_profile: Option<&'a str>,
+    base_ldif: Option<&'a str>,
+    admin_ldif: Option<&'a str>,
+    access_control_rules: Option<&'a str>,
 }
 
 impl Drop for TestBinaryServer {
@@ -150,12 +157,17 @@ fn write_tls_fixture(tempdir: &TempDir, fixture: &TlsFixtureConfig<'_>) {
     let production_profile = fixture
         .security_profile
         .is_some_and(|profile| profile.eq_ignore_ascii_case("production"));
+    let root_password = if production_profile {
+        PRODUCTION_TEST_ROOT_PASSWORD
+    } else {
+        DEFAULT_TEST_ROOT_PASSWORD
+    };
     let root_password_toml = if production_profile {
         let root_password_file = config_dir.join("root-password.txt");
-        fs::write(&root_password_file, PRODUCTION_TEST_ROOT_PASSWORD).unwrap();
+        fs::write(&root_password_file, root_password).unwrap();
         r#"root_password_file = "config/root-password.txt""#.to_string()
     } else {
-        format!(r#"root_password = "{DEFAULT_TEST_ROOT_PASSWORD}""#)
+        format!(r#"root_password = "{root_password}""#)
     };
 
     let mut security_toml = fixture
@@ -178,6 +190,26 @@ profile = "{profile}"
             "sasl_external_identity_map = {{ \"{certificate_cn}\" = \"{mapped_dn}\" }}\n"
         ));
     }
+    if let Some(base_ldif) = fixture.base_ldif {
+        fs::write(config_dir.join("base.ldif"), base_ldif).unwrap();
+    }
+    if let Some(admin_ldif) = fixture.admin_ldif {
+        fs::write(config_dir.join("admin.ldif"), admin_ldif).unwrap();
+    }
+    let access_control_toml = if let Some(rules) = fixture.access_control_rules {
+        fs::write(config_dir.join("aci.toml"), rules).unwrap();
+        r#"
+[access_control]
+enabled = true
+default_policy = "deny"
+rules_file = "config/aci.toml"
+"#
+    } else {
+        r#"
+[access_control]
+enabled = false
+"#
+    };
 
     let server_toml = format!(
         r#"
@@ -209,8 +241,15 @@ enabled = false
 [replication]
 enabled = false
 
+[audit]
+enabled = false
+
+[access_control]
+enabled = false
+
 [rate_limit]
 enabled = false
+# access_control placeholder
 "#,
         runtime = fixture.runtime,
         ldap_port = fixture.ldap_port,
@@ -224,6 +263,12 @@ enabled = false
         root_password_toml = root_password_toml,
         security_toml = security_toml,
     );
+    let server_toml = server_toml
+        .replace(
+            "[audit]\nenabled = false\n\n[access_control]\nenabled = false\n\n[rate_limit]",
+            &format!("[audit]\nenabled = false\n{access_control_toml}\n[rate_limit]"),
+        )
+        .replace("\n# access_control placeholder", "");
     fs::write(config_dir.join("server.toml"), server_toml).unwrap();
 
     let log4rs = r#"
@@ -282,6 +327,9 @@ fn tls_runtime_fixture(runtime: &str, tls_enabled: bool) -> TestBinaryServer {
             require_client_cert: false,
             sasl_external_identity_map: None,
             security_profile: None,
+            base_ldif: None,
+            admin_ldif: None,
+            access_control_rules: None,
         },
     );
     spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem, None, None)
@@ -305,6 +353,9 @@ fn tls_runtime_fixture_with_security_profile(runtime: &str, profile: &str) -> Te
             require_client_cert: false,
             sasl_external_identity_map: None,
             security_profile: Some(profile),
+            base_ldif: None,
+            admin_ldif: None,
+            access_control_rules: None,
         },
     );
     spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem, None, None)
@@ -329,6 +380,127 @@ fn mtls_runtime_fixture(runtime: &str) -> TestBinaryServer {
             require_client_cert: true,
             sasl_external_identity_map: Some(("opendr-client", "cn=admin,dc=example,dc=org")),
             security_profile: None,
+            base_ldif: None,
+            admin_ldif: None,
+            access_control_rules: None,
+        },
+    );
+    spawn_opendr(
+        tempdir,
+        ldap_port,
+        ldaps_port,
+        ca_pem,
+        Some(client_cert_pem),
+        Some(client_key_pem),
+    )
+}
+
+fn proxy_authorization_base_ldif() -> &'static str {
+    r#"dn: dc=example,dc=org
+objectClass: top
+objectClass: domain
+dc: example
+"#
+}
+
+fn proxy_authorization_admin_ldif(root_password: &str) -> String {
+    format!(
+        r#"dn: cn=admin,dc=example,dc=org
+objectClass: top
+objectClass: person
+cn: admin
+sn: Administrator
+userPassword: {root_password}
+
+dn: {proxy_agent_dn}
+objectClass: top
+objectClass: person
+cn: proxy-agent
+sn: Agent
+userPassword: {proxy_agent_password}
+
+dn: {proxy_target_dn}
+objectClass: top
+objectClass: person
+cn: proxy-target
+sn: Target
+userPassword: ProxyTargetSecret123!
+
+dn: {proxy_denied_dn}
+objectClass: top
+objectClass: person
+cn: proxy-denied
+sn: Denied
+userPassword: ProxyDeniedSecret123!
+"#,
+        proxy_agent_dn = PROXY_AGENT_DN,
+        proxy_agent_password = PROXY_AGENT_PASSWORD,
+        proxy_target_dn = PROXY_TARGET_DN,
+        proxy_denied_dn = PROXY_DENIED_DN,
+    )
+}
+
+fn proxy_authorization_aci_rules() -> &'static str {
+    r#"[[rules]]
+name = "proxy-agent-may-proxy-target"
+effect = "grant"
+priority = 100
+permissions = ["proxy"]
+target = { dn = "cn=proxy-target,dc=example,dc=org" }
+subject = { user = "cn=proxy-agent,dc=example,dc=org" }
+"#
+}
+
+fn tls_runtime_fixture_with_proxy_authorization(runtime: &str) -> TestBinaryServer {
+    let tempdir = tempfile::tempdir().unwrap();
+    let ldap_port = reserve_port();
+    let ldaps_port = reserve_port();
+    let (cert_pem, key_pem) = generate_test_certificate();
+    let admin_ldif = proxy_authorization_admin_ldif(DEFAULT_TEST_ROOT_PASSWORD);
+    write_tls_fixture(
+        &tempdir,
+        &TlsFixtureConfig {
+            runtime,
+            ldap_port,
+            ldaps_port,
+            tls_enabled: true,
+            cert_pem: &cert_pem,
+            key_pem: &key_pem,
+            ca_pem: None,
+            require_client_cert: false,
+            sasl_external_identity_map: None,
+            security_profile: None,
+            base_ldif: Some(proxy_authorization_base_ldif()),
+            admin_ldif: Some(admin_ldif.as_str()),
+            access_control_rules: Some(proxy_authorization_aci_rules()),
+        },
+    );
+    spawn_opendr(tempdir, ldap_port, ldaps_port, cert_pem, None, None)
+}
+
+fn mtls_runtime_fixture_with_proxy_authorization(runtime: &str) -> TestBinaryServer {
+    let tempdir = tempfile::tempdir().unwrap();
+    let ldap_port = reserve_port();
+    let ldaps_port = reserve_port();
+    let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
+        generate_mtls_certificates();
+    let admin_ldif = proxy_authorization_admin_ldif(DEFAULT_TEST_ROOT_PASSWORD);
+    write_tls_fixture(
+        &tempdir,
+        &TlsFixtureConfig {
+            runtime,
+            ldap_port,
+            ldaps_port,
+            tls_enabled: true,
+            cert_pem: &server_cert_pem,
+            key_pem: &server_key_pem,
+            ca_pem: Some(&ca_pem),
+            require_client_cert: true,
+            sasl_external_identity_map: Some(("opendr-client", PROXY_AGENT_DN)),
+            security_profile: None,
+            base_ldif: Some(proxy_authorization_base_ldif()),
+            admin_ldif: Some(admin_ldif.as_str()),
+            access_control_rules: Some(proxy_authorization_aci_rules()),
         },
     );
     spawn_opendr(
@@ -427,11 +599,32 @@ async fn send_sasl_plain_bind_request<S>(stream: &mut S, message_id: u32) -> Vec
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let bind_dn = "cn=admin,dc=example,dc=org";
-    let credentials = format!("\0{bind_dn}\0secret").into_bytes();
+    send_sasl_plain_bind_request_with_authzid(
+        stream,
+        message_id,
+        "cn=admin,dc=example,dc=org",
+        "",
+        "cn=admin,dc=example,dc=org",
+        "secret",
+    )
+    .await
+}
+
+async fn send_sasl_plain_bind_request_with_authzid<S>(
+    stream: &mut S,
+    message_id: u32,
+    request_dn: &str,
+    authzid: &str,
+    authcid: &str,
+    password: &str,
+) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let credentials = format!("{authzid}\0{authcid}\0{password}").into_bytes();
     let bind_request = RasnBindRequest::new(
         3,
-        bind_dn.as_bytes().to_vec().into(),
+        request_dn.as_bytes().to_vec().into(),
         RasnAuthChoice::Sasl(RasnSaslCredentials::new(
             b"PLAIN".to_vec().into(),
             Some(credentials.into()),
@@ -725,6 +918,14 @@ async fn assert_production_security_profile(runtime: &str) {
     assert_bind_success(&response);
 }
 
+async fn assert_anonymous_bind_succeeds_when_enabled(runtime: &str) {
+    let server = tls_runtime_fixture(runtime, true);
+
+    let mut stream = connect_with_retry(server.ldap_port).await;
+    let response = send_anonymous_bind_request(&mut stream, 1).await;
+    assert_bind_success(&response);
+}
+
 fn trusted_tls_connector(cert_pem: &str) -> TlsConnector {
     let mut roots = RootCertStore::empty();
     let mut reader = Cursor::new(cert_pem.as_bytes());
@@ -808,6 +1009,10 @@ fn assert_starttls_success(response: &[u8]) {
 }
 
 fn assert_whoami_bound_admin(response: &[u8]) {
+    assert_whoami_bound_dn(response, "dn:cn=admin,dc=example,dc=org");
+}
+
+fn assert_whoami_bound_dn(response: &[u8], expected: &str) {
     let (_, messages) = parse_ldap_messages(response).unwrap();
     assert_eq!(messages.len(), 1);
     match &messages[0].protocol_op {
@@ -825,7 +1030,7 @@ fn assert_whoami_bound_admin(response: &[u8]) {
                     .response_value
                     .as_ref()
                     .map(|value| std::str::from_utf8(value.as_ref()).unwrap()),
-                Some("dn:cn=admin,dc=example,dc=org")
+                Some(expected)
             );
         }
         other => panic!("unexpected WhoAmI response: {:?}", other),
@@ -850,6 +1055,16 @@ async fn legacy_production_profile_denies_unsafe_binds_until_starttls() {
 #[tokio::test]
 async fn fsm_production_profile_denies_unsafe_binds_until_starttls() {
     assert_production_security_profile("fsm").await;
+}
+
+#[tokio::test]
+async fn legacy_plaintext_anonymous_bind_succeeds_when_enabled() {
+    assert_anonymous_bind_succeeds_when_enabled("legacy").await;
+}
+
+#[tokio::test]
+async fn fsm_plaintext_anonymous_bind_succeeds_when_enabled() {
+    assert_anonymous_bind_succeeds_when_enabled("fsm").await;
 }
 
 #[tokio::test]
@@ -972,6 +1187,98 @@ async fn assert_ldaps_sasl_external_with_client_certificate(runtime: &str) {
     assert_whoami_bound_admin(&whoami_response);
 }
 
+async fn assert_starttls_sasl_plain_proxy_authorization(runtime: &str) {
+    let server = tls_runtime_fixture_with_proxy_authorization(runtime);
+
+    let mut denied_stream = connect_with_retry(server.ldap_port).await;
+    let denied_starttls = send_starttls_request(&mut denied_stream, 1).await;
+    assert_starttls_success(&denied_starttls);
+    let connector = trusted_tls_connector(&server.cert_pem);
+    let mut denied_tls_stream = connector
+        .connect(localhost_server_name(), denied_stream)
+        .await
+        .expect("StartTLS upgrade should complete with trusted server certificate");
+    let denied_response = send_sasl_plain_bind_request_with_authzid(
+        &mut denied_tls_stream,
+        2,
+        "cn=ignored,dc=example,dc=org",
+        "u:proxy-denied",
+        "proxy-agent",
+        PROXY_AGENT_PASSWORD,
+    )
+    .await;
+    assert_bind_result(&denied_response, ParserResultCode::InvalidCredentials);
+
+    let mut success_stream = connect_with_retry(server.ldap_port).await;
+    let success_starttls = send_starttls_request(&mut success_stream, 3).await;
+    assert_starttls_success(&success_starttls);
+    let connector = trusted_tls_connector(&server.cert_pem);
+    let mut success_tls_stream = connector
+        .connect(localhost_server_name(), success_stream)
+        .await
+        .expect("StartTLS upgrade should complete with trusted server certificate");
+    let bind_response = send_sasl_plain_bind_request_with_authzid(
+        &mut success_tls_stream,
+        4,
+        "cn=ignored,dc=example,dc=org",
+        "u:proxy-target",
+        "proxy-agent",
+        PROXY_AGENT_PASSWORD,
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let whoami_response = send_whoami_request(&mut success_tls_stream, 5).await;
+    assert_whoami_bound_dn(&whoami_response, "dn:cn=proxy-target,dc=example,dc=org");
+}
+
+async fn assert_starttls_sasl_external_proxy_authorization(runtime: &str) {
+    let server = mtls_runtime_fixture_with_proxy_authorization(runtime);
+
+    let mut denied_stream = connect_with_retry(server.ldap_port).await;
+    let denied_starttls = send_starttls_request(&mut denied_stream, 1).await;
+    assert_starttls_success(&denied_starttls);
+    let connector = trusted_tls_connector_with_client_cert(
+        &server.cert_pem,
+        server.client_cert_pem.as_ref().unwrap(),
+        server.client_key_pem.as_ref().unwrap(),
+    );
+    let mut denied_tls_stream = connector
+        .connect(localhost_server_name(), denied_stream)
+        .await
+        .expect("StartTLS mTLS upgrade should complete with client certificate");
+    let denied_response = send_sasl_external_bind_request(
+        &mut denied_tls_stream,
+        2,
+        Some("dn:CN=proxy-denied,DC=example,DC=org"),
+    )
+    .await;
+    assert_bind_result(&denied_response, ParserResultCode::InvalidCredentials);
+
+    let mut success_stream = connect_with_retry(server.ldap_port).await;
+    let success_starttls = send_starttls_request(&mut success_stream, 3).await;
+    assert_starttls_success(&success_starttls);
+    let connector = trusted_tls_connector_with_client_cert(
+        &server.cert_pem,
+        server.client_cert_pem.as_ref().unwrap(),
+        server.client_key_pem.as_ref().unwrap(),
+    );
+    let mut success_tls_stream = connector
+        .connect(localhost_server_name(), success_stream)
+        .await
+        .expect("StartTLS mTLS upgrade should complete with client certificate");
+    let bind_response = send_sasl_external_bind_request(
+        &mut success_tls_stream,
+        4,
+        Some("dn:CN=proxy-target,DC=example,DC=org"),
+    )
+    .await;
+    assert_bind_success(&bind_response);
+
+    let whoami_response = send_whoami_request(&mut success_tls_stream, 5).await;
+    assert_whoami_bound_dn(&whoami_response, "dn:cn=proxy-target,dc=example,dc=org");
+}
+
 #[tokio::test]
 async fn legacy_ldaps_accepts_sasl_external_with_client_certificate() {
     assert_ldaps_sasl_external_with_client_certificate("legacy").await;
@@ -1010,6 +1317,26 @@ async fn fsm_starttls_accepts_sasl_external_with_client_certificate_authzid() {
 
     let whoami_response = send_whoami_request(&mut tls_stream, 4).await;
     assert_whoami_bound_admin(&whoami_response);
+}
+
+#[tokio::test]
+async fn legacy_starttls_accepts_sasl_plain_proxy_authorization_with_aci() {
+    assert_starttls_sasl_plain_proxy_authorization("legacy").await;
+}
+
+#[tokio::test]
+async fn fsm_starttls_accepts_sasl_plain_proxy_authorization_with_aci() {
+    assert_starttls_sasl_plain_proxy_authorization("fsm").await;
+}
+
+#[tokio::test]
+async fn legacy_starttls_accepts_sasl_external_proxy_authorization_with_aci() {
+    assert_starttls_sasl_external_proxy_authorization("legacy").await;
+}
+
+#[tokio::test]
+async fn fsm_starttls_accepts_sasl_external_proxy_authorization_with_aci() {
+    assert_starttls_sasl_external_proxy_authorization("fsm").await;
 }
 
 #[tokio::test]

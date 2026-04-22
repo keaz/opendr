@@ -136,6 +136,8 @@ async fn build_legacy_security_config(
         root_dn: Some(config.canonical_root_dn()?),
         security_policy,
         sasl_external_identity_map: config.security.sasl_external_identity_map.clone(),
+        sasl_identity_search_attributes: config.security.sasl_identity_search_attributes.clone(),
+        naming_contexts: vec![config.server.base_dn.clone()],
     })))
 }
 

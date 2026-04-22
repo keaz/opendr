@@ -86,17 +86,19 @@ use crate::server::{
     LegacyServerConfig, PagedSearchCursor, RequestContext, SearchRequestSignature, ServerError,
     SharedLdapSchema, SubentriesRequestError, SubentriesSearchVisibility, SyncRequestError,
     apply_online_schema_modify, authorize_attribute_permissions, authorize_operation,
-    build_entry_from_add_request, can_skip_search_post_filter,
-    convert_ldap_changes_to_modifications, entry_is_referral as directory_entry_is_referral,
-    entry_matches_subentries_visibility, filter_search_entries_for_read_access,
-    first_server_managed_operational_attribute, handle_sync_search_request,
-    increment_control_counter, log_add_audit_event, log_anonymous_bind, log_compare_audit,
-    log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event, log_modify_audit_event,
-    log_password_modify_audit_event, log_sasl_bind, log_simple_bind_failure,
-    log_simple_bind_success, online_schema_update_result, parse_subentries_request_control,
-    parse_sync_request_control, record_authentication_failure_metadata_with_context,
+    authorize_sasl_authorization_identity, build_entry_from_add_request,
+    can_skip_search_post_filter, convert_ldap_changes_to_modifications,
+    entry_is_referral as directory_entry_is_referral, entry_matches_subentries_visibility,
+    filter_search_entries_for_read_access, first_server_managed_operational_attribute,
+    handle_sync_search_request, increment_control_counter, log_add_audit_event, log_anonymous_bind,
+    log_compare_audit, log_delete_audit_event, log_generic_audit_event, log_moddn_audit_event,
+    log_modify_audit_event, log_password_modify_audit_event, log_sasl_bind,
+    log_simple_bind_failure, log_simple_bind_success, online_schema_update_result,
+    parse_subentries_request_control, parse_sync_request_control,
+    record_authentication_failure_metadata_with_context,
     record_authentication_success_metadata_with_context, referral_urls_for_entry,
-    reject_sync_request, resolve_search_base_dn, resolve_search_candidate_entry, schema_snapshot,
+    reject_sync_request, resolve_bind_identity, resolve_search_base_dn,
+    resolve_search_candidate_entry, schema_snapshot,
     server_managed_operational_attribute_diagnostic, shared_schema,
 };
 use crate::shutdown::ShutdownCoordinator;
@@ -6267,8 +6269,8 @@ async fn handle_bind_with_fsm(
     let bind_name = bind_req.name.0.as_ref().trim().to_owned();
     match bind_req.authentication {
         AuthenticationChoice::Simple(password) => {
-            let dn = bind_name;
-            let is_anonymous_bind = dn.is_empty() && password.as_ref().is_empty();
+            let trace_dn = bind_name;
+            let is_anonymous_bind = trace_dn.is_empty() && password.as_ref().is_empty();
             let security_policy = crate::server::security_policy(request_context);
             if is_anonymous_bind && !security_policy.allow_anonymous_bind {
                 reset_auth_state(fsm_set).await?;
@@ -6287,6 +6289,58 @@ async fn handle_bind_with_fsm(
                 .await?;
                 return Ok(());
             }
+            if is_anonymous_bind {
+                reset_auth_state(fsm_set).await?;
+                if let Some(metrics) = metrics {
+                    metrics.record_fsm_state(FsmType::Auth, "anonymous");
+                }
+                log_anonymous_bind(request_context).await;
+                send_bind_success(fsm_set, message_id as u32).await?;
+                return Ok(());
+            }
+            if !trace_dn.is_empty() && password.as_ref().is_empty() {
+                if !security_policy.allow_unauthenticated_bind {
+                    reset_auth_state(fsm_set).await?;
+                    log_simple_bind_failure(
+                        request_context,
+                        &trace_dn,
+                        "unauthenticated bind is disabled by security policy",
+                    )
+                    .await;
+                    send_bind_result(
+                        fsm_set,
+                        message_id as u32,
+                        ResultCode::UnwillingToPerform,
+                        "unauthenticated bind is disabled by security policy",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                reset_auth_state(fsm_set).await?;
+                if let Some(metrics) = metrics {
+                    metrics.record_fsm_state(FsmType::Auth, "anonymous");
+                }
+                log_anonymous_bind(request_context).await;
+                send_bind_success(fsm_set, message_id as u32).await?;
+                return Ok(());
+            }
+
+            let dn = match crate::dn::canonicalize_dn(&trace_dn) {
+                Ok(dn) if !dn.is_empty() => dn,
+                _ => {
+                    reset_auth_state(fsm_set).await?;
+                    log_simple_bind_failure(request_context, &trace_dn, "invalid DN syntax").await;
+                    send_bind_result(
+                        fsm_set,
+                        message_id as u32,
+                        ResultCode::InvalidDnSyntax,
+                        "invalid DN syntax",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
             if !is_anonymous_bind
                 && !connection_is_secure
                 && !security_policy.allow_cleartext_simple_bind
@@ -6294,7 +6348,7 @@ async fn handle_bind_with_fsm(
                 reset_auth_state(fsm_set).await?;
                 log_simple_bind_failure(
                     request_context,
-                    &dn,
+                    &trace_dn,
                     "simple bind requires TLS by security policy",
                 )
                 .await;
@@ -6370,9 +6424,15 @@ async fn handle_bind_with_fsm(
                             if let Some(metrics) = metrics {
                                 metrics.record_fsm_state(FsmType::Auth, "authentication_failed");
                             }
-                            log_simple_bind_failure(request_context, &dn, &err.to_string()).await;
-                            send_bind_error(fsm_set, message_id as u32, "authentication failed")
-                                .await?;
+                            log_simple_bind_failure(request_context, &trace_dn, &err.to_string())
+                                .await;
+                            send_bind_result(
+                                fsm_set,
+                                message_id as u32,
+                                ResultCode::Unavailable,
+                                "authentication failed",
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -6518,13 +6578,7 @@ async fn handle_sasl_bind_with_fsm(
         }
     };
 
-    let bind_dn = if request_name.is_empty() {
-        parsed.authcid.to_owned()
-    } else {
-        request_name
-    };
-
-    if bind_dn.is_empty() {
+    if parsed.authcid.is_empty() {
         if let Some(metrics) = metrics {
             metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
         }
@@ -6546,51 +6600,122 @@ async fn handle_sasl_bind_with_fsm(
         return Ok(());
     }
 
-    if !crate::sasl_mechanisms::plain_authzid_matches_authenticated_identity(
-        parsed.authzid,
-        parsed.authcid,
-        &bind_dn,
-    ) {
-        if let Some(metrics) = metrics {
-            metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
-        }
-        log_sasl_bind(
-            request_context,
-            bind_dn.as_str(),
-            "PLAIN",
-            false,
-            Some("proxy authorization is not supported"),
-        )
-        .await;
-        send_bind_result(
-            fsm_set,
-            message_id,
-            ResultCode::InappropriateAuthentication,
-            "proxy authorization is not supported",
-        )
-        .await?;
-        return Ok(());
-    }
+    let authenticated_dn =
+        match resolve_bind_identity(fsm_set.backend().as_ref(), request_context, parsed.authcid)
+            .await
+        {
+            Ok(Some(bind_dn)) => bind_dn,
+            Ok(None) | Err(_) => {
+                if let Some(metrics) = metrics {
+                    metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+                }
+                log_sasl_bind(
+                    request_context,
+                    parsed.authcid,
+                    "PLAIN",
+                    false,
+                    Some("invalid credentials"),
+                )
+                .await;
+                send_bind_result(
+                    fsm_set,
+                    message_id,
+                    ResultCode::InvalidCredentials,
+                    "invalid credentials",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
     let auth_event = AuthEvent::BindRequest {
-        dn: bind_dn.clone(),
+        dn: authenticated_dn.clone(),
         password: parsed.password.to_vec(),
     };
     let backend = fsm_set.backend().clone();
 
     match fsm_set.auth_mut() {
         AuthenticationFsm::Simple(auth_fsm) => match auth_fsm.handle_event(auth_event).await {
-            Ok(_) if fsm_set.is_authenticated() => {
+            Ok(_)
+                if matches!(
+                    auth_fsm.current_state(),
+                    crate::fsm::AuthState::SimpleBound { .. }
+                ) =>
+            {
+                let authz_dn = match authorize_sasl_authorization_identity(
+                    backend.as_ref(),
+                    request_context,
+                    &authenticated_dn,
+                    parsed.authcid,
+                    parsed.authzid,
+                )
+                .await
+                {
+                    Ok(authz_dn) => authz_dn,
+                    Err((diagnostic, result_code)) => {
+                        auth_fsm.reset().await.map_err(|err| err.to_string())?;
+                        if let Some(metrics) = metrics {
+                            metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+                        }
+                        log_sasl_bind(
+                            request_context,
+                            authenticated_dn.as_str(),
+                            "PLAIN",
+                            false,
+                            Some(diagnostic),
+                        )
+                        .await;
+                        send_bind_result(fsm_set, message_id, result_code, diagnostic).await?;
+                        return Ok(());
+                    }
+                };
+
+                if !authz_dn.eq_ignore_ascii_case(&authenticated_dn)
+                    && let Err(err) = auth_fsm
+                        .handle_event(AuthEvent::ExternalBind {
+                            dn: authz_dn.clone(),
+                        })
+                        .await
+                {
+                    auth_fsm
+                        .reset()
+                        .await
+                        .map_err(|reset_err| reset_err.to_string())?;
+                    error!(
+                        "SASL PLAIN authorization transition failed for {} -> {}: {}",
+                        authenticated_dn, authz_dn, err
+                    );
+                    if let Some(metrics) = metrics {
+                        metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+                    }
+                    log_sasl_bind(
+                        request_context,
+                        authenticated_dn.as_str(),
+                        "PLAIN",
+                        false,
+                        Some("authorization state transition failed"),
+                    )
+                    .await;
+                    send_bind_result(
+                        fsm_set,
+                        message_id,
+                        ResultCode::Unavailable,
+                        "authorization state transition failed",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
                 if let Some(metrics) = metrics {
                     metrics.record_fsm_state(FsmType::Auth, "sasl_bound");
                 }
                 record_authentication_success_metadata_with_context(
                     request_context,
                     backend.as_ref(),
-                    &bind_dn,
+                    &authenticated_dn,
                 )
                 .await;
-                log_sasl_bind(request_context, bind_dn.as_str(), "PLAIN", true, None).await;
+                log_sasl_bind(request_context, authz_dn.as_str(), "PLAIN", true, None).await;
                 send_bind_success(fsm_set, message_id).await?;
             }
             Ok(_) => {
@@ -6600,21 +6725,30 @@ async fn handle_sasl_bind_with_fsm(
                 record_authentication_failure_metadata_with_context(
                     request_context,
                     backend.as_ref(),
-                    &bind_dn,
+                    &authenticated_dn,
                 )
                 .await;
                 log_sasl_bind(
                     request_context,
-                    bind_dn.as_str(),
+                    authenticated_dn.as_str(),
                     "PLAIN",
                     false,
                     Some("invalid credentials"),
                 )
                 .await;
-                send_bind_error(fsm_set, message_id, "invalid credentials").await?;
+                send_bind_result(
+                    fsm_set,
+                    message_id,
+                    ResultCode::InvalidCredentials,
+                    "invalid credentials",
+                )
+                .await?;
             }
             Err(err) => {
-                error!("SASL PLAIN auth FSM error for {}: {}", bind_dn, err);
+                error!(
+                    "SASL PLAIN auth FSM error for {}: {}",
+                    authenticated_dn, err
+                );
                 let backend_error =
                     matches!(err, crate::auth_fsm::AuthError::DirectoryError { .. });
                 if let Some(metrics) = metrics {
@@ -6627,7 +6761,7 @@ async fn handle_sasl_bind_with_fsm(
                 };
                 log_sasl_bind(
                     request_context,
-                    bind_dn.as_str(),
+                    authenticated_dn.as_str(),
                     "PLAIN",
                     false,
                     Some(diagnostic),
@@ -6642,7 +6776,7 @@ async fn handle_sasl_bind_with_fsm(
             }
             log_sasl_bind(
                 request_context,
-                bind_dn.as_str(),
+                authenticated_dn.as_str(),
                 "PLAIN",
                 false,
                 Some("SASL not configured"),
@@ -6731,7 +6865,7 @@ async fn handle_sasl_external_bind_with_fsm(
         send_bind_result(
             fsm_set,
             message_id,
-            ResultCode::InvalidCredentials,
+            ResultCode::InappropriateAuthentication,
             "SASL EXTERNAL requires a verified client certificate",
         )
         .await?;
@@ -6759,43 +6893,71 @@ async fn handle_sasl_external_bind_with_fsm(
         }
     };
 
-    if !crate::sasl_mechanisms::plain_authzid_matches_authenticated_identity(
-        authzid,
-        &external_dn,
-        &external_dn,
-    ) {
-        if let Some(metrics) = metrics {
-            metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
-        }
-        log_sasl_bind(
-            request_context,
-            external_dn.as_str(),
-            "EXTERNAL",
-            false,
-            Some("proxy authorization is not supported"),
-        )
-        .await;
-        send_bind_result(
-            fsm_set,
-            message_id,
-            ResultCode::InappropriateAuthentication,
-            "proxy authorization is not supported",
-        )
-        .await?;
-        return Ok(());
-    }
-
     let backend = fsm_set.backend().clone();
     match backend.get_entry(&external_dn).await {
         Ok(Some(_)) => {
+            let authz_dn = match authorize_sasl_authorization_identity(
+                backend.as_ref(),
+                request_context,
+                &external_dn,
+                &external_dn,
+                authzid,
+            )
+            .await
+            {
+                Ok(authz_dn) => authz_dn,
+                Err((diagnostic, result_code)) => {
+                    if let Some(metrics) = metrics {
+                        metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+                    }
+                    log_sasl_bind(
+                        request_context,
+                        external_dn.as_str(),
+                        "EXTERNAL",
+                        false,
+                        Some(diagnostic),
+                    )
+                    .await;
+                    send_bind_result(fsm_set, message_id, result_code, diagnostic).await?;
+                    return Ok(());
+                }
+            };
             match fsm_set.auth_mut() {
                 AuthenticationFsm::Simple(auth_fsm) => {
-                    auth_fsm
+                    if let Err(err) = auth_fsm
                         .handle_event(AuthEvent::ExternalBind {
-                            dn: external_dn.clone(),
+                            dn: authz_dn.clone(),
                         })
                         .await
-                        .map_err(|err| err.to_string())?;
+                    {
+                        auth_fsm
+                            .reset()
+                            .await
+                            .map_err(|reset_err| reset_err.to_string())?;
+                        error!(
+                            "SASL EXTERNAL authorization transition failed for {} -> {}: {}",
+                            external_dn, authz_dn, err
+                        );
+                        if let Some(metrics) = metrics {
+                            metrics.record_fsm_state(FsmType::Auth, "sasl_failed");
+                        }
+                        log_sasl_bind(
+                            request_context,
+                            external_dn.as_str(),
+                            "EXTERNAL",
+                            false,
+                            Some("authorization state transition failed"),
+                        )
+                        .await;
+                        send_bind_result(
+                            fsm_set,
+                            message_id,
+                            ResultCode::Unavailable,
+                            "authorization state transition failed",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 }
                 AuthenticationFsm::Sasl(_) => {
                     return send_bind_result(
@@ -6816,14 +6978,7 @@ async fn handle_sasl_external_bind_with_fsm(
                 &external_dn,
             )
             .await;
-            log_sasl_bind(
-                request_context,
-                external_dn.as_str(),
-                "EXTERNAL",
-                true,
-                None,
-            )
-            .await;
+            log_sasl_bind(request_context, authz_dn.as_str(), "EXTERNAL", true, None).await;
             send_bind_success(fsm_set, message_id).await?;
         }
         Ok(None) => {
@@ -8598,6 +8753,12 @@ mod tests {
                 root_dn: Some("cn=directory manager,dc=example,dc=org".to_string()),
                 security_policy: crate::server::LegacySecurityPolicy::default(),
                 sasl_external_identity_map: HashMap::new(),
+                sasl_identity_search_attributes: vec![
+                    "uid".to_string(),
+                    "cn".to_string(),
+                    "mail".to_string(),
+                ],
+                naming_contexts: vec!["dc=example,dc=org".to_string()],
             })),
             ..FsmServerRuntimeContext::default()
         };
@@ -10501,8 +10662,82 @@ mod tests {
             ProtocolOp::BindResponse(bind_response) => {
                 assert_eq!(
                     bind_response.result.result_code,
-                    ParserResultCode::InappropriateAuthentication
+                    ParserResultCode::InvalidCredentials
                 );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_bind_with_fsm_accepts_sasl_plain_proxy_authorization_with_aci() {
+        let backend = Arc::new(MockBackend::from_credentials([
+            ("cn=proxy-agent,dc=example,dc=org", b"agent-secret".to_vec()),
+            (
+                "cn=proxy-target,dc=example,dc=org",
+                b"target-secret".to_vec(),
+            ),
+        ]));
+        let aci_engine = Arc::new(crate::aci::AciEngine::restrictive());
+        aci_engine
+            .add_rule(
+                crate::aci::AciRuleBuilder::grant("proxy-agent-may-proxy-target")
+                    .target_dn("cn=proxy-target,dc=example,dc=org")
+                    .permission(crate::aci::Permission::Proxy)
+                    .subject_user("cn=proxy-agent,dc=example,dc=org")
+                    .build()
+                    .unwrap(),
+            )
+            .await;
+        let request_context = RequestContext::new(
+            None,
+            None,
+            Some(Arc::new(LegacySecurityConfig {
+                audit_logger: None,
+                audit_config: crate::server::LegacyAuditConfig::default(),
+                access_control: Some(aci_engine),
+                root_dn: Some("cn=admin,dc=example,dc=org".to_string()),
+                security_policy: crate::server::LegacySecurityPolicy::default(),
+                sasl_external_identity_map: HashMap::new(),
+                sasl_identity_search_attributes: vec![
+                    "uid".to_string(),
+                    "cn".to_string(),
+                    "mail".to_string(),
+                ],
+                naming_contexts: vec!["dc=example,dc=org".to_string()],
+            })),
+            None,
+        );
+
+        let (server_stream, mut client_stream) = connected_stream_pair().await;
+        let mut fsm_set = ConnectionFsmSet::new(server_stream, backend, None);
+
+        handle_bind_with_fsm(
+            &mut fsm_set,
+            40,
+            sasl_plain_bind_request_with_authzid(
+                "cn=ignored,dc=example,dc=org",
+                "u:proxy-target",
+                "proxy-agent",
+                b"agent-secret",
+            ),
+            true,
+            &request_context,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = read_ldap_payload(&mut client_stream, 1).await;
+        let (_, messages) = parse_ldap_messages(&response).unwrap();
+
+        assert_eq!(
+            fsm_set.authenticated_dn(),
+            Some("cn=proxy-target,dc=example,dc=org")
+        );
+        match &messages[0].protocol_op {
+            ProtocolOp::BindResponse(bind_response) => {
+                assert_eq!(bind_response.result.result_code, ParserResultCode::Success);
             }
             other => panic!("unexpected response: {:?}", other),
         }

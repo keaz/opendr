@@ -1118,13 +1118,15 @@ pnpm build`}</code></pre>
                 <strong>Authentication support:</strong> FSM and legacy
                 runtimes support simple bind, anonymous bind, and SASL PLAIN
                 over LDAPS or StartTLS. SASL PLAIN accepts empty authzid plus
-                self <code>dn:</code> and <code>u:</code> authzid forms; proxy
-                authorization remains unsupported. SASL EXTERNAL is accepted
-                over verified mutual TLS when the client certificate maps to an
-                LDAP DN. The release gate in <code>scripts/ldap_interop_gate.sh</code>
-                must pass before claiming RFC 4513 production readiness. User
-                bind metadata is recorded through server-managed operational
-                attributes including{" "}
+                self and delegated <code>dn:</code> and <code>u:</code> authzid
+                forms when the authenticating DN is granted <code>proxy</code>
+                permission by the access-control engine. SASL EXTERNAL is
+                accepted over verified mutual TLS when the client certificate
+                maps to an LDAP DN. The release gate in{" "}
+                <code>scripts/ldap_interop_gate.sh</code> must pass before
+                claiming RFC 4513 production readiness. User bind metadata is
+                recorded through server-managed operational attributes
+                including{" "}
                 <code>lastSuccessfulLogin</code>, <code>lastFailedLogin</code>,
                 and <code>failedLoginCount</code>.
               </div>
