@@ -4,9 +4,6 @@ This backlog converts the current RFC gap analysis into actionable GitHub issues
 It is based on the codebase implementation surface (`src/`, `tests/`, `docs/`) and
 current RFC statuses in `docs/LDAP_RFC_COMPLIANCE_MATRIX.md`.
 
-Use `scripts/create_rfc_gap_issues.py` to create these drafts directly as GitHub
-issues (requires `GITHUB_TOKEN` and repository slug).
-
 ## Scope and method
 
 - Reviewed server architecture and protocol paths in `src/server.rs`,
